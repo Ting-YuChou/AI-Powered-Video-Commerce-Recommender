@@ -1,0 +1,486 @@
+# AI-Powered Video Commerce Recommender - Docker Compose
+# ========================================================
+# Complete containerized deployment for the video commerce recommendation system
+# 
+# Usage:
+#   docker-compose up -d                    # Start all services
+#   docker-compose up app                   # Start only the app
+#   docker-compose logs -f app              # Follow app logs
+#   docker-compose exec app bash            # Shell into app container
+#   docker-compose down                     # Stop all services
+
+version: '3.8'
+
+services:
+  # Main Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - PYTHON_VERSION=3.9
+        - BUILD_ENV=production
+    container_name: video-commerce-app
+    ports:
+      - "8000:8000"
+    environment:
+      # Application Settings
+      - ENVIRONMENT=production
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - API_WORKERS=2
+      - API_DEBUG=false
+      
+      # Redis Connection
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      
+      # Model Settings
+      - MODEL_DEVICE=auto
+      - MODEL_CACHE_DIR=/app/models
+      - MODEL_ENABLE_GPU=true
+      
+      # Data Settings
+      - DATA_UPLOAD_DIR=/app/uploads
+      - DATA_LOAD_SAMPLE_DATA=true
+      
+      # Monitoring
+      - MONITORING_LOG_LEVEL=INFO
+      - MONITORING_ENABLE_METRICS=true
+    volumes:
+      # Persistent storage for models and data
+      - models_data:/app/models
+      - upload_data:/app/uploads
+      - logs_data:/app/logs
+      - ./config:/app/config:ro
+    depends_on:
+      - redis
+      - prometheus
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+    profiles:
+      - development
+
+# Named Volumes
+volumes:
+  # Application Data
+  models_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/models
+  
+  upload_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/uploads
+  
+  logs_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/logs
+
+  # Database Data
+  redis_data:
+    driver: local
+  
+  postgres_data:
+    driver: local
+  
+  elasticsearch_data:
+    driver: local
+
+  # Monitoring Data
+  prometheus_data:
+    driver: local
+  
+  grafana_data:
+    driver: local
+  
+  # Worker Data
+  celery_beat_data:
+    driver: local
+
+# Networks
+networks:
+  video-commerce-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Configuration Profiles
+# ======================
+# 
+# Default (minimal):
+#   docker-compose up
+#   Includes: app, redis, prometheus, grafana
+#
+# With PostgreSQL:
+#   docker-compose --profile with-postgres up
+#
+# With Elasticsearch:
+#   docker-compose --profile with-elasticsearch up
+#
+# With Nginx:
+#   docker-compose --profile with-nginx up
+#
+# With Triton (GPU required):
+#   docker-compose --profile with-triton up
+#
+# With Celery workers:
+#   docker-compose --profile with-celery up
+#
+# Development environment:
+#   docker-compose --profile development up
+#
+# Full production stack:
+#   docker-compose --profile with-postgres --profile with-nginx --profile with-celery up
+
+# Additional docker-compose files for different environments:
+# ===========================================================
+#
+# docker-compose.override.yml (development overrides)
+# docker-compose.prod.yml (production settings)
+# docker-compose.test.yml (testing configuration)
+#
+# Usage:
+# docker-compose -f docker-compose.yml -f docker-compose.prod.yml up
+
+# Environment-specific commands:
+# ==============================
+#
+# Development:
+# export COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
+# docker-compose up
+#
+# Production:
+# export COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+# docker-compose up -d
+#
+# Testing:
+# export COMPOSE_FILE=docker-compose.yml:docker-compose.test.yml
+# docker-compose run --rm app pytest
+
+# Scaling services:
+# =================
+# docker-compose up --scale app=3
+# docker-compose up --scale celery-worker=4
+
+# Health checks and monitoring:
+# =============================
+# docker-compose ps                    # Service status
+# docker-compose logs -f app           # Application logs
+# docker-compose exec app bash         # Shell into container
+# docker-compose top                   # Running processes
+# 
+# Health endpoints:
+# http://localhost:8000/health         # App health
+# http://localhost:9090                # Prometheus
+# http://localhost:3000                # Grafana (admin/admin)
+# http://localhost:6379                # Redis
+
+# Backup and restore:
+# ===================
+# 
+# Backup volumes:
+# docker run --rm -v video-commerce-recommender_redis_data:/data -v $(pwd):/backup alpine tar czf /backup/redis_backup.tar.gz -C /data .
+#
+# Restore volumes:
+# docker run --rm -v video-commerce-recommender_redis_data:/data -v $(pwd):/backup alpine tar xzf /backup/redis_backup.tar.gz -C /data
+
+# Troubleshooting:
+# ================
+#
+# Service won't start:
+# - Check logs: docker-compose logs service-name
+# - Check ports: netstat -tulpn | grep :8000
+# - Check resources: docker stats
+#
+# Connection refused:
+# - Verify network: docker network ls
+# - Check service health: docker-compose ps
+# - Test connectivity: docker-compose exec app ping redis
+#
+# Out of memory:
+# - Increase Docker memory limits
+# - Reduce batch sizes in environment variables
+# - Scale down workers
+#
+# GPU not detected:
+# - Install nvidia-docker2
+# - Verify: docker run --gpus all nvidia/cuda:11.0-base nvidia-smicommerce-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+
+  # Redis - Feature Store and Caching
+  redis:
+    image: redis:7-alpine
+    container_name: video-commerce-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    volumes:
+      - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - video-commerce-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+
+  # Prometheus - Metrics Collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: video-commerce-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+    depends_on:
+      - app
+
+  # Grafana - Metrics Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: video-commerce-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # PostgreSQL - Optional Relational Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: video-commerce-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=video_commerce
+      - POSTGRES_USER=recommender
+      - POSTGRES_PASSWORD=secure_password_change_me
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - video-commerce-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recommender -d video_commerce"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - with-postgres
+
+  # Elasticsearch - Optional Search Engine
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: video-commerce-elasticsearch
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx1g"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - video-commerce-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+    profiles:
+      - with-elasticsearch
+
+  # Nginx - Reverse Proxy and Load Balancer
+  nginx:
+    image: nginx:alpine
+    container_name: video-commerce-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./static:/usr/share/nginx/html/static:ro
+    depends_on:
+      - app
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+    profiles:
+      - with-nginx
+
+  # Model Serving - Triton Inference Server (Optional)
+  triton:
+    image: nvcr.io/nvidia/tritonserver:23.10-py3
+    container_name: video-commerce-triton
+    ports:
+      - "8001:8001"  # HTTP
+      - "8002:8002"  # GRPC
+    command: >
+      tritonserver
+      --model-repository=/models
+      --allow-http=true
+      --allow-grpc=true
+      --allow-metrics=true
+      --strict-model-config=false
+    volumes:
+      - ./models/triton:/models:ro
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+    profiles:
+      - with-triton
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Background Workers - Celery (Optional)
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: video-commerce-worker
+    command: celery -A app.celery worker --loglevel=info --concurrency=2
+    environment:
+      - ENVIRONMENT=production
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    volumes:
+      - models_data:/app/models
+      - upload_data:/app/uploads
+      - logs_data:/app/logs
+    depends_on:
+      - redis
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+    profiles:
+      - with-celery
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+
+  # Task Scheduler - Celery Beat (Optional)
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: video-commerce-scheduler
+    command: celery -A app.celery beat --loglevel=info
+    environment:
+      - ENVIRONMENT=production
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    volumes:
+      - celery_beat_data:/app/celerybeat-schedule
+      - logs_data:/app/logs
+    depends_on:
+      - redis
+      - celery-worker
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+    profiles:
+      - with-celery
+
+  # Development Tools
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.jupyter
+    container_name: video-commerce-jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=secure_token_change_me
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - models_data:/home/jovyan/models
+      - upload_data:/home/jovyan/uploads
+    networks:
+      - video-

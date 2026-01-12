@@ -1,0 +1,248 @@
+# AI Video Commerce Recommender - .gitignore
+# =============================================
+
+# Python
+# ------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+# --------------------
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# PyCharm
+# -------
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# VS Code
+# -------
+.vscode/
+*.code-workspace
+.history/
+
+# Jupyter Notebook
+# ----------------
+.ipynb_checkpoints
+*.ipynb
+
+# Environment Variables
+# ---------------------
+.env
+.env.local
+.env.*.local
+*.env
+
+# Logs
+# ----
+logs/
+*.log
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing
+# -------
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# MyPy
+# ----
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre
+# ----
+.pyre/
+
+# Machine Learning & AI
+# ---------------------
+# Model files and caches
+/models/
+*.h5
+*.pkl
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Model cache directories
+/tmp/
+/cache/
+/.cache/
+*.faiss
+*.index
+
+# Hugging Face cache
+transformers_cache/
+.huggingface/
+
+# Data files
+# ----------
+/data/*.csv
+/data/*.json
+/data/*.parquet
+/data/*.feather
+/data/raw/
+/data/processed/
+/data/external/
+
+# Keep example data structure
+!data/.gitkeep
+!data/sample_products.json
+
+# Uploads and temp files
+# ----------------------
+/uploads/
+/temp/
+/temporary/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Redis dumps
+# -----------
+dump.rdb
+*.rdb
+
+# Node.js (Frontend)
+# ------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Frontend build
+# --------------
+dist/
+dist-ssr/
+*.local
+.cache/
+
+# Frontend environment
+# --------------------
+.env.development.local
+.env.test.local
+.env.production.local
+
+# OS files
+# --------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Docker
+# ------
+*.dockerignore
+.docker/
+
+# Application specific
+# --------------------
+# Application PID files
+*.pid
+app.pid
+
+# Database files
+# --------------
+*.db
+*.sqlite
+*.sqlite3
+
+# Monitoring and metrics
+# ----------------------
+.prometheus/
+.grafana/
+
+# Profiling
+# ---------
+*.prof
+*.lprof
+profile_*.txt
+
+# Documentation builds
+# --------------------
+docs/_build/
+docs/.doctrees/
+site/
+
+# Backup files
+# ------------
+*.bak
+*.backup
+*~
+
+# Incomplete downloads
+# --------------------
+*.crdownload
+*.part
+
+# Large files
+# -----------
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+
+# PDF documentation (keep markdown versions only)
+*.pdf
+
+# Keep important config templates
+# --------------------------------
+!.env.example
+!config.example.json
+
+# Keep README
+# -----------
+!README.md
+!CONTRIBUTING.md
+!LICENSE

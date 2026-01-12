@@ -1,0 +1,197 @@
+# AI-Powered Video Commerce Recommender - Docker Compose
+# ========================================================
+# Complete containerized deployment for the video commerce recommendation system
+
+version: '3.8'
+
+services:
+  # Main Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        - PYTHON_VERSION=3.10
+        - BUILD_ENV=production
+    container_name: video-commerce-app
+    ports:
+      - "8000:8000"
+    environment:
+      # Application Settings
+      - ENVIRONMENT=production
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - API_WORKERS=2
+      - API_DEBUG=false
+      
+      # Redis Connection
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      
+      # Model Settings
+      - MODEL_DEVICE=auto
+      - MODEL_CACHE_DIR=/app/models
+      - MODEL_ENABLE_GPU=true
+      
+      # Data Settings
+      - DATA_UPLOAD_DIR=/app/uploads
+      - DATA_LOAD_SAMPLE_DATA=true
+      
+      # Monitoring
+      - MONITORING_LOG_LEVEL=INFO
+      - MONITORING_ENABLE_METRICS=true
+    volumes:
+      # Persistent storage for models and data
+      - models_data:/app/models
+      - upload_data:/app/uploads
+      - logs_data:/app/logs
+    depends_on:
+      - redis
+    networks:
+      - video-commerce-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+
+  # Redis - Feature Store and Caching
+  redis:
+    image: redis:7-alpine
+    container_name: video-commerce-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    volumes:
+      - redis_data:/data
+    networks:
+      - video-commerce-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+
+  # Prometheus - Metrics Collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: video-commerce-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - prometheus_data:/prometheus
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  # Grafana - Metrics Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: video-commerce-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+# Named Volumes
+volumes:
+  models_data:
+    driver: local
+  upload_data:
+    driver: local
+  logs_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# Networks
+networks:
+  video-commerce-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# =============================================================================
+# Usage Examples
+# =============================================================================
+#
+# Start all services:
+#   docker-compose up -d
+#
+# Start only the app:
+#   docker-compose up app
+#
+# View logs:
+#   docker-compose logs -f app
+#
+# Shell into container:
+#   docker-compose exec app bash
+#
+# Stop all services:
+#   docker-compose down
+#
+# Stop and remove volumes:
+#   docker-compose down -v
+#
+# Scale the application:
+#   docker-compose up --scale app=3
+#
+# Rebuild and start:
+#   docker-compose up --build
+#
+# =============================================================================
+# Service Endpoints
+# =============================================================================
+#
+# Application API:       http://localhost:8000
+# API Documentation:     http://localhost:8000/docs
+# Health Check:          http://localhost:8000/health
+# Redis:                 localhost:6379
+# Prometheus:            http://localhost:9090
+# Grafana:               http://localhost:3000 (admin/admin)
+
