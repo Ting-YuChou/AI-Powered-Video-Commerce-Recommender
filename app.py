@@ -110,9 +110,23 @@ async def startup_event():
             feature_store, content_processor, recommendation_engine
         )
         
-        # Load sample data if needed
+        # Load data if needed
         if config.load_sample_data:
-            await data.initialize_sample_data(feature_store, vector_search)
+            if config.data_config.use_csv_dataset:
+                # Load from CSV dataset
+                logger.info("Loading data from CSV dataset...")
+                await data.load_dataset_from_csv(
+                    dataset_dir=config.data_config.dataset_dir,
+                    feature_store=feature_store,
+                    vector_search=vector_search,
+                    limit_users=config.data_config.csv_limit_users,
+                    limit_products=config.data_config.csv_limit_products,
+                    limit_interactions=config.data_config.csv_limit_interactions,
+                    limit_content=config.data_config.csv_limit_content
+                )
+            else:
+                # Generate sample data
+                await data.initialize_sample_data(feature_store, vector_search)
         
         logger.info("All components initialized successfully!")
         

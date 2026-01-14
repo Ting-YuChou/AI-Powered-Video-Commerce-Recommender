@@ -13,6 +13,8 @@ import random
 import time
 import numpy as np
 import logging
+import pandas as pd
+import base64
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1003,6 +1005,472 @@ def quick_sample_data(scale: str = "small") -> Dict[str, Any]:
     
     config = scale_configs.get(scale, scale_configs['small'])
     return generate_and_validate_sample_data(**config, save_to_files=False)
+
+# ============================================================================
+# CSV Dataset Loading Functions
+# ============================================================================
+
+def decode_base64_embedding(encoded_str: str, dim: int = 128) -> np.ndarray:
+    """Decode base64 encoded embedding string to numpy array."""
+    try:
+        decoded_bytes = base64.b64decode(encoded_str)
+        embedding = np.frombuffer(decoded_bytes, dtype=np.float32)
+        if len(embedding) != dim:
+            logger.warning(f"Embedding dimension mismatch: expected {dim}, got {len(embedding)}")
+            # Pad or truncate if needed
+            if len(embedding) < dim:
+                embedding = np.pad(embedding, (0, dim - len(embedding)), 'constant')
+            else:
+                embedding = embedding[:dim]
+        return embedding
+    except Exception as e:
+        logger.error(f"Error decoding embedding: {e}")
+        # Return zero vector as fallback
+        return np.zeros(dim, dtype=np.float32)
+
+def load_users_from_csv(csv_path: str, limit: Optional[int] = None) -> List[UserFeatures]:
+    """Load users from CSV file and convert to UserFeatures."""
+    try:
+        logger.info(f"Loading users from {csv_path}")
+        df = pd.read_csv(csv_path)
+        
+        if limit:
+            df = df.head(limit)
+        
+        users = []
+        for _, row in df.iterrows():
+            # Calculate user features from interactions (will be updated later)
+            user = UserFeatures(
+                user_id=row['user_id'],
+                total_interactions=0,  # Will be updated from interactions CSV
+                avg_session_length=0.0,
+                preferred_categories=[],  # Will be inferred from interactions
+                price_sensitivity=0.5,  # Default value
+                click_through_rate=0.0,
+                conversion_rate=0.0,
+                last_active=time.time(),
+                demographics={
+                    'country': row.get('country', 'US'),
+                    'platform': row.get('platform', 'unknown'),
+                    'preferred_language': row.get('preferred_language', 'en-US'),
+                    'marketing_source': row.get('marketing_source', 'unknown'),
+                    'membership_level': row.get('membership_level', 'Silver'),
+                    'signup_date': row.get('signup_date', '')
+                }
+            )
+            users.append(user)
+        
+        logger.info(f"Loaded {len(users)} users from CSV")
+        return users
+        
+    except Exception as e:
+        logger.error(f"Error loading users from CSV: {e}")
+        return []
+
+def load_products_from_csv(csv_path: str, limit: Optional[int] = None) -> List[ProductData]:
+    """Load products from CSV file and convert to ProductData."""
+    try:
+        logger.info(f"Loading products from {csv_path}")
+        df = pd.read_csv(csv_path)
+        
+        if limit:
+            df = df.head(limit)
+        
+        products = []
+        for _, row in df.iterrows():
+            # Parse availability
+            availability = str(row.get('availability', 'in_stock')).lower()
+            in_stock = availability in ['in_stock', 'in stock', 'available']
+            
+            # Create description from title and category if description is missing
+            description = f"{row.get('title', '')} - {row.get('product_category', '')}"
+            
+            product = ProductData(
+                product_id=row['product_id'],
+                title=row.get('title', 'Unknown Product'),
+                description=description,
+                price=float(row.get('price_value', 0.0)),
+                currency=row.get('currency', 'USD'),
+                category=row.get('product_category', 'Unknown'),
+                brand=row.get('brand', 'Unknown'),
+                image_url=None,  # CSV doesn't have image URLs
+                rating=float(row.get('product_rating', 0.0)) if pd.notna(row.get('product_rating')) else None,
+                num_reviews=0,  # CSV doesn't have review count
+                in_stock=in_stock,
+                tags=[row.get('product_category', ''), row.get('brand', '')],
+                created_at=time.time(),
+                updated_at=time.time()
+            )
+            products.append(product)
+        
+        logger.info(f"Loaded {len(products)} products from CSV")
+        return products
+        
+    except Exception as e:
+        logger.error(f"Error loading products from CSV: {e}")
+        return []
+
+def load_content_features_from_csv(
+    csv_path: str, 
+    embeddings_npy_path: Optional[str] = None,
+    limit: Optional[int] = None
+) -> List[ContentFeatures]:
+    """
+    Load content features from CSV file and convert to ContentFeatures.
+    
+    Args:
+        csv_path: Path to multimodal_features.csv
+        embeddings_npy_path: Optional path to video_embeddings_128d.npy file
+                           If provided, embeddings will be loaded from .npy file instead of CSV
+        limit: Optional limit on number of records to load
+    """
+    try:
+        logger.info(f"Loading content features from {csv_path}")
+        df = pd.read_csv(csv_path)
+        
+        if limit:
+            df = df.head(limit)
+        
+        # Load embeddings from .npy file if provided
+        embeddings_array = None
+        if embeddings_npy_path and Path(embeddings_npy_path).exists():
+            logger.info(f"Loading visual embeddings from {embeddings_npy_path}")
+            embeddings_array = np.load(embeddings_npy_path)
+            logger.info(f"Loaded embeddings array with shape: {embeddings_array.shape}")
+            # Limit embeddings to match CSV limit if specified
+            if limit and embeddings_array.shape[0] > limit:
+                embeddings_array = embeddings_array[:limit]
+        
+        content_items = []
+        for idx, row in df.iterrows():
+            video_id = row['video_id']
+            
+            # Load visual embedding from .npy file or CSV
+            if embeddings_array is not None:
+                # Use embedding from .npy file (index should match CSV row index)
+                if idx < len(embeddings_array):
+                    visual_embedding_128 = embeddings_array[idx].astype(np.float32)
+                else:
+                    logger.warning(f"Index {idx} out of range for embeddings array, using zero vector")
+                    visual_embedding_128 = np.zeros(128, dtype=np.float32)
+            else:
+                # Fallback: try to decode from CSV base64 field
+                visual_embedding_encoded = row.get('visual_embedding_128d', '')
+                if pd.notna(visual_embedding_encoded) and visual_embedding_encoded:
+                    visual_embedding_128 = decode_base64_embedding(visual_embedding_encoded, dim=128)
+                else:
+                    visual_embedding_128 = np.zeros(128, dtype=np.float32)
+            
+            # Convert to 512-dim if needed (pad with zeros)
+            if len(visual_embedding_128) == 128:
+                # Pad to 512 dimensions for compatibility
+                visual_embedding_512 = np.pad(visual_embedding_128, (0, 512 - 128), 'constant')
+            else:
+                visual_embedding_512 = visual_embedding_128[:512] if len(visual_embedding_128) >= 512 else np.pad(visual_embedding_128, (0, 512 - len(visual_embedding_128)), 'constant')
+            
+            # Parse OCR text
+            ocr_text = str(row.get('ocr_text', '')) if pd.notna(row.get('ocr_text')) else ''
+            extracted_text = [t.strip() for t in ocr_text.split(',') if t.strip()] if ocr_text else []
+            
+            # Parse scene labels
+            scene_labels = str(row.get('scene_labels', '')) if pd.notna(row.get('scene_labels')) else ''
+            detected_objects = [s.strip() for s in scene_labels.split(',') if s.strip()] if scene_labels else []
+            
+            # Audio features
+            audio_transcript = str(row.get('audio_transcript', '')) if pd.notna(row.get('audio_transcript')) else ''
+            audio_sentiment = float(row.get('audio_sentiment', 0.0)) if pd.notna(row.get('audio_sentiment')) else 0.0
+            
+            # Extract product mentions from transcript and OCR
+            product_mentions = []
+            if audio_transcript:
+                product_mentions.append(audio_transcript[:100])  # First 100 chars
+            if extracted_text:
+                product_mentions.extend(extracted_text[:3])  # First 3 OCR texts
+            
+            content = ContentFeatures(
+                content_id=video_id,
+                visual_embedding=visual_embedding_512.tolist(),
+                duration_seconds=None,  # Not in CSV
+                detected_objects=detected_objects,
+                extracted_text=extracted_text,
+                product_mentions=product_mentions,
+                category_scores={},  # Will be inferred from content
+                processing_time=None,
+                audio_features={
+                    'has_audio': bool(audio_transcript),
+                    'audio_transcript': audio_transcript,
+                    'audio_sentiment': audio_sentiment
+                },
+                text_features={
+                    'total_text_regions': len(extracted_text),
+                    'ocr_text': ocr_text,
+                    'quality_score': float(row.get('quality_score', 0.5)) if pd.notna(row.get('quality_score')) else 0.5
+                }
+            )
+            content_items.append(content)
+        
+        logger.info(f"Loaded {len(content_items)} content items from CSV")
+        return content_items
+        
+    except Exception as e:
+        logger.error(f"Error loading content features from CSV: {e}")
+        return []
+
+def load_interactions_from_csv(
+    csv_path: str, 
+    limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """Load interactions from CSV file."""
+    try:
+        logger.info(f"Loading interactions from {csv_path}")
+        df = pd.read_csv(csv_path)
+        
+        if limit:
+            df = df.head(limit)
+        
+        interactions = []
+        for _, row in df.iterrows():
+            # Determine interaction type based on boolean columns
+            action = InteractionType.VIEW.value  # Default
+            
+            if row.get('purchased', False):
+                action = InteractionType.PURCHASE.value
+            elif row.get('added_to_cart', False):
+                action = InteractionType.ADD_TO_CART.value
+            elif row.get('liked', False):
+                action = InteractionType.FAVORITE.value
+            elif row.get('shared', False):
+                action = InteractionType.SHARE.value
+            elif row.get('commented', False) or row.get('watch_percentage', 0) > 0.5:
+                action = InteractionType.CLICK.value
+            
+            # Parse timestamp
+            timestamp_str = row.get('timestamp', '')
+            try:
+                if pd.notna(timestamp_str):
+                    # Try parsing ISO format
+                    dt = pd.to_datetime(timestamp_str)
+                    timestamp = dt.timestamp()
+                else:
+                    timestamp = time.time()
+            except:
+                timestamp = time.time()
+            
+            interaction = {
+                'user_id': row['user_id'],
+                'product_id': row['product_id'],
+                'action': action,
+                'timestamp': timestamp,
+                'context': {
+                    'video_id': row.get('video_id', ''),
+                    'session_id': row.get('session_id', ''),
+                    'device_type': row.get('device_type', 'unknown'),
+                    'platform': row.get('platform', 'unknown'),
+                    'watch_time_seconds': float(row.get('watch_time_seconds', 0)) if pd.notna(row.get('watch_time_seconds')) else 0,
+                    'watch_percentage': float(row.get('watch_percentage', 0)) if pd.notna(row.get('watch_percentage')) else 0,
+                    'video_category': row.get('video_category', ''),
+                    'product_category': row.get('product_category', ''),
+                    'product_price': float(row.get('product_price', 0)) if pd.notna(row.get('product_price')) else 0,
+                    'purchase_amount': float(row.get('purchase_amount', 0)) if pd.notna(row.get('purchase_amount')) else 0
+                }
+            }
+            
+            # Add purchase value if it's a purchase
+            if action == InteractionType.PURCHASE.value:
+                interaction['value'] = float(row.get('purchase_amount', 0)) if pd.notna(row.get('purchase_amount')) else 0
+            
+            interactions.append(interaction)
+        
+        logger.info(f"Loaded {len(interactions)} interactions from CSV")
+        return interactions
+        
+    except Exception as e:
+        logger.error(f"Error loading interactions from CSV: {e}")
+        return []
+
+async def load_dataset_from_csv(
+    dataset_dir: str = "Dataset",
+    feature_store: Optional[FeatureStore] = None,
+    vector_search: Optional[VectorSearchEngine] = None,
+    limit_users: Optional[int] = None,
+    limit_products: Optional[int] = None,
+    limit_interactions: Optional[int] = None,
+    limit_content: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Load dataset from CSV files in the Dataset directory.
+    
+    Args:
+        dataset_dir: Directory containing CSV files
+        feature_store: FeatureStore instance to load data into
+        vector_search: VectorSearchEngine instance to load embeddings into
+        limit_*: Optional limits on number of records to load
+    
+    Returns:
+        Dictionary with loading statistics
+    """
+    try:
+        dataset_path = Path(dataset_dir)
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
+        
+        logger.info(f"Loading dataset from {dataset_dir}")
+        
+        # Load data from CSV files
+        users_csv = dataset_path / "users.csv"
+        products_csv = dataset_path / "products.csv"
+        interactions_csv = dataset_path / "video_commerce_interactions_500k.csv"
+        features_csv = dataset_path / "multimodal_features.csv"
+        
+        # Load users
+        users = []
+        if users_csv.exists():
+            users = load_users_from_csv(str(users_csv), limit=limit_users)
+        else:
+            logger.warning(f"Users CSV not found: {users_csv}")
+        
+        # Load products
+        products = []
+        if products_csv.exists():
+            products = load_products_from_csv(str(products_csv), limit=limit_products)
+        else:
+            logger.warning(f"Products CSV not found: {products_csv}")
+        
+        # Load interactions
+        interactions = []
+        if interactions_csv.exists():
+            interactions = load_interactions_from_csv(str(interactions_csv), limit=limit_interactions)
+        else:
+            logger.warning(f"Interactions CSV not found: {interactions_csv}")
+        
+        # Load content features
+        content_items = []
+        if features_csv.exists():
+            # Check for embeddings .npy file
+            embeddings_npy = dataset_path / "video_embeddings_128d.npy"
+            # Also check in parent directory (project root)
+            if not embeddings_npy.exists():
+                embeddings_npy = Path("video_embeddings_128d.npy")
+            
+            embeddings_path = str(embeddings_npy) if embeddings_npy.exists() else None
+            if embeddings_path:
+                logger.info(f"Found embeddings file: {embeddings_path}")
+            else:
+                logger.warning(f"Embeddings .npy file not found, will try to use CSV base64 field")
+            
+            content_items = load_content_features_from_csv(
+                str(features_csv), 
+                embeddings_npy_path=embeddings_path,
+                limit=limit_content
+            )
+        else:
+            logger.warning(f"Features CSV not found: {features_csv}")
+        
+        # Update user features based on interactions
+        logger.info("Updating user features from interactions...")
+        user_interaction_counts = {}
+        user_categories = {}
+        user_last_active = {}
+        
+        for interaction in interactions:
+            user_id = interaction['user_id']
+            if user_id not in user_interaction_counts:
+                user_interaction_counts[user_id] = 0
+                user_categories[user_id] = set()
+                user_last_active[user_id] = interaction['timestamp']
+            
+            user_interaction_counts[user_id] += 1
+            user_last_active[user_id] = max(user_last_active[user_id], interaction['timestamp'])
+            
+            # Extract category from context
+            category = interaction.get('context', {}).get('product_category', '')
+            if category:
+                user_categories[user_id].add(category)
+        
+        # Update user objects
+        user_dict = {u.user_id: u for u in users}
+        for user_id, count in user_interaction_counts.items():
+            if user_id in user_dict:
+                user = user_dict[user_id]
+                user.total_interactions = count
+                user.preferred_categories = list(user_categories.get(user_id, set()))
+                user.last_active = user_last_active.get(user_id, time.time())
+        
+        # Load data into feature store if provided
+        if feature_store:
+            logger.info("Loading data into feature store...")
+            
+            # Store users
+            for user in users:
+                await feature_store._set_user_features(user.user_id, user)
+            
+            # Store interactions
+            for interaction in interactions:
+                await feature_store.log_user_interaction(
+                    interaction['user_id'],
+                    interaction['product_id'],
+                    interaction['action'],
+                    interaction.get('context', {})
+                )
+            
+            # Store content features
+            for content in content_items:
+                await feature_store.store_content_features(content.content_id, content)
+        
+        # Load product embeddings into vector search if provided
+        if vector_search and products:
+            logger.info("Loading product embeddings into vector search...")
+            
+            # Create embeddings for products (use category-based embeddings)
+            for product in products:
+                # Generate category-based embedding
+                category_embedding = np.random.normal(0, 0.1, vector_search.embedding_dim)
+                
+                # Add category-specific patterns
+                category_hash = hash(product.category) % vector_search.embedding_dim
+                category_embedding[category_hash:category_hash+20] += 0.3
+                
+                # Normalize
+                category_embedding = category_embedding / np.linalg.norm(category_embedding)
+                
+                # Add to vector search
+                metadata = {
+                    'title': product.title,
+                    'category': product.category,
+                    'price': product.price,
+                    'rating': product.rating,
+                    'brand': product.brand
+                }
+                
+                await vector_search.add_product_embedding(
+                    product.product_id,
+                    category_embedding.astype(np.float32),
+                    metadata
+                )
+            
+            # Save vector index
+            await vector_search.save_index()
+            logger.info("Vector search index saved")
+        
+        # Generate summary
+        summary = {
+            'users_loaded': len(users),
+            'products_loaded': len(products),
+            'interactions_loaded': len(interactions),
+            'content_items_loaded': len(content_items),
+            'loaded_into_feature_store': feature_store is not None,
+            'loaded_into_vector_search': vector_search is not None,
+            'loading_timestamp': time.time()
+        }
+        
+        logger.info("Dataset loading completed successfully")
+        logger.info(f"Summary: {summary}")
+        
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Error loading dataset from CSV: {e}")
+        raise
 
 if __name__ == "__main__":
     # Example usage

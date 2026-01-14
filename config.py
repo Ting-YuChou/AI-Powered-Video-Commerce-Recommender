@@ -207,9 +207,17 @@ class DataConfig(BaseSettings):
     """Data management configuration."""
     # Sample data
     load_sample_data: bool = Field(True, description="Load sample data on startup")
+    use_csv_dataset: bool = Field(False, description="Load data from CSV files in Dataset folder")
+    dataset_dir: str = Field("Dataset", description="Directory containing CSV dataset files")
     sample_data_path: str = Field("data/sample_products.json", description="Sample data file path")
     sample_users: int = Field(1000, description="Number of sample users to generate")
     sample_interactions: int = Field(10000, description="Number of sample interactions")
+    
+    # CSV dataset loading limits (None = load all)
+    csv_limit_users: Optional[int] = Field(None, description="Limit number of users to load from CSV")
+    csv_limit_products: Optional[int] = Field(None, description="Limit number of products to load from CSV")
+    csv_limit_interactions: Optional[int] = Field(None, description="Limit number of interactions to load from CSV")
+    csv_limit_content: Optional[int] = Field(None, description="Limit number of content items to load from CSV")
     
     # Data storage
     upload_dir: str = Field("/tmp/uploads", description="File upload directory")

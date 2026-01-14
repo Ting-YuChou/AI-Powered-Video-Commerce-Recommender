@@ -236,13 +236,24 @@ site/
 # PDF documentation (keep markdown versions only)
 *.pdf
 
+# Documentation files (exclude all .md except README.md)
+# --------------------------------------------------------
+*.md
+!README.md
+!LICENSE
+
+# Dataset files and directories
+# ------------------------------
+Dataset/
+dataset/
+datasets/
+*.csv
+*.npy
+*.npz
+video_embeddings_*.npy
+load_dataset.py
+
 # Keep important config templates
 # --------------------------------
 !.env.example
 !config.example.json
-
-# Keep README
-# -----------
-!README.md
-!CONTRIBUTING.md
-!LICENSE
