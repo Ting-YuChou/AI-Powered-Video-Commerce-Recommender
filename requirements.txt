@@ -136,6 +136,10 @@ prefect==2.14.10
 airflow==2.7.3
 celery==5.3.4
 
+# Message Queue and Streaming (Kafka)
+aiokafka==0.10.0
+kafka-python==2.0.2
+
 # Security
 cryptography==41.0.8
 bcrypt==4.1.1

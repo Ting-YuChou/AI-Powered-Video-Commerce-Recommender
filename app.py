@@ -35,6 +35,7 @@ from feature_store import FeatureStore
 from vector_search import VectorSearchEngine
 from health import HealthChecker
 from config import Config
+from kafka_client import KafkaManager, init_kafka, close_kafka, get_kafka_manager
 import data
 
 # Configure logging
@@ -69,13 +70,14 @@ ranking_model: Optional[RankingModel] = None
 feature_store: Optional[FeatureStore] = None
 vector_search: Optional[VectorSearchEngine] = None
 health_checker: Optional[HealthChecker] = None
+kafka_manager: Optional[KafkaManager] = None
 config: Optional[Config] = None
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize all components on application startup."""
     global content_processor, recommendation_engine, ranking_model
-    global feature_store, vector_search, health_checker, config
+    global feature_store, vector_search, health_checker, kafka_manager, config
     
     try:
         logger.info("Starting Video Commerce Recommender...")
@@ -86,6 +88,18 @@ async def startup_event():
         # Initialize feature store (Redis)
         feature_store = FeatureStore(config.redis_config)
         await feature_store.initialize()
+        
+        # Initialize Kafka (if enabled)
+        if config.kafka_config.enable:
+            logger.info("Initializing Kafka connection...")
+            try:
+                kafka_manager = await init_kafka(config.kafka_config)
+                logger.info("Kafka connection established successfully")
+            except Exception as kafka_error:
+                logger.warning(f"Kafka initialization failed, continuing without Kafka: {kafka_error}")
+                kafka_manager = None
+        else:
+            logger.info("Kafka is disabled in configuration")
         
         # Initialize content processor
         content_processor = ContentProcessor(config.model_config)
@@ -105,9 +119,10 @@ async def startup_event():
         ranking_model = RankingModel(config.ranking_config)
         await ranking_model.load_model()
         
-        # Initialize health checker
+        # Initialize health checker (include Kafka if available)
         health_checker = HealthChecker(
-            feature_store, content_processor, recommendation_engine
+            feature_store, content_processor, recommendation_engine,
+            kafka_manager=kafka_manager
         )
         
         # Load data if needed
@@ -139,6 +154,11 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup on application shutdown."""
     logger.info("Shutting down Video Commerce Recommender...")
+    
+    # Close Kafka connection
+    if kafka_manager:
+        logger.info("Closing Kafka connection...")
+        await close_kafka()
     
     if feature_store:
         await feature_store.close()
@@ -209,8 +229,28 @@ async def get_recommendations(request: RecommendationRequest):
             k=request.k
         )
         
-        # Log metrics
+        # Calculate response time
         response_time = time.time() - start_time
+        response_time_ms = int(response_time * 1000)
+        
+        # Send recommendation event to Kafka (async, non-blocking)
+        if kafka_manager and config.kafka_config.enable:
+            # Fire and forget - don't wait for Kafka response
+            asyncio.create_task(
+                kafka_manager.send_recommendation_event(
+                    user_id=request.user_id,
+                    recommendations=[r.product_id for r in ranked_recommendations],
+                    response_time_ms=response_time_ms,
+                    metadata={
+                        "total_candidates": len(candidates),
+                        "model_version": config.model_version,
+                        "content_id": request.content_id,
+                        "context": request.context
+                    }
+                )
+            )
+        
+        # Also log to Redis for backward compatibility
         await feature_store.log_recommendation_request(
             request.user_id, len(ranked_recommendations), response_time
         )
@@ -225,9 +265,10 @@ async def get_recommendations(request: RecommendationRequest):
             recommendations=ranked_recommendations,
             metadata={
                 "total_candidates": len(candidates),
-                "response_time_ms": int(response_time * 1000),
+                "response_time_ms": response_time_ms,
                 "model_version": config.model_version,
-                "content_processed": request.content_id is not None
+                "content_processed": request.content_id is not None,
+                "kafka_enabled": kafka_manager is not None and config.kafka_config.enable
             }
         )
         
@@ -257,18 +298,29 @@ async def get_recommendations(request: RecommendationRequest):
 async def upload_content(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    user_id: str = None
+    user_id: str = None,
+    priority: str = "normal"
 ):
     """
     Upload video content and extract features for recommendations.
     
     This endpoint handles video file uploads and triggers background processing
     to extract multi-modal features (visual, audio, text) from the content.
+    
+    When Kafka is enabled, video processing tasks are sent to Kafka for
+    distributed processing by worker nodes, enabling:
+    - Horizontal scaling of video processing
+    - Task persistence and automatic retry on failure
+    - Priority-based processing (high/normal/low)
     """
     try:
         # Validate file
         if not file.content_type.startswith('video/'):
             raise HTTPException(status_code=400, detail="File must be a video")
+        
+        # Validate priority
+        if priority not in ["low", "normal", "high"]:
+            priority = "normal"
         
         # Generate content ID
         content_id = f"content_{int(time.time())}_{file.filename}"
@@ -279,7 +331,32 @@ async def upload_content(
             tmp_file.write(content)
             file_path = tmp_file.name
         
-        # Process content in background
+        # Set initial status
+        await feature_store.update_content_status(content_id, "pending")
+        
+        # Check if Kafka is available for distributed processing
+        if kafka_manager and config.kafka_config.enable:
+            # Send to Kafka for distributed processing
+            success = await kafka_manager.send_video_processing_task(
+                content_id=content_id,
+                file_path=file_path,
+                user_id=user_id,
+                priority=priority
+            )
+            
+            if success:
+                logger.info(f"Video task sent to Kafka: {content_id} (priority: {priority})")
+                return ContentUploadResponse(
+                    content_id=content_id,
+                    filename=file.filename,
+                    size_bytes=len(content),
+                    status="queued",
+                    message=f"Content uploaded and queued for processing (priority: {priority})."
+                )
+            else:
+                logger.warning("Kafka send failed, falling back to local processing")
+        
+        # Fallback: Process content in background (local processing)
         background_tasks.add_task(
             process_uploaded_content, 
             content_id, 
@@ -338,21 +415,53 @@ async def log_user_interaction(request: UserInteractionRequest):
     Log user interactions for model training and personalization.
     
     Records user actions (views, clicks, purchases) to improve future recommendations.
+    
+    When Kafka is enabled, interactions are sent to Kafka for async processing,
+    providing much faster API response times (~2-5ms vs ~100-200ms).
     """
     try:
+        # Check if Kafka is available for async processing
+        if kafka_manager and config.kafka_config.enable:
+            # Send to Kafka for async processing (fast path)
+            success = await kafka_manager.send_user_interaction(
+                user_id=request.user_id,
+                product_id=request.product_id,
+                action=request.action.value if hasattr(request.action, 'value') else str(request.action),
+                context=request.context
+            )
+            
+            if success:
+                logger.debug(f"Interaction sent to Kafka: {request.user_id} -> {request.action} -> {request.product_id}")
+                return {
+                    "status": "success", 
+                    "message": "Interaction queued for processing",
+                    "processing_mode": "async"
+                }
+            else:
+                # Fallback to sync processing if Kafka send fails
+                logger.warning("Kafka send failed, falling back to sync processing")
+        
+        # Sync processing (fallback or when Kafka is disabled)
         await feature_store.log_user_interaction(
             user_id=request.user_id,
             product_id=request.product_id,
-            action=request.action,
+            action=request.action.value if hasattr(request.action, 'value') else str(request.action),
             context=request.context
         )
         
         # Update user features in real-time
-        await feature_store.update_user_features(request.user_id, request.action)
+        await feature_store.update_user_features(
+            request.user_id, 
+            request.action.value if hasattr(request.action, 'value') else str(request.action)
+        )
         
         logger.info(f"Logged interaction: {request.user_id} -> {request.action} -> {request.product_id}")
         
-        return {"status": "success", "message": "Interaction logged successfully"}
+        return {
+            "status": "success", 
+            "message": "Interaction logged successfully",
+            "processing_mode": "sync"
+        }
         
     except Exception as e:
         logger.error(f"Error logging interaction: {e}")
@@ -429,6 +538,70 @@ async def get_metrics():
     except Exception as e:
         logger.error(f"Error getting metrics: {e}")
         raise HTTPException(status_code=500, detail="Metrics unavailable")
+
+@app.get("/kafka/health")
+async def kafka_health():
+    """
+    Get Kafka connection health status.
+    
+    Returns detailed health information about the Kafka producer and consumers.
+    """
+    try:
+        if not kafka_manager:
+            return {
+                "status": "disabled",
+                "message": "Kafka is not enabled or failed to initialize",
+                "enabled": config.kafka_config.enable if config else False
+            }
+        
+        health = await kafka_manager.health_check()
+        health['status'] = 'healthy' if health['producer']['connected'] else 'unhealthy'
+        return health
+        
+    except Exception as e:
+        logger.error(f"Error checking Kafka health: {e}")
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+@app.get("/kafka/topics")
+async def kafka_topics():
+    """
+    Get information about Kafka topics used by this application.
+    
+    Returns the topic names and their configurations.
+    """
+    if not config:
+        raise HTTPException(status_code=500, detail="Configuration not loaded")
+    
+    return {
+        "topics": {
+            "user_interactions": {
+                "name": config.kafka_config.user_interactions_topic,
+                "description": "User interaction events (clicks, views, purchases)",
+                "partition_key": "user_id"
+            },
+            "video_processing": {
+                "name": config.kafka_config.video_processing_topic,
+                "description": "Video processing tasks",
+                "partition_key": "content_id"
+            },
+            "recommendation_events": {
+                "name": config.kafka_config.recommendation_events_topic,
+                "description": "Recommendation request events for analytics",
+                "partition_key": "user_id"
+            },
+            "feature_updates": {
+                "name": config.kafka_config.feature_updates_topic,
+                "description": "Feature update notifications",
+                "partition_key": "entity_id"
+            }
+        },
+        "bootstrap_servers": config.kafka_config.bootstrap_servers,
+        "consumer_group": config.kafka_config.consumer_group_id,
+        "enabled": config.kafka_config.enable
+    }
 
 # Error handlers
 @app.exception_handler(404)

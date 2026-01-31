@@ -24,6 +24,7 @@ from content_processor import ContentProcessor
 from recommender import RecommendationEngine
 from ranking import RankingModel
 from vector_search import VectorSearchEngine
+from kafka_client import KafkaManager
 
 logger = logging.getLogger(__name__)
 
@@ -353,13 +354,15 @@ class HealthChecker:
         content_processor: ContentProcessor,
         recommendation_engine: RecommendationEngine,
         ranking_model: RankingModel = None,
-        vector_search: VectorSearchEngine = None
+        vector_search: VectorSearchEngine = None,
+        kafka_manager: KafkaManager = None
     ):
         self.feature_store = feature_store
         self.content_processor = content_processor
         self.recommendation_engine = recommendation_engine
         self.ranking_model = ranking_model
         self.vector_search = vector_search
+        self.kafka_manager = kafka_manager
         
         self.system_metrics = SystemMetrics()
         self.alert_manager = AlertManager()
@@ -418,6 +421,14 @@ class HealthChecker:
                 components['vector_search'] = await self._check_vector_search()
                 if components['vector_search'].status != HealthStatus.HEALTHY:
                     overall_status = HealthStatus.DEGRADED
+            
+            # Kafka (if available)
+            if self.kafka_manager:
+                components['kafka'] = await self._check_kafka()
+                if components['kafka'].status != HealthStatus.HEALTHY:
+                    # Kafka is optional, so only degrade if unhealthy
+                    if overall_status == HealthStatus.HEALTHY:
+                        overall_status = HealthStatus.DEGRADED
             
             # System Resources
             components['system_resources'] = self._check_system_resources(system_metrics)
@@ -624,6 +635,54 @@ class HealthChecker:
             
             return ComponentHealth(
                 status=HealthStatus.UNHEALTHY,
+                response_time_ms=(time.time() - start_time) * 1000,
+                error_message=error_msg
+            )
+    
+    async def _check_kafka(self) -> ComponentHealth:
+        """Check Kafka messaging health."""
+        start_time = time.time()
+        
+        try:
+            health_data = await self.kafka_manager.health_check()
+            response_time = (time.time() - start_time) * 1000
+            
+            producer_health = health_data.get('producer', {})
+            is_connected = producer_health.get('connected', False)
+            is_enabled = health_data.get('enabled', False)
+            
+            if not is_enabled:
+                return ComponentHealth(
+                    status=HealthStatus.HEALTHY,
+                    response_time_ms=response_time,
+                    error_message="Kafka is disabled"
+                )
+            
+            if is_connected:
+                return ComponentHealth(
+                    status=HealthStatus.HEALTHY,
+                    response_time_ms=response_time
+                )
+            else:
+                error_msg = "Kafka producer not connected"
+                self.alert_manager.add_alert(
+                    AlertLevel.WARNING, 
+                    'kafka', 
+                    error_msg
+                )
+                
+                return ComponentHealth(
+                    status=HealthStatus.DEGRADED,
+                    response_time_ms=response_time,
+                    error_message=error_msg
+                )
+                
+        except Exception as e:
+            error_msg = f"Kafka health check failed: {e}"
+            self.alert_manager.add_alert(AlertLevel.WARNING, 'kafka', error_msg)
+            
+            return ComponentHealth(
+                status=HealthStatus.DEGRADED,
                 response_time_ms=(time.time() - start_time) * 1000,
                 error_message=error_msg
             )

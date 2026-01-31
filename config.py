@@ -203,6 +203,44 @@ class MonitoringConfig(BaseSettings):
     class Config:
         env_prefix = "MONITORING_"
 
+class KafkaConfig(BaseSettings):
+    """Kafka message streaming configuration."""
+    # Connection settings
+    bootstrap_servers: str = Field("localhost:9092", description="Kafka bootstrap servers")
+    enable: bool = Field(True, description="Enable Kafka integration")
+    
+    # Topic names
+    user_interactions_topic: str = Field("user-interactions", description="User interactions topic")
+    video_processing_topic: str = Field("video-processing-tasks", description="Video processing tasks topic")
+    recommendation_events_topic: str = Field("recommendation-events", description="Recommendation events topic")
+    feature_updates_topic: str = Field("feature-updates", description="Feature updates topic")
+    
+    # Producer settings
+    producer_acks: str = Field("all", description="Producer acknowledgment level")
+    producer_retries: int = Field(3, description="Number of producer retries")
+    producer_batch_size: int = Field(16384, description="Producer batch size in bytes")
+    producer_linger_ms: int = Field(10, description="Producer linger time in milliseconds")
+    producer_compression_type: str = Field("gzip", description="Producer compression type")
+    
+    # Consumer settings
+    consumer_group_id: str = Field("video-commerce-group", description="Consumer group ID")
+    consumer_auto_offset_reset: str = Field("earliest", description="Auto offset reset policy")
+    consumer_enable_auto_commit: bool = Field(True, description="Enable auto commit")
+    consumer_auto_commit_interval_ms: int = Field(5000, description="Auto commit interval")
+    consumer_max_poll_records: int = Field(500, description="Max records per poll")
+    
+    # Timeout settings
+    request_timeout_ms: int = Field(30000, description="Request timeout in milliseconds")
+    session_timeout_ms: int = Field(10000, description="Session timeout in milliseconds")
+    
+    # Retry settings
+    retry_backoff_ms: int = Field(100, description="Retry backoff in milliseconds")
+    max_in_flight_requests: int = Field(5, description="Max in-flight requests per connection")
+    
+    class Config:
+        env_prefix = "KAFKA_"
+
+
 class DataConfig(BaseSettings):
     """Data management configuration."""
     # Sample data
@@ -251,6 +289,7 @@ class Config:
         self.cache_config = CacheConfig()
         self.monitoring_config = MonitoringConfig()
         self.data_config = DataConfig()
+        self.kafka_config = KafkaConfig()
         
         # Load additional config from file if provided
         if config_file and os.path.exists(config_file):
@@ -415,6 +454,10 @@ def get_model_config() -> ModelConfig:
 def get_api_config() -> APIConfig:
     """Get API configuration."""
     return get_config().api_config
+
+def get_kafka_config() -> KafkaConfig:
+    """Get Kafka configuration."""
+    return get_config().kafka_config
 
 # Environment detection
 def is_production() -> bool:
