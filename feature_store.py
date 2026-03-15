@@ -350,10 +350,36 @@ class FeatureStore:
             await self.redis_client.ltrim(global_key, 0, 9999)  # Keep last 10k
             await self.redis_client.expire(global_key, 86400 * 7)  # 7 days
             
+            # Store for Two-Tower training (larger retention window)
+            await self.store_training_interaction(interaction_data)
+            
             logger.debug(f"Logged interaction: {user_id} -> {action} -> {product_id}")
             
         except Exception as e:
             logger.error(f"Error logging interaction: {e}")
+
+    async def enqueue_user_interaction(
+        self,
+        user_id: str,
+        product_id: str,
+        action: str,
+        context: Dict[str, Any] = None,
+        timestamp: Optional[float] = None,
+    ) -> str:
+        """Persist an interaction into a Redis stream for async downstream processing."""
+        try:
+            stream_key = "interaction_stream"
+            payload = {
+                "user_id": user_id,
+                "product_id": product_id,
+                "action": action,
+                "context": json.dumps(context or {}),
+                "timestamp": str(timestamp or time.time()),
+            }
+            return await self.redis_client.xadd(stream_key, payload, maxlen=100000, approximate=True)
+        except Exception as e:
+            logger.error(f"Error enqueueing interaction to Redis stream: {e}")
+            raise
     
     async def get_user_interactions(self, user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         """Get recent user interactions."""
@@ -599,6 +625,72 @@ class FeatureStore:
                 'error': str(e)
             }
     
+    # Two-Tower Training Data Persistence
+    async def store_training_interaction(self, interaction: Dict[str, Any]):
+        """Store interaction in a high-capacity list for Two-Tower model training.
+
+        Retains up to 100K interactions over 30 days, providing a much larger
+        training window than the 10K global_interactions list.
+        """
+        try:
+            key = "tt_training_interactions"
+            await self.redis_client.lpush(key, json.dumps(interaction))
+            await self.redis_client.ltrim(key, 0, 99999)  # Keep 100K interactions
+            await self.redis_client.expire(key, 86400 * 30)  # 30 days
+        except Exception as e:
+            logger.error(f"Error storing training interaction: {e}")
+
+    async def get_training_interactions(self, limit: int = 50000) -> List[Dict[str, Any]]:
+        """Get training interactions for the Two-Tower model.
+
+        Returns up to *limit* recent interactions from the dedicated training list.
+        """
+        try:
+            key = "tt_training_interactions"
+            data = await self.redis_client.lrange(key, 0, limit - 1)
+            interactions = []
+            for item in data:
+                try:
+                    interactions.append(json.loads(item.decode()))
+                except Exception:
+                    continue
+            return interactions
+        except Exception as e:
+            logger.error(f"Error getting training interactions: {e}")
+            return []
+
+    async def get_all_user_features_map(self) -> Dict[str, Dict[str, Any]]:
+        """Batch-get user features for all known users.
+
+        Returns a dict mapping user_id -> user features dict.
+        Used by the Two-Tower trainer to build side-feature tensors.
+        """
+        try:
+            pattern = f"{self.prefixes['user_features']}*"
+            keys = await self.redis_client.keys(pattern)
+            if not keys:
+                return {}
+
+            result: Dict[str, Dict[str, Any]] = {}
+            prefix_len = len(self.prefixes['user_features'])
+
+            for key in keys:
+                try:
+                    key_str = key.decode() if isinstance(key, bytes) else key
+                    user_id = key_str[prefix_len:]
+                    cached = await self.redis_client.get(key)
+                    if cached:
+                        import pickle as _pkl
+                        data = _pkl.loads(cached)
+                        result[user_id] = data
+                except Exception:
+                    continue
+
+            return result
+        except Exception as e:
+            logger.error(f"Error getting all user features: {e}")
+            return {}
+
     async def _initialize_default_data(self):
         """Initialize any default data needed for the system."""
         try:

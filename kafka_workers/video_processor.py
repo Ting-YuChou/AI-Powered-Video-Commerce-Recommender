@@ -142,16 +142,17 @@ class VideoProcessorWorker:
             
             # Send feature update event via Kafka
             kafka_manager = get_kafka_manager()
-            await kafka_manager.send_feature_update(
-                entity_type='content',
-                entity_id=content_id,
-                feature_updates={
-                    'status': 'completed',
-                    'has_visual_embedding': features.visual_embedding is not None,
-                    'detected_objects': features.detected_objects,
-                    'processing_time': features.processing_time
-                }
-            )
+            if kafka_manager:
+                await kafka_manager.send_feature_update(
+                    entity_type='content',
+                    entity_id=content_id,
+                    feature_updates={
+                        'status': 'completed',
+                        'has_visual_embedding': features.visual_embedding is not None,
+                        'detected_objects': features.detected_objects,
+                        'processing_time': features.processing_time
+                    }
+                )
             
         except Exception as e:
             logger.error(f"Error processing video {content_id}: {e}")

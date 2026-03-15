@@ -187,15 +187,16 @@ class FeatureUpdaterWorker:
             
             # Send feature update notification
             kafka_manager = get_kafka_manager()
-            await kafka_manager.send_feature_update(
-                entity_type='user',
-                entity_id=user_id,
-                feature_updates={
-                    'interactions_processed': len(interactions),
-                    'action_counts': dict(action_counts),
-                    'updated_at': time.time()
-                }
-            )
+            if kafka_manager:
+                await kafka_manager.send_feature_update(
+                    entity_type='user',
+                    entity_id=user_id,
+                    feature_updates={
+                        'interactions_processed': len(interactions),
+                        'action_counts': dict(action_counts),
+                        'updated_at': time.time()
+                    }
+                )
             
         except Exception as e:
             logger.error(f"Error processing interactions for user {user_id}: {e}")

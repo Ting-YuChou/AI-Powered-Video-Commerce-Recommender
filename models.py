@@ -7,7 +7,10 @@ data serialization, and internal data structures throughout the system.
 """
 
 from __future__ import annotations
-from pydantic import BaseModel, Field, validator
+try:
+    from pydantic.v1 import BaseModel, Field, validator
+except ImportError:
+    from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Optional, Any, Union, TYPE_CHECKING
 from enum import Enum
 import time
@@ -318,6 +321,15 @@ class SystemMetrics(BaseModel):
     resource_metrics: Dict[str, Any] = Field(..., description="System resource usage")
     timestamp: float = Field(default_factory=time.time, description="Metrics timestamp")
 
+class TwoTowerTrainingSample(BaseModel):
+    """Structured training sample for the Two-Tower retrieval model."""
+    user_id: str = Field(..., description="User identifier")
+    positive_item_id: str = Field(..., description="Positively interacted item identifier")
+    interaction_weight: float = Field(1.0, ge=0, description="Interaction signal weight")
+    user_features: Dict[str, float] = Field(default_factory=dict, description="User side features")
+    item_features: Dict[str, float] = Field(default_factory=dict, description="Item side features")
+    timestamp: float = Field(default_factory=time.time, description="Interaction timestamp")
+
 # Remove these - validators are now in the ProductRecommendation class
 
 # Configuration Models
@@ -350,7 +362,7 @@ __all__ = [
     "AnalyticsResponse", "HealthResponse", "ComponentHealth",
     # Internal models
     "UserFeatures", "ContentFeatures", "ProductData", "CandidateProduct", 
-    "RankingFeatures", "SystemMetrics",
+    "RankingFeatures", "SystemMetrics", "TwoTowerTrainingSample",
     # Configuration models
     "RedisConfig", "ModelConfig"
 ]

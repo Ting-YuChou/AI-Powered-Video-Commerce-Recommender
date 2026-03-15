@@ -50,6 +50,7 @@ class ContentProcessor:
         self.clip_processor = None
         self.device = torch.device(self._get_device())
         self.is_initialized = False
+        self.lazy_load = os.getenv("MODEL_LAZY_LOAD", "false").lower() == "true"
         
         # Processing parameters
         self.max_keyframes = config.num_keyframes
@@ -493,6 +494,7 @@ class ContentProcessor:
         try:
             status = {
                 'initialized': self.is_initialized,
+                'lazy_load_enabled': self.lazy_load,
                 'device': str(self.device),
                 'clip_model_loaded': self.clip_model is not None,
                 'clip_processor_loaded': self.clip_processor is not None,

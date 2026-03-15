@@ -30,6 +30,12 @@ from config import RankingConfig
 
 logger = logging.getLogger(__name__)
 
+try:
+    if hasattr(torch.backends, "mkldnn"):
+        torch.backends.mkldnn.enabled = False
+except Exception:
+    pass
+
 class MultiObjectiveRankingModel(nn.Module):
     """
     Multi-objective neural ranking model that predicts:
@@ -70,8 +76,7 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.Dropout(config.dropout_rate),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
+            nn.Linear(32, 2),
         )
         
         # CVR prediction tower
@@ -81,8 +86,7 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.Dropout(config.dropout_rate),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
+            nn.Linear(32, 2),
         )
         
         # GMV prediction tower
@@ -92,8 +96,7 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.Dropout(config.dropout_rate),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.ReLU()  # Ensure positive GMV
+            nn.Linear(32, 2),
         )
         
         # Final ranking tower
@@ -102,7 +105,7 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
-            nn.Linear(16, 1)
+            nn.Linear(16, 2)
         )
         
         # Initialize weights
@@ -114,6 +117,11 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _collapse_scalar_head(x: torch.Tensor) -> torch.Tensor:
+        """Collapse a 2-unit head into one scalar while avoiding Linear(..., 1)."""
+        return x[:, 1:2] - x[:, 0:1]
     
     def forward(self, x):
         """Forward pass through the model."""
@@ -121,13 +129,13 @@ class MultiObjectiveRankingModel(nn.Module):
         shared_features = self.shared_layers(x)
         
         # Task-specific predictions
-        ctr_pred = self.ctr_tower(shared_features)
-        cvr_pred = self.cvr_tower(shared_features)
-        gmv_pred = self.gmv_tower(shared_features)
+        ctr_pred = torch.sigmoid(self._collapse_scalar_head(self.ctr_tower(shared_features)))
+        cvr_pred = torch.sigmoid(self._collapse_scalar_head(self.cvr_tower(shared_features)))
+        gmv_pred = torch.relu(self._collapse_scalar_head(self.gmv_tower(shared_features)))
         
         # Combine for final ranking
         combined_features = torch.cat([shared_features, ctr_pred, cvr_pred, gmv_pred], dim=1)
-        ranking_score = self.ranking_tower(combined_features)
+        ranking_score = self._collapse_scalar_head(self.ranking_tower(combined_features))
         
         return {
             'ctr': ctr_pred,
@@ -277,6 +285,7 @@ class RankingModel:
             'avg_inference_time': 0.0,
             'batch_inference_time': 0.0
         }
+        self.torch_inference_available = True
         
         logger.info(f"RankingModel initialized on device: {self.device}")
     
@@ -291,7 +300,12 @@ class RankingModel:
             if model_path and Path(model_path).exists():
                 logger.info(f"Loading model from {model_path}")
                 state_dict = torch.load(model_path, map_location=self.device)
-                self.model.load_state_dict(state_dict)
+                load_result = self.model.load_state_dict(state_dict, strict=False)
+                if load_result.missing_keys or load_result.unexpected_keys:
+                    logger.warning(
+                        "Ranking checkpoint partially loaded due to head-shape mismatch: "
+                        f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
+                    )
                 self.is_trained = True
             else:
                 logger.info("Initializing new model")
@@ -339,6 +353,9 @@ class RankingModel:
         if not candidates:
             logger.warning("No candidates to rank")
             return []
+
+        if not self.torch_inference_available:
+            return self._fallback_rank_candidates(candidates, k)
         
         start_time = time.time()
         
@@ -444,7 +461,44 @@ class RankingModel:
             
         except Exception as e:
             logger.error(f"Error ranking candidates: {e}")
-            return []
+            self.torch_inference_available = False
+            return self._fallback_rank_candidates(candidates, k)
+
+    def _fallback_rank_candidates(
+        self,
+        candidates: List[CandidateProduct],
+        k: int,
+    ) -> List[ProductRecommendation]:
+        """Fallback ranking path when Torch inference is unavailable."""
+        fallback_recommendations: List[ProductRecommendation] = []
+
+        for candidate in candidates:
+            collaborative = candidate.collaborative_score or 0.0
+            content_similarity = candidate.content_similarity_score or 0.0
+            popularity = candidate.popularity_score or 0.0
+            combined = candidate.combined_score or (
+                0.5 * collaborative + 0.3 * content_similarity + 0.2 * popularity
+            )
+            confidence_score = max(0.0, min(combined, 1.0))
+
+            fallback_recommendations.append(
+                ProductRecommendation(
+                    product_id=candidate.product_id,
+                    title=f"Product {candidate.product_id}",
+                    description="Fallback ranking path used",
+                    price=0.0,
+                    currency="USD",
+                    category="General",
+                    brand="Unknown",
+                    rating=None,
+                    confidence_score=confidence_score,
+                    ranking_score=combined,
+                    reason="Fallback ranking based on candidate generation scores",
+                )
+            )
+
+        fallback_recommendations.sort(key=lambda item: item.ranking_score, reverse=True)
+        return fallback_recommendations[:k]
     
     def _generate_explanation(
         self, 
@@ -642,7 +696,8 @@ class RankingModel:
                 'model_loaded': self.model is not None,
                 'is_trained': self.is_trained,
                 'device': str(self.device),
-                'feature_dim': self.feature_extractor.total_feature_dim
+                'feature_dim': self.feature_extractor.total_feature_dim,
+                'torch_inference_available': self.torch_inference_available,
             }
             
             # Test inference if model is loaded

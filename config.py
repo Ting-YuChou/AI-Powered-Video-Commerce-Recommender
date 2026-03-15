@@ -10,7 +10,10 @@ for development and production environments.
 import os
 import json
 from typing import Dict, Any, Optional, List
-from pydantic import BaseSettings, Field, validator
+try:
+    from pydantic.v1 import BaseSettings, Field, validator
+except ImportError:
+    from pydantic import BaseSettings, Field, validator
 from pathlib import Path
 import logging
 
@@ -85,10 +88,10 @@ class VectorConfig(BaseSettings):
 
 class RecommendationConfig(BaseSettings):
     """Recommendation engine configuration."""
-    # Collaborative filtering
-    cf_factors: int = Field(64, description="Collaborative filtering factors")
-    cf_regularization: float = Field(0.1, description="CF regularization parameter")
-    cf_iterations: int = Field(50, description="CF training iterations")
+    # Legacy collaborative filtering (kept for backward-compat env vars)
+    cf_factors: int = Field(64, description="Collaborative filtering factors (legacy)")
+    cf_regularization: float = Field(0.1, description="CF regularization parameter (legacy)")
+    cf_iterations: int = Field(50, description="CF training iterations (legacy)")
     
     # Candidate generation
     candidates_per_source: int = Field(100, description="Candidates per recommendation source")
@@ -107,6 +110,24 @@ class RecommendationConfig(BaseSettings):
     enable_diversity: bool = Field(True, description="Enable recommendation diversity")
     diversity_factor: float = Field(0.1, description="Diversity vs relevance trade-off")
     max_items_per_category: int = Field(3, description="Max recommendations per category")
+    
+    # Two-Tower model settings
+    tt_embedding_dim: int = Field(128, description="Two-Tower output embedding dimension")
+    tt_user_hidden_dims: List[int] = Field([256, 128], description="User tower hidden dimensions")
+    tt_item_hidden_dims: List[int] = Field([256, 128], description="Item tower hidden dimensions")
+    tt_learning_rate: float = Field(0.001, description="Two-Tower learning rate")
+    tt_batch_size: int = Field(1024, description="Two-Tower training batch size")
+    tt_epochs: int = Field(20, description="Two-Tower training epochs")
+    tt_temperature: float = Field(0.07, description="InfoNCE temperature parameter")
+    
+    # Negative sampling settings
+    tt_num_hard_negatives: int = Field(5, description="Hard negatives per positive sample")
+    tt_num_random_negatives: int = Field(10, description="Random negatives per positive sample")
+    tt_hard_negative_ratio_start: float = Field(0.1, description="Initial hard negative ratio (curriculum)")
+    tt_hard_negative_ratio_end: float = Field(0.5, description="Final hard negative ratio (curriculum)")
+    
+    # CF FAISS index path
+    cf_index_path: str = Field("/tmp/cf_vector_index.faiss", description="CF FAISS index file path")
     
     class Config:
         env_prefix = "RECOMMENDATION_"
@@ -182,9 +203,12 @@ class MonitoringConfig(BaseSettings):
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         description="Log format string"
     )
+    structured_logging: bool = Field(True, description="Emit logs as JSON")
+    request_id_header: str = Field("X-Request-ID", description="Request ID header name")
     
     # Metrics collection
     enable_metrics: bool = Field(True, description="Enable metrics collection")
+    enable_prometheus_metrics: bool = Field(True, description="Expose Prometheus metrics")
     metrics_interval: int = Field(60, description="Metrics collection interval")
     
     # Health checks
@@ -241,6 +265,38 @@ class KafkaConfig(BaseSettings):
         env_prefix = "KAFKA_"
 
 
+class ServiceTopologyConfig(BaseSettings):
+    """Inter-service routing and deployment configuration."""
+    gateway_host: str = Field("0.0.0.0", description="Gateway bind host")
+    gateway_port: int = Field(8000, description="Gateway bind port")
+    recommendation_host: str = Field("0.0.0.0", description="Recommendation service bind host")
+    recommendation_port: int = Field(8001, description="Recommendation service bind port")
+    interaction_host: str = Field("0.0.0.0", description="Interaction ingest service bind host")
+    interaction_port: int = Field(8002, description="Interaction ingest service bind port")
+    recommendation_service_url: str = Field(
+        "http://recommendation-service:8001",
+        description="Internal URL for the recommendation service",
+    )
+    interaction_ingest_service_url: str = Field(
+        "http://interaction-ingest-service:8002",
+        description="Internal URL for the interaction ingest service",
+    )
+    request_forward_timeout_seconds: float = Field(
+        10.0,
+        description="Gateway timeout when forwarding to internal services",
+    )
+    trainer_interval_seconds: int = Field(
+        3600,
+        description="Background model trainer interval in seconds",
+    )
+    gateway_workers: int = Field(2, description="Gateway worker process count")
+    recommendation_workers: int = Field(2, description="Recommendation worker process count")
+    interaction_workers: int = Field(2, description="Interaction ingest worker process count")
+
+    class Config:
+        env_prefix = "SERVICE_"
+
+
 class DataConfig(BaseSettings):
     """Data management configuration."""
     # Sample data
@@ -290,6 +346,7 @@ class Config:
         self.monitoring_config = MonitoringConfig()
         self.data_config = DataConfig()
         self.kafka_config = KafkaConfig()
+        self.service_topology_config = ServiceTopologyConfig()
         
         # Load additional config from file if provided
         if config_file and os.path.exists(config_file):
