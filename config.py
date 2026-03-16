@@ -10,7 +10,10 @@ for development and production environments.
 import os
 import json
 from typing import Dict, Any, Optional, List
-from pydantic import BaseSettings, Field, validator
+try:
+    from pydantic.v1 import BaseSettings, Field, validator
+except ImportError:
+    from pydantic import BaseSettings, Field, validator
 from pathlib import Path
 import logging
 
@@ -61,6 +64,14 @@ class ModelConfig(BaseSettings):
     enable_quantization: bool = Field(False, description="Enable model quantization")
     enable_gpu: bool = Field(True, description="Enable GPU acceleration if available")
     max_concurrent_requests: int = Field(10, description="Max concurrent ML requests")
+    torch_num_threads: int = Field(
+        0,
+        description="Torch intra-op CPU thread count; 0 auto-detects from cgroup quota",
+    )
+    torch_num_interop_threads: int = Field(
+        1,
+        description="Torch inter-op CPU thread count; 0 auto-detects from cgroup quota",
+    )
     
     class Config:
         env_prefix = "MODEL_"
@@ -85,14 +96,50 @@ class VectorConfig(BaseSettings):
 
 class RecommendationConfig(BaseSettings):
     """Recommendation engine configuration."""
-    # Collaborative filtering
-    cf_factors: int = Field(64, description="Collaborative filtering factors")
-    cf_regularization: float = Field(0.1, description="CF regularization parameter")
-    cf_iterations: int = Field(50, description="CF training iterations")
+    # Legacy collaborative filtering (kept for backward-compat env vars)
+    cf_factors: int = Field(64, description="Collaborative filtering factors (legacy)")
+    cf_regularization: float = Field(0.1, description="CF regularization parameter (legacy)")
+    cf_iterations: int = Field(50, description="CF training iterations (legacy)")
     
     # Candidate generation
     candidates_per_source: int = Field(100, description="Candidates per recommendation source")
     max_total_candidates: int = Field(500, description="Maximum total candidates")
+    cold_start_random_candidate_cap: int = Field(
+        50,
+        description="Maximum random fallback candidates when no stronger retrieval source is available",
+    )
+    serving_trending_pool_size: int = Field(
+        300,
+        description="Number of products to precompute in the global trending pool",
+    )
+    serving_category_pool_size: int = Field(
+        150,
+        description="Number of products to precompute per category pool",
+    )
+    preferred_category_pool_count: int = Field(
+        2,
+        description="Maximum preferred categories to pull from serving pools per request",
+    )
+    max_live_cf_candidates: int = Field(
+        40,
+        description="Maximum collaborative candidates to fetch live per request",
+    )
+    max_live_content_candidates: int = Field(
+        20,
+        description="Maximum content-similar candidates to fetch live per request",
+    )
+    max_pool_trending_candidates: int = Field(
+        30,
+        description="Maximum precomputed trending candidates to merge per request",
+    )
+    max_pool_category_candidates: int = Field(
+        30,
+        description="Maximum precomputed category-pool candidates to merge per request",
+    )
+    max_random_candidates: int = Field(
+        10,
+        description="Maximum random fallback candidates to merge per request",
+    )
     
     # Ranking weights
     cf_weight: float = Field(0.4, description="Collaborative filtering weight")
@@ -108,6 +155,24 @@ class RecommendationConfig(BaseSettings):
     diversity_factor: float = Field(0.1, description="Diversity vs relevance trade-off")
     max_items_per_category: int = Field(3, description="Max recommendations per category")
     
+    # Two-Tower model settings
+    tt_embedding_dim: int = Field(128, description="Two-Tower output embedding dimension")
+    tt_user_hidden_dims: List[int] = Field([256, 128], description="User tower hidden dimensions")
+    tt_item_hidden_dims: List[int] = Field([256, 128], description="Item tower hidden dimensions")
+    tt_learning_rate: float = Field(0.001, description="Two-Tower learning rate")
+    tt_batch_size: int = Field(1024, description="Two-Tower training batch size")
+    tt_epochs: int = Field(20, description="Two-Tower training epochs")
+    tt_temperature: float = Field(0.07, description="InfoNCE temperature parameter")
+    
+    # Negative sampling settings
+    tt_num_hard_negatives: int = Field(5, description="Hard negatives per positive sample")
+    tt_num_random_negatives: int = Field(10, description="Random negatives per positive sample")
+    tt_hard_negative_ratio_start: float = Field(0.1, description="Initial hard negative ratio (curriculum)")
+    tt_hard_negative_ratio_end: float = Field(0.5, description="Final hard negative ratio (curriculum)")
+    
+    # CF FAISS index path
+    cf_index_path: str = Field("/tmp/cf_vector_index.faiss", description="CF FAISS index file path")
+    
     class Config:
         env_prefix = "RECOMMENDATION_"
 
@@ -117,7 +182,23 @@ class RankingConfig(BaseSettings):
     hidden_dims: List[int] = Field([256, 128, 64], description="Neural network hidden dimensions")
     dropout_rate: float = Field(0.2, description="Dropout rate")
     learning_rate: float = Field(0.001, description="Learning rate")
-    
+    enable_async_batching: bool = Field(
+        True,
+        description="Enable micro-batching queue for ranking inference",
+    )
+    batch_max_requests: int = Field(
+        8,
+        description="Maximum number of ranking requests to combine into one micro-batch",
+    )
+    batch_wait_ms: float = Field(
+        5.0,
+        description="Maximum time to wait for more ranking requests before dispatching a batch",
+    )
+    batch_queue_size: int = Field(
+        2048,
+        description="Maximum queued ranking requests per worker",
+    )
+
     # Multi-objective settings
     enable_multi_objective: bool = Field(True, description="Enable multi-objective optimization")
     ctr_weight: float = Field(1.0, description="Click-through rate weight")
@@ -162,6 +243,9 @@ class CacheConfig(BaseSettings):
     user_features_ttl: int = Field(1800, description="User features cache TTL")
     content_features_ttl: int = Field(86400, description="Content features cache TTL")
     recommendations_ttl: int = Field(900, description="Recommendations cache TTL")
+    candidate_ttl: int = Field(300, description="Candidate cache TTL in seconds")
+    product_metadata_ttl: int = Field(86400, description="Product metadata cache TTL in seconds")
+    serving_pool_ttl: int = Field(1800, description="Serving pool cache TTL in seconds")
     
     # Cache size limits
     max_cache_size: int = Field(10000, description="Maximum cache entries")
@@ -182,9 +266,12 @@ class MonitoringConfig(BaseSettings):
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         description="Log format string"
     )
+    structured_logging: bool = Field(True, description="Emit logs as JSON")
+    request_id_header: str = Field("X-Request-ID", description="Request ID header name")
     
     # Metrics collection
     enable_metrics: bool = Field(True, description="Enable metrics collection")
+    enable_prometheus_metrics: bool = Field(True, description="Expose Prometheus metrics")
     metrics_interval: int = Field(60, description="Metrics collection interval")
     
     # Health checks
@@ -194,6 +281,14 @@ class MonitoringConfig(BaseSettings):
     # Performance monitoring
     slow_request_threshold: float = Field(1.0, description="Slow request threshold in seconds")
     enable_request_logging: bool = Field(True, description="Enable request logging")
+    enable_profiling_logs: bool = Field(
+        False,
+        description="Emit detailed timing breakdown logs for critical request paths",
+    )
+    profiling_log_min_duration_ms: float = Field(
+        250.0,
+        description="Minimum end-to-end request duration before detailed timing logs are emitted",
+    )
     
     # Alerting thresholds
     error_rate_threshold: float = Field(0.05, description="Error rate alert threshold")
@@ -239,6 +334,66 @@ class KafkaConfig(BaseSettings):
     
     class Config:
         env_prefix = "KAFKA_"
+
+
+class ServiceTopologyConfig(BaseSettings):
+    """Inter-service routing and deployment configuration."""
+    gateway_host: str = Field("0.0.0.0", description="Gateway bind host")
+    gateway_port: int = Field(8000, description="Gateway bind port")
+    recommendation_host: str = Field("0.0.0.0", description="Recommendation service bind host")
+    recommendation_port: int = Field(8001, description="Recommendation service bind port")
+    interaction_host: str = Field("0.0.0.0", description="Interaction ingest service bind host")
+    interaction_port: int = Field(8002, description="Interaction ingest service bind port")
+    recommendation_service_url: str = Field(
+        "http://recommendation-service:8001",
+        description="Internal URL for the recommendation service",
+    )
+    interaction_ingest_service_url: str = Field(
+        "http://interaction-ingest-service:8002",
+        description="Internal URL for the interaction ingest service",
+    )
+    request_forward_timeout_seconds: float = Field(
+        10.0,
+        description="Gateway timeout when forwarding to internal services",
+    )
+    proxy_connect_timeout_seconds: float = Field(
+        5.0,
+        description="HTTP connect timeout from gateway to internal services",
+    )
+    proxy_read_timeout_seconds: float = Field(
+        10.0,
+        description="HTTP read timeout from gateway to internal services",
+    )
+    proxy_write_timeout_seconds: float = Field(
+        10.0,
+        description="HTTP write timeout from gateway to internal services",
+    )
+    proxy_pool_timeout_seconds: float = Field(
+        15.0,
+        description="HTTP connection-pool acquisition timeout in the gateway",
+    )
+    proxy_max_connections: int = Field(
+        500,
+        description="Maximum concurrent upstream HTTP connections per gateway worker",
+    )
+    proxy_max_keepalive_connections: int = Field(
+        100,
+        description="Maximum idle keepalive upstream HTTP connections per gateway worker",
+    )
+    proxy_keepalive_expiry_seconds: float = Field(
+        5.0,
+        description="Idle keepalive expiry for upstream HTTP connections in the gateway",
+    )
+    trainer_interval_seconds: int = Field(
+        3600,
+        description="Background model trainer interval in seconds",
+    )
+    gateway_workers: int = Field(2, description="Gateway worker process count")
+    recommendation_workers: int = Field(2, description="Recommendation worker process count")
+    interaction_workers: int = Field(2, description="Interaction ingest worker process count")
+
+    class Config:
+        env_prefix = "SERVICE_"
 
 
 class DataConfig(BaseSettings):
@@ -290,6 +445,7 @@ class Config:
         self.monitoring_config = MonitoringConfig()
         self.data_config = DataConfig()
         self.kafka_config = KafkaConfig()
+        self.service_topology_config = ServiceTopologyConfig()
         
         # Load additional config from file if provided
         if config_file and os.path.exists(config_file):

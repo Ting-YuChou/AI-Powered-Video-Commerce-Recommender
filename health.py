@@ -499,6 +499,12 @@ class HealthChecker:
             health_data = self.content_processor.health_check()
             response_time = (time.time() - start_time) * 1000
             
+            if health_data.get('lazy_load_enabled') and not health_data.get('initialized'):
+                return ComponentHealth(
+                    status=HealthStatus.HEALTHY,
+                    response_time_ms=response_time
+                )
+
             if health_data.get('initialized') and health_data.get('clip_model_loaded'):
                 return ComponentHealth(
                     status=HealthStatus.HEALTHY,

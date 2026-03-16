@@ -16,30 +16,22 @@ FROM python:${PYTHON_VERSION}-slim as base
 RUN apt-get update && apt-get install -y \
     # Build essentials
     build-essential \
-    pkg-config \
     # Media processing
     ffmpeg \
     libsm6 \
     libxext6 \
     libfontconfig1 \
     libxrender1 \
-    libgl1-mesa-glx \
+    libgl1 \
     # OCR dependencies
     tesseract-ocr \
     tesseract-ocr-eng \
-    libtesseract-dev \
-    libleptonica-dev \
     # Image processing
-    libopencv-dev \
     libglib2.0-0 \
-    libgtk-3-dev \
     # Audio processing
     libsndfile1 \
-    libportaudio2 \
-    portaudio19-dev \
     # Network utilities
     curl \
-    wget \
     # Process monitoring
     procps \
     # Cleanup
@@ -65,22 +57,19 @@ RUN pip install --no-cache-dir --upgrade \
     wheel \
     cython
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# Copy runtime requirements first for better caching
+COPY requirements.runtime.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --user -r requirements.txt
+# Install Python dependencies into the image's main Python environment
+RUN pip install --no-cache-dir -r requirements.runtime.txt
 
 # =============================================================================
 # Stage 3: Application Build
 # =============================================================================
 FROM base as app-build
 
-# Copy Python dependencies from previous stage
-COPY --from=python-deps /root/.local /root/.local
-
-# Make sure scripts in .local are usable
-ENV PATH=/root/.local/bin:$PATH
+# Copy Python dependencies from the previous stage
+COPY --from=python-deps /usr/local /usr/local
 
 # Create necessary directories
 RUN mkdir -p /app/models /app/data /app/logs /app/uploads /app/tmp
@@ -105,8 +94,7 @@ RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
 FROM base as production
 
 # Copy Python dependencies
-COPY --from=app-build /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+COPY --from=app-build /usr/local /usr/local
 
 # Copy application
 COPY --from=app-build /app /app
@@ -132,7 +120,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 EXPOSE 8000
 
 # Default command
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "gateway_api:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # =============================================================================
 # Stage 5: Development Build
@@ -171,7 +159,7 @@ ENV MONITORING_LOG_LEVEL=DEBUG
 EXPOSE 8000 8888
 
 # Development command (can be overridden)
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["python", "-m", "uvicorn", "gateway_api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
 # =============================================================================
 # Stage 6: GPU-Enabled Runtime
@@ -199,11 +187,10 @@ RUN ln -s /usr/bin/python3.10 /usr/bin/python
 WORKDIR /app
 
 # Copy application and dependencies
-COPY --from=app-build /root/.local /root/.local
+COPY --from=app-build /usr/local /usr/local
 COPY --from=app-build /app /app
 
 # Set environment variables
-ENV PATH=/root/.local/bin:$PATH
 ENV PYTHONPATH=/app
 ENV CUDA_VISIBLE_DEVICES=0
 ENV MODEL_DEVICE=cuda
@@ -224,7 +211,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 EXPOSE 8000
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "gateway_api:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # =============================================================================
 # Build Instructions and Examples
@@ -315,4 +302,3 @@ CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"
 
 # Security scan:
 # docker scout cves video-commerce:latest
-

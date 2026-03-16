@@ -59,13 +59,11 @@ class KafkaProducerClient:
                 self.producer = AIOKafkaProducer(
                     bootstrap_servers=self.config.bootstrap_servers,
                     acks=self.config.producer_acks,
-                    retries=self.config.producer_retries,
-                    batch_size=self.config.producer_batch_size,
+                    max_batch_size=self.config.producer_batch_size,
                     linger_ms=self.config.producer_linger_ms,
                     compression_type=self.config.producer_compression_type,
                     request_timeout_ms=self.config.request_timeout_ms,
                     retry_backoff_ms=self.config.retry_backoff_ms,
-                    max_in_flight_requests_per_connection=self.config.max_in_flight_requests,
                     key_serializer=lambda k: k.encode('utf-8') if k else None,
                     value_serializer=lambda v: json.dumps(v).encode('utf-8')
                 )
@@ -148,6 +146,44 @@ class KafkaProducerClient:
             return False
         except Exception as e:
             logger.error(f"Unexpected error sending message: {e}")
+            return False
+
+    async def send_nowait(
+        self,
+        topic: str,
+        value: Dict[str, Any],
+        key: Optional[str] = None,
+        headers: Optional[List[tuple]] = None,
+    ) -> bool:
+        """Enqueue a message to Kafka without waiting for broker acknowledgment."""
+        if not self.config.enable:
+            logger.debug(f"Kafka disabled, skipping async enqueue to topic: {topic}")
+            return True
+
+        if not self.is_connected or not self.producer:
+            logger.warning("Kafka producer not connected, attempting to reconnect...")
+            try:
+                await self.start()
+            except Exception as e:
+                logger.error(f"Failed to reconnect Kafka producer: {e}")
+                return False
+
+        try:
+            value["_kafka_timestamp"] = datetime.utcnow().isoformat()
+            value["_kafka_topic"] = topic
+            await self.producer.send(
+                topic=topic,
+                value=value,
+                key=key,
+                headers=headers,
+            )
+            logger.debug(f"Message enqueued to topic '{topic}' with key '{key}'")
+            return True
+        except KafkaError as e:
+            logger.error(f"Failed to enqueue message to topic '{topic}': {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error enqueueing message: {e}")
             return False
     
     async def send_batch(
@@ -416,6 +452,30 @@ class KafkaManager:
             topic=self.config.user_interactions_topic,
             value=event,
             key=user_id  # Partition by user for ordering
+        )
+
+    async def send_user_interaction_async(
+        self,
+        user_id: str,
+        product_id: str,
+        action: str,
+        context: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Enqueue a user interaction event without waiting for broker ack."""
+        event = {
+            'event_type': 'user_interaction',
+            'user_id': user_id,
+            'product_id': product_id,
+            'action': action,
+            'context': context or {},
+            'timestamp': timestamp or time.time()
+        }
+
+        return await self.producer.send_nowait(
+            topic=self.config.user_interactions_topic,
+            value=event,
+            key=user_id
         )
     
     # ==================== Video Processing Tasks ====================

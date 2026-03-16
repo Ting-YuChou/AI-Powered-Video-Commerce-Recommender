@@ -7,7 +7,7 @@ video commerce recommendation system. It handles all HTTP endpoints and
 orchestrates the recommendation pipeline.
 """
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Request, Response, Body
 import tempfile
 import os
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +16,7 @@ import uvicorn
 import asyncio
 import time
 import logging
+import uuid
 from typing import List, Optional, Dict, Any
 import traceback
 
@@ -36,7 +37,11 @@ from vector_search import VectorSearchEngine
 from health import HealthChecker
 from config import Config
 from kafka_client import KafkaManager, init_kafka, close_kafka, get_kafka_manager
-import data
+from observability import (
+    ObservabilityManager,
+    configure_logging,
+    request_id_ctx_var,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -72,18 +77,86 @@ vector_search: Optional[VectorSearchEngine] = None
 health_checker: Optional[HealthChecker] = None
 kafka_manager: Optional[KafkaManager] = None
 config: Optional[Config] = None
+observability = ObservabilityManager()
+health_monitor_task: Optional[asyncio.Task] = None
+
+
+def _get_route_template(request: Request) -> str:
+    route = request.scope.get("route")
+    if route and getattr(route, "path", None):
+        return route.path
+    return request.url.path
+
+
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    request_id_header = (
+        config.monitoring_config.request_id_header
+        if config
+        else "X-Request-ID"
+    )
+    request_id = request.headers.get(request_id_header) or str(uuid.uuid4())
+    request.state.request_id = request_id
+    request.state.request_started_at = time.perf_counter()
+    request_id_token = request_id_ctx_var.set(request_id)
+    observability.http_requests_in_progress.inc()
+
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        duration = time.perf_counter() - request.state.request_started_at
+        route_path = _get_route_template(request)
+        observability.record_exception(
+            request.method,
+            route_path,
+            type(exc).__name__,
+        )
+        observability.record_request(request.method, route_path, 500, duration)
+        logger.exception(
+            "request_failed",
+            extra={
+                "method": request.method,
+                "path": route_path,
+                "status_code": 500,
+                "duration_ms": round(duration * 1000, 2),
+                "client_ip": request.client.host if request.client else None,
+            },
+        )
+        raise
+    else:
+        duration = time.perf_counter() - request.state.request_started_at
+        route_path = _get_route_template(request)
+        observability.record_request(request.method, route_path, response.status_code, duration)
+
+        if not (config and not config.monitoring_config.enable_request_logging):
+            logger.info(
+                "request_complete",
+                extra={
+                    "method": request.method,
+                    "path": route_path,
+                    "status_code": response.status_code,
+                    "duration_ms": round(duration * 1000, 2),
+                    "client_ip": request.client.host if request.client else None,
+                },
+            )
+
+        response.headers[request_id_header] = request_id
+        return response
+    finally:
+        observability.http_requests_in_progress.dec()
+        request_id_ctx_var.reset(request_id_token)
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize all components on application startup."""
     global content_processor, recommendation_engine, ranking_model
-    global feature_store, vector_search, health_checker, kafka_manager, config
+    global feature_store, vector_search, health_checker, kafka_manager, config, health_monitor_task
     
     try:
-        logger.info("Starting Video Commerce Recommender...")
-        
         # Load configuration
         config = Config()
+        configure_logging(config.monitoring_config)
+        logger.info("Starting Video Commerce Recommender...")
         
         # Initialize feature store (Redis)
         feature_store = FeatureStore(config.redis_config)
@@ -103,7 +176,8 @@ async def startup_event():
         
         # Initialize content processor
         content_processor = ContentProcessor(config.model_config)
-        await content_processor.load_models()
+        if not content_processor.lazy_load:
+            await content_processor.load_models()
         
         # Initialize vector search
         vector_search = VectorSearchEngine(config.vector_config)
@@ -122,11 +196,15 @@ async def startup_event():
         # Initialize health checker (include Kafka if available)
         health_checker = HealthChecker(
             feature_store, content_processor, recommendation_engine,
+            ranking_model=ranking_model,
+            vector_search=vector_search,
             kafka_manager=kafka_manager
         )
+        health_monitor_task = health_checker.start_monitoring()
         
         # Load data if needed
         if config.load_sample_data:
+            import data
             if config.data_config.use_csv_dataset:
                 # Load from CSV dataset
                 logger.info("Loading data from CSV dataset...")
@@ -143,6 +221,9 @@ async def startup_event():
                 # Generate sample data
                 await data.initialize_sample_data(feature_store, vector_search)
         
+        # Schedule periodic model updates (Two-Tower retraining + trending)
+        asyncio.create_task(_periodic_model_update())
+        
         logger.info("All components initialized successfully!")
         
     except Exception as e:
@@ -150,10 +231,36 @@ async def startup_event():
         logger.error(traceback.format_exc())
         raise
 
+
+async def _periodic_model_update():
+    """Background task that periodically retrains the Two-Tower model and trending scores."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Check every hour
+            if recommendation_engine:
+                logger.info("Running periodic model update...")
+                await recommendation_engine.update_models()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in periodic model update: {e}")
+            await asyncio.sleep(60)  # Retry after 1 minute on error
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on application shutdown."""
     logger.info("Shutting down Video Commerce Recommender...")
+
+    global health_monitor_task
+
+    if health_monitor_task:
+        health_monitor_task.cancel()
+        try:
+            await health_monitor_task
+        except asyncio.CancelledError:
+            pass
+        health_monitor_task = None
     
     # Close Kafka connection
     if kafka_manager:
@@ -176,7 +283,7 @@ async def root():
     }
 
 @app.post("/api/recommendations", response_model=RecommendationResponse)
-async def get_recommendations(request: RecommendationRequest):
+async def get_recommendations(request: RecommendationRequest = Body(...)):
     """
     Generate product recommendations based on user and content data.
     
@@ -410,7 +517,7 @@ async def process_uploaded_content(content_id: str, file_path: str, user_id: Opt
             pass
 
 @app.post("/api/interactions")
-async def log_user_interaction(request: UserInteractionRequest):
+async def log_user_interaction(request: UserInteractionRequest = Body(...)):
     """
     Log user interactions for model training and personalization.
     
@@ -530,14 +637,35 @@ async def health_check():
 
 @app.get("/metrics")
 async def get_metrics():
-    """Get detailed system metrics for monitoring."""
+    """Expose Prometheus metrics."""
     try:
-        metrics = await feature_store.get_system_metrics()
-        return metrics
+        if config and config.monitoring_config.enable_prometheus_metrics:
+            await observability.collect_runtime_metrics(
+                feature_store=feature_store,
+                kafka_manager=kafka_manager,
+            )
+        return Response(
+            content=observability.prometheus_payload(),
+            media_type=observability.prometheus_content_type,
+        )
         
     except Exception as e:
         logger.error(f"Error getting metrics: {e}")
         raise HTTPException(status_code=500, detail="Metrics unavailable")
+
+
+@app.get("/metrics/system")
+async def get_system_metrics():
+    """Get JSON system metrics for debugging and manual baseline analysis."""
+    try:
+        metrics = await feature_store.get_system_metrics()
+        if health_checker:
+            metrics["system_status"] = health_checker.get_system_status_summary()
+        return metrics
+
+    except Exception as e:
+        logger.error(f"Error getting system metrics: {e}")
+        raise HTTPException(status_code=500, detail="System metrics unavailable")
 
 @app.get("/kafka/health")
 async def kafka_health():
@@ -606,24 +734,37 @@ async def kafka_topics():
 # Error handlers
 @app.exception_handler(404)
 async def not_found_handler(request, exc):
+    request_id_header = (
+        config.monitoring_config.request_id_header
+        if config
+        else "X-Request-ID"
+    )
     return JSONResponse(
         status_code=404,
         content={
             "error": "Not Found",
             "message": "The requested resource was not found",
-            "path": str(request.url)
-        }
+            "path": str(request.url),
+            "request_id": getattr(request.state, 'request_id', 'unknown'),
+        },
+        headers={request_id_header: getattr(request.state, 'request_id', 'unknown')},
     )
 
 @app.exception_handler(500)
 async def internal_error_handler(request, exc):
+    request_id_header = (
+        config.monitoring_config.request_id_header
+        if config
+        else "X-Request-ID"
+    )
     return JSONResponse(
         status_code=500,
         content={
             "error": "Internal Server Error",
             "message": "An unexpected error occurred",
             "request_id": getattr(request.state, 'request_id', 'unknown')
-        }
+        },
+        headers={request_id_header: getattr(request.state, 'request_id', 'unknown')},
     )
 
 if __name__ == "__main__":

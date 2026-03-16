@@ -13,13 +13,19 @@ import pickle
 import time
 import asyncio
 import logging
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional, Union, Iterable
 import numpy as np
 from datetime import datetime, timedelta
 import hashlib
 
 # Local imports
-from models import UserFeatures, ContentFeatures, InteractionType, SystemMetrics
+from models import (
+    CandidateProduct,
+    UserFeatures,
+    ContentFeatures,
+    InteractionType,
+    SystemMetrics,
+)
 from config import RedisConfig, CacheConfig
 
 logger = logging.getLogger(__name__)
@@ -50,12 +56,18 @@ class FeatureStore:
             'content_status': 'cs:',
             'user_interactions': 'ui:',
             'recommendations_cache': 'rc:',
+            'candidate_cache': 'cc:',
+            'product_metadata': 'pm:',
             'system_metrics': 'sm:',
             'trending_products': 'tp:',
+            'category_pool': 'cp:',
             'product_embeddings': 'pe:',
             'analytics': 'analytics:',
             'health': 'health:'
         }
+        self._product_metadata_memory_cache: Dict[str, Dict[str, Any]] = {}
+        self._trending_pool_memory_cache: Dict[str, List[CandidateProduct]] = {}
+        self._category_pool_memory_cache: Dict[str, List[CandidateProduct]] = {}
         
         logger.info("FeatureStore initialized")
     
@@ -141,6 +153,21 @@ class FeatureStore:
             
         except Exception as e:
             logger.error(f"Error setting user features for {user_id}: {e}")
+
+    async def set_user_features_batch(self, features_map: Dict[str, UserFeatures]):
+        """Batch-set user features using one Redis pipeline."""
+        try:
+            if not features_map:
+                return
+
+            pipeline = self.redis_client.pipeline(transaction=False)
+            for user_id, features in features_map.items():
+                key = f"{self.prefixes['user_features']}{user_id}"
+                ttl = self._calculate_adaptive_ttl(features)
+                pipeline.setex(key, ttl, pickle.dumps(features.dict()))
+            await pipeline.execute()
+        except Exception as e:
+            logger.error(f"Error batch-setting user features: {e}")
     
     async def update_user_features(self, user_id: str, action: str, context: Dict[str, Any] = None):
         """Update user features based on new interaction."""
@@ -350,10 +377,79 @@ class FeatureStore:
             await self.redis_client.ltrim(global_key, 0, 9999)  # Keep last 10k
             await self.redis_client.expire(global_key, 86400 * 7)  # 7 days
             
+            # Store for Two-Tower training (larger retention window)
+            await self.store_training_interaction(interaction_data)
+            
             logger.debug(f"Logged interaction: {user_id} -> {action} -> {product_id}")
             
         except Exception as e:
             logger.error(f"Error logging interaction: {e}")
+
+    async def log_user_interactions_batch(
+        self,
+        user_id: str,
+        interactions: List[Dict[str, Any]],
+    ):
+        """Batch-log interactions for a single user with one Redis pipeline."""
+        try:
+            if not interactions:
+                return
+
+            serialized = [
+                json.dumps(
+                    {
+                        "user_id": user_id,
+                        "product_id": interaction["product_id"],
+                        "action": interaction["action"],
+                        "timestamp": interaction.get("timestamp", time.time()),
+                        "context": interaction.get("context", {}),
+                    }
+                )
+                for interaction in interactions
+            ]
+
+            user_key = f"{self.prefixes['user_interactions']}{user_id}"
+            global_key = "global_interactions"
+            training_key = "tt_training_interactions"
+
+            pipeline = self.redis_client.pipeline(transaction=False)
+            pipeline.lpush(user_key, *serialized)
+            pipeline.ltrim(user_key, 0, 999)
+            pipeline.expire(user_key, 86400 * 30)
+
+            pipeline.lpush(global_key, *serialized)
+            pipeline.ltrim(global_key, 0, 9999)
+            pipeline.expire(global_key, 86400 * 7)
+
+            pipeline.lpush(training_key, *serialized)
+            pipeline.ltrim(training_key, 0, 99999)
+            pipeline.expire(training_key, 86400 * 30)
+            await pipeline.execute()
+        except Exception as e:
+            logger.error(f"Error batch-logging interactions for {user_id}: {e}")
+
+    async def enqueue_user_interaction(
+        self,
+        user_id: str,
+        product_id: str,
+        action: str,
+        context: Dict[str, Any] = None,
+        timestamp: Optional[float] = None,
+    ) -> str:
+        """Persist an interaction into a Redis stream for async downstream processing."""
+        try:
+            stream_key = "interaction_stream"
+            payload = {
+                "user_id": user_id,
+                "product_id": product_id,
+                "action": action,
+                "context": json.dumps(context or {}),
+                "timestamp": str(timestamp or time.time()),
+            }
+            return await self.redis_client.xadd(stream_key, payload, maxlen=100000, approximate=True)
+        except Exception as e:
+            logger.error(f"Error enqueueing interaction to Redis stream: {e}")
+            raise
     
     async def get_user_interactions(self, user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         """Get recent user interactions."""
@@ -374,6 +470,83 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error getting user interactions for {user_id}: {e}")
             return []
+
+    async def apply_user_interaction_batch(
+        self,
+        user_id: str,
+        interactions: List[Dict[str, Any]],
+    ) -> UserFeatures:
+        """Apply aggregated interaction updates to one user's feature row."""
+        try:
+            if not interactions:
+                return await self.get_user_features(user_id)
+
+            features = await self.get_user_features(user_id)
+            action_counts: Dict[str, int] = {}
+            categories: List[str] = []
+            session_lengths: List[float] = []
+            timestamps: List[float] = []
+
+            for interaction in interactions:
+                action = interaction.get("action", InteractionType.VIEW.value)
+                action_counts[action] = action_counts.get(action, 0) + 1
+                context = interaction.get("context") or {}
+                category = context.get("product_category")
+                if category:
+                    categories.append(category)
+                if "session_length" in context:
+                    try:
+                        session_lengths.append(float(context["session_length"]))
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    timestamps.append(float(interaction.get("timestamp", time.time())))
+                except (TypeError, ValueError):
+                    timestamps.append(time.time())
+
+            previous_interactions = features.total_interactions
+            features.total_interactions += len(interactions)
+            features.last_active = max([features.last_active, *timestamps])
+
+            if session_lengths:
+                previous_total_session = features.avg_session_length * max(previous_interactions, 0)
+                features.avg_session_length = (
+                    previous_total_session + sum(session_lengths)
+                ) / max(previous_interactions + len(session_lengths), 1)
+
+            for category in categories:
+                if category not in features.preferred_categories:
+                    features.preferred_categories.append(category)
+            features.preferred_categories = features.preferred_categories[:10]
+
+            stat_names = ("total_views", "total_clicks", "total_purchases")
+            stat_keys = [f"user_stats:{user_id}:{name}" for name in stat_names]
+            stat_values = await self.redis_client.mget(stat_keys)
+            stats = {
+                name: int(value) if value else 0
+                for name, value in zip(stat_names, stat_values)
+            }
+            stats["total_views"] += action_counts.get(InteractionType.VIEW.value, 0)
+            stats["total_clicks"] += action_counts.get(InteractionType.CLICK.value, 0)
+            stats["total_purchases"] += action_counts.get(InteractionType.PURCHASE.value, 0)
+
+            features.click_through_rate = stats["total_clicks"] / max(stats["total_views"], 1)
+            features.conversion_rate = stats["total_purchases"] / max(stats["total_clicks"], 1)
+
+            pipeline = self.redis_client.pipeline(transaction=False)
+            ttl = self._calculate_adaptive_ttl(features)
+            pipeline.setex(
+                f"{self.prefixes['user_features']}{user_id}",
+                ttl,
+                pickle.dumps(features.dict()),
+            )
+            for stat_name, stat_value in stats.items():
+                pipeline.setex(f"user_stats:{user_id}:{stat_name}", 86400 * 7, str(stat_value))
+            await pipeline.execute()
+            return features
+        except Exception as e:
+            logger.error(f"Error applying user interaction batch for {user_id}: {e}")
+            return await self.get_user_features(user_id)
     
     # Recommendation Caching
     async def cache_recommendations(
@@ -406,6 +579,229 @@ class FeatureStore:
             
         except Exception as e:
             logger.error(f"Error caching recommendations for {user_id}: {e}")
+
+    async def cache_candidate_products(
+        self,
+        user_id: str,
+        context_hash: str,
+        candidates: List[CandidateProduct],
+    ):
+        """Cache pre-ranked candidate products for reuse across requests."""
+        try:
+            if not self.cache_config.enable_caching:
+                return
+
+            key = f"{self.prefixes['candidate_cache']}{user_id}:{context_hash}"
+            user_features = await self.get_user_features(user_id)
+            ttl = min(
+                self._calculate_adaptive_ttl(user_features),
+                self.cache_config.candidate_ttl,
+            )
+            payload = {
+                "candidates": [candidate.dict() for candidate in candidates],
+                "cached_at": time.time(),
+                "user_id": user_id,
+            }
+            await self.redis_client.setex(key, ttl, pickle.dumps(payload))
+        except Exception as e:
+            logger.error(f"Error caching candidates for {user_id}: {e}")
+
+    async def get_cached_candidate_products(
+        self,
+        user_id: str,
+        context_hash: str,
+    ) -> Optional[List[CandidateProduct]]:
+        """Return cached candidate products for a user/context pair."""
+        try:
+            if not self.cache_config.enable_caching:
+                return None
+
+            key = f"{self.prefixes['candidate_cache']}{user_id}:{context_hash}"
+            cached_data = await self.redis_client.get(key)
+            if not cached_data:
+                return None
+
+            cache_data = pickle.loads(cached_data)
+            return [CandidateProduct(**item) for item in cache_data.get("candidates", [])]
+        except Exception as e:
+            logger.error(f"Error getting cached candidates for {user_id}: {e}")
+            return None
+
+    async def store_product_metadata(
+        self,
+        product_id: str,
+        metadata: Dict[str, Any],
+    ):
+        """Store product metadata in the local and Redis-backed metadata cache."""
+        await self.store_product_metadata_batch({product_id: metadata})
+
+    async def store_product_metadata_batch(
+        self,
+        metadata_map: Dict[str, Dict[str, Any]],
+    ):
+        """Batch-store product metadata in memory and Redis."""
+        try:
+            if not metadata_map:
+                return
+
+            self._product_metadata_memory_cache.update(metadata_map)
+            pipeline = self.redis_client.pipeline(transaction=False)
+            for product_id, metadata in metadata_map.items():
+                key = f"{self.prefixes['product_metadata']}{product_id}"
+                pipeline.setex(
+                    key,
+                    self.cache_config.product_metadata_ttl,
+                    json.dumps(metadata),
+                )
+            await pipeline.execute()
+        except Exception as e:
+            logger.error(f"Error storing product metadata batch: {e}")
+
+    async def get_product_metadata(
+        self,
+        product_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Get cached product metadata for a single product."""
+        metadata_map = await self.get_product_metadata_batch([product_id])
+        return metadata_map.get(product_id)
+
+    async def get_product_metadata_batch(
+        self,
+        product_ids: Iterable[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Get cached product metadata for many products with local-memory fast path."""
+        try:
+            unique_product_ids = list(dict.fromkeys(product_ids))
+            if not unique_product_ids:
+                return {}
+
+            metadata_map: Dict[str, Dict[str, Any]] = {}
+            missing_ids: List[str] = []
+            for product_id in unique_product_ids:
+                cached = self._product_metadata_memory_cache.get(product_id)
+                if cached is not None:
+                    metadata_map[product_id] = cached
+                else:
+                    missing_ids.append(product_id)
+
+            if missing_ids:
+                keys = [f"{self.prefixes['product_metadata']}{product_id}" for product_id in missing_ids]
+                values = await self.redis_client.mget(keys)
+                for product_id, value in zip(missing_ids, values):
+                    if not value:
+                        continue
+                    try:
+                        decoded = json.loads(value.decode() if isinstance(value, bytes) else value)
+                        metadata_map[product_id] = decoded
+                        self._product_metadata_memory_cache[product_id] = decoded
+                    except Exception:
+                        continue
+
+            return metadata_map
+        except Exception as e:
+            logger.error(f"Error getting product metadata batch: {e}")
+            return {}
+
+    async def store_trending_pool(
+        self,
+        candidates: List[CandidateProduct],
+        pool_name: str = "global",
+    ):
+        """Store a precomputed trending pool in memory and Redis."""
+        try:
+            key = f"{self.prefixes['trending_products']}{pool_name}"
+            payload = [candidate.dict() for candidate in candidates]
+            self._trending_pool_memory_cache[pool_name] = [CandidateProduct(**item) for item in payload]
+            await self.redis_client.setex(
+                key,
+                self.cache_config.serving_pool_ttl,
+                pickle.dumps(payload),
+            )
+        except Exception as e:
+            logger.error(f"Error storing trending pool {pool_name}: {e}")
+
+    async def get_trending_pool(
+        self,
+        limit: int,
+        pool_name: str = "global",
+        exclude_items: Optional[set] = None,
+    ) -> List[CandidateProduct]:
+        """Get a precomputed trending pool, filtered for excluded items."""
+        try:
+            exclude_items = exclude_items or set()
+            cached = self._trending_pool_memory_cache.get(pool_name)
+            if cached is None:
+                key = f"{self.prefixes['trending_products']}{pool_name}"
+                raw = await self.redis_client.get(key)
+                if raw:
+                    payload = pickle.loads(raw)
+                    cached = [CandidateProduct(**item) for item in payload]
+                    self._trending_pool_memory_cache[pool_name] = cached
+                else:
+                    return []
+
+            return [
+                candidate
+                for candidate in cached
+                if candidate.product_id not in exclude_items
+            ][:limit]
+        except Exception as e:
+            logger.error(f"Error getting trending pool {pool_name}: {e}")
+            return []
+
+    async def store_category_pools(
+        self,
+        pools: Dict[str, List[CandidateProduct]],
+    ):
+        """Store precomputed category pools in memory and Redis."""
+        try:
+            if not pools:
+                return
+
+            pipeline = self.redis_client.pipeline(transaction=False)
+            for category, candidates in pools.items():
+                payload = [candidate.dict() for candidate in candidates]
+                self._category_pool_memory_cache[category] = [
+                    CandidateProduct(**item) for item in payload
+                ]
+                key = f"{self.prefixes['category_pool']}{category}"
+                pipeline.setex(
+                    key,
+                    self.cache_config.serving_pool_ttl,
+                    pickle.dumps(payload),
+                )
+            await pipeline.execute()
+        except Exception as e:
+            logger.error(f"Error storing category pools: {e}")
+
+    async def get_category_pool(
+        self,
+        category: str,
+        limit: int,
+        exclude_items: Optional[set] = None,
+    ) -> List[CandidateProduct]:
+        """Get a precomputed category pool, filtered for excluded items."""
+        try:
+            exclude_items = exclude_items or set()
+            cached = self._category_pool_memory_cache.get(category)
+            if cached is None:
+                key = f"{self.prefixes['category_pool']}{category}"
+                raw = await self.redis_client.get(key)
+                if raw:
+                    payload = pickle.loads(raw)
+                    cached = [CandidateProduct(**item) for item in payload]
+                    self._category_pool_memory_cache[category] = cached
+                else:
+                    return []
+
+            return [
+                candidate
+                for candidate in cached
+                if candidate.product_id not in exclude_items
+            ][:limit]
+        except Exception as e:
+            logger.error(f"Error getting category pool {category}: {e}")
+            return []
     
     async def get_cached_recommendations(
         self, 
@@ -433,21 +829,29 @@ class FeatureStore:
     async def invalidate_user_cache(self, user_id: str):
         """Invalidate all cache entries for a user."""
         try:
-            # Find all cache keys for this user
             patterns = [
                 f"{self.prefixes['recommendations_cache']}{user_id}:*",
+                f"{self.prefixes['candidate_cache']}{user_id}:*",
                 f"{self.prefixes['user_features']}{user_id}"
             ]
-            
-            for pattern in patterns:
-                keys = await self.redis_client.keys(pattern)
-                if keys:
-                    await self.redis_client.delete(*keys)
+
+            await self._delete_matching_keys(patterns)
             
             logger.info(f"Invalidated cache for user {user_id}")
             
         except Exception as e:
             logger.error(f"Error invalidating cache for {user_id}: {e}")
+
+    async def invalidate_user_serving_cache(self, user_id: str):
+        """Invalidate only user-serving caches, leaving user features intact."""
+        try:
+            patterns = [
+                f"{self.prefixes['recommendations_cache']}{user_id}:*",
+                f"{self.prefixes['candidate_cache']}{user_id}:*",
+            ]
+            await self._delete_matching_keys(patterns)
+        except Exception as e:
+            logger.error(f"Error invalidating serving cache for {user_id}: {e}")
     
     # System Metrics and Analytics
     async def log_recommendation_request(self, user_id: str, num_recommendations: int, response_time: float):
@@ -501,8 +905,7 @@ class FeatureStore:
             
             # Count total users (approximate)
             user_pattern = f"{self.prefixes['user_features']}*"
-            user_keys = await self.redis_client.keys(user_pattern)
-            metrics['total_users'] = len(user_keys) if user_keys else 0
+            metrics['total_users'] = await self._count_matching_keys(user_pattern)
             
             return metrics
             
@@ -599,6 +1002,72 @@ class FeatureStore:
                 'error': str(e)
             }
     
+    # Two-Tower Training Data Persistence
+    async def store_training_interaction(self, interaction: Dict[str, Any]):
+        """Store interaction in a high-capacity list for Two-Tower model training.
+
+        Retains up to 100K interactions over 30 days, providing a much larger
+        training window than the 10K global_interactions list.
+        """
+        try:
+            key = "tt_training_interactions"
+            await self.redis_client.lpush(key, json.dumps(interaction))
+            await self.redis_client.ltrim(key, 0, 99999)  # Keep 100K interactions
+            await self.redis_client.expire(key, 86400 * 30)  # 30 days
+        except Exception as e:
+            logger.error(f"Error storing training interaction: {e}")
+
+    async def get_training_interactions(self, limit: int = 50000) -> List[Dict[str, Any]]:
+        """Get training interactions for the Two-Tower model.
+
+        Returns up to *limit* recent interactions from the dedicated training list.
+        """
+        try:
+            key = "tt_training_interactions"
+            data = await self.redis_client.lrange(key, 0, limit - 1)
+            interactions = []
+            for item in data:
+                try:
+                    interactions.append(json.loads(item.decode()))
+                except Exception:
+                    continue
+            return interactions
+        except Exception as e:
+            logger.error(f"Error getting training interactions: {e}")
+            return []
+
+    async def get_all_user_features_map(self) -> Dict[str, Dict[str, Any]]:
+        """Batch-get user features for all known users.
+
+        Returns a dict mapping user_id -> user features dict.
+        Used by the Two-Tower trainer to build side-feature tensors.
+        """
+        try:
+            pattern = f"{self.prefixes['user_features']}*"
+            keys = await self._collect_matching_keys(pattern)
+            if not keys:
+                return {}
+
+            result: Dict[str, Dict[str, Any]] = {}
+            prefix_len = len(self.prefixes['user_features'])
+
+            for key in keys:
+                try:
+                    key_str = key.decode() if isinstance(key, bytes) else key
+                    user_id = key_str[prefix_len:]
+                    cached = await self.redis_client.get(key)
+                    if cached:
+                        import pickle as _pkl
+                        data = _pkl.loads(cached)
+                        result[user_id] = data
+                except Exception:
+                    continue
+
+            return result
+        except Exception as e:
+            logger.error(f"Error getting all user features: {e}")
+            return {}
+
     async def _initialize_default_data(self):
         """Initialize any default data needed for the system."""
         try:
@@ -615,6 +1084,27 @@ class FeatureStore:
             
         except Exception as e:
             logger.error(f"Error initializing default data: {e}")
+
+    async def _collect_matching_keys(self, pattern: str) -> List[Union[str, bytes]]:
+        """Collect Redis keys with SCAN to avoid blocking KEYS."""
+        results: List[Union[str, bytes]] = []
+        async for key in self.redis_client.scan_iter(match=pattern, count=500):
+            results.append(key)
+        return results
+
+    async def _count_matching_keys(self, pattern: str) -> int:
+        """Count Redis keys with SCAN to avoid blocking KEYS."""
+        count = 0
+        async for _ in self.redis_client.scan_iter(match=pattern, count=500):
+            count += 1
+        return count
+
+    async def _delete_matching_keys(self, patterns: List[str]):
+        """Delete groups of keys discovered via SCAN."""
+        for pattern in patterns:
+            keys = await self._collect_matching_keys(pattern)
+            if keys:
+                await self.redis_client.delete(*keys)
     
     # Utility methods
     def generate_context_hash(self, context: Dict[str, Any]) -> str:

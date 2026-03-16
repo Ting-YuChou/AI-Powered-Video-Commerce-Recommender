@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // Create axios instance with base configuration
 const api = axios.create({
-  baseURL: 'http://localhost:8000',
+  baseURL: '',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
@@ -36,7 +36,7 @@ api.interceptors.response.use(
       console.error('Server error - check backend health');
     } else if (error.response?.status === 404) {
       console.error('API endpoint not found');
-    } else if (error.code === 'ECONNREFUSED') {
+    } else if (error.code === 'ECONNREFUSED' || error.code === 'ERR_NETWORK') {
       console.error('Cannot connect to backend server');
     }
     
@@ -109,8 +109,15 @@ export const videoApi = {
 export const systemApi = {
   // Get system health
   getHealth: async () => {
-    const response = await api.get('/health');
-    return response.data;
+    try {
+      const response = await api.get('/health');
+      return response.data;
+    } catch (error) {
+      if (error.response?.data) {
+        return error.response.data;
+      }
+      throw error;
+    }
   },
   
   // Get system metrics
@@ -129,7 +136,7 @@ export const systemApi = {
 // Utility functions
 export const utils = {
   // Poll for content processing completion
-  pollContentStatus: async (contentId, maxAttempts = 30, intervalMs = 2000) => {
+  pollContentStatus: async (contentId, maxAttempts = 120, intervalMs = 3000) => {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const status = await videoApi.getContentStatus(contentId);
@@ -170,17 +177,71 @@ export const utils = {
   // Validate video file
   validateVideoFile: (file) => {
     const maxSize = 500 * 1024 * 1024; // 500MB
-    const allowedTypes = ['video/mp4', 'video/avi', 'video/mov', 'video/mkv'];
+    const allowedTypes = new Set([
+      'video/mp4',
+      'video/quicktime',
+      'video/x-msvideo',
+      'video/x-matroska',
+      'video/webm',
+    ]);
+    const allowedExtensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm'];
+    const fileName = file.name?.toLowerCase() ?? '';
+    const hasAllowedExtension = allowedExtensions.some((extension) => fileName.endsWith(extension));
     
     if (file.size > maxSize) {
       return { valid: false, error: 'File size exceeds 500MB limit' };
     }
     
-    if (!allowedTypes.includes(file.type)) {
-      return { valid: false, error: 'File type not supported. Please use MP4, AVI, MOV, or MKV.' };
+    if (file.type && !allowedTypes.has(file.type) && !hasAllowedExtension) {
+      return { valid: false, error: 'File type not supported. Please use MP4, MOV, AVI, MKV, or WEBM.' };
     }
     
     return { valid: true };
+  },
+
+  formatDuration: (seconds) => {
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      return '—';
+    }
+
+    const totalMinutes = Math.floor(seconds / 60);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+
+    if (hours > 0) {
+      return `${hours}h ${minutes}m`;
+    }
+
+    return `${minutes}m`;
+  },
+
+  formatPrice: (value, currency = 'USD') => {
+    if (!Number.isFinite(Number(value))) {
+      return '—';
+    }
+
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: 'currency',
+        currency,
+      }).format(Number(value));
+    } catch {
+      return `$${Number(value).toFixed(2)}`;
+    }
+  },
+
+  getErrorMessage: (error, fallbackMessage) => {
+    const detail = error?.response?.data?.detail;
+
+    if (typeof detail === 'string' && detail.trim()) {
+      return detail;
+    }
+
+    if (typeof error?.message === 'string' && error.message.trim()) {
+      return error.message;
+    }
+
+    return fallbackMessage;
   },
   
   // Generate unique user ID for demo

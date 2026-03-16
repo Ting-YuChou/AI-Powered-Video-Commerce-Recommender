@@ -30,6 +30,12 @@ from config import RankingConfig
 
 logger = logging.getLogger(__name__)
 
+try:
+    if hasattr(torch.backends, "mkldnn"):
+        torch.backends.mkldnn.enabled = False
+except Exception:
+    pass
+
 class MultiObjectiveRankingModel(nn.Module):
     """
     Multi-objective neural ranking model that predicts:
@@ -70,8 +76,7 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.Dropout(config.dropout_rate),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
+            nn.Linear(32, 2),
         )
         
         # CVR prediction tower
@@ -81,8 +86,7 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.Dropout(config.dropout_rate),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
+            nn.Linear(32, 2),
         )
         
         # GMV prediction tower
@@ -92,8 +96,7 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.Dropout(config.dropout_rate),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.ReLU()  # Ensure positive GMV
+            nn.Linear(32, 2),
         )
         
         # Final ranking tower
@@ -102,7 +105,7 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
-            nn.Linear(16, 1)
+            nn.Linear(16, 2)
         )
         
         # Initialize weights
@@ -114,6 +117,11 @@ class MultiObjectiveRankingModel(nn.Module):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _collapse_scalar_head(x: torch.Tensor) -> torch.Tensor:
+        """Collapse a 2-unit head into one scalar while avoiding Linear(..., 1)."""
+        return x[:, 1:2] - x[:, 0:1]
     
     def forward(self, x):
         """Forward pass through the model."""
@@ -121,13 +129,13 @@ class MultiObjectiveRankingModel(nn.Module):
         shared_features = self.shared_layers(x)
         
         # Task-specific predictions
-        ctr_pred = self.ctr_tower(shared_features)
-        cvr_pred = self.cvr_tower(shared_features)
-        gmv_pred = self.gmv_tower(shared_features)
+        ctr_pred = torch.sigmoid(self._collapse_scalar_head(self.ctr_tower(shared_features)))
+        cvr_pred = torch.sigmoid(self._collapse_scalar_head(self.cvr_tower(shared_features)))
+        gmv_pred = torch.relu(self._collapse_scalar_head(self.gmv_tower(shared_features)))
         
         # Combine for final ranking
         combined_features = torch.cat([shared_features, ctr_pred, cvr_pred, gmv_pred], dim=1)
-        ranking_score = self.ranking_tower(combined_features)
+        ranking_score = self._collapse_scalar_head(self.ranking_tower(combined_features))
         
         return {
             'ctr': ctr_pred,
@@ -277,6 +285,9 @@ class RankingModel:
             'avg_inference_time': 0.0,
             'batch_inference_time': 0.0
         }
+        self.torch_inference_available = True
+        self.enable_profiling_logs = False
+        self.profiling_log_min_duration_ms = 250.0
         
         logger.info(f"RankingModel initialized on device: {self.device}")
     
@@ -291,7 +302,12 @@ class RankingModel:
             if model_path and Path(model_path).exists():
                 logger.info(f"Loading model from {model_path}")
                 state_dict = torch.load(model_path, map_location=self.device)
-                self.model.load_state_dict(state_dict)
+                load_result = self.model.load_state_dict(state_dict, strict=False)
+                if load_result.missing_keys or load_result.unexpected_keys:
+                    logger.warning(
+                        "Ranking checkpoint partially loaded due to head-shape mismatch: "
+                        f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
+                    )
                 self.is_trained = True
             else:
                 logger.info("Initializing new model")
@@ -312,13 +328,145 @@ class RankingModel:
         except Exception as e:
             logger.error(f"Error loading ranking model: {e}")
             raise
+
+    def prepare_request_matrix(
+        self,
+        candidates: List[CandidateProduct],
+        user_features: UserFeatures,
+        context: Dict[str, Any],
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[Optional[np.ndarray], List[Tuple[CandidateProduct, Dict[str, Any]]], float]:
+        """Prepare a request's ranking feature matrix and candidate metadata."""
+        feature_stage_started = time.perf_counter()
+        feature_vectors = []
+        valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]] = []
+        product_metadata_map = product_metadata_map or {}
+
+        for candidate in candidates:
+            try:
+                product_metadata = product_metadata_map.get(candidate.product_id) or self._build_product_metadata(candidate)
+                features = self.feature_extractor.create_ranking_features(
+                    user_features,
+                    product_metadata,
+                    context,
+                    candidate,
+                )
+                feature_vectors.append(features)
+                valid_candidates.append((candidate, product_metadata))
+            except Exception as e:
+                logger.warning(
+                    f"Error extracting features for candidate {candidate.product_id}: {e}"
+                )
+
+        feature_extraction_ms = round(
+            (time.perf_counter() - feature_stage_started) * 1000, 2
+        )
+        if not feature_vectors:
+            return None, [], feature_extraction_ms
+
+        return np.vstack(feature_vectors), valid_candidates, feature_extraction_ms
+
+    def run_inference_batch(
+        self,
+        feature_matrix: np.ndarray,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+        """Run one Torch forward pass for a feature matrix."""
+        with torch.no_grad():
+            tensor_stage_started = time.perf_counter()
+            features_tensor = torch.as_tensor(
+                feature_matrix,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            tensor_prep_ms = round((time.perf_counter() - tensor_stage_started) * 1000, 2)
+
+            model_stage_started = time.perf_counter()
+            predictions = self.model(features_tensor)
+            model_forward_ms = round((time.perf_counter() - model_stage_started) * 1000, 2)
+
+        prediction_arrays = {
+            key: value.detach().cpu().numpy().reshape(-1)
+            for key, value in predictions.items()
+        }
+        return prediction_arrays, {
+            "tensor_prep_ms": tensor_prep_ms,
+            "model_forward_ms": model_forward_ms,
+        }
+
+    def build_recommendations_from_predictions(
+        self,
+        valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]],
+        predictions: Dict[str, np.ndarray],
+        k: int,
+    ) -> Tuple[List[ProductRecommendation], float]:
+        """Convert raw model predictions into ranked recommendation objects."""
+        response_stage_started = time.perf_counter()
+        recommendations: List[ProductRecommendation] = []
+
+        for i, (candidate, metadata) in enumerate(valid_candidates):
+            ctr_score = float(predictions["ctr"][i])
+            cvr_score = float(predictions["cvr"][i])
+            gmv_score = float(predictions["gmv"][i])
+            ranking_score = float(predictions["ranking_score"][i])
+
+            if self.config.enable_multi_objective:
+                confidence_score = (
+                    ctr_score * self.config.ctr_weight +
+                    cvr_score * self.config.cvr_weight +
+                    (gmv_score / 100.0) * self.config.gmv_weight
+                ) / (
+                    self.config.ctr_weight +
+                    self.config.cvr_weight +
+                    self.config.gmv_weight
+                )
+            else:
+                confidence_score = ranking_score
+
+            reason = self._generate_explanation(candidate, ctr_score, cvr_score, gmv_score)
+            recommendations.append(
+                ProductRecommendation(
+                    product_id=candidate.product_id,
+                    title=metadata.get("title", f"Product {candidate.product_id}"),
+                    description="Recommended based on your preferences",
+                    price=metadata.get("price", 0.0),
+                    currency="USD",
+                    category=metadata.get("category", "General"),
+                    brand=metadata.get("brand", "Unknown"),
+                    rating=metadata.get("rating"),
+                    confidence_score=min(confidence_score, 1.0),
+                    ranking_score=ranking_score,
+                    reason=reason,
+                )
+            )
+
+        recommendations.sort(key=lambda item: item.ranking_score, reverse=True)
+        return recommendations[:k], round(
+            (time.perf_counter() - response_stage_started) * 1000,
+            2,
+        )
+
+    def _build_product_metadata(self, candidate: CandidateProduct) -> Dict[str, Any]:
+        """Build deterministic fallback metadata when the cache misses."""
+        return {
+            "title": f"Product {candidate.product_id}",
+            "category": "General",
+            "price": 0.0,
+            "rating": 0.0,
+            "num_reviews": 0,
+            "in_stock": True,
+            "created_at": time.time(),
+            "tags": [],
+            "brand": "Unknown",
+        }
     
     async def rank_candidates(
         self,
         candidates: List[CandidateProduct],
         user_features: UserFeatures,
         context: Dict[str, Any],
-        k: int = 10
+        k: int = 10,
+        include_profile: bool = False,
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[ProductRecommendation]:
         """
         Rank candidate products and return top-k recommendations.
@@ -339,93 +487,60 @@ class RankingModel:
         if not candidates:
             logger.warning("No candidates to rank")
             return []
+
+        if not self.torch_inference_available:
+            fallback = self._fallback_rank_candidates(candidates, k)
+            if include_profile:
+                return fallback, {
+                    "path": "fallback",
+                    "feature_extraction_ms": 0.0,
+                    "tensor_prep_ms": 0.0,
+                    "model_forward_ms": 0.0,
+                    "response_build_ms": 0.0,
+                    "total_ms": 0.0,
+                    "candidate_count": len(candidates),
+                    "ranked_count": len(fallback),
+                }
+            return fallback
         
         start_time = time.time()
+        profile = {
+            "path": "torch",
+            "feature_extraction_ms": 0.0,
+            "tensor_prep_ms": 0.0,
+            "model_forward_ms": 0.0,
+            "response_build_ms": 0.0,
+            "total_ms": 0.0,
+            "candidate_count": len(candidates),
+            "ranked_count": 0,
+        }
         
         try:
-            # Extract features for all candidates
-            feature_vectors = []
-            valid_candidates = []
-            
-            for candidate in candidates:
-                try:
-                    # Get product metadata (placeholder - would come from vector search)
-                    product_metadata = {
-                        'price': np.random.uniform(10, 500),
-                        'rating': np.random.uniform(3.0, 5.0),
-                        'num_reviews': np.random.randint(1, 1000),
-                        'in_stock': True,
-                        'created_at': time.time() - np.random.uniform(0, 86400 * 365),
-                        'tags': ['tag1', 'tag2'],
-                        'brand': f"brand_{hash(candidate.product_id) % 50}"
-                    }
-                    
-                    # Extract features
-                    features = self.feature_extractor.create_ranking_features(
-                        user_features, product_metadata, context, candidate
-                    )
-                    
-                    feature_vectors.append(features)
-                    valid_candidates.append((candidate, product_metadata))
-                    
-                except Exception as e:
-                    logger.warning(f"Error extracting features for candidate {candidate.product_id}: {e}")
-                    continue
-            
-            if not feature_vectors:
+            feature_matrix, valid_candidates, feature_extraction_ms = self.prepare_request_matrix(
+                candidates,
+                user_features,
+                context,
+                product_metadata_map=product_metadata_map,
+            )
+            profile["feature_extraction_ms"] = feature_extraction_ms
+
+            if feature_matrix is None:
                 logger.warning("No valid feature vectors created")
+                if include_profile:
+                    return [], profile
                 return []
-            
-            # Batch inference
-            with torch.no_grad():
-                features_tensor = torch.tensor(
-                    np.vstack(feature_vectors), 
-                    dtype=torch.float32
-                ).to(self.device)
-                
-                predictions = self.model(features_tensor)
-            
-            # Create ranked recommendations
-            recommendations = []
-            
-            for i, (candidate, metadata) in enumerate(valid_candidates):
-                ctr_score = float(predictions['ctr'][i].item())
-                cvr_score = float(predictions['cvr'][i].item())
-                gmv_score = float(predictions['gmv'][i].item())
-                ranking_score = float(predictions['ranking_score'][i].item())
-                
-                # Calculate confidence score (combine multiple objectives)
-                if self.config.enable_multi_objective:
-                    confidence_score = (
-                        ctr_score * self.config.ctr_weight +
-                        cvr_score * self.config.cvr_weight +
-                        (gmv_score / 100.0) * self.config.gmv_weight  # Normalize GMV
-                    ) / (self.config.ctr_weight + self.config.cvr_weight + self.config.gmv_weight)
-                else:
-                    confidence_score = ranking_score
-                
-                # Generate recommendation explanation
-                reason = self._generate_explanation(candidate, ctr_score, cvr_score, gmv_score)
-                
-                recommendation = ProductRecommendation(
-                    product_id=candidate.product_id,
-                    title=metadata.get('title', f"Product {candidate.product_id}"),
-                    description=f"Recommended based on your preferences",
-                    price=metadata.get('price', 0.0),
-                    currency="USD",
-                    category=metadata.get('category', 'General'),
-                    brand=metadata.get('brand', 'Unknown'),
-                    rating=metadata.get('rating'),
-                    confidence_score=min(confidence_score, 1.0),
-                    ranking_score=ranking_score,
-                    reason=reason
-                )
-                
-                recommendations.append(recommendation)
-            
-            # Sort by ranking score and return top-k
-            recommendations.sort(key=lambda x: x.ranking_score, reverse=True)
-            top_recommendations = recommendations[:k]
+
+            predictions, inference_profile = self.run_inference_batch(feature_matrix)
+            profile["tensor_prep_ms"] = inference_profile["tensor_prep_ms"]
+            profile["model_forward_ms"] = inference_profile["model_forward_ms"]
+
+            top_recommendations, response_build_ms = self.build_recommendations_from_predictions(
+                valid_candidates,
+                predictions,
+                k,
+            )
+            profile["response_build_ms"] = response_build_ms
+            profile["ranked_count"] = len(top_recommendations)
             
             # Update inference statistics
             inference_time = time.time() - start_time
@@ -439,12 +554,64 @@ class RankingModel:
                 f"Ranked {len(candidates)} candidates -> {len(top_recommendations)} "
                 f"recommendations in {inference_time:.3f}s"
             )
+            profile["total_ms"] = round(inference_time * 1000, 2)
+            if (
+                self.enable_profiling_logs
+                or profile["total_ms"] >= self.profiling_log_min_duration_ms
+            ):
+                logger.info("ranking_profile", extra=profile)
             
+            if include_profile:
+                return top_recommendations, profile
             return top_recommendations
             
         except Exception as e:
             logger.error(f"Error ranking candidates: {e}")
-            return []
+            self.torch_inference_available = False
+            fallback = self._fallback_rank_candidates(candidates, k)
+            if include_profile:
+                profile["path"] = "fallback_on_error"
+                profile["error"] = str(e)
+                profile["ranked_count"] = len(fallback)
+                profile["total_ms"] = round((time.time() - start_time) * 1000, 2)
+                return fallback, profile
+            return fallback
+
+    def _fallback_rank_candidates(
+        self,
+        candidates: List[CandidateProduct],
+        k: int,
+    ) -> List[ProductRecommendation]:
+        """Fallback ranking path when Torch inference is unavailable."""
+        fallback_recommendations: List[ProductRecommendation] = []
+
+        for candidate in candidates:
+            collaborative = candidate.collaborative_score or 0.0
+            content_similarity = candidate.content_similarity_score or 0.0
+            popularity = candidate.popularity_score or 0.0
+            combined = candidate.combined_score or (
+                0.5 * collaborative + 0.3 * content_similarity + 0.2 * popularity
+            )
+            confidence_score = max(0.0, min(combined, 1.0))
+
+            fallback_recommendations.append(
+                ProductRecommendation(
+                    product_id=candidate.product_id,
+                    title=f"Product {candidate.product_id}",
+                    description="Fallback ranking path used",
+                    price=0.0,
+                    currency="USD",
+                    category="General",
+                    brand="Unknown",
+                    rating=None,
+                    confidence_score=confidence_score,
+                    ranking_score=combined,
+                    reason="Fallback ranking based on candidate generation scores",
+                )
+            )
+
+        fallback_recommendations.sort(key=lambda item: item.ranking_score, reverse=True)
+        return fallback_recommendations[:k]
     
     def _generate_explanation(
         self, 
@@ -642,7 +809,8 @@ class RankingModel:
                 'model_loaded': self.model is not None,
                 'is_trained': self.is_trained,
                 'device': str(self.device),
-                'feature_dim': self.feature_extractor.total_feature_dim
+                'feature_dim': self.feature_extractor.total_feature_dim,
+                'torch_inference_available': self.torch_inference_available,
             }
             
             # Test inference if model is loaded

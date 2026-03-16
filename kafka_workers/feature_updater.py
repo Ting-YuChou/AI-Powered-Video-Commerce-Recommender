@@ -25,8 +25,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kafka_client import KafkaConsumerClient, KafkaManager, get_kafka_manager
 from config import Config, KafkaConfig
 from feature_store import FeatureStore
-from models import InteractionType
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -68,7 +66,7 @@ class FeatureUpdaterWorker:
         logger.info("Initializing feature updater components...")
         
         # Initialize feature store (Redis)
-        self.feature_store = FeatureStore(self.config.redis_config)
+        self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
         await self.feature_store.initialize()
         
         # Initialize Kafka consumer
@@ -156,15 +154,8 @@ class FeatureUpdaterWorker:
             interactions: List of interactions to process
         """
         try:
-            # Log interactions to Redis
-            for interaction in interactions:
-                await self.feature_store.log_user_interaction(
-                    user_id=user_id,
-                    product_id=interaction['product_id'],
-                    action=interaction['action'],
-                    context=interaction.get('context', {})
-                )
-            
+            await self.feature_store.log_user_interactions_batch(user_id, interactions)
+
             # Aggregate stats for batch update
             action_counts = defaultdict(int)
             categories = set()
@@ -173,29 +164,28 @@ class FeatureUpdaterWorker:
                 action_counts[interaction['action']] += 1
                 if 'product_category' in interaction.get('context', {}):
                     categories.add(interaction['context']['product_category'])
-            
-            # Update user features
-            for action, count in action_counts.items():
-                for _ in range(count):
-                    await self.feature_store.update_user_features(
-                        user_id=user_id,
-                        action=action,
-                        context={'batch_update': True}
-                    )
+
+            updated_features = await self.feature_store.apply_user_interaction_batch(
+                user_id=user_id,
+                interactions=interactions,
+            )
+            await self.feature_store.invalidate_user_serving_cache(user_id)
             
             logger.debug(f"Processed {len(interactions)} interactions for user {user_id}")
             
             # Send feature update notification
             kafka_manager = get_kafka_manager()
-            await kafka_manager.send_feature_update(
-                entity_type='user',
-                entity_id=user_id,
-                feature_updates={
-                    'interactions_processed': len(interactions),
-                    'action_counts': dict(action_counts),
-                    'updated_at': time.time()
-                }
-            )
+            if kafka_manager:
+                await kafka_manager.send_feature_update(
+                    entity_type='user',
+                    entity_id=user_id,
+                    feature_updates={
+                        'interactions_processed': len(interactions),
+                        'action_counts': dict(action_counts),
+                        'preferred_categories': updated_features.preferred_categories,
+                        'updated_at': time.time()
+                    }
+                )
             
         except Exception as e:
             logger.error(f"Error processing interactions for user {user_id}: {e}")
