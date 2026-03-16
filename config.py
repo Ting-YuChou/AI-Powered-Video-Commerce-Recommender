@@ -64,6 +64,14 @@ class ModelConfig(BaseSettings):
     enable_quantization: bool = Field(False, description="Enable model quantization")
     enable_gpu: bool = Field(True, description="Enable GPU acceleration if available")
     max_concurrent_requests: int = Field(10, description="Max concurrent ML requests")
+    torch_num_threads: int = Field(
+        0,
+        description="Torch intra-op CPU thread count; 0 auto-detects from cgroup quota",
+    )
+    torch_num_interop_threads: int = Field(
+        1,
+        description="Torch inter-op CPU thread count; 0 auto-detects from cgroup quota",
+    )
     
     class Config:
         env_prefix = "MODEL_"
@@ -96,6 +104,42 @@ class RecommendationConfig(BaseSettings):
     # Candidate generation
     candidates_per_source: int = Field(100, description="Candidates per recommendation source")
     max_total_candidates: int = Field(500, description="Maximum total candidates")
+    cold_start_random_candidate_cap: int = Field(
+        50,
+        description="Maximum random fallback candidates when no stronger retrieval source is available",
+    )
+    serving_trending_pool_size: int = Field(
+        300,
+        description="Number of products to precompute in the global trending pool",
+    )
+    serving_category_pool_size: int = Field(
+        150,
+        description="Number of products to precompute per category pool",
+    )
+    preferred_category_pool_count: int = Field(
+        2,
+        description="Maximum preferred categories to pull from serving pools per request",
+    )
+    max_live_cf_candidates: int = Field(
+        40,
+        description="Maximum collaborative candidates to fetch live per request",
+    )
+    max_live_content_candidates: int = Field(
+        20,
+        description="Maximum content-similar candidates to fetch live per request",
+    )
+    max_pool_trending_candidates: int = Field(
+        30,
+        description="Maximum precomputed trending candidates to merge per request",
+    )
+    max_pool_category_candidates: int = Field(
+        30,
+        description="Maximum precomputed category-pool candidates to merge per request",
+    )
+    max_random_candidates: int = Field(
+        10,
+        description="Maximum random fallback candidates to merge per request",
+    )
     
     # Ranking weights
     cf_weight: float = Field(0.4, description="Collaborative filtering weight")
@@ -138,7 +182,23 @@ class RankingConfig(BaseSettings):
     hidden_dims: List[int] = Field([256, 128, 64], description="Neural network hidden dimensions")
     dropout_rate: float = Field(0.2, description="Dropout rate")
     learning_rate: float = Field(0.001, description="Learning rate")
-    
+    enable_async_batching: bool = Field(
+        True,
+        description="Enable micro-batching queue for ranking inference",
+    )
+    batch_max_requests: int = Field(
+        8,
+        description="Maximum number of ranking requests to combine into one micro-batch",
+    )
+    batch_wait_ms: float = Field(
+        5.0,
+        description="Maximum time to wait for more ranking requests before dispatching a batch",
+    )
+    batch_queue_size: int = Field(
+        2048,
+        description="Maximum queued ranking requests per worker",
+    )
+
     # Multi-objective settings
     enable_multi_objective: bool = Field(True, description="Enable multi-objective optimization")
     ctr_weight: float = Field(1.0, description="Click-through rate weight")
@@ -183,6 +243,9 @@ class CacheConfig(BaseSettings):
     user_features_ttl: int = Field(1800, description="User features cache TTL")
     content_features_ttl: int = Field(86400, description="Content features cache TTL")
     recommendations_ttl: int = Field(900, description="Recommendations cache TTL")
+    candidate_ttl: int = Field(300, description="Candidate cache TTL in seconds")
+    product_metadata_ttl: int = Field(86400, description="Product metadata cache TTL in seconds")
+    serving_pool_ttl: int = Field(1800, description="Serving pool cache TTL in seconds")
     
     # Cache size limits
     max_cache_size: int = Field(10000, description="Maximum cache entries")
@@ -218,6 +281,14 @@ class MonitoringConfig(BaseSettings):
     # Performance monitoring
     slow_request_threshold: float = Field(1.0, description="Slow request threshold in seconds")
     enable_request_logging: bool = Field(True, description="Enable request logging")
+    enable_profiling_logs: bool = Field(
+        False,
+        description="Emit detailed timing breakdown logs for critical request paths",
+    )
+    profiling_log_min_duration_ms: float = Field(
+        250.0,
+        description="Minimum end-to-end request duration before detailed timing logs are emitted",
+    )
     
     # Alerting thresholds
     error_rate_threshold: float = Field(0.05, description="Error rate alert threshold")
@@ -284,6 +355,34 @@ class ServiceTopologyConfig(BaseSettings):
     request_forward_timeout_seconds: float = Field(
         10.0,
         description="Gateway timeout when forwarding to internal services",
+    )
+    proxy_connect_timeout_seconds: float = Field(
+        5.0,
+        description="HTTP connect timeout from gateway to internal services",
+    )
+    proxy_read_timeout_seconds: float = Field(
+        10.0,
+        description="HTTP read timeout from gateway to internal services",
+    )
+    proxy_write_timeout_seconds: float = Field(
+        10.0,
+        description="HTTP write timeout from gateway to internal services",
+    )
+    proxy_pool_timeout_seconds: float = Field(
+        15.0,
+        description="HTTP connection-pool acquisition timeout in the gateway",
+    )
+    proxy_max_connections: int = Field(
+        500,
+        description="Maximum concurrent upstream HTTP connections per gateway worker",
+    )
+    proxy_max_keepalive_connections: int = Field(
+        100,
+        description="Maximum idle keepalive upstream HTTP connections per gateway worker",
+    )
+    proxy_keepalive_expiry_seconds: float = Field(
+        5.0,
+        description="Idle keepalive expiry for upstream HTTP connections in the gateway",
     )
     trainer_interval_seconds: int = Field(
         3600,

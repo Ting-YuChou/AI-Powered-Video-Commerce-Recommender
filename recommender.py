@@ -433,6 +433,7 @@ class RecommendationEngine:
         try:
             logger.info("Loading recommendation serving state")
             await self._try_load_cf_index()
+            await self.refresh_serving_pools()
             self.is_initialized = True
             if not self.cf_engine.is_trained:
                 logger.warning("Two-Tower index not available; serving will fall back to non-CF sources")
@@ -489,14 +490,135 @@ class RecommendationEngine:
 
                 # Update trending scores (use last 1K for recency)
                 await self.trending_engine.update_trending_scores(interactions[-1000:])
+                await self.refresh_serving_pools()
 
                 self.last_model_update = time.time()
                 logger.info(f"Updated models with {len(interactions)} interactions")
             else:
+                await self.refresh_serving_pools()
                 logger.warning("No interactions found for model training")
 
         except Exception as e:
             logger.error(f"Error updating models from interactions: {e}")
+
+    def _compute_serving_pool_score(
+        self,
+        product_id: str,
+        metadata: Dict[str, Any],
+        current_time: Optional[float] = None,
+    ) -> float:
+        """Compute a stable heuristic score for serving pools."""
+        current_time = current_time or time.time()
+        trending_score = float(self.trending_engine.trending_scores.get(product_id, 0.0))
+        rating_score = float(metadata.get("rating", 0.0)) / 5.0
+        review_score = np.log1p(float(metadata.get("num_reviews", 0.0))) / 5.0
+        age_days = max((current_time - float(metadata.get("created_at", current_time))) / 86400.0, 0.0)
+        freshness_score = 1.0 / (1.0 + age_days / 30.0)
+        return trending_score + rating_score * 0.6 + review_score * 0.2 + freshness_score * 0.2
+
+    async def refresh_serving_pools(self):
+        """Precompute global trending and per-category serving pools."""
+        try:
+            if not self.vector_search.product_metadata:
+                return
+
+            current_time = time.time()
+            global_scored: List[Tuple[str, float]] = []
+            category_scored: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+
+            for product_id, metadata in self.vector_search.product_metadata.items():
+                score = self._compute_serving_pool_score(product_id, metadata, current_time)
+                global_scored.append((product_id, score))
+                category = metadata.get("category", "unknown")
+                category_scored[category].append((product_id, score))
+
+            global_scored.sort(key=lambda item: item[1], reverse=True)
+            global_top = global_scored[: self.config.serving_trending_pool_size]
+            global_max = max((score for _, score in global_top), default=1.0) or 1.0
+            trending_pool = [
+                CandidateProduct(
+                    product_id=product_id,
+                    popularity_score=float(score / global_max),
+                    combined_score=float(score / global_max),
+                    source="trending_pool",
+                )
+                for product_id, score in global_top
+            ]
+            await self.feature_store.store_trending_pool(trending_pool)
+
+            category_pools: Dict[str, List[CandidateProduct]] = {}
+            for category, scored_items in category_scored.items():
+                scored_items.sort(key=lambda item: item[1], reverse=True)
+                category_top = scored_items[: self.config.serving_category_pool_size]
+                category_max = max((score for _, score in category_top), default=1.0) or 1.0
+                category_pools[category] = [
+                    CandidateProduct(
+                        product_id=product_id,
+                        popularity_score=float(score / category_max),
+                        combined_score=float(score / category_max),
+                        source="category_pool",
+                    )
+                    for product_id, score in category_top
+                ]
+
+            await self.feature_store.store_category_pools(category_pools)
+            logger.info(
+                "Refreshed serving pools: %s global products, %s categories",
+                len(trending_pool),
+                len(category_pools),
+            )
+        except Exception as e:
+            logger.error(f"Error refreshing serving pools: {e}")
+
+    def _merge_candidate(
+        self,
+        all_candidates: Dict[str, CandidateProduct],
+        candidate: CandidateProduct,
+    ):
+        """Merge candidate scores without expanding the candidate set excessively."""
+        existing = all_candidates.get(candidate.product_id)
+        if existing is None:
+            all_candidates[candidate.product_id] = candidate
+            return
+
+        if candidate.collaborative_score is not None:
+            existing.collaborative_score = max(
+                existing.collaborative_score or 0.0,
+                candidate.collaborative_score,
+            )
+        if candidate.content_similarity_score is not None:
+            existing.content_similarity_score = max(
+                existing.content_similarity_score or 0.0,
+                candidate.content_similarity_score,
+            )
+        if candidate.popularity_score is not None:
+            existing.popularity_score = max(
+                existing.popularity_score or 0.0,
+                candidate.popularity_score,
+            )
+        if candidate.source not in existing.source.split("+"):
+            existing.source = f"{existing.source}+{candidate.source}"
+
+    def _resolve_preferred_categories(
+        self,
+        user_features: Optional[UserFeatures],
+        context: Dict[str, Any],
+    ) -> List[str]:
+        """Resolve the small set of categories to pull from precomputed pools."""
+        categories: List[str] = []
+        for key in ("product_category", "category"):
+            value = context.get(key)
+            if isinstance(value, str) and value:
+                categories.append(value)
+
+        if user_features:
+            categories.extend(user_features.preferred_categories)
+
+        deduped: List[str] = []
+        for category in categories:
+            if category and category not in deduped:
+                deduped.append(category)
+        return deduped[: self.config.preferred_category_pool_count]
 
     async def generate_candidates(
         self,
@@ -504,6 +626,7 @@ class RecommendationEngine:
         content_features: Optional[ContentFeatures] = None,
         context: Optional[Dict[str, Any]] = None,
         k_per_source: int = 100,
+        include_profile: bool = False,
     ) -> List[CandidateProduct]:
         """
         Generate candidate products from multiple recommendation sources.
@@ -521,61 +644,115 @@ class RecommendationEngine:
             logger.debug(f"Generating candidates for user {user_id}")
             context = context or {}
             all_candidates: Dict[str, CandidateProduct] = {}
+            started_at = time.perf_counter()
+            profile = {
+                "user_interactions_ms": 0.0,
+                "user_features_ms": 0.0,
+                "cf_candidates_ms": 0.0,
+                "content_candidates_ms": 0.0,
+                "trending_candidates_ms": 0.0,
+                "category_pool_ms": 0.0,
+                "random_candidates_ms": 0.0,
+                "score_merge_ms": 0.0,
+                "total_ms": 0.0,
+                "candidate_count": 0,
+                "preferred_categories": [],
+                "source_counts": {},
+            }
 
             # Get user's interaction history to exclude already seen items
-            user_interactions = await self.feature_store.get_user_interactions(user_id, limit=500)
+            stage_started = time.perf_counter()
+            user_interactions = await self.feature_store.get_user_interactions(user_id, limit=200)
+            profile["user_interactions_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
             exclude_items = {interaction["product_id"] for interaction in user_interactions}
 
             # Get user features once for reuse
+            stage_started = time.perf_counter()
             user_features_obj = await self.feature_store.get_user_features(user_id)
+            profile["user_features_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
             user_features_dict = user_features_obj.dict() if user_features_obj else {}
+            preferred_categories = self._resolve_preferred_categories(user_features_obj, context)
+            profile["preferred_categories"] = preferred_categories
+            target_candidates = min(
+                max(k_per_source, self.config.candidates_per_source),
+                self.config.max_total_candidates,
+            )
 
             # 1. Collaborative Filtering via Two-Tower ANN Retrieval
+            stage_started = time.perf_counter()
             if self.cf_engine.is_trained:
                 cf_candidates = await self.cf_engine.get_user_recommendations(
-                    user_id, k_per_source, exclude_items, user_features=user_features_dict
+                    user_id,
+                    min(target_candidates, self.config.max_live_cf_candidates),
+                    exclude_items,
+                    user_features=user_features_dict,
                 )
                 for candidate in cf_candidates:
-                    if candidate.product_id not in all_candidates:
-                        all_candidates[candidate.product_id] = candidate
-                    else:
-                        all_candidates[candidate.product_id].collaborative_score = (
-                            candidate.collaborative_score
-                        )
+                    self._merge_candidate(all_candidates, candidate)
+                profile["source_counts"]["cf"] = len(cf_candidates)
+            profile["cf_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
 
             # 2. Content-Based Recommendations (if content provided)
+            stage_started = time.perf_counter()
             if content_features and content_features.visual_embedding:
                 try:
                     content_candidates = await self.vector_search.search_similar_products(
-                        np.array(content_features.visual_embedding), k=k_per_source
+                        np.array(content_features.visual_embedding),
+                        k=min(target_candidates, self.config.max_live_content_candidates),
                     )
                     for candidate in content_candidates:
                         if candidate.product_id not in exclude_items:
-                            if candidate.product_id not in all_candidates:
-                                all_candidates[candidate.product_id] = candidate
-                            else:
-                                all_candidates[
-                                    candidate.product_id
-                                ].content_similarity_score = candidate.content_similarity_score
+                            self._merge_candidate(all_candidates, candidate)
+                    profile["source_counts"]["content"] = len(content_candidates)
                 except Exception as e:
                     logger.warning(f"Error getting content-based recommendations: {e}")
+            profile["content_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
 
-            # 3. Trending/Popular Recommendations
-            trending_candidates = await self.trending_engine.get_trending_recommendations(
-                k=k_per_source, exclude_items=exclude_items
+            # 3. Precomputed Trending Pool
+            stage_started = time.perf_counter()
+            trending_candidates = await self.feature_store.get_trending_pool(
+                min(target_candidates, self.config.max_pool_trending_candidates),
+                exclude_items=exclude_items.union(all_candidates.keys()),
             )
             for candidate in trending_candidates:
-                if candidate.product_id not in all_candidates:
-                    all_candidates[candidate.product_id] = candidate
-                else:
-                    all_candidates[candidate.product_id].popularity_score = (
-                        candidate.popularity_score
-                    )
+                self._merge_candidate(all_candidates, candidate)
+            profile["source_counts"]["trending_pool"] = len(trending_candidates)
+            profile["trending_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
 
-            # 4. Random/Diversity Recommendations (for exploration)
-            if len(all_candidates) < k_per_source:
+            # 4. Preferred Category Pools
+            stage_started = time.perf_counter()
+            category_pool_candidates = 0
+            if preferred_categories:
+                per_category_limit = max(
+                    1,
+                    self.config.max_pool_category_candidates // max(len(preferred_categories), 1),
+                )
+                for category in preferred_categories:
+                    category_candidates = await self.feature_store.get_category_pool(
+                        category,
+                        per_category_limit,
+                        exclude_items=exclude_items.union(all_candidates.keys()),
+                    )
+                    for candidate in category_candidates:
+                        self._merge_candidate(all_candidates, candidate)
+                    category_pool_candidates += len(category_candidates)
+            profile["source_counts"]["category_pool"] = category_pool_candidates
+            profile["category_pool_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+
+            # 5. Small random fallback only if stronger sources are still thin
+            stage_started = time.perf_counter()
+            if len(all_candidates) < target_candidates:
+                random_target = min(
+                    target_candidates - len(all_candidates),
+                    self.config.max_random_candidates,
+                )
+                if not all_candidates:
+                    random_target = min(
+                        random_target,
+                        self.config.cold_start_random_candidate_cap,
+                    )
                 random_candidates = await self.vector_search.get_random_products(
-                    k=k_per_source - len(all_candidates)
+                    k=random_target
                 )
                 for candidate in random_candidates:
                     if (
@@ -583,8 +760,11 @@ class RecommendationEngine:
                         and candidate.product_id not in all_candidates
                     ):
                         all_candidates[candidate.product_id] = candidate
+                profile["source_counts"]["random"] = len(random_candidates)
+            profile["random_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
 
             # Combine scores for final ranking
+            stage_started = time.perf_counter()
             final_candidates: List[CandidateProduct] = []
             for candidate in all_candidates.values():
                 cf_score = candidate.collaborative_score or 0.0
@@ -606,12 +786,33 @@ class RecommendationEngine:
             # Sort by combined score
             final_candidates.sort(key=lambda x: x.combined_score, reverse=True)
             final_candidates = final_candidates[: self.config.max_total_candidates]
+            profile["score_merge_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+            profile["candidate_count"] = len(final_candidates)
+            profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
 
             logger.debug(f"Generated {len(final_candidates)} candidates from multiple sources")
+            if include_profile:
+                return final_candidates, profile
             return final_candidates
 
         except Exception as e:
             logger.error(f"Error generating candidates for {user_id}: {e}")
+            if include_profile:
+                return [], {
+                    "user_interactions_ms": 0.0,
+                    "user_features_ms": 0.0,
+                    "cf_candidates_ms": 0.0,
+                    "content_candidates_ms": 0.0,
+                    "trending_candidates_ms": 0.0,
+                    "category_pool_ms": 0.0,
+                    "random_candidates_ms": 0.0,
+                    "score_merge_ms": 0.0,
+                    "total_ms": 0.0,
+                    "candidate_count": 0,
+                    "preferred_categories": [],
+                    "source_counts": {},
+                    "error": str(e),
+                }
             return []
 
     async def _apply_diversity_filter(
@@ -626,7 +827,7 @@ class RecommendationEngine:
             ungrouped_candidates: List[CandidateProduct] = []
 
             for candidate in candidates:
-                metadata = await self.vector_search.get_product_metadata(candidate.product_id)
+                metadata = self.vector_search.product_metadata.get(candidate.product_id)
                 if metadata and "category" in metadata:
                     category_groups[metadata["category"]].append(candidate)
                 else:
@@ -674,15 +875,16 @@ class RecommendationEngine:
 
     def _get_candidate_category(self, candidate: CandidateProduct) -> str:
         """Get category for a candidate (cached lookup)."""
-        return "unknown"
+        metadata = self.vector_search.product_metadata.get(candidate.product_id, {})
+        return metadata.get("category", "unknown")
 
     async def get_trending_recommendations(self, k: int = 10) -> List[Dict[str, Any]]:
         """Get trending recommendations for fallback scenarios."""
         try:
-            trending_candidates = await self.trending_engine.get_trending_recommendations(k=k)
+            trending_candidates = await self.feature_store.get_trending_pool(k)
             recommendations = []
             for candidate in trending_candidates:
-                metadata = await self.vector_search.get_product_metadata(candidate.product_id)
+                metadata = self.vector_search.product_metadata.get(candidate.product_id)
                 if metadata:
                     recommendations.append(
                         {
