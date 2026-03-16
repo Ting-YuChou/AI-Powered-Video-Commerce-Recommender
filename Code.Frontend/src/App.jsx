@@ -1,116 +1,164 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Play, ShoppingBag, Star, TrendingUp, Filter, Search, Heart, Share2, Eye } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Upload, ShoppingBag, Star, TrendingUp, Filter, Search, Heart, Share2, Eye } from 'lucide-react';
+import { videoApi, systemApi, utils } from './api';
+
+const DEMO_USER_ID = 'demo_user';
+const FALLBACK_REASON = 'Recommended based on similarity to the uploaded video.';
+const FALLBACK_IMAGE =
+  'https://images.unsplash.com/photo-1523275335684-37898b6baf30?auto=format&fit=crop&w=800&q=80';
+
+const normalizeRecommendation = (item) => {
+  const productId = item.product_id ?? item.id ?? '';
+  const category = item.category?.trim() || 'Uncategorized';
+  const confidenceScore = Number(item.confidence_score ?? item.confidence ?? 0);
+
+  return {
+    ...item,
+    productId,
+    category,
+    categoryKey: category.toLowerCase(),
+    imageUrl: item.image_url ?? item.image ?? FALLBACK_IMAGE,
+    confidenceScore: Number.isFinite(confidenceScore) ? confidenceScore : 0,
+    rating: Number.isFinite(Number(item.rating)) ? Number(item.rating) : null,
+    reason: item.reason ?? item.description ?? FALLBACK_REASON,
+    currency: item.currency ?? 'USD',
+  };
+};
 
 const VideoCommerceApp = () => {
   const [selectedVideo, setSelectedVideo] = useState(null);
   const [recommendations, setRecommendations] = useState([]);
-  const [loading, setLoading] = useState(false);
   const [processingVideo, setProcessingVideo] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterCategory, setFilterCategory] = useState('all');
   const [currentContentId, setCurrentContentId] = useState(null);
+  const [systemHealth, setSystemHealth] = useState(null);
+  const [analytics, setAnalytics] = useState(null);
+  const [error, setError] = useState(null);
   const fileInputRef = useRef(null);
+  const objectUrlRef = useRef(null);
 
-  // Sample data for demonstration
-  const sampleRecommendations = [
-    {
-      id: 1,
-      title: "Wireless Bluetooth Headphones",
-      price: 129.99,
-      category: "Electronics",
-      rating: 4.5,
-      image: "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=300",
-      confidence: 0.92,
-      reason: "Based on video content analysis"
-    },
-    {
-      id: 2,
-      title: "Premium Coffee Maker",
-      price: 89.99,
-      category: "Home",
-      rating: 4.2,
-      image: "https://images.unsplash.com/photo-1559056199-641a0ac8b55e?w=300",
-      confidence: 0.87,
-      reason: "Popular in similar videos"
-    },
-    {
-      id: 3,
-      title: "Fitness Tracker Watch",
-      price: 199.99,
-      category: "Sports",
-      rating: 4.7,
-      image: "https://images.unsplash.com/photo-1575311373937-040b8e1fd5b6?w=300",
-      confidence: 0.85,
-      reason: "Matches your viewing history"
-    },
-    {
-      id: 4,
-      title: "Leather Crossbody Bag",
-      price: 159.99,
-      category: "Fashion",
-      rating: 4.3,
-      image: "https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=300",
-      confidence: 0.83,
-      reason: "Trending product"
+  useEffect(() => {
+    const loadDashboardData = async () => {
+      const [healthResult, analyticsResult] = await Promise.allSettled([
+        systemApi.getHealth(),
+        systemApi.getAnalytics(),
+      ]);
+
+      setSystemHealth(healthResult.status === 'fulfilled' ? healthResult.value : null);
+      setAnalytics(analyticsResult.status === 'fulfilled' ? analyticsResult.value : null);
+    };
+
+    loadDashboardData();
+  }, []);
+
+  useEffect(() => (
+    () => {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
     }
-  ];
+  ), []);
+
+  const updateSelectedVideo = useCallback((file) => {
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+
+    if (!file) {
+      setSelectedVideo(null);
+      return;
+    }
+
+    const nextObjectUrl = URL.createObjectURL(file);
+    objectUrlRef.current = nextObjectUrl;
+    setSelectedVideo(nextObjectUrl);
+  }, []);
+
+  const fetchRecommendations = useCallback(async (contentId) => {
+    try {
+      const data = await videoApi.getRecommendations(DEMO_USER_ID, contentId);
+      setRecommendations((data.recommendations ?? []).map(normalizeRecommendation));
+    } catch (err) {
+      console.error('Failed to fetch recommendations:', err);
+      setError(utils.getErrorMessage(err, 'Failed to load recommendations.'));
+    }
+  }, []);
 
   const handleVideoUpload = async (event) => {
     const file = event.target.files[0];
     if (!file) return;
+    event.target.value = '';
 
-    setSelectedVideo(URL.createObjectURL(file));
+    const validation = utils.validateVideoFile(file);
+    if (!validation.valid) {
+      setError(validation.error);
+      return;
+    }
+
+    updateSelectedVideo(file);
     setProcessingVideo(true);
     setRecommendations([]);
+    setError(null);
+    setSearchQuery('');
+    setFilterCategory('all');
 
-    // Simulate API call to upload and process video
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('user_id', 'demo_user');
+      const uploadResult = await videoApi.uploadVideo(file, DEMO_USER_ID);
+      const contentId = uploadResult.content_id;
+      setCurrentContentId(contentId);
 
-      // Simulate processing delay
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      
-      // Set sample recommendations
-      setRecommendations(sampleRecommendations);
-      setCurrentContentId(`content_${Date.now()}`);
-      
-    } catch (error) {
-      console.error('Error processing video:', error);
+      const pollResult = await utils.pollContentStatus(contentId);
+      if (pollResult.success) {
+        await fetchRecommendations(contentId);
+      } else {
+        setError('Video processing is taking longer than expected. Please check again shortly.');
+      }
+    } catch (err) {
+      console.error('Error processing video:', err);
+      setError(utils.getErrorMessage(err, 'Failed to upload video. Is the backend running?'));
     } finally {
       setProcessingVideo(false);
     }
   };
 
-  const handleProductClick = async (productId) => {
-    // Log interaction
+  const handleProductClick = async (productId, position) => {
+    if (!productId) {
+      return;
+    }
+
     try {
-      const interaction = {
-        user_id: 'demo_user',
-        product_id: productId.toString(),
-        action: 'click',
-        context: {
-          position: recommendations.findIndex(r => r.id === productId) + 1,
-          content_id: currentContentId
+      await videoApi.logInteraction(
+        DEMO_USER_ID,
+        String(productId),
+        'click',
+        {
+          position,
+          content_id: currentContentId,
         }
-      };
-      
-      console.log('Logging interaction:', interaction);
-      // In real implementation, make API call to /api/interactions
-      
-    } catch (error) {
-      console.error('Error logging interaction:', error);
+      );
+    } catch (err) {
+      console.error('Error logging interaction:', err);
     }
   };
 
   const filteredRecommendations = recommendations.filter(item => {
     const matchesSearch = item.title.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesCategory = filterCategory === 'all' || item.category.toLowerCase() === filterCategory.toLowerCase();
+    const matchesCategory = filterCategory === 'all' || item.categoryKey === filterCategory;
     return matchesSearch && matchesCategory;
   });
 
-  const categories = ['all', 'electronics', 'home', 'sports', 'fashion'];
+  const categories = ['all', ...new Set(recommendations.map((item) => item.categoryKey))];
+  const categoryLabels = recommendations.reduce((labels, item) => {
+    labels[item.categoryKey] = item.category;
+    return labels;
+  }, {});
+  const systemStatus = systemHealth?.status ?? 'offline';
+  const healthyComponentCount = Object.values(systemHealth?.components ?? {}).filter(
+    (component) => component?.status === 'healthy'
+  ).length;
+  const totalComponentCount = Object.keys(systemHealth?.components ?? {}).length;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
@@ -146,7 +194,7 @@ const VideoCommerceApp = () => {
                 >
                   <Upload className="h-12 w-12 text-gray-400 mx-auto mb-4" />
                   <p className="text-lg text-gray-600 mb-2">Upload a video to get AI-powered product recommendations</p>
-                  <p className="text-sm text-gray-500">Supports MP4, MOV, AVI files up to 500MB</p>
+                  <p className="text-sm text-gray-500">Supports MP4, MOV, AVI, MKV, and WEBM files up to 500MB</p>
                   <input
                     type="file"
                     ref={fileInputRef}
@@ -177,9 +225,12 @@ const VideoCommerceApp = () => {
                   <div className="flex justify-between items-center">
                     <button
                       onClick={() => {
-                        setSelectedVideo(null);
+                        updateSelectedVideo(null);
                         setRecommendations([]);
                         setCurrentContentId(null);
+                        setSearchQuery('');
+                        setFilterCategory('all');
+                        setError(null);
                       }}
                       className="px-4 py-2 text-sm bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors"
                     >
@@ -209,6 +260,21 @@ const VideoCommerceApp = () => {
                 </div>
               </div>
             )}
+
+            {/* Error Message */}
+            {error && (
+              <div className="mt-6 bg-red-50 border border-red-200 rounded-xl p-4">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-red-700">{error}</p>
+                  <button
+                    onClick={() => setError(null)}
+                    className="text-red-400 hover:text-red-600 text-sm font-medium"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Sidebar - System Stats */}
@@ -217,23 +283,54 @@ const VideoCommerceApp = () => {
               <h3 className="text-lg font-semibold text-gray-900 mb-4">System Performance</h3>
               <div className="space-y-4">
                 <div className="flex justify-between items-center">
-                  <span className="text-sm text-gray-600">Response Time</span>
-                  <span className="text-sm font-medium text-green-600">245ms</span>
+                  <span className="text-sm text-gray-600">Service Version</span>
+                  <span className="text-sm font-medium text-gray-900">
+                    {systemHealth?.version ?? 'N/A'}
+                  </span>
                 </div>
                 <div className="flex justify-between items-center">
-                  <span className="text-sm text-gray-600">Accuracy</span>
-                  <span className="text-sm font-medium text-blue-600">92.5%</span>
+                  <span className="text-sm text-gray-600">Uptime</span>
+                  <span className="text-sm font-medium text-blue-600">
+                    {utils.formatDuration(systemHealth?.uptime_seconds)}
+                  </span>
                 </div>
                 <div className="flex justify-between items-center">
-                  <span className="text-sm text-gray-600">Model Version</span>
-                  <span className="text-sm font-medium text-gray-900">v1.0.0</span>
+                  <span className="text-sm text-gray-600">Healthy Components</span>
+                  <span className="text-sm font-medium text-blue-600">
+                    {totalComponentCount > 0 ? `${healthyComponentCount}/${totalComponentCount}` : '—'}
+                  </span>
                 </div>
                 <div className="flex justify-between items-center">
                   <span className="text-sm text-gray-600">Status</span>
-                  <div className="flex items-center space-x-1">
-                    <div className="h-2 w-2 bg-green-500 rounded-full"></div>
-                    <span className="text-sm font-medium text-green-600">Healthy</span>
-                  </div>
+                  {systemStatus !== 'offline' ? (
+                    <div className="flex items-center space-x-1">
+                      <div
+                        className={`h-2 w-2 rounded-full ${
+                          systemStatus === 'healthy'
+                            ? 'bg-green-500'
+                            : systemStatus === 'degraded'
+                              ? 'bg-yellow-500'
+                              : 'bg-red-500'
+                        }`}
+                      ></div>
+                      <span
+                        className={`text-sm font-medium ${
+                          systemStatus === 'healthy'
+                            ? 'text-green-600'
+                            : systemStatus === 'degraded'
+                              ? 'text-yellow-600'
+                              : 'text-red-600'
+                        }`}
+                      >
+                        {systemStatus}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center space-x-1">
+                      <div className="h-2 w-2 bg-red-500 rounded-full"></div>
+                      <span className="text-sm font-medium text-red-600">Offline</span>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -244,23 +341,38 @@ const VideoCommerceApp = () => {
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-2">
                     <Eye className="h-4 w-4 text-blue-500" />
-                    <span className="text-sm text-gray-600">Videos Processed</span>
+                    <span className="text-sm text-gray-600">Interactions</span>
                   </div>
-                  <span className="font-semibold text-gray-900">1,247</span>
+                  <span className="font-semibold text-gray-900">
+                    {analytics?.total_interactions?.toLocaleString() ?? '—'}
+                  </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-2">
                     <ShoppingBag className="h-4 w-4 text-green-500" />
-                    <span className="text-sm text-gray-600">Products Matched</span>
+                    <span className="text-sm text-gray-600">Unique Products</span>
                   </div>
-                  <span className="font-semibold text-gray-900">8,932</span>
+                  <span className="font-semibold text-gray-900">
+                    {analytics?.unique_products?.toLocaleString() ?? '—'}
+                  </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-2">
                     <TrendingUp className="h-4 w-4 text-purple-500" />
-                    <span className="text-sm text-gray-600">Conversion Rate</span>
+                    <span className="text-sm text-gray-600">Active Users</span>
                   </div>
-                  <span className="font-semibold text-gray-900">12.8%</span>
+                  <span className="font-semibold text-gray-900">
+                    {analytics?.unique_users?.toLocaleString() ?? '—'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-2">
+                    <Filter className="h-4 w-4 text-indigo-500" />
+                    <span className="text-sm text-gray-600">CTR</span>
+                  </div>
+                  <span className="font-semibold text-gray-900">
+                    {analytics?.ctr != null ? `${(analytics.ctr * 100).toFixed(1)}%` : '—'}
+                  </span>
                 </div>
               </div>
             </div>
@@ -294,7 +406,7 @@ const VideoCommerceApp = () => {
                 >
                   {categories.map(category => (
                     <option key={category} value={category}>
-                      {category.charAt(0).toUpperCase() + category.slice(1)}
+                      {category === 'all' ? 'All' : (categoryLabels[category] ?? category)}
                     </option>
                   ))}
                 </select>
@@ -302,15 +414,15 @@ const VideoCommerceApp = () => {
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-              {filteredRecommendations.map((product) => (
+              {filteredRecommendations.map((product, index) => (
                 <div 
-                  key={product.id} 
+                  key={product.productId} 
                   className="bg-gray-50 rounded-xl overflow-hidden hover:shadow-lg transition-shadow cursor-pointer group"
-                  onClick={() => handleProductClick(product.id)}
+                  onClick={() => handleProductClick(product.productId, index + 1)}
                 >
                   <div className="relative">
                     <img 
-                      src={product.image} 
+                      src={product.imageUrl} 
                       alt={product.title}
                       className="w-full h-48 object-cover group-hover:scale-105 transition-transform duration-300"
                     />
@@ -319,7 +431,7 @@ const VideoCommerceApp = () => {
                     </div>
                     <div className="absolute top-2 left-2">
                       <div className="bg-indigo-600 text-white text-xs px-2 py-1 rounded-full font-medium">
-                        {Math.round(product.confidence * 100)}% Match
+                        {Math.round(product.confidenceScore * 100)}% Match
                       </div>
                     </div>
                   </div>
@@ -331,7 +443,7 @@ const VideoCommerceApp = () => {
                       </span>
                       <div className="flex items-center space-x-1">
                         <Star className="h-3 w-3 text-yellow-400 fill-current" />
-                        <span className="text-xs text-gray-600">{product.rating}</span>
+                        <span className="text-xs text-gray-600">{product.rating ?? '—'}</span>
                       </div>
                     </div>
                     
@@ -341,7 +453,7 @@ const VideoCommerceApp = () => {
                     
                     <div className="flex items-center justify-between mb-3">
                       <span className="text-lg font-bold text-gray-900">
-                        ${product.price}
+                        {utils.formatPrice(product.price, product.currency)}
                       </span>
                       <button className="text-gray-400 hover:text-gray-600">
                         <Share2 className="h-4 w-4" />
