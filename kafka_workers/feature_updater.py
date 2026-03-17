@@ -57,6 +57,7 @@ class FeatureUpdaterWorker:
         self.batch_size = 100
         self.batch_timeout_seconds = 5.0
         self._pending_updates: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self._pending_updates_lock = asyncio.Lock()
         self._last_flush_time = time.time()
         
         self.is_running = False
@@ -175,39 +176,53 @@ class FeatureUpdaterWorker:
         timestamp = value.get('timestamp', time.time())
         
         logger.debug(f"Received interaction: {user_id} -> {action} -> {product_id}")
-        
-        # Add to pending updates
-        self._pending_updates[user_id].append({
-            'product_id': product_id,
-            'action': action,
-            'context': context,
-            'timestamp': timestamp
-        })
-        
-        # Check if we should flush
-        total_pending = sum(len(updates) for updates in self._pending_updates.values())
-        time_since_flush = time.time() - self._last_flush_time
-        
-        if total_pending >= self.batch_size or time_since_flush >= self.batch_timeout_seconds:
+
+        should_flush = False
+        async with self._pending_updates_lock:
+            self._pending_updates[user_id].append({
+                'product_id': product_id,
+                'action': action,
+                'context': context,
+                'timestamp': timestamp
+            })
+
+            total_pending = sum(len(updates) for updates in self._pending_updates.values())
+            time_since_flush = time.time() - self._last_flush_time
+            should_flush = (
+                total_pending >= self.batch_size
+                or time_since_flush >= self.batch_timeout_seconds
+            )
+
+        if should_flush:
             await self._flush_pending_updates()
     
     async def _flush_pending_updates(self):
         """Flush pending updates to the feature store."""
-        if not self._pending_updates:
-            return
-        
-        logger.info(f"Flushing {sum(len(u) for u in self._pending_updates.values())} pending updates")
-        
+        pending_updates: Optional[Dict[str, List[Dict[str, Any]]]] = None
+        pending_count = 0
+
+        async with self._pending_updates_lock:
+            if not self._pending_updates:
+                return
+
+            pending_updates = self._pending_updates
+            pending_count = sum(len(updates) for updates in pending_updates.values())
+            self._pending_updates = defaultdict(list)
+            self._last_flush_time = time.time()
+
+        logger.info(f"Flushing {pending_count} pending updates")
+
         try:
             # Process updates for each user
-            for user_id, interactions in self._pending_updates.items():
+            for user_id, interactions in pending_updates.items():
                 await self._process_user_interactions(user_id, interactions)
-            
-            # Clear pending updates
-            self._pending_updates.clear()
-            self._last_flush_time = time.time()
-            
         except Exception as e:
+            async with self._pending_updates_lock:
+                for user_id, interactions in pending_updates.items():
+                    if interactions:
+                        self._pending_updates[user_id] = (
+                            list(interactions) + self._pending_updates[user_id]
+                        )
             logger.error(f"Error flushing updates: {e}")
     
     async def _process_user_interactions(
@@ -269,8 +284,7 @@ class FeatureUpdaterWorker:
         """Periodically flush pending updates."""
         while self.is_running:
             await asyncio.sleep(self.batch_timeout_seconds)
-            if self._pending_updates:
-                await self._flush_pending_updates()
+            await self._flush_pending_updates()
     
     async def run(self):
         """Run the feature updater worker."""

@@ -172,6 +172,15 @@ class FeatureStore:
             await pipeline.execute()
         except Exception as e:
             logger.error(f"Error batch-setting user features: {e}")
+
+    @staticmethod
+    def _bounded_ratio(numerator: int, denominator: int) -> float:
+        """Return a ratio clamped to the UserFeatures validator range."""
+        if numerator <= 0:
+            return 0.0
+        if denominator <= 0:
+            return 1.0
+        return min(max(float(numerator) / float(denominator), 0.0), 1.0)
     
     async def update_user_features(self, user_id: str, action: str, context: Dict[str, Any] = None):
         """Update user features based on new interaction."""
@@ -189,7 +198,7 @@ class FeatureStore:
                 total_views = await self._get_user_stat(user_id, 'total_views') or 1
                 total_clicks = await self._get_user_stat(user_id, 'total_clicks') or 0
                 total_clicks += 1
-                features.click_through_rate = total_clicks / max(total_views, 1)
+                features.click_through_rate = self._bounded_ratio(total_clicks, total_views)
                 await self._set_user_stat(user_id, 'total_clicks', total_clicks)
                 
             elif action == InteractionType.PURCHASE.value:
@@ -197,7 +206,7 @@ class FeatureStore:
                 total_clicks = await self._get_user_stat(user_id, 'total_clicks') or 1
                 total_purchases = await self._get_user_stat(user_id, 'total_purchases') or 0
                 total_purchases += 1
-                features.conversion_rate = total_purchases / max(total_clicks, 1)
+                features.conversion_rate = self._bounded_ratio(total_purchases, total_clicks)
                 await self._set_user_stat(user_id, 'total_purchases', total_purchases)
             
             elif action == InteractionType.VIEW.value:
@@ -570,8 +579,14 @@ class FeatureStore:
             stats["total_clicks"] += action_counts.get(InteractionType.CLICK.value, 0)
             stats["total_purchases"] += action_counts.get(InteractionType.PURCHASE.value, 0)
 
-            features.click_through_rate = stats["total_clicks"] / max(stats["total_views"], 1)
-            features.conversion_rate = stats["total_purchases"] / max(stats["total_clicks"], 1)
+            features.click_through_rate = self._bounded_ratio(
+                stats["total_clicks"],
+                stats["total_views"],
+            )
+            features.conversion_rate = self._bounded_ratio(
+                stats["total_purchases"],
+                stats["total_clicks"],
+            )
 
             pipeline = self.redis_client.pipeline(transaction=False)
             ttl = self._calculate_adaptive_ttl(features)
