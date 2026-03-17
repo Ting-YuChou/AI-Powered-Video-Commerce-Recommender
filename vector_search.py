@@ -70,9 +70,17 @@ class VectorSearchEngine:
             
             # Try to load existing index
             if not force_rebuild and index_path.exists() and metadata_path.exists():
-                await self._load_existing_index(index_path, metadata_path)
+                try:
+                    await self._load_existing_index(index_path, metadata_path)
+                except Exception as exc:
+                    logger.warning(f"Existing vector index load failed; rebuilding: {exc}")
+                    await self._build_new_index()
             else:
                 # Build new index with sample data
+                await self._build_new_index()
+
+            if self.index is None or self.index.ntotal == 0 or not self.product_index_map:
+                logger.warning("Vector index is empty after load; rebuilding sample index")
                 await self._build_new_index()
             
             self.is_loaded = True
@@ -82,7 +90,7 @@ class VectorSearchEngine:
             logger.error(f"Failed to load vector index: {e}")
             # Create empty index as fallback
             await self._create_empty_index()
-            raise
+            self.is_loaded = True
     
     async def _load_existing_index(self, index_path: Path, metadata_path: Path):
         """Load existing FAISS index from disk."""
@@ -159,6 +167,9 @@ class VectorSearchEngine:
         """Create sample products with embeddings for demo purposes."""
         try:
             logger.info(f"Creating {num_products} sample products")
+            self.product_index_map = {}
+            self.product_embeddings = {}
+            self.product_metadata = {}
             
             # Product categories and their typical embeddings
             categories = {
@@ -183,7 +194,11 @@ class VectorSearchEngine:
                 
                 # Add category-specific patterns
                 category_offset = hash(category) % self.embedding_dim
-                base_embedding[category_offset:category_offset+10] += np.random.normal(0.5, 0.1, 10)
+                pattern_width = min(10, self.embedding_dim)
+                pattern_indices = (category_offset + np.arange(pattern_width)) % self.embedding_dim
+                base_embedding[pattern_indices] += np.random.normal(
+                    0.5, 0.1, pattern_width
+                ).astype(np.float32)
                 
                 # Normalize embedding
                 norm = np.linalg.norm(base_embedding)
@@ -497,6 +512,83 @@ class VectorSearchEngine:
             logger.error(f"Error getting random products: {e}")
             return []
     
+    # ------------------------------------------------------------------
+    # CF Index helpers (for Two-Tower retrieval)
+    # ------------------------------------------------------------------
+
+    def create_cf_index(self, embedding_dim: int = 128) -> faiss.Index:
+        """Create a FAISS HNSW index for Two-Tower CF embeddings.
+
+        This is a *separate* index from the content-similarity index.
+        """
+        index = faiss.IndexHNSWFlat(embedding_dim, self.config.hnsw_m)
+        index.hnsw.efConstruction = self.config.hnsw_ef_construction
+        index.hnsw.efSearch = self.config.hnsw_ef_search
+        logger.info(f"Created CF FAISS index (dim={embedding_dim}, M={self.config.hnsw_m})")
+        return index
+
+    @staticmethod
+    def save_cf_index(index: faiss.Index, path: str, metadata: Dict[str, Any] = None):
+        """Persist a CF FAISS index and optional metadata to disk."""
+        try:
+            index_path = Path(path)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            faiss.write_index(index, str(index_path))
+
+            if metadata:
+                meta_path = index_path.with_suffix('.cf_meta.json')
+                with open(meta_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+
+            logger.info(f"Saved CF index ({index.ntotal} vectors) to {path}")
+        except Exception as e:
+            logger.error(f"Error saving CF index: {e}")
+
+    @staticmethod
+    def load_cf_index(path: str) -> Optional[Tuple[faiss.Index, Dict[str, Any]]]:
+        """Load a CF FAISS index and its metadata from disk.
+
+        Returns (index, metadata) or None on failure.
+        """
+        try:
+            index_path = Path(path)
+            if not index_path.exists():
+                return None
+
+            index = faiss.read_index(str(index_path))
+
+            metadata: Dict[str, Any] = {}
+            meta_path = index_path.with_suffix('.cf_meta.json')
+            if meta_path.exists():
+                with open(meta_path, 'r') as f:
+                    metadata = json.load(f)
+
+            logger.info(f"Loaded CF index ({index.ntotal} vectors) from {path}")
+            return index, metadata
+        except Exception as e:
+            logger.error(f"Error loading CF index: {e}")
+            return None
+
+    def get_product_embedding(self, product_id: str) -> Optional[np.ndarray]:
+        """Get a product's CLIP embedding vector (used by ItemTower as input).
+
+        Returns the stored embedding or None if not found.
+        """
+        emb = self.product_embeddings.get(product_id)
+        if emb is not None:
+            return np.array(emb, dtype=np.float32)
+        return None
+
+    def get_all_product_embeddings(self) -> Dict[str, np.ndarray]:
+        """Get all product CLIP embeddings.
+
+        Returns a dict mapping product_id -> embedding (numpy float32).
+        """
+        return {
+            pid: np.array(emb, dtype=np.float32)
+            for pid, emb in self.product_embeddings.items()
+        }
+
     def get_stats(self) -> Dict[str, Any]:
         """Get search engine statistics."""
         return {
