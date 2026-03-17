@@ -59,7 +59,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Create environment file
+# Create environment file from the single repository template
 cp .env.example .env
 # Edit .env with your configuration
 ```
@@ -198,7 +198,7 @@ For complete API documentation, visit: http://localhost:8000/docs
 
 ### Environment Variables
 
-Key configuration options (see `.env.example` for complete list):
+Key configuration options (see `.env.example` for the single source of truth):
 
 ```bash
 # API Configuration
@@ -335,4 +335,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Facebook FAISS**: For efficient vector search
 - **FastAPI**: For the amazing web framework
 - **Hugging Face**: For model hosting and transformers library
-

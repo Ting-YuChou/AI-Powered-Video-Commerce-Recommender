@@ -14,6 +14,7 @@ PROJECT_DIR="$SCRIPT_DIR"
 LOG_DIR="$PROJECT_DIR/logs"
 PID_FILE="$PROJECT_DIR/app.pid"
 ENV_FILE="$PROJECT_DIR/.env"
+ENV_TEMPLATE_FILE="$PROJECT_DIR/.env.example"
 REQUIREMENTS_FILE="$PROJECT_DIR/requirements.txt"
 
 # Colors for output
@@ -191,54 +192,15 @@ setup_environment() {
 
 # Create default environment file
 create_default_env_file() {
-    print_info "Creating default .env file..."
-    
-    cat > "$ENV_FILE" << EOF
-# AI Video Commerce Recommender Configuration
-# ===========================================
+    print_info "Creating default .env file from $ENV_TEMPLATE_FILE..."
 
-# API Configuration
-API_HOST=0.0.0.0
-API_PORT=8000
-API_DEBUG=false
-API_RELOAD=false
-API_WORKERS=1
+    if [ ! -f "$ENV_TEMPLATE_FILE" ]; then
+        print_error "Environment template not found at $ENV_TEMPLATE_FILE"
+        exit 1
+    fi
 
-# Redis Configuration
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_DB=0
-REDIS_PASSWORD=
-
-# Model Configuration
-MODEL_DEVICE=auto
-MODEL_CACHE_DIR=/tmp/models
-MODEL_BATCH_SIZE=32
-MODEL_CLIP_MODEL=openai/clip-vit-large-patch14
-
-# Vector Search Configuration
-VECTOR_INDEX_PATH=/tmp/vector_index.faiss
-VECTOR_EMBEDDING_DIM=512
-
-# Data Configuration
-DATA_LOAD_SAMPLE_DATA=true
-DATA_UPLOAD_DIR=/tmp/uploads
-DATA_MAX_FILE_SIZE=104857600
-
-# Monitoring Configuration
-MONITORING_LOG_LEVEL=INFO
-MONITORING_ENABLE_METRICS=true
-
-# Cache Configuration
-CACHE_ENABLE_CACHING=true
-CACHE_DEFAULT_TTL=3600
-CACHE_ADAPTIVE_TTL=true
-
-# Environment
-ENVIRONMENT=development
-EOF
-    
-    print_success "Default .env file created"
+    cp "$ENV_TEMPLATE_FILE" "$ENV_FILE"
+    print_success "Default .env file created from .env.example"
 }
 
 # Install Python dependencies
