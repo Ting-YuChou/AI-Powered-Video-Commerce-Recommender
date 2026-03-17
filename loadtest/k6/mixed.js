@@ -62,7 +62,7 @@ export default function () {
   });
 
   check(response, {
-    "mixed request status is 200": (r) => r.status === 200,
+    "mixed request status is 2xx": (r) => r.status === 200 || r.status === 202,
   });
 
   sleep(0.02);

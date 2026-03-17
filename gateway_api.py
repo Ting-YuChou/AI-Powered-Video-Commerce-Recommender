@@ -9,6 +9,7 @@ import tempfile
 import time
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import Body, File, HTTPException, Request, UploadFile
@@ -75,7 +76,31 @@ async def startup_event():
             kafka_manager = None
 
     proxy_client = httpx.AsyncClient(
-        timeout=runtime.config.service_topology_config.request_forward_timeout_seconds
+        timeout=httpx.Timeout(
+            timeout=runtime.config.service_topology_config.request_forward_timeout_seconds,
+            connect=runtime.config.service_topology_config.proxy_connect_timeout_seconds,
+            read=runtime.config.service_topology_config.proxy_read_timeout_seconds,
+            write=runtime.config.service_topology_config.proxy_write_timeout_seconds,
+            pool=runtime.config.service_topology_config.proxy_pool_timeout_seconds,
+        ),
+        limits=httpx.Limits(
+            max_connections=runtime.config.service_topology_config.proxy_max_connections,
+            max_keepalive_connections=runtime.config.service_topology_config.proxy_max_keepalive_connections,
+            keepalive_expiry=runtime.config.service_topology_config.proxy_keepalive_expiry_seconds,
+        ),
+    )
+    logger.info(
+        "gateway_proxy_client_configured",
+        extra={
+            "service": runtime.service_name,
+            "proxy_max_connections": runtime.config.service_topology_config.proxy_max_connections,
+            "proxy_max_keepalive_connections": runtime.config.service_topology_config.proxy_max_keepalive_connections,
+            "proxy_keepalive_expiry_seconds": runtime.config.service_topology_config.proxy_keepalive_expiry_seconds,
+            "proxy_connect_timeout_seconds": runtime.config.service_topology_config.proxy_connect_timeout_seconds,
+            "proxy_read_timeout_seconds": runtime.config.service_topology_config.proxy_read_timeout_seconds,
+            "proxy_write_timeout_seconds": runtime.config.service_topology_config.proxy_write_timeout_seconds,
+            "proxy_pool_timeout_seconds": runtime.config.service_topology_config.proxy_pool_timeout_seconds,
+        },
     )
     rate_limiter = InMemoryRateLimiter(
         limit=runtime.config.api_config.rate_limit_requests,
@@ -236,16 +261,38 @@ async def metrics():
 
 
 async def _proxy_json_request(url: str, payload: dict, request: Request) -> Response:
+    started_at = time.perf_counter()
+    upstream_service = urlparse(url).netloc
+    runtime = app.state.runtime
     try:
         headers = {"Content-Type": "application/json"}
-        request_id_header = app.state.runtime.config.monitoring_config.request_id_header
+        request_id_header = runtime.config.monitoring_config.request_id_header
         if request and getattr(request.state, "request_id", None):
             headers[request_id_header] = request.state.request_id
         upstream = await proxy_client.post(url, json=payload, headers=headers)
+        upstream_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        if (
+            runtime.config.monitoring_config.enable_profiling_logs
+            or upstream_duration_ms >= runtime.config.monitoring_config.profiling_log_min_duration_ms
+        ):
+            logger.info(
+                "gateway_proxy_profile",
+                extra={
+                    "service": runtime.service_name,
+                    "upstream_service": upstream_service,
+                    "upstream_status_code": upstream.status_code,
+                    "proxy_duration_ms": upstream_duration_ms,
+                    "request_path": request.url.path if request else None,
+                    "payload_bytes": len(upstream.request.content or b""),
+                },
+            )
         content_type = upstream.headers.get("content-type", "application/json")
         response_headers = {}
         if request_id_header in upstream.headers:
             response_headers[request_id_header] = upstream.headers[request_id_header]
+        if runtime.config.monitoring_config.enable_profiling_logs:
+            response_headers["X-Gateway-Proxy-Duration-Ms"] = str(upstream_duration_ms)
+            response_headers["X-Upstream-Service"] = upstream_service
         return Response(
             content=upstream.content,
             status_code=upstream.status_code,
@@ -253,7 +300,21 @@ async def _proxy_json_request(url: str, payload: dict, request: Request) -> Resp
             headers=response_headers,
         )
     except httpx.HTTPError as exc:
-        logger.error(f"Gateway proxy request failed: {exc}")
+        upstream_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.error(
+            "gateway_proxy_request_failed",
+            extra={
+                "service": runtime.service_name,
+                "upstream_service": upstream_service,
+                "request_path": request.url.path if request else None,
+                "proxy_duration_ms": upstream_duration_ms,
+                "exception_type": type(exc).__name__,
+                "exception_repr": repr(exc),
+                "proxy_max_connections": runtime.config.service_topology_config.proxy_max_connections,
+                "proxy_max_keepalive_connections": runtime.config.service_topology_config.proxy_max_keepalive_connections,
+                "proxy_pool_timeout_seconds": runtime.config.service_topology_config.proxy_pool_timeout_seconds,
+            },
+        )
         raise HTTPException(status_code=502, detail=f"Upstream service unavailable: {exc}") from exc
 
 

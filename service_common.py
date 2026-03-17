@@ -4,6 +4,7 @@ Shared helpers for multi-service API entrypoints.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 import logging
@@ -32,6 +33,10 @@ class ServiceRuntime:
         self.config = None
         self.observability = ObservabilityManager()
         self.started_at = time.time()
+        self.process_id = os.getpid()
+        self.active_requests = 0
+        self.handled_requests = 0
+        self.max_active_requests = 0
 
 
 class InMemoryRateLimiter:
@@ -90,6 +95,12 @@ def create_service_app(
         request_id = request.headers.get(request_id_header) or str(uuid.uuid4())
         request.state.request_id = request_id
         request.state.request_started_at = time.perf_counter()
+        runtime.active_requests += 1
+        runtime.handled_requests += 1
+        runtime.max_active_requests = max(runtime.max_active_requests, runtime.active_requests)
+        request.state.worker_process_id = runtime.process_id
+        request.state.worker_active_requests_at_entry = runtime.active_requests
+        request.state.worker_handled_requests = runtime.handled_requests
         request_id_token = request_id_ctx_var.set(request_id)
         runtime.observability.http_requests_in_progress.inc()
 
@@ -113,6 +124,17 @@ def create_service_app(
                     "duration_ms": round(duration * 1000, 2),
                     "client_ip": request.client.host if request.client else None,
                     "service": runtime.service_name,
+                    "process_id": runtime.process_id,
+                    "worker_active_requests_at_entry": getattr(
+                        request.state,
+                        "worker_active_requests_at_entry",
+                        None,
+                    ),
+                    "worker_handled_requests": getattr(
+                        request.state,
+                        "worker_handled_requests",
+                        None,
+                    ),
                 },
             )
             raise
@@ -135,12 +157,25 @@ def create_service_app(
                         "duration_ms": round(duration * 1000, 2),
                         "client_ip": request.client.host if request.client else None,
                         "service": runtime.service_name,
+                        "process_id": runtime.process_id,
+                        "worker_active_requests_at_entry": getattr(
+                            request.state,
+                            "worker_active_requests_at_entry",
+                            None,
+                        ),
+                        "worker_handled_requests": getattr(
+                            request.state,
+                            "worker_handled_requests",
+                            None,
+                        ),
                     },
                 )
             response.headers[request_id_header] = request_id
+            response.headers["X-Service-Process-Pid"] = str(runtime.process_id)
             return response
         finally:
             runtime.observability.http_requests_in_progress.dec()
+            runtime.active_requests = max(runtime.active_requests - 1, 0)
             request_id_ctx_var.reset(request_id_token)
 
     @app.exception_handler(404)

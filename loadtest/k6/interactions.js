@@ -49,7 +49,7 @@ export default function () {
   });
 
   check(response, {
-    "interactions status is 200": (r) => r.status === 200,
+    "interactions status is 202": (r) => r.status === 202,
   });
 
   sleep(0.02);
