@@ -30,6 +30,22 @@ from two_tower import TwoTowerTrainer
 logger = logging.getLogger(__name__)
 
 
+def build_candidate_cache_context(
+    content_id: Optional[str],
+    context: Optional[Dict[str, Any]],
+    k_per_source: int,
+) -> Dict[str, Any]:
+    """Build the coarse retrieval context used for shared candidate caches."""
+    context = context or {}
+    return {
+        "content_id": content_id,
+        "device": context.get("device"),
+        "page": context.get("page"),
+        "category": context.get("product_category") or context.get("category"),
+        "k_per_source": k_per_source,
+    }
+
+
 class TwoTowerRetrievalEngine:
     """Two-Tower neural retrieval engine for collaborative filtering.
 
@@ -74,6 +90,7 @@ class TwoTowerRetrievalEngine:
         self.is_trained = False
         self.last_training_time: float = 0
         self._item_popularity: Dict[str, float] = {}
+        self.model_version: Optional[str] = None
 
         logger.info("Two-Tower retrieval engine initialized")
 
@@ -152,6 +169,8 @@ class TwoTowerRetrievalEngine:
             # Sync backward-compat attributes
             self.user_mapping = dict(self.trainer.user_mapping)
             self.item_mapping = dict(self.trainer.item_mapping)
+            self.model_version = f"cf-{int(time.time())}"
+            self.trainer.model_version = self.model_version
 
             # Save checkpoint and index
             self.trainer.save_checkpoint(checkpoint_path)
@@ -159,6 +178,7 @@ class TwoTowerRetrievalEngine:
                 self.cf_index,
                 self.config.cf_index_path,
                 metadata={
+                    "model_version": self.model_version,
                     "num_items": len(self.item_mapping),
                     "embedding_dim": self.config.tt_embedding_dim,
                     "index_map": {str(k): v for k, v in self.cf_index_map.items()},
@@ -188,6 +208,7 @@ class TwoTowerRetrievalEngine:
         k: int = 100,
         exclude_items: Optional[Set[str]] = None,
         user_features: Optional[Dict[str, Any]] = None,
+        user_embedding: Optional[np.ndarray] = None,
     ) -> List[CandidateProduct]:
         """Get collaborative-filtering recommendations via Two-Tower ANN retrieval.
 
@@ -205,8 +226,9 @@ class TwoTowerRetrievalEngine:
             exclude_items = exclude_items or set()
             user_features = user_features or {}
 
-            # Encode user via UserTower
-            user_embedding = self.trainer.encode_user(user_id, user_features)
+            # Encode user via UserTower unless a pre-published embedding was provided.
+            if user_embedding is None:
+                user_embedding = self.trainer.encode_user(user_id, user_features)
 
             if user_embedding is None:
                 return await self._get_popular_items_fallback(k, exclude_items)
@@ -416,6 +438,17 @@ class RecommendationEngine:
             # Train / update with latest interaction data
             await self._update_models_from_interactions()
 
+            if self.cf_engine.model_version:
+                await self.feature_store.publish_cf_model_version(
+                    self.cf_engine.model_version,
+                    source="trainer",
+                    metadata={
+                        "updated_at": time.time(),
+                        "cf_users": len(self.cf_engine.user_mapping),
+                        "cf_items": len(self.cf_engine.item_mapping),
+                    },
+                )
+
             self.is_initialized = True
             logger.info("Recommendation models loaded successfully")
 
@@ -452,12 +485,17 @@ class RecommendationEngine:
                 index_map_raw = metadata.get("index_map", {})
                 self.cf_engine.cf_index = index
                 self.cf_engine.cf_index_map = {int(k): v for k, v in index_map_raw.items()}
+                self.cf_engine.model_version = metadata.get("model_version")
 
                 # Load trainer checkpoint
                 checkpoint_path = self.config.cf_index_path.replace(".faiss", ".pt")
                 if self.cf_engine.trainer.load_checkpoint(checkpoint_path):
                     self.cf_engine.user_mapping = dict(self.cf_engine.trainer.user_mapping)
                     self.cf_engine.item_mapping = dict(self.cf_engine.trainer.item_mapping)
+                    self.cf_engine.model_version = (
+                        self.cf_engine.trainer.model_version
+                        or self.cf_engine.model_version
+                    )
                     self.cf_engine.is_trained = True
                     logger.info("Loaded pre-existing Two-Tower model and CF index")
         except Exception as e:
@@ -493,6 +531,16 @@ class RecommendationEngine:
                 await self.refresh_serving_pools()
 
                 self.last_model_update = time.time()
+                if self.cf_engine.model_version:
+                    await self.feature_store.publish_cf_model_version(
+                        self.cf_engine.model_version,
+                        source="trainer",
+                        metadata={
+                            "updated_at": self.last_model_update,
+                            "cf_users": len(self.cf_engine.user_mapping),
+                            "cf_items": len(self.cf_engine.item_mapping),
+                        },
+                    )
                 logger.info(f"Updated models with {len(interactions)} interactions")
             else:
                 await self.refresh_serving_pools()
@@ -620,6 +668,319 @@ class RecommendationEngine:
                 deduped.append(category)
         return deduped[: self.config.preferred_category_pool_count]
 
+    def _new_candidate_profile(self) -> Dict[str, Any]:
+        return {
+            "user_interactions_ms": 0.0,
+            "user_features_ms": 0.0,
+            "user_embedding_lookup_ms": 0.0,
+            "cf_candidates_ms": 0.0,
+            "content_candidates_ms": 0.0,
+            "trending_candidates_ms": 0.0,
+            "category_pool_ms": 0.0,
+            "random_candidates_ms": 0.0,
+            "score_merge_ms": 0.0,
+            "total_ms": 0.0,
+            "candidate_count": 0,
+            "preferred_categories": [],
+            "source_counts": {},
+            "user_embedding_cache_hit": False,
+        }
+
+    async def _resolve_user_embedding(
+        self,
+        user_id: str,
+        user_features_dict: Dict[str, Any],
+        profile: Dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        stage_started = time.perf_counter()
+        model_version = self.cf_engine.model_version or self.cf_engine.trainer.model_version
+        resolved_embedding: Optional[np.ndarray] = None
+
+        try:
+            if not self.config.enable_user_embedding_publish or not model_version:
+                return self.cf_engine.trainer.encode_user(user_id, user_features_dict)
+
+            if user_id in self.cf_engine.trainer.user_mapping:
+                cached_embedding = await self.feature_store.get_cached_user_embedding(
+                    user_id,
+                    model_version,
+                )
+                if cached_embedding is not None:
+                    profile["user_embedding_cache_hit"] = True
+                    return cached_embedding
+
+                resolved_embedding = self.cf_engine.trainer.encode_user(user_id, user_features_dict)
+                if resolved_embedding is not None:
+                    await self.feature_store.cache_user_embedding(
+                        user_id,
+                        model_version,
+                        resolved_embedding,
+                        metadata={"source": "serving_fallback"},
+                    )
+                return resolved_embedding
+
+            return self.cf_engine.trainer.encode_user(user_id, user_features_dict)
+        finally:
+            profile["user_embedding_lookup_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000,
+                2,
+            )
+
+    async def _collect_candidates_from_sources(
+        self,
+        all_candidates: Dict[str, CandidateProduct],
+        profile: Dict[str, Any],
+        *,
+        target_candidates: int,
+        preferred_categories: List[str],
+        exclude_items: Set[str],
+        context: Dict[str, Any],
+        content_features: Optional[ContentFeatures],
+        user_id: Optional[str] = None,
+        user_features_dict: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        stage_started = time.perf_counter()
+        if user_id and self.cf_engine.is_trained:
+            user_embedding = await self._resolve_user_embedding(
+                user_id,
+                user_features_dict or {},
+                profile,
+            )
+            cf_candidates = await self.cf_engine.get_user_recommendations(
+                user_id,
+                min(target_candidates, self.config.max_live_cf_candidates),
+                exclude_items,
+                user_features=user_features_dict or {},
+                user_embedding=user_embedding,
+            )
+            for candidate in cf_candidates:
+                self._merge_candidate(all_candidates, candidate)
+            profile["source_counts"]["cf"] = len(cf_candidates)
+        profile["cf_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+
+        stage_started = time.perf_counter()
+        if content_features and content_features.visual_embedding:
+            try:
+                content_candidates = await self.vector_search.search_similar_products(
+                    np.array(content_features.visual_embedding),
+                    k=min(target_candidates, self.config.max_live_content_candidates),
+                )
+                for candidate in content_candidates:
+                    if candidate.product_id not in exclude_items:
+                        self._merge_candidate(all_candidates, candidate)
+                profile["source_counts"]["content"] = len(content_candidates)
+            except Exception as e:
+                logger.warning(f"Error getting content-based recommendations: {e}")
+        profile["content_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+
+        stage_started = time.perf_counter()
+        trending_candidates = await self.feature_store.get_trending_pool(
+            min(target_candidates, self.config.max_pool_trending_candidates),
+            exclude_items=exclude_items.union(all_candidates.keys()),
+        )
+        for candidate in trending_candidates:
+            self._merge_candidate(all_candidates, candidate)
+        profile["source_counts"]["trending_pool"] = len(trending_candidates)
+        profile["trending_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+
+        stage_started = time.perf_counter()
+        category_pool_candidates = 0
+        if preferred_categories:
+            per_category_limit = max(
+                1,
+                self.config.max_pool_category_candidates // max(len(preferred_categories), 1),
+            )
+            for category in preferred_categories:
+                category_candidates = await self.feature_store.get_category_pool(
+                    category,
+                    per_category_limit,
+                    exclude_items=exclude_items.union(all_candidates.keys()),
+                )
+                for candidate in category_candidates:
+                    self._merge_candidate(all_candidates, candidate)
+                category_pool_candidates += len(category_candidates)
+        profile["source_counts"]["category_pool"] = category_pool_candidates
+        profile["category_pool_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+
+        stage_started = time.perf_counter()
+        if len(all_candidates) < target_candidates:
+            random_target = min(
+                target_candidates - len(all_candidates),
+                self.config.max_random_candidates,
+            )
+            if not all_candidates:
+                random_target = min(
+                    random_target,
+                    self.config.cold_start_random_candidate_cap,
+                )
+            random_candidates = await self.vector_search.get_random_products(
+                k=random_target
+            )
+            for candidate in random_candidates:
+                if (
+                    candidate.product_id not in exclude_items
+                    and candidate.product_id not in all_candidates
+                ):
+                    all_candidates[candidate.product_id] = candidate
+            profile["source_counts"]["random"] = len(random_candidates)
+        profile["random_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+
+    async def _finalize_candidates(
+        self,
+        all_candidates: Dict[str, CandidateProduct],
+        context: Dict[str, Any],
+        profile: Dict[str, Any],
+        started_at: float,
+    ) -> List[CandidateProduct]:
+        stage_started = time.perf_counter()
+        final_candidates: List[CandidateProduct] = []
+        for candidate in all_candidates.values():
+            cf_score = candidate.collaborative_score or 0.0
+            content_score = candidate.content_similarity_score or 0.0
+            popularity_score = candidate.popularity_score or 0.0
+
+            combined_score = (
+                cf_score * self.config.cf_weight
+                + content_score * self.config.content_weight
+                + popularity_score * self.config.popularity_weight
+            )
+            candidate.combined_score = combined_score
+            final_candidates.append(candidate)
+
+        if self.config.enable_diversity:
+            final_candidates = await self._apply_diversity_filter(final_candidates, context)
+
+        final_candidates.sort(key=lambda x: x.combined_score, reverse=True)
+        final_candidates = final_candidates[: self.config.max_total_candidates]
+        profile["score_merge_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+        profile["candidate_count"] = len(final_candidates)
+        profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+        return final_candidates
+
+    def _get_hot_segment_categories(self) -> List[str]:
+        counts: Dict[str, int] = defaultdict(int)
+        for metadata in self.vector_search.product_metadata.values():
+            category = metadata.get("category")
+            if category:
+                counts[category] += 1
+        sorted_categories = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        return [
+            category
+            for category, _ in sorted_categories[: self.config.segment_candidate_precompute_max_categories]
+        ]
+
+    def _iter_hot_segment_contexts(
+        self,
+        content_ids: List[str],
+    ) -> List[Tuple[Optional[str], Dict[str, Any]]]:
+        categories = self._get_hot_segment_categories()
+        pages = [page for page in self.config.segment_candidate_precompute_pages if page]
+        devices = [device for device in self.config.segment_candidate_precompute_devices if device]
+        if not categories or not pages or not devices:
+            return []
+
+        segment_contexts: List[Tuple[Optional[str], Dict[str, Any]]] = []
+        seen_keys: Set[Tuple[Optional[str], str, str, str]] = set()
+        for content_id in [None, *content_ids]:
+            for page in pages:
+                for device in devices:
+                    for category in categories:
+                        dedupe_key = (content_id, page, device, category)
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        segment_contexts.append(
+                            (
+                                content_id,
+                                {
+                                    "page": page,
+                                    "device": device,
+                                    "category": category,
+                                },
+                            )
+                        )
+        return segment_contexts
+
+    async def precompute_segment_candidate_cache(self) -> Dict[str, Any]:
+        """Precompute candidate caches for hot cohort/segment contexts."""
+        started_at = time.perf_counter()
+        result = {
+            "segments_considered": 0,
+            "segments_cached": 0,
+            "content_segments": 0,
+            "contextless_segments": 0,
+            "total_ms": 0.0,
+        }
+
+        if not self.config.enable_segment_candidate_precompute:
+            return result
+
+        try:
+            content_ids = await self.feature_store.list_recent_content_ids(
+                self.config.segment_candidate_precompute_max_contents
+            )
+            segment_contexts = self._iter_hot_segment_contexts(content_ids)
+            result["segments_considered"] = len(segment_contexts)
+
+            for content_id, context in segment_contexts:
+                content_features = (
+                    await self.feature_store.get_content_features(content_id)
+                    if content_id
+                    else None
+                )
+                profile = self._new_candidate_profile()
+                profile["preferred_categories"] = self._resolve_preferred_categories(None, context)
+                all_candidates: Dict[str, CandidateProduct] = {}
+                target_candidates = min(
+                    self.config.candidates_per_source,
+                    self.config.max_total_candidates,
+                )
+
+                await self._collect_candidates_from_sources(
+                    all_candidates,
+                    profile,
+                    target_candidates=target_candidates,
+                    preferred_categories=profile["preferred_categories"],
+                    exclude_items=set(),
+                    context=context,
+                    content_features=content_features,
+                    user_id=None,
+                    user_features_dict=None,
+                )
+                final_candidates = await self._finalize_candidates(
+                    all_candidates,
+                    context,
+                    profile,
+                    time.perf_counter(),
+                )
+                if not final_candidates:
+                    continue
+
+                candidate_cache_context = build_candidate_cache_context(
+                    content_id,
+                    context,
+                    target_candidates,
+                )
+                context_hash = self.feature_store.generate_context_hash(candidate_cache_context)
+                await self.feature_store.cache_segment_candidate_products(
+                    context_hash,
+                    final_candidates,
+                )
+                result["segments_cached"] += 1
+                if content_id:
+                    result["content_segments"] += 1
+                else:
+                    result["contextless_segments"] += 1
+
+            result["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+            logger.info("segment_candidate_precompute_completed", extra=result)
+            return result
+        except Exception as e:
+            result["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+            result["error"] = str(e)
+            logger.error(f"Error precomputing segment candidate cache: {e}")
+            return result
+
     async def generate_candidates(
         self,
         user_id: str,
@@ -645,20 +1006,7 @@ class RecommendationEngine:
             context = context or {}
             all_candidates: Dict[str, CandidateProduct] = {}
             started_at = time.perf_counter()
-            profile = {
-                "user_interactions_ms": 0.0,
-                "user_features_ms": 0.0,
-                "cf_candidates_ms": 0.0,
-                "content_candidates_ms": 0.0,
-                "trending_candidates_ms": 0.0,
-                "category_pool_ms": 0.0,
-                "random_candidates_ms": 0.0,
-                "score_merge_ms": 0.0,
-                "total_ms": 0.0,
-                "candidate_count": 0,
-                "preferred_categories": [],
-                "source_counts": {},
-            }
+            profile = self._new_candidate_profile()
 
             # Get user's interaction history to exclude already seen items
             stage_started = time.perf_counter()
@@ -678,117 +1026,23 @@ class RecommendationEngine:
                 self.config.max_total_candidates,
             )
 
-            # 1. Collaborative Filtering via Two-Tower ANN Retrieval
-            stage_started = time.perf_counter()
-            if self.cf_engine.is_trained:
-                cf_candidates = await self.cf_engine.get_user_recommendations(
-                    user_id,
-                    min(target_candidates, self.config.max_live_cf_candidates),
-                    exclude_items,
-                    user_features=user_features_dict,
-                )
-                for candidate in cf_candidates:
-                    self._merge_candidate(all_candidates, candidate)
-                profile["source_counts"]["cf"] = len(cf_candidates)
-            profile["cf_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-
-            # 2. Content-Based Recommendations (if content provided)
-            stage_started = time.perf_counter()
-            if content_features and content_features.visual_embedding:
-                try:
-                    content_candidates = await self.vector_search.search_similar_products(
-                        np.array(content_features.visual_embedding),
-                        k=min(target_candidates, self.config.max_live_content_candidates),
-                    )
-                    for candidate in content_candidates:
-                        if candidate.product_id not in exclude_items:
-                            self._merge_candidate(all_candidates, candidate)
-                    profile["source_counts"]["content"] = len(content_candidates)
-                except Exception as e:
-                    logger.warning(f"Error getting content-based recommendations: {e}")
-            profile["content_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-
-            # 3. Precomputed Trending Pool
-            stage_started = time.perf_counter()
-            trending_candidates = await self.feature_store.get_trending_pool(
-                min(target_candidates, self.config.max_pool_trending_candidates),
-                exclude_items=exclude_items.union(all_candidates.keys()),
+            await self._collect_candidates_from_sources(
+                all_candidates,
+                profile,
+                target_candidates=target_candidates,
+                preferred_categories=preferred_categories,
+                exclude_items=exclude_items,
+                context=context,
+                content_features=content_features,
+                user_id=user_id,
+                user_features_dict=user_features_dict,
             )
-            for candidate in trending_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["trending_pool"] = len(trending_candidates)
-            profile["trending_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-
-            # 4. Preferred Category Pools
-            stage_started = time.perf_counter()
-            category_pool_candidates = 0
-            if preferred_categories:
-                per_category_limit = max(
-                    1,
-                    self.config.max_pool_category_candidates // max(len(preferred_categories), 1),
-                )
-                for category in preferred_categories:
-                    category_candidates = await self.feature_store.get_category_pool(
-                        category,
-                        per_category_limit,
-                        exclude_items=exclude_items.union(all_candidates.keys()),
-                    )
-                    for candidate in category_candidates:
-                        self._merge_candidate(all_candidates, candidate)
-                    category_pool_candidates += len(category_candidates)
-            profile["source_counts"]["category_pool"] = category_pool_candidates
-            profile["category_pool_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-
-            # 5. Small random fallback only if stronger sources are still thin
-            stage_started = time.perf_counter()
-            if len(all_candidates) < target_candidates:
-                random_target = min(
-                    target_candidates - len(all_candidates),
-                    self.config.max_random_candidates,
-                )
-                if not all_candidates:
-                    random_target = min(
-                        random_target,
-                        self.config.cold_start_random_candidate_cap,
-                    )
-                random_candidates = await self.vector_search.get_random_products(
-                    k=random_target
-                )
-                for candidate in random_candidates:
-                    if (
-                        candidate.product_id not in exclude_items
-                        and candidate.product_id not in all_candidates
-                    ):
-                        all_candidates[candidate.product_id] = candidate
-                profile["source_counts"]["random"] = len(random_candidates)
-            profile["random_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-
-            # Combine scores for final ranking
-            stage_started = time.perf_counter()
-            final_candidates: List[CandidateProduct] = []
-            for candidate in all_candidates.values():
-                cf_score = candidate.collaborative_score or 0.0
-                content_score = candidate.content_similarity_score or 0.0
-                popularity_score = candidate.popularity_score or 0.0
-
-                combined_score = (
-                    cf_score * self.config.cf_weight
-                    + content_score * self.config.content_weight
-                    + popularity_score * self.config.popularity_weight
-                )
-                candidate.combined_score = combined_score
-                final_candidates.append(candidate)
-
-            # Apply diversity if enabled
-            if self.config.enable_diversity:
-                final_candidates = await self._apply_diversity_filter(final_candidates, context)
-
-            # Sort by combined score
-            final_candidates.sort(key=lambda x: x.combined_score, reverse=True)
-            final_candidates = final_candidates[: self.config.max_total_candidates]
-            profile["score_merge_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-            profile["candidate_count"] = len(final_candidates)
-            profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+            final_candidates = await self._finalize_candidates(
+                all_candidates,
+                context,
+                profile,
+                started_at,
+            )
 
             logger.debug(f"Generated {len(final_candidates)} candidates from multiple sources")
             if include_profile:
@@ -798,21 +1052,9 @@ class RecommendationEngine:
         except Exception as e:
             logger.error(f"Error generating candidates for {user_id}: {e}")
             if include_profile:
-                return [], {
-                    "user_interactions_ms": 0.0,
-                    "user_features_ms": 0.0,
-                    "cf_candidates_ms": 0.0,
-                    "content_candidates_ms": 0.0,
-                    "trending_candidates_ms": 0.0,
-                    "category_pool_ms": 0.0,
-                    "random_candidates_ms": 0.0,
-                    "score_merge_ms": 0.0,
-                    "total_ms": 0.0,
-                    "candidate_count": 0,
-                    "preferred_categories": [],
-                    "source_counts": {},
-                    "error": str(e),
-                }
+                profile = self._new_candidate_profile()
+                profile["error"] = str(e)
+                return [], profile
             return []
 
     async def _apply_diversity_filter(
@@ -926,6 +1168,7 @@ class RecommendationEngine:
             "is_initialized": self.is_initialized,
             "last_model_update": self.last_model_update,
             "cf_trained": self.cf_engine.is_trained,
+            "cf_model_version": self.cf_engine.model_version,
             "cf_users": len(self.cf_engine.user_mapping),
             "cf_items": len(self.cf_engine.item_mapping),
             "cf_embedding_dim": self.config.tt_embedding_dim,

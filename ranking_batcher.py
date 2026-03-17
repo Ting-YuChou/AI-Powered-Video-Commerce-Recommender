@@ -161,28 +161,26 @@ class RankingBatcher:
             total_batch_candidates = 0
 
             for request in batch:
-                feature_matrix, valid_candidates, feature_extraction_ms = (
-                    self.ranking_model.prepare_request_matrix(
-                        request.candidates,
-                        request.user_features,
-                        request.context,
-                        product_metadata_map=request.product_metadata_map,
-                    )
+                prepared_request = self.ranking_model.prepare_request_matrix(
+                    request.candidates,
+                    request.user_features,
+                    request.context,
+                    request.k,
+                    product_metadata_map=request.product_metadata_map,
                 )
                 prepared.append(
                     {
                         "request": request,
-                        "feature_matrix": feature_matrix,
-                        "valid_candidates": valid_candidates,
-                        "feature_extraction_ms": feature_extraction_ms,
+                        "prepared_request": prepared_request,
                     }
                 )
-                if feature_matrix is not None:
-                    feature_matrices.append(feature_matrix)
-                    total_batch_candidates += feature_matrix.shape[0]
+                if prepared_request.feature_matrix is not None:
+                    feature_matrices.append(prepared_request.feature_matrix)
+                    total_batch_candidates += prepared_request.feature_matrix.shape[0]
 
             if not feature_matrices:
                 for item in prepared:
+                    prepared_request = item["prepared_request"]
                     self._set_result(
                         item["request"],
                         [],
@@ -193,12 +191,14 @@ class RankingBatcher:
                             "batch_wait_ms": round(
                                 (batch_started - item["request"].enqueued_at) * 1000, 2
                             ),
-                            "feature_extraction_ms": item["feature_extraction_ms"],
+                            "pre_rank_ms": prepared_request.pre_rank_ms,
+                            "feature_extraction_ms": prepared_request.feature_extraction_ms,
                             "tensor_prep_ms": 0.0,
                             "model_forward_ms": 0.0,
                             "response_build_ms": 0.0,
                             "total_ms": round((time.perf_counter() - batch_started) * 1000, 2),
                             "candidate_count": len(item["request"].candidates),
+                            "rerank_candidate_count": prepared_request.rerank_candidate_count,
                             "ranked_count": 0,
                         },
                     )
@@ -211,7 +211,8 @@ class RankingBatcher:
             offset = 0
             for item in prepared:
                 request = item["request"]
-                feature_matrix = item["feature_matrix"]
+                prepared_request = item["prepared_request"]
+                feature_matrix = prepared_request.feature_matrix
                 if feature_matrix is None:
                     self._set_result(
                         request,
@@ -223,12 +224,14 @@ class RankingBatcher:
                             "batch_wait_ms": round(
                                 (batch_started - request.enqueued_at) * 1000, 2
                             ),
-                            "feature_extraction_ms": item["feature_extraction_ms"],
+                            "pre_rank_ms": prepared_request.pre_rank_ms,
+                            "feature_extraction_ms": prepared_request.feature_extraction_ms,
                             "tensor_prep_ms": inference_profile["tensor_prep_ms"],
                             "model_forward_ms": inference_profile["model_forward_ms"],
                             "response_build_ms": 0.0,
                             "total_ms": round((time.perf_counter() - batch_started) * 1000, 2),
                             "candidate_count": len(request.candidates),
+                            "rerank_candidate_count": prepared_request.rerank_candidate_count,
                             "ranked_count": 0,
                         },
                     )
@@ -242,7 +245,7 @@ class RankingBatcher:
                 offset += size
                 recommendations, response_build_ms = (
                     self.ranking_model.build_recommendations_from_predictions(
-                        item["valid_candidates"],
+                        prepared_request.valid_candidates,
                         request_predictions,
                         request.k,
                     )
@@ -258,12 +261,14 @@ class RankingBatcher:
                             (batch_started - request.enqueued_at) * 1000,
                             2,
                         ),
-                        "feature_extraction_ms": item["feature_extraction_ms"],
+                        "pre_rank_ms": prepared_request.pre_rank_ms,
+                        "feature_extraction_ms": prepared_request.feature_extraction_ms,
                         "tensor_prep_ms": inference_profile["tensor_prep_ms"],
                         "model_forward_ms": inference_profile["model_forward_ms"],
                         "response_build_ms": response_build_ms,
                         "total_ms": round((time.perf_counter() - batch_started) * 1000, 2),
                         "candidate_count": len(request.candidates),
+                        "rerank_candidate_count": prepared_request.rerank_candidate_count,
                         "ranked_count": len(recommendations),
                     },
                 )

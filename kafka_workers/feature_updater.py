@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kafka_client import KafkaConsumerClient, KafkaManager, get_kafka_manager
 from config import Config, KafkaConfig
 from feature_store import FeatureStore
+from two_tower import TwoTowerTrainer
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +50,8 @@ class FeatureUpdaterWorker:
         # Initialize components
         self.feature_store: Optional[FeatureStore] = None
         self.consumer: Optional[KafkaConsumerClient] = None
+        self.user_embedding_trainer: Optional[TwoTowerTrainer] = None
+        self.cf_model_version: Optional[str] = None
         
         # Batch processing settings
         self.batch_size = 100
@@ -68,6 +71,7 @@ class FeatureUpdaterWorker:
         # Initialize feature store (Redis)
         self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
         await self.feature_store.initialize()
+        await self._load_user_embedding_publisher()
         
         # Initialize Kafka consumer
         self.consumer = KafkaConsumerClient(
@@ -82,6 +86,71 @@ class FeatureUpdaterWorker:
         await self.consumer.start([self.kafka_config.user_interactions_topic])
         
         logger.info("Feature updater components initialized successfully")
+
+    async def _load_user_embedding_publisher(self):
+        """Load the local Two-Tower user encoder used for async embedding publish."""
+        if not self.config.recommendation_config.enable_user_embedding_publish:
+            return
+
+        checkpoint_path = self.config.recommendation_config.cf_index_path.replace(".faiss", ".pt")
+        trainer = TwoTowerTrainer(
+            clip_dim=self.config.vector_config.embedding_dim,
+            output_dim=self.config.recommendation_config.tt_embedding_dim,
+            temperature=self.config.recommendation_config.tt_temperature,
+            learning_rate=self.config.recommendation_config.tt_learning_rate,
+            batch_size=self.config.recommendation_config.tt_batch_size,
+            epochs=self.config.recommendation_config.tt_epochs,
+            num_hard_negatives=self.config.recommendation_config.tt_num_hard_negatives,
+            num_random_negatives=self.config.recommendation_config.tt_num_random_negatives,
+            hard_ratio_start=self.config.recommendation_config.tt_hard_negative_ratio_start,
+            hard_ratio_end=self.config.recommendation_config.tt_hard_negative_ratio_end,
+            user_hidden_dims=self.config.recommendation_config.tt_user_hidden_dims,
+            item_hidden_dims=self.config.recommendation_config.tt_item_hidden_dims,
+        )
+        if not trainer.load_checkpoint(checkpoint_path):
+            logger.warning("Feature updater user embedding publisher disabled: checkpoint unavailable")
+            return
+
+        self.user_embedding_trainer = trainer
+        self.cf_model_version = trainer.model_version
+        await self.feature_store.publish_cf_model_version(
+            self.cf_model_version,
+            source="feature_updater",
+            metadata={"process_id": os.getpid()},
+        )
+        trainer_version = await self.feature_store.get_cf_model_version("trainer")
+        if trainer_version and trainer_version.get("model_version") != self.cf_model_version:
+            logger.warning(
+                "feature_updater_cf_model_version_mismatch",
+                extra={
+                    "feature_updater_model_version": self.cf_model_version,
+                    "trainer_model_version": trainer_version.get("model_version"),
+                },
+            )
+
+    async def _publish_user_embedding(self, user_id: str, user_features: Dict[str, Any]) -> bool:
+        """Publish a versioned user embedding after user-feature updates."""
+        if (
+            not self.config.recommendation_config.enable_user_embedding_publish
+            or self.user_embedding_trainer is None
+            or not self.cf_model_version
+        ):
+            return False
+
+        if user_id not in self.user_embedding_trainer.user_mapping:
+            return False
+
+        embedding = self.user_embedding_trainer.encode_user(user_id, user_features)
+        if embedding is None:
+            return False
+
+        await self.feature_store.cache_user_embedding(
+            user_id,
+            self.cf_model_version,
+            embedding,
+            metadata={"source": "feature_updater"},
+        )
+        return True
     
     async def _handle_user_interaction(
         self,
@@ -170,6 +239,10 @@ class FeatureUpdaterWorker:
                 interactions=interactions,
             )
             await self.feature_store.invalidate_user_serving_cache(user_id)
+            user_embedding_published = await self._publish_user_embedding(
+                user_id,
+                updated_features.dict(),
+            )
             
             logger.debug(f"Processed {len(interactions)} interactions for user {user_id}")
             
@@ -183,7 +256,9 @@ class FeatureUpdaterWorker:
                         'interactions_processed': len(interactions),
                         'action_counts': dict(action_counts),
                         'preferred_categories': updated_features.preferred_categories,
-                        'updated_at': time.time()
+                        'updated_at': time.time(),
+                        'user_embedding_published': user_embedding_published,
+                        'cf_model_version': self.cf_model_version,
                     }
                 )
             

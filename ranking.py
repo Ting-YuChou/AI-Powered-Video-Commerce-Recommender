@@ -13,6 +13,7 @@ import torch.optim as optim
 import numpy as np
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
 import json
 import time
@@ -35,6 +36,23 @@ try:
         torch.backends.mkldnn.enabled = False
 except Exception:
     pass
+
+
+@dataclass
+class CachedProductFeatures:
+    feature_vector: np.ndarray
+    created_at: float
+    quality_prior: float
+    signature: Tuple[Any, ...]
+
+
+@dataclass
+class PreparedRankingRequest:
+    feature_matrix: Optional[np.ndarray]
+    valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]]
+    feature_extraction_ms: float
+    pre_rank_ms: float
+    rerank_candidate_count: int
 
 class MultiObjectiveRankingModel(nn.Module):
     """
@@ -183,20 +201,62 @@ class FeatureExtractor:
         ], dtype=np.float32)
         
         return features
-    
-    def extract_product_features(self, product_metadata: Dict[str, Any]) -> np.ndarray:
-        """Extract features from product metadata."""
-        features = np.array([
-            np.log1p(product_metadata.get('price', 1.0)),  # Log price
-            product_metadata.get('rating', 3.0) / 5.0,  # Normalized rating
-            np.log1p(product_metadata.get('num_reviews', 1)),  # Log review count
-            1.0 if product_metadata.get('in_stock', True) else 0.0,  # Stock status
-            (time.time() - product_metadata.get('created_at', time.time())) / 86400,  # Age in days
-            len(product_metadata.get('tags', [])) / 10,  # Tag count normalized
-            1.0 if product_metadata.get('price', 0) > 100 else 0.0,  # Premium product
-            hash(product_metadata.get('brand', '')) % 100 / 100,  # Brand embedding (simple)
+
+    def build_product_feature_signature(self, product_metadata: Dict[str, Any]) -> Tuple[Any, ...]:
+        """Build a compact signature so cached static features can be refreshed when metadata changes."""
+        return (
+            float(product_metadata.get("price", 1.0) or 1.0),
+            float(product_metadata.get("rating", 3.0) or 3.0),
+            int(product_metadata.get("num_reviews", 1) or 1),
+            bool(product_metadata.get("in_stock", True)),
+            float(product_metadata.get("created_at", 0.0) or 0.0),
+            len(product_metadata.get("tags", []) or []),
+            str(product_metadata.get("brand", "") or ""),
+        )
+
+    def prepare_product_features(
+        self,
+        product_metadata: Dict[str, Any],
+    ) -> CachedProductFeatures:
+        """Precompute the static product-side ranking features once per metadata version."""
+        created_at = float(product_metadata.get("created_at", 0.0) or 0.0)
+        rating_score = float(product_metadata.get("rating", 3.0) or 3.0) / 5.0
+        review_score = min(np.log1p(product_metadata.get("num_reviews", 1) or 1) / 5.0, 1.0)
+        in_stock_score = 1.0 if product_metadata.get("in_stock", True) else 0.0
+        premium_score = 1.0 if float(product_metadata.get("price", 0.0) or 0.0) > 100 else 0.0
+        static_features = np.array([
+            np.log1p(product_metadata.get("price", 1.0) or 1.0),
+            rating_score,
+            np.log1p(product_metadata.get("num_reviews", 1) or 1),
+            in_stock_score,
+            0.0,
+            len(product_metadata.get("tags", []) or []) / 10.0,
+            premium_score,
+            hash(product_metadata.get("brand", "") or "") % 100 / 100,
         ], dtype=np.float32)
-        
+        quality_prior = min(
+            rating_score * 0.5 + review_score * 0.25 + in_stock_score * 0.15 + premium_score * 0.1,
+            1.0,
+        )
+        return CachedProductFeatures(
+            feature_vector=static_features,
+            created_at=created_at,
+            quality_prior=quality_prior,
+            signature=self.build_product_feature_signature(product_metadata),
+        )
+
+    def materialize_product_features(
+        self,
+        cached_product_features: CachedProductFeatures,
+        current_time: Optional[float] = None,
+    ) -> np.ndarray:
+        """Build the per-request product vector from cached static features."""
+        current_time = current_time or time.time()
+        features = cached_product_features.feature_vector.copy()
+        if cached_product_features.created_at > 0:
+            features[4] = max((current_time - cached_product_features.created_at) / 86400.0, 0.0)
+        else:
+            features[4] = 30.0
         return features
     
     def extract_context_features(self, context: Dict[str, Any]) -> np.ndarray:
@@ -229,7 +289,7 @@ class FeatureExtractor:
     def create_ranking_features(
         self,
         user_features: UserFeatures,
-        product_metadata: Dict[str, Any],
+        product_features: np.ndarray,
         context: Dict[str, Any],
         candidate: CandidateProduct
     ) -> np.ndarray:
@@ -237,14 +297,13 @@ class FeatureExtractor:
         try:
             # Extract individual feature groups
             user_feats = self.extract_user_features(user_features)
-            product_feats = self.extract_product_features(product_metadata)
             context_feats = self.extract_context_features(context)
             candidate_feats = self.extract_candidate_features(candidate)
             
             # Concatenate all features
             combined_features = np.concatenate([
                 user_feats,
-                product_feats, 
+                product_features,
                 context_feats,
                 candidate_feats
             ])
@@ -267,6 +326,9 @@ class RankingModel:
     def __init__(self, config: RankingConfig):
         self.config = config
         self.feature_extractor = FeatureExtractor()
+        self.enable_cheap_prerank = config.enable_cheap_prerank
+        self.cheap_prerank_top_m = max(1, config.cheap_prerank_top_m)
+        self._product_static_feature_cache: Dict[str, CachedProductFeatures] = {}
         
         # Model components
         self.model: Optional[MultiObjectiveRankingModel] = None
@@ -329,25 +391,99 @@ class RankingModel:
             logger.error(f"Error loading ranking model: {e}")
             raise
 
+    def warm_product_feature_cache(
+        self,
+        product_metadata_map: Dict[str, Dict[str, Any]],
+    ) -> int:
+        """Warm the static product feature cache from a metadata snapshot."""
+        warmed = 0
+        for product_id, metadata in product_metadata_map.items():
+            if not isinstance(metadata, dict):
+                continue
+            self._product_static_feature_cache[product_id] = (
+                self.feature_extractor.prepare_product_features(metadata)
+            )
+            warmed += 1
+        return warmed
+
+    def _get_cached_product_features(
+        self,
+        candidate: CandidateProduct,
+        product_metadata: Dict[str, Any],
+    ) -> CachedProductFeatures:
+        cache_key = candidate.product_id
+        signature = self.feature_extractor.build_product_feature_signature(product_metadata)
+        cached = self._product_static_feature_cache.get(cache_key)
+        if cached is not None and cached.signature == signature:
+            return cached
+
+        cached = self.feature_extractor.prepare_product_features(product_metadata)
+        self._product_static_feature_cache[cache_key] = cached
+        return cached
+
+    def _cheap_score_candidate(
+        self,
+        candidate: CandidateProduct,
+        cached_product_features: CachedProductFeatures,
+    ) -> float:
+        collaborative = candidate.collaborative_score or 0.0
+        content_similarity = candidate.content_similarity_score or 0.0
+        popularity = candidate.popularity_score or 0.0
+        combined = candidate.combined_score or (
+            collaborative * 0.5 + content_similarity * 0.3 + popularity * 0.2
+        )
+        strongest_source = max(collaborative, content_similarity, popularity)
+        return (
+            combined * 0.75
+            + strongest_source * 0.15
+            + cached_product_features.quality_prior * 0.10
+        )
+
     def prepare_request_matrix(
         self,
         candidates: List[CandidateProduct],
         user_features: UserFeatures,
         context: Dict[str, Any],
+        k: int,
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
-    ) -> Tuple[Optional[np.ndarray], List[Tuple[CandidateProduct, Dict[str, Any]]], float]:
+    ) -> PreparedRankingRequest:
         """Prepare a request's ranking feature matrix and candidate metadata."""
+        pre_rank_started = time.perf_counter()
+        product_metadata_map = product_metadata_map or {}
+        cached_entries: List[Tuple[float, CandidateProduct, Dict[str, Any], CachedProductFeatures]] = []
+
+        for candidate in candidates:
+            product_metadata = (
+                product_metadata_map.get(candidate.product_id) or self._build_product_metadata(candidate)
+            )
+            cached_product_features = self._get_cached_product_features(candidate, product_metadata)
+            cheap_score = self._cheap_score_candidate(candidate, cached_product_features)
+            cached_entries.append(
+                (cheap_score, candidate, product_metadata, cached_product_features)
+            )
+
+        rerank_limit = len(cached_entries)
+        if self.enable_cheap_prerank and cached_entries:
+            rerank_limit = min(len(cached_entries), max(k, self.cheap_prerank_top_m))
+            if len(cached_entries) > rerank_limit:
+                cached_entries.sort(key=lambda item: item[0], reverse=True)
+                cached_entries = cached_entries[:rerank_limit]
+        pre_rank_ms = round((time.perf_counter() - pre_rank_started) * 1000, 2)
+
         feature_stage_started = time.perf_counter()
         feature_vectors = []
         valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]] = []
-        product_metadata_map = product_metadata_map or {}
+        current_time = time.time()
 
-        for candidate in candidates:
+        for _, candidate, product_metadata, cached_product_features in cached_entries:
             try:
-                product_metadata = product_metadata_map.get(candidate.product_id) or self._build_product_metadata(candidate)
+                product_features = self.feature_extractor.materialize_product_features(
+                    cached_product_features,
+                    current_time=current_time,
+                )
                 features = self.feature_extractor.create_ranking_features(
                     user_features,
-                    product_metadata,
+                    product_features,
                     context,
                     candidate,
                 )
@@ -362,9 +498,21 @@ class RankingModel:
             (time.perf_counter() - feature_stage_started) * 1000, 2
         )
         if not feature_vectors:
-            return None, [], feature_extraction_ms
+            return PreparedRankingRequest(
+                feature_matrix=None,
+                valid_candidates=[],
+                feature_extraction_ms=feature_extraction_ms,
+                pre_rank_ms=pre_rank_ms,
+                rerank_candidate_count=len(cached_entries),
+            )
 
-        return np.vstack(feature_vectors), valid_candidates, feature_extraction_ms
+        return PreparedRankingRequest(
+            feature_matrix=np.vstack(feature_vectors),
+            valid_candidates=valid_candidates,
+            feature_extraction_ms=feature_extraction_ms,
+            pre_rank_ms=pre_rank_ms,
+            rerank_candidate_count=len(valid_candidates),
+        )
 
     def run_inference_batch(
         self,
@@ -402,8 +550,22 @@ class RankingModel:
         """Convert raw model predictions into ranked recommendation objects."""
         response_stage_started = time.perf_counter()
         recommendations: List[ProductRecommendation] = []
+        if not valid_candidates:
+            return recommendations, 0.0
 
-        for i, (candidate, metadata) in enumerate(valid_candidates):
+        ranking_scores = np.asarray(predictions["ranking_score"])
+        top_k = min(k, len(valid_candidates))
+        if top_k <= 0:
+            return recommendations, 0.0
+
+        if top_k == len(valid_candidates):
+            top_indices = np.argsort(ranking_scores)[::-1]
+        else:
+            top_indices = np.argpartition(ranking_scores, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(ranking_scores[top_indices])[::-1]]
+
+        for i in top_indices:
+            candidate, metadata = valid_candidates[int(i)]
             ctr_score = float(predictions["ctr"][i])
             cvr_score = float(predictions["cvr"][i])
             gmv_score = float(predictions["gmv"][i])
@@ -439,8 +601,7 @@ class RankingModel:
                 )
             )
 
-        recommendations.sort(key=lambda item: item.ranking_score, reverse=True)
-        return recommendations[:k], round(
+        return recommendations, round(
             (time.perf_counter() - response_stage_started) * 1000,
             2,
         )
@@ -454,7 +615,7 @@ class RankingModel:
             "rating": 0.0,
             "num_reviews": 0,
             "in_stock": True,
-            "created_at": time.time(),
+            "created_at": 0.0,
             "tags": [],
             "brand": "Unknown",
         }
@@ -493,12 +654,14 @@ class RankingModel:
             if include_profile:
                 return fallback, {
                     "path": "fallback",
+                    "pre_rank_ms": 0.0,
                     "feature_extraction_ms": 0.0,
                     "tensor_prep_ms": 0.0,
                     "model_forward_ms": 0.0,
                     "response_build_ms": 0.0,
                     "total_ms": 0.0,
                     "candidate_count": len(candidates),
+                    "rerank_candidate_count": 0,
                     "ranked_count": len(fallback),
                 }
             return fallback
@@ -506,36 +669,41 @@ class RankingModel:
         start_time = time.time()
         profile = {
             "path": "torch",
+            "pre_rank_ms": 0.0,
             "feature_extraction_ms": 0.0,
             "tensor_prep_ms": 0.0,
             "model_forward_ms": 0.0,
             "response_build_ms": 0.0,
             "total_ms": 0.0,
             "candidate_count": len(candidates),
+            "rerank_candidate_count": 0,
             "ranked_count": 0,
         }
         
         try:
-            feature_matrix, valid_candidates, feature_extraction_ms = self.prepare_request_matrix(
+            prepared_request = self.prepare_request_matrix(
                 candidates,
                 user_features,
                 context,
+                k,
                 product_metadata_map=product_metadata_map,
             )
-            profile["feature_extraction_ms"] = feature_extraction_ms
+            profile["pre_rank_ms"] = prepared_request.pre_rank_ms
+            profile["feature_extraction_ms"] = prepared_request.feature_extraction_ms
+            profile["rerank_candidate_count"] = prepared_request.rerank_candidate_count
 
-            if feature_matrix is None:
+            if prepared_request.feature_matrix is None:
                 logger.warning("No valid feature vectors created")
                 if include_profile:
                     return [], profile
                 return []
 
-            predictions, inference_profile = self.run_inference_batch(feature_matrix)
+            predictions, inference_profile = self.run_inference_batch(prepared_request.feature_matrix)
             profile["tensor_prep_ms"] = inference_profile["tensor_prep_ms"]
             profile["model_forward_ms"] = inference_profile["model_forward_ms"]
 
             top_recommendations, response_build_ms = self.build_recommendations_from_predictions(
-                valid_candidates,
+                prepared_request.valid_candidates,
                 predictions,
                 k,
             )

@@ -140,6 +140,34 @@ class RecommendationConfig(BaseSettings):
         10,
         description="Maximum random fallback candidates to merge per request",
     )
+    enable_user_embedding_publish: bool = Field(
+        True,
+        description="Publish versioned Two-Tower user embeddings from async workers and consume them in serving",
+    )
+    enable_segment_candidate_precompute: bool = Field(
+        True,
+        description="Precompute cohort-level candidate caches for hot content/page/device/category segments",
+    )
+    segment_candidate_precompute_interval_seconds: int = Field(
+        240,
+        description="Refresh interval for hot segment candidate precompute",
+    )
+    segment_candidate_precompute_max_contents: int = Field(
+        8,
+        description="Maximum recent content ids to include in hot segment candidate precompute",
+    )
+    segment_candidate_precompute_max_categories: int = Field(
+        4,
+        description="Maximum hot categories to include in hot segment candidate precompute",
+    )
+    segment_candidate_precompute_pages: List[str] = Field(
+        ["home", "detail"],
+        description="Pages to include in hot segment candidate precompute",
+    )
+    segment_candidate_precompute_devices: List[str] = Field(
+        ["mobile", "desktop"],
+        description="Devices to include in hot segment candidate precompute",
+    )
     
     # Ranking weights
     cf_weight: float = Field(0.4, description="Collaborative filtering weight")
@@ -171,7 +199,10 @@ class RecommendationConfig(BaseSettings):
     tt_hard_negative_ratio_end: float = Field(0.5, description="Final hard negative ratio (curriculum)")
     
     # CF FAISS index path
-    cf_index_path: str = Field("/tmp/cf_vector_index.faiss", description="CF FAISS index file path")
+    cf_index_path: str = Field(
+        "/app/models/cf_vector_index.faiss",
+        description="CF FAISS index file path",
+    )
     
     class Config:
         env_prefix = "RECOMMENDATION_"
@@ -197,6 +228,14 @@ class RankingConfig(BaseSettings):
     batch_queue_size: int = Field(
         2048,
         description="Maximum queued ranking requests per worker",
+    )
+    enable_cheap_prerank: bool = Field(
+        True,
+        description="Use a cheap scoring stage to reduce neural rerank candidate count",
+    )
+    cheap_prerank_top_m: int = Field(
+        64,
+        description="Maximum candidates to send into the neural reranker after cheap pre-rank",
     )
 
     # Multi-objective settings
@@ -244,6 +283,7 @@ class CacheConfig(BaseSettings):
     content_features_ttl: int = Field(86400, description="Content features cache TTL")
     recommendations_ttl: int = Field(900, description="Recommendations cache TTL")
     candidate_ttl: int = Field(300, description="Candidate cache TTL in seconds")
+    user_embedding_ttl: int = Field(1800, description="Versioned user embedding cache TTL in seconds")
     product_metadata_ttl: int = Field(86400, description="Product metadata cache TTL in seconds")
     serving_pool_ttl: int = Field(1800, description="Serving pool cache TTL in seconds")
     

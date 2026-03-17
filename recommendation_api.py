@@ -21,7 +21,7 @@ from kafka_client import close_kafka, init_kafka
 from models import RecommendationRequest, RecommendationResponse
 from ranking_batcher import RankingBatcher
 from ranking import RankingModel
-from recommender import RecommendationEngine
+from recommender import RecommendationEngine, build_candidate_cache_context
 from service_common import (
     build_health_response,
     build_metrics_response,
@@ -45,23 +45,13 @@ recommendation_engine: Optional[RecommendationEngine] = None
 ranking_model: Optional[RankingModel] = None
 ranking_batcher: Optional[RankingBatcher] = None
 kafka_manager = None
-
-
-def _build_candidate_cache_context(payload: RecommendationRequest, k_per_source: int) -> dict:
-    """Build a coarse retrieval context so candidate cache can be reused."""
-    context = payload.context or {}
-    return {
-        "content_id": payload.content_id,
-        "device": context.get("device"),
-        "page": context.get("page"),
-        "category": context.get("product_category") or context.get("category"),
-        "k_per_source": k_per_source,
-    }
+segment_candidate_precompute_task: Optional[asyncio.Task] = None
 
 
 @app.on_event("startup")
 async def startup_event():
     global feature_store, vector_search, recommendation_engine, ranking_model, ranking_batcher, kafka_manager
+    global segment_candidate_precompute_task
 
     runtime = app.state.runtime
     runtime.config = Config()
@@ -81,9 +71,30 @@ async def startup_event():
         runtime.config.recommendation_config,
     )
     await recommendation_engine.load_serving_state()
+    if recommendation_engine.cf_engine.model_version:
+        await feature_store.publish_cf_model_version(
+            recommendation_engine.cf_engine.model_version,
+            source="recommendation_service",
+            metadata={"process_id": os.getpid()},
+        )
+        trainer_version = await feature_store.get_cf_model_version("trainer")
+        if trainer_version and trainer_version.get("model_version") != recommendation_engine.cf_engine.model_version:
+            logger.warning(
+                "recommendation_service_cf_model_version_mismatch",
+                extra={
+                    "service_model_version": recommendation_engine.cf_engine.model_version,
+                    "trainer_model_version": trainer_version.get("model_version"),
+                },
+            )
+    if runtime.config.recommendation_config.enable_segment_candidate_precompute:
+        segment_candidate_precompute_task = asyncio.create_task(
+            _periodic_segment_candidate_precompute(runtime),
+            name="segment-candidate-precompute",
+        )
 
     ranking_model = RankingModel(runtime.config.ranking_config)
     await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
+    ranking_model.warm_product_feature_cache(vector_search.product_metadata)
     ranking_model.enable_profiling_logs = runtime.config.monitoring_config.enable_profiling_logs
     ranking_model.profiling_log_min_duration_ms = (
         runtime.config.monitoring_config.profiling_log_min_duration_ms
@@ -112,6 +123,15 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global segment_candidate_precompute_task
+
+    if segment_candidate_precompute_task:
+        segment_candidate_precompute_task.cancel()
+        try:
+            await segment_candidate_precompute_task
+        except asyncio.CancelledError:
+            pass
+        segment_candidate_precompute_task = None
     if ranking_batcher:
         await ranking_batcher.close()
     if feature_store:
@@ -159,6 +179,7 @@ async def get_recommendations(
         ),
         "cache_lookup_ms": 0.0,
         "candidate_cache_lookup_ms": 0.0,
+        "segment_candidate_filter_ms": 0.0,
         "content_features_ms": 0.0,
         "user_features_ms": 0.0,
         "candidate_generation_ms": 0.0,
@@ -173,6 +194,8 @@ async def get_recommendations(
         "ranked_count": 0,
         "cache_hit": False,
         "candidate_cache_hit": False,
+        "segment_candidate_cache_hit": False,
+        "segment_candidate_filtered_count": 0,
         "metadata_cache_miss_count": 0,
         "serving_path": "live_candidates_then_rank",
     }
@@ -223,20 +246,64 @@ async def get_recommendations(
         profile["user_features_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
 
         k_per_source = min(payload.k * 10, 500)
-        candidate_cache_key = feature_store.generate_context_hash(
-            _build_candidate_cache_context(payload, k_per_source)
+        candidate_cache_context = build_candidate_cache_context(
+            payload.content_id,
+            payload.context,
+            k_per_source,
+        )
+        candidate_cache_key = feature_store.generate_context_hash(candidate_cache_context)
+        segment_candidate_cache_context = build_candidate_cache_context(
+            payload.content_id,
+            payload.context,
+            runtime.config.recommendation_config.candidates_per_source,
+        )
+        segment_candidate_cache_key = feature_store.generate_context_hash(
+            segment_candidate_cache_context
         )
         stage_started = time.perf_counter()
         candidates = await feature_store.get_cached_candidate_products(
             payload.user_id,
             candidate_cache_key,
         )
-        profile["candidate_cache_lookup_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-        candidate_profile = {"path": "candidate_cache", "candidate_count": len(candidates or [])}
+        candidate_profile = {"path": "user_candidate_cache", "candidate_count": len(candidates or [])}
         if candidates is not None:
             profile["candidate_cache_hit"] = True
-            profile["serving_path"] = "candidate_cache_then_rank"
+            profile["serving_path"] = "user_candidate_cache_then_rank"
         else:
+            segment_candidates = await feature_store.get_cached_segment_candidate_products(
+                segment_candidate_cache_key,
+            )
+            if segment_candidates is not None:
+                profile["segment_candidate_cache_hit"] = True
+                stage_started_filter = time.perf_counter()
+                user_interactions = await feature_store.get_user_interactions(
+                    payload.user_id,
+                    limit=200,
+                )
+                exclude_items = {interaction["product_id"] for interaction in user_interactions}
+                filtered_segment_candidates = [
+                    candidate
+                    for candidate in segment_candidates
+                    if candidate.product_id not in exclude_items
+                ]
+                profile["segment_candidate_filter_ms"] = round(
+                    (time.perf_counter() - stage_started_filter) * 1000,
+                    2,
+                )
+                profile["segment_candidate_filtered_count"] = len(filtered_segment_candidates)
+                candidate_profile = {
+                    "path": "segment_candidate_cache",
+                    "segment_candidate_count": len(segment_candidates),
+                    "candidate_count": len(filtered_segment_candidates),
+                }
+                if filtered_segment_candidates:
+                    candidates = filtered_segment_candidates
+                    profile["candidate_cache_hit"] = True
+                    profile["serving_path"] = "segment_candidate_cache_then_rank"
+                else:
+                    candidate_profile["path"] = "segment_candidate_cache_filtered_empty"
+        profile["candidate_cache_lookup_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+        if candidates is None:
             stage_started = time.perf_counter()
             candidates, candidate_profile = await recommendation_engine.generate_candidates(
                 user_id=payload.user_id,
@@ -288,6 +355,7 @@ async def get_recommendations(
                     fetched_metadata[product_id] = metadata
             if fetched_metadata:
                 await feature_store.store_product_metadata_batch(fetched_metadata)
+                ranking_model.warm_product_feature_cache(fetched_metadata)
                 product_metadata_map.update(fetched_metadata)
             profile["metadata_cache_miss_count"] = len(missing_product_ids) - len(fetched_metadata)
         profile["metadata_lookup_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
@@ -397,6 +465,23 @@ def _attach_profile_headers(response: Response, profile: dict) -> None:
     response.headers["X-Recommendation-Total-Ms"] = str(profile["total_ms"])
     response.headers["X-Torch-Num-Threads"] = str(profile["torch_num_threads"])
     response.headers["X-Torch-Num-Interop-Threads"] = str(profile["torch_num_interop_threads"])
+
+
+async def _periodic_segment_candidate_precompute(runtime) -> None:
+    interval_seconds = max(
+        1,
+        int(runtime.config.recommendation_config.segment_candidate_precompute_interval_seconds),
+    )
+    while True:
+        try:
+            if recommendation_engine:
+                await recommendation_engine.precompute_segment_candidate_cache()
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error(f"Periodic segment candidate precompute failed: {exc}")
+            await asyncio.sleep(min(interval_seconds, 60))
 
 
 def _configure_torch_runtime(runtime) -> None:

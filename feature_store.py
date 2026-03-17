@@ -57,17 +57,21 @@ class FeatureStore:
             'user_interactions': 'ui:',
             'recommendations_cache': 'rc:',
             'candidate_cache': 'cc:',
+            'user_embedding': 'ue:',
             'product_metadata': 'pm:',
             'system_metrics': 'sm:',
             'trending_products': 'tp:',
             'category_pool': 'cp:',
             'product_embeddings': 'pe:',
+            'cf_model_version': 'cfmv:',
             'analytics': 'analytics:',
             'health': 'health:'
         }
         self._product_metadata_memory_cache: Dict[str, Dict[str, Any]] = {}
         self._trending_pool_memory_cache: Dict[str, List[CandidateProduct]] = {}
         self._category_pool_memory_cache: Dict[str, List[CandidateProduct]] = {}
+        self._segment_candidate_memory_cache: Dict[str, List[CandidateProduct]] = {}
+        self._user_embedding_memory_cache: Dict[str, np.ndarray] = {}
         
         logger.info("FeatureStore initialized")
     
@@ -344,6 +348,42 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error getting content processed time for {content_id}: {e}")
             return None
+
+    async def list_recent_content_ids(self, limit: int = 10) -> List[str]:
+        """List the most recently completed content ids seen in the feature store."""
+        try:
+            status_keys: List[Union[str, bytes]] = []
+            async for key in self.redis_client.scan_iter(
+                match=f"{self.prefixes['content_status']}*",
+                count=500,
+            ):
+                status_keys.append(key)
+
+            if not status_keys:
+                return []
+
+            values = await self.redis_client.mget(status_keys)
+            ranked_content: List[tuple[float, str]] = []
+            prefix = self.prefixes["content_status"]
+
+            for key, value in zip(status_keys, values):
+                if not value:
+                    continue
+                try:
+                    status_data = json.loads(value.decode() if isinstance(value, bytes) else value)
+                except Exception:
+                    continue
+                if status_data.get("status") != "completed":
+                    continue
+                key_text = key.decode() if isinstance(key, bytes) else key
+                content_id = key_text[len(prefix):] if key_text.startswith(prefix) else key_text
+                ranked_content.append((float(status_data.get("updated_at", 0.0) or 0.0), content_id))
+
+            ranked_content.sort(key=lambda item: item[0], reverse=True)
+            return [content_id for _, content_id in ranked_content[:limit]]
+        except Exception as e:
+            logger.error(f"Error listing recent content ids: {e}")
+            return []
     
     # Interaction Logging
     async def log_user_interaction(
@@ -591,18 +631,17 @@ class FeatureStore:
             if not self.cache_config.enable_caching:
                 return
 
-            key = f"{self.prefixes['candidate_cache']}{user_id}:{context_hash}"
             user_features = await self.get_user_features(user_id)
             ttl = min(
                 self._calculate_adaptive_ttl(user_features),
                 self.cache_config.candidate_ttl,
             )
-            payload = {
-                "candidates": [candidate.dict() for candidate in candidates],
-                "cached_at": time.time(),
-                "user_id": user_id,
-            }
-            await self.redis_client.setex(key, ttl, pickle.dumps(payload))
+            await self._cache_candidate_payload(
+                owner_key=user_id,
+                context_hash=context_hash,
+                candidates=candidates,
+                ttl=ttl,
+            )
         except Exception as e:
             logger.error(f"Error caching candidates for {user_id}: {e}")
 
@@ -616,16 +655,205 @@ class FeatureStore:
             if not self.cache_config.enable_caching:
                 return None
 
-            key = f"{self.prefixes['candidate_cache']}{user_id}:{context_hash}"
-            cached_data = await self.redis_client.get(key)
-            if not cached_data:
-                return None
-
-            cache_data = pickle.loads(cached_data)
-            return [CandidateProduct(**item) for item in cache_data.get("candidates", [])]
+            return await self._get_cached_candidate_payload(
+                owner_key=user_id,
+                context_hash=context_hash,
+            )
         except Exception as e:
             logger.error(f"Error getting cached candidates for {user_id}: {e}")
             return None
+
+    async def cache_segment_candidate_products(
+        self,
+        context_hash: str,
+        candidates: List[CandidateProduct],
+        ttl: Optional[int] = None,
+    ):
+        """Cache precomputed candidate products for a shared cohort/segment context."""
+        try:
+            if not self.cache_config.enable_caching:
+                return
+            await self._cache_candidate_payload(
+                owner_key="segment",
+                context_hash=context_hash,
+                candidates=candidates,
+                ttl=ttl or self.cache_config.candidate_ttl,
+            )
+            self._segment_candidate_memory_cache[context_hash] = list(candidates)
+        except Exception as e:
+            logger.error(f"Error caching segment candidates for {context_hash}: {e}")
+
+    async def get_cached_segment_candidate_products(
+        self,
+        context_hash: str,
+    ) -> Optional[List[CandidateProduct]]:
+        """Return cached candidate products for a shared cohort/segment context."""
+        try:
+            if not self.cache_config.enable_caching:
+                return None
+
+            cached = self._segment_candidate_memory_cache.get(context_hash)
+            if cached is not None:
+                return list(cached)
+
+            candidates = await self._get_cached_candidate_payload(
+                owner_key="segment",
+                context_hash=context_hash,
+            )
+            if candidates is not None:
+                self._segment_candidate_memory_cache[context_hash] = list(candidates)
+            return candidates
+        except Exception as e:
+            logger.error(f"Error getting cached segment candidates for {context_hash}: {e}")
+            return None
+
+    async def _cache_candidate_payload(
+        self,
+        owner_key: str,
+        context_hash: str,
+        candidates: List[CandidateProduct],
+        ttl: int,
+    ):
+        key = f"{self.prefixes['candidate_cache']}{owner_key}:{context_hash}"
+        payload = {
+            "candidates": [candidate.dict() for candidate in candidates],
+            "cached_at": time.time(),
+            "owner_key": owner_key,
+        }
+        await self.redis_client.setex(key, ttl, pickle.dumps(payload))
+
+    async def _get_cached_candidate_payload(
+        self,
+        owner_key: str,
+        context_hash: str,
+    ) -> Optional[List[CandidateProduct]]:
+        key = f"{self.prefixes['candidate_cache']}{owner_key}:{context_hash}"
+        cached_data = await self.redis_client.get(key)
+        if not cached_data:
+            return None
+
+        cache_data = pickle.loads(cached_data)
+        return [CandidateProduct(**item) for item in cache_data.get("candidates", [])]
+
+    async def publish_cf_model_version(
+        self,
+        model_version: str,
+        source: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Publish a CF model version record for a producer/consumer component."""
+        try:
+            if not model_version or not source:
+                return
+
+            key = f"{self.prefixes['cf_model_version']}{source}"
+            payload = {
+                "model_version": model_version,
+                "source": source,
+                "updated_at": time.time(),
+                "metadata": metadata or {},
+            }
+            await self.redis_client.set(key, json.dumps(payload))
+        except Exception as e:
+            logger.error(f"Error publishing CF model version for {source}: {e}")
+
+    async def get_cf_model_version(
+        self,
+        source: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Get a published CF model version record for a component."""
+        try:
+            key = f"{self.prefixes['cf_model_version']}{source}"
+            raw = await self.redis_client.get(key)
+            if not raw:
+                return None
+            return json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception as e:
+            logger.error(f"Error getting CF model version for {source}: {e}")
+            return None
+
+    async def cache_user_embedding(
+        self,
+        user_id: str,
+        model_version: str,
+        embedding: np.ndarray,
+        ttl: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Cache a versioned user embedding for CF retrieval."""
+        try:
+            if not model_version:
+                return
+
+            emb = np.asarray(embedding, dtype=np.float32)
+            cache_key = self._build_user_embedding_cache_key(user_id, model_version)
+            payload = {
+                "user_id": user_id,
+                "model_version": model_version,
+                "embedding": emb,
+                "cached_at": time.time(),
+                "metadata": metadata or {},
+            }
+            self._user_embedding_memory_cache[cache_key] = emb
+            await self.redis_client.setex(
+                f"{self.prefixes['user_embedding']}{cache_key}",
+                ttl or self.cache_config.user_embedding_ttl,
+                pickle.dumps(payload),
+            )
+        except Exception as e:
+            logger.error(f"Error caching user embedding for {user_id}@{model_version}: {e}")
+
+    async def get_cached_user_embedding(
+        self,
+        user_id: str,
+        model_version: str,
+    ) -> Optional[np.ndarray]:
+        """Get a versioned cached user embedding."""
+        try:
+            if not model_version:
+                return None
+
+            cache_key = self._build_user_embedding_cache_key(user_id, model_version)
+            cached = self._user_embedding_memory_cache.get(cache_key)
+            if cached is not None:
+                return np.array(cached, dtype=np.float32, copy=True)
+
+            raw = await self.redis_client.get(f"{self.prefixes['user_embedding']}{cache_key}")
+            if not raw:
+                return None
+
+            payload = pickle.loads(raw)
+            emb = np.asarray(payload.get("embedding"), dtype=np.float32)
+            self._user_embedding_memory_cache[cache_key] = emb
+            return np.array(emb, dtype=np.float32, copy=True)
+        except Exception as e:
+            logger.error(f"Error getting cached user embedding for {user_id}@{model_version}: {e}")
+            return None
+
+    async def invalidate_user_embeddings(
+        self,
+        user_id: str,
+        model_version: Optional[str] = None,
+    ):
+        """Invalidate versioned cached user embeddings for a user."""
+        try:
+            if model_version:
+                cache_key = self._build_user_embedding_cache_key(user_id, model_version)
+                self._user_embedding_memory_cache.pop(cache_key, None)
+                await self.redis_client.delete(f"{self.prefixes['user_embedding']}{cache_key}")
+                return
+
+            pattern = f"{self.prefixes['user_embedding']}*:{user_id}"
+            await self._delete_matching_keys([pattern])
+            suffix = f":{user_id}"
+            for cache_key in list(self._user_embedding_memory_cache.keys()):
+                if cache_key.endswith(suffix):
+                    self._user_embedding_memory_cache.pop(cache_key, None)
+        except Exception as e:
+            logger.error(f"Error invalidating user embeddings for {user_id}: {e}")
+
+    def _build_user_embedding_cache_key(self, user_id: str, model_version: str) -> str:
+        return f"{model_version}:{user_id}"
 
     async def store_product_metadata(
         self,
@@ -836,6 +1064,7 @@ class FeatureStore:
             ]
 
             await self._delete_matching_keys(patterns)
+            await self.invalidate_user_embeddings(user_id)
             
             logger.info(f"Invalidated cache for user {user_id}")
             
@@ -850,6 +1079,7 @@ class FeatureStore:
                 f"{self.prefixes['candidate_cache']}{user_id}:*",
             ]
             await self._delete_matching_keys(patterns)
+            await self.invalidate_user_embeddings(user_id)
         except Exception as e:
             logger.error(f"Error invalidating serving cache for {user_id}: {e}")
     
