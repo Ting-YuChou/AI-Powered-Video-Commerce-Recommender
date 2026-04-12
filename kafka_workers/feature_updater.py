@@ -15,6 +15,7 @@ import logging
 import signal
 import sys
 import os
+import socket
 from collections import defaultdict
 from typing import Dict, Any, Optional, List
 import time
@@ -25,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kafka_client import KafkaConsumerClient, KafkaManager, get_kafka_manager
 from config import Config, KafkaConfig
 from feature_store import FeatureStore
+from system_store import SystemStore
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +50,7 @@ class FeatureUpdaterWorker:
         
         # Initialize components
         self.feature_store: Optional[FeatureStore] = None
+        self.system_store: Optional[SystemStore] = None
         self.consumer: Optional[KafkaConsumerClient] = None
         
         # Batch processing settings
@@ -58,6 +61,8 @@ class FeatureUpdaterWorker:
         
         self.is_running = False
         self._shutdown_event = asyncio.Event()
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self.instance_id = f"feature-worker-{socket.gethostname()}-{os.getpid()}"
         
         logger.info("FeatureUpdaterWorker initialized")
     
@@ -68,6 +73,10 @@ class FeatureUpdaterWorker:
         # Initialize feature store (Redis)
         self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
         await self.feature_store.initialize()
+
+        if self.config.database_config.enable:
+            self.system_store = SystemStore(self.config.database_config)
+            await self.system_store.initialize()
         
         # Initialize Kafka consumer
         self.consumer = KafkaConsumerClient(
@@ -109,10 +118,15 @@ class FeatureUpdaterWorker:
         
         # Add to pending updates
         self._pending_updates[user_id].append({
+            'event_id': value.get('event_id'),
+            'schema_version': value.get('schema_version', 1),
+            'request_id': value.get('request_id'),
             'product_id': product_id,
             'action': action,
             'context': context,
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'occurred_at': value.get('occurred_at', timestamp),
+            'user_id': user_id,
         })
         
         # Check if we should flush
@@ -154,6 +168,8 @@ class FeatureUpdaterWorker:
             interactions: List of interactions to process
         """
         try:
+            if self.system_store:
+                await self.system_store.record_interaction_events_batch(interactions)
             await self.feature_store.log_user_interactions_batch(user_id, interactions)
 
             # Aggregate stats for batch update
@@ -184,7 +200,8 @@ class FeatureUpdaterWorker:
                         'action_counts': dict(action_counts),
                         'preferred_categories': updated_features.preferred_categories,
                         'updated_at': time.time()
-                    }
+                    },
+                    request_id=interactions[-1].get("request_id"),
                 )
             
         except Exception as e:
@@ -196,6 +213,22 @@ class FeatureUpdaterWorker:
             await asyncio.sleep(self.batch_timeout_seconds)
             if self._pending_updates:
                 await self._flush_pending_updates()
+
+    async def _publish_heartbeat(self):
+        """Publish worker liveness into Redis for readiness checks."""
+        interval = self.config.monitoring_config.worker_heartbeat_interval_seconds
+        ttl = self.config.monitoring_config.worker_heartbeat_ttl_seconds
+        while self.is_running:
+            try:
+                await self.feature_store.write_service_heartbeat(
+                    "feature-worker",
+                    self.instance_id,
+                    ttl,
+                    {"pid": os.getpid()},
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to publish feature worker heartbeat: {exc}")
+            await asyncio.sleep(interval)
     
     async def run(self):
         """Run the feature updater worker."""
@@ -205,6 +238,7 @@ class FeatureUpdaterWorker:
         try:
             # Start periodic flush task
             flush_task = asyncio.create_task(self._periodic_flush())
+            self._heartbeat_task = asyncio.create_task(self._publish_heartbeat())
             
             # Start consuming messages
             consume_task = asyncio.create_task(self.consumer.consume())
@@ -242,9 +276,18 @@ class FeatureUpdaterWorker:
         
         if self.consumer:
             await self.consumer.stop()
-        
+
         if self.feature_store:
             await self.feature_store.close()
+        if self.system_store:
+            await self.system_store.close()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
         
         self._shutdown_event.set()
         logger.info("Feature updater worker shutdown complete")

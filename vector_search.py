@@ -496,7 +496,71 @@ class VectorSearchEngine:
         except Exception as e:
             logger.error(f"Error getting random products: {e}")
             return []
-    
+
+    # ------------------------------------------------------------------
+    # CF Index helpers (for Two-Tower retrieval)
+    # ------------------------------------------------------------------
+
+    def create_cf_index(self, embedding_dim: int = 128) -> faiss.Index:
+        """Create a FAISS HNSW index for Two-Tower CF embeddings."""
+        index = faiss.IndexHNSWFlat(embedding_dim, self.config.hnsw_m)
+        index.hnsw.efConstruction = self.config.hnsw_ef_construction
+        index.hnsw.efSearch = self.config.hnsw_ef_search
+        logger.info(f"Created CF FAISS index (dim={embedding_dim}, M={self.config.hnsw_m})")
+        return index
+
+    @staticmethod
+    def save_cf_index(index: faiss.Index, path: str, metadata: Dict[str, Any] = None):
+        """Persist a CF FAISS index and optional metadata to disk."""
+        try:
+            index_path = Path(path)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            faiss.write_index(index, str(index_path))
+
+            if metadata:
+                meta_path = index_path.with_suffix('.cf_meta.json')
+                with open(meta_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+
+            logger.info(f"Saved CF index ({index.ntotal} vectors) to {path}")
+        except Exception as e:
+            logger.error(f"Error saving CF index: {e}")
+
+    @staticmethod
+    def load_cf_index(path: str) -> Optional[Tuple[faiss.Index, Dict[str, Any]]]:
+        """Load a CF FAISS index and its metadata from disk."""
+        try:
+            index_path = Path(path)
+            if not index_path.exists():
+                return None
+
+            index = faiss.read_index(str(index_path))
+            metadata: Dict[str, Any] = {}
+            meta_path = index_path.with_suffix('.cf_meta.json')
+            if meta_path.exists():
+                with open(meta_path, 'r') as f:
+                    metadata = json.load(f)
+
+            logger.info(f"Loaded CF index ({index.ntotal} vectors) from {path}")
+            return index, metadata
+        except Exception as e:
+            logger.error(f"Error loading CF index: {e}")
+            return None
+
+    def get_product_embedding(self, product_id: str) -> Optional[np.ndarray]:
+        """Get a product's CLIP embedding vector."""
+        emb = self.product_embeddings.get(product_id)
+        if emb is not None:
+            return np.array(emb, dtype=np.float32)
+        return None
+
+    def get_all_product_embeddings(self) -> Dict[str, np.ndarray]:
+        """Get all product CLIP embeddings."""
+        return {
+            pid: np.array(emb, dtype=np.float32)
+            for pid, emb in self.product_embeddings.items()
+        }
+
     def get_stats(self) -> Dict[str, Any]:
         """Get search engine statistics."""
         return {

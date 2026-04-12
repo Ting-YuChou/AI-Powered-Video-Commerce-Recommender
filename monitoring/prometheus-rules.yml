@@ -1,0 +1,90 @@
+groups:
+  - name: video-commerce-slo
+    rules:
+      - record: job:video_commerce_gateway_5xx_rate:5m
+        expr: |
+          sum(rate(video_commerce_http_requests_total{job="gateway-api",status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(video_commerce_http_requests_total{job="gateway-api"}[5m])), 1)
+
+      - alert: GatewayErrorBudgetBurn
+        expr: job:video_commerce_gateway_5xx_rate:5m > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: Gateway 5xx rate is above the 5% error budget burn threshold
+          description: The gateway has exceeded the 5xx error budget for at least 10 minutes.
+
+      - alert: GatewayP95LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(video_commerce_http_request_duration_seconds_bucket{job="gateway-api"}[5m])
+            )
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: Gateway p95 latency is above 1 second
+          description: The gateway p95 latency has stayed above 1 second for 10 minutes.
+
+  - name: video-commerce-dependencies
+    rules:
+      - alert: GatewayUnavailable
+        expr: up{job="gateway-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Gateway API is unavailable
+          description: Prometheus has failed to scrape the gateway for more than 2 minutes.
+
+      - alert: RecommendationServiceUnavailable
+        expr: up{job="recommendation-service"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Recommendation service is unavailable
+          description: The recommendation service scrape target is down.
+
+      - alert: InteractionIngestServiceUnavailable
+        expr: up{job="interaction-ingest-service"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Interaction ingest service is unavailable
+          description: The interaction ingest service scrape target is down.
+
+      - alert: WorkerHeartbeatMissing
+        expr: video_commerce_worker_live_instances < 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Background worker heartbeat missing
+          description: A worker service has reported zero live instances for more than 2 minutes.
+
+      - alert: KafkaProducerDisconnected
+        expr: max(video_commerce_kafka_producer_connected) < 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Kafka producer is disconnected
+          description: The gateway Kafka producer has not been connected for at least 5 minutes.
+
+      - alert: RedisMemoryHigh
+        expr: max(video_commerce_redis_used_memory_bytes) > 8e8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Redis memory usage is above 800MB
+          description: Redis memory use has exceeded the configured warning threshold.

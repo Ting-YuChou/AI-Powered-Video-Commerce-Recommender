@@ -8,6 +8,7 @@ content-based matching, and trending/popularity algorithms to generate diverse
 candidate products.
 """
 
+import asyncio
 import numpy as np
 import faiss
 import logging
@@ -121,7 +122,8 @@ class TwoTowerRetrievalEngine:
                     self._item_popularity[pid] += interaction_weights.get(action, 1.0)
 
             # Prepare data
-            self.trainer.prepare(
+            await asyncio.to_thread(
+                self.trainer.prepare,
                 interactions=interactions,
                 product_metadata=product_metadata,
                 product_clip_embeddings=product_clip_embeddings,
@@ -132,15 +134,18 @@ class TwoTowerRetrievalEngine:
             existing_index = self.cf_index
             checkpoint_path = self.config.cf_index_path.replace(".faiss", ".pt")
             if Path(checkpoint_path).exists():
-                self.trainer.load_checkpoint(checkpoint_path)
+                await asyncio.to_thread(self.trainer.load_checkpoint, checkpoint_path)
 
             # Run training
             start_time = time.time()
-            stats = self.trainer.train(existing_cf_index=existing_index)
+            stats = await asyncio.to_thread(
+                self.trainer.train,
+                existing_cf_index=existing_index,
+            )
             training_time = time.time() - start_time
 
             # Build FAISS index from trained item embeddings
-            self.cf_index, idx_map = self.trainer.build_item_index()
+            self.cf_index, idx_map = await asyncio.to_thread(self.trainer.build_item_index)
 
             # Build reverse mapping: faiss_idx -> product_id
             self.cf_index_map = {}
@@ -154,11 +159,12 @@ class TwoTowerRetrievalEngine:
             self.item_mapping = dict(self.trainer.item_mapping)
 
             # Save checkpoint and index
-            self.trainer.save_checkpoint(checkpoint_path)
-            VectorSearchEngine.save_cf_index(
+            await asyncio.to_thread(self.trainer.save_checkpoint, checkpoint_path)
+            await asyncio.to_thread(
+                VectorSearchEngine.save_cf_index,
                 self.cf_index,
                 self.config.cf_index_path,
-                metadata={
+                {
                     "num_items": len(self.item_mapping),
                     "embedding_dim": self.config.tt_embedding_dim,
                     "index_map": {str(k): v for k, v in self.cf_index_map.items()},

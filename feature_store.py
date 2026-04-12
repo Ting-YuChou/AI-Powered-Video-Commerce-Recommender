@@ -9,7 +9,6 @@ and intelligent caching strategies for optimal performance.
 
 import redis.asyncio as redis
 import json
-import pickle
 import time
 import asyncio
 import logging
@@ -25,6 +24,13 @@ from models import (
     ContentFeatures,
     InteractionType,
     SystemMetrics,
+)
+from cache_codec import (
+    CacheDecodeError,
+    json_dumps,
+    json_loads,
+    pack_cache_payload,
+    unpack_cache_payload,
 )
 from config import RedisConfig, CacheConfig
 
@@ -116,7 +122,7 @@ class FeatureStore:
             cached_data = await self.redis_client.get(key)
             
             if cached_data:
-                data = pickle.loads(cached_data)
+                data = unpack_cache_payload(cached_data, "user_features")
                 return UserFeatures(**data)
             else:
                 # Return default user features
@@ -144,7 +150,7 @@ class FeatureStore:
         """Set user features in cache."""
         try:
             key = f"{self.prefixes['user_features']}{user_id}"
-            data = pickle.dumps(features.dict())
+            data = pack_cache_payload("user_features", features.dict())
             
             # Use adaptive TTL based on user activity
             ttl = self._calculate_adaptive_ttl(features)
@@ -164,7 +170,11 @@ class FeatureStore:
             for user_id, features in features_map.items():
                 key = f"{self.prefixes['user_features']}{user_id}"
                 ttl = self._calculate_adaptive_ttl(features)
-                pipeline.setex(key, ttl, pickle.dumps(features.dict()))
+                pipeline.setex(
+                    key,
+                    ttl,
+                    pack_cache_payload("user_features", features.dict()),
+                )
             await pipeline.execute()
         except Exception as e:
             logger.error(f"Error batch-setting user features: {e}")
@@ -263,7 +273,7 @@ class FeatureStore:
         """Store content features in cache."""
         try:
             key = f"{self.prefixes['content_features']}{content_id}"
-            data = pickle.dumps(features.dict())
+            data = pack_cache_payload("content_features", features.dict())
             
             await self.redis_client.setex(
                 key, 
@@ -286,7 +296,7 @@ class FeatureStore:
             cached_data = await self.redis_client.get(key)
             
             if cached_data:
-                data = pickle.loads(cached_data)
+                data = unpack_cache_payload(cached_data, "content_features")
                 return ContentFeatures(**data)
             
             return None
@@ -307,7 +317,7 @@ class FeatureStore:
             await self.redis_client.setex(
                 key, 
                 86400,  # 24 hours
-                json.dumps(status_data)
+                json_dumps(status_data)
             )
             
         except Exception as e:
@@ -320,7 +330,7 @@ class FeatureStore:
             data = await self.redis_client.get(key)
             
             if data:
-                status_data = json.loads(data.decode())
+                status_data = json_loads(data)
                 return status_data.get('status')
             
             return None
@@ -336,7 +346,7 @@ class FeatureStore:
             data = await self.redis_client.get(key)
             
             if data:
-                status_data = json.loads(data.decode())
+                status_data = json_loads(data)
                 return status_data.get('updated_at')
             
             return None
@@ -428,29 +438,6 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error batch-logging interactions for {user_id}: {e}")
 
-    async def enqueue_user_interaction(
-        self,
-        user_id: str,
-        product_id: str,
-        action: str,
-        context: Dict[str, Any] = None,
-        timestamp: Optional[float] = None,
-    ) -> str:
-        """Persist an interaction into a Redis stream for async downstream processing."""
-        try:
-            stream_key = "interaction_stream"
-            payload = {
-                "user_id": user_id,
-                "product_id": product_id,
-                "action": action,
-                "context": json.dumps(context or {}),
-                "timestamp": str(timestamp or time.time()),
-            }
-            return await self.redis_client.xadd(stream_key, payload, maxlen=100000, approximate=True)
-        except Exception as e:
-            logger.error(f"Error enqueueing interaction to Redis stream: {e}")
-            raise
-    
     async def get_user_interactions(self, user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         """Get recent user interactions."""
         try:
@@ -538,7 +525,7 @@ class FeatureStore:
             pipeline.setex(
                 f"{self.prefixes['user_features']}{user_id}",
                 ttl,
-                pickle.dumps(features.dict()),
+                pack_cache_payload("user_features", features.dict()),
             )
             for stat_name, stat_value in stats.items():
                 pipeline.setex(f"user_stats:{user_id}:{stat_name}", 86400 * 7, str(stat_value))
@@ -574,7 +561,7 @@ class FeatureStore:
             await self.redis_client.setex(
                 key, 
                 min(ttl, self.cache_config.recommendations_ttl),
-                pickle.dumps(cache_data)
+                pack_cache_payload("recommendations_cache", cache_data)
             )
             
         except Exception as e:
@@ -602,7 +589,11 @@ class FeatureStore:
                 "cached_at": time.time(),
                 "user_id": user_id,
             }
-            await self.redis_client.setex(key, ttl, pickle.dumps(payload))
+            await self.redis_client.setex(
+                key,
+                ttl,
+                pack_cache_payload("candidate_cache", payload),
+            )
         except Exception as e:
             logger.error(f"Error caching candidates for {user_id}: {e}")
 
@@ -621,9 +612,9 @@ class FeatureStore:
             if not cached_data:
                 return None
 
-            cache_data = pickle.loads(cached_data)
+            cache_data = unpack_cache_payload(cached_data, "candidate_cache")
             return [CandidateProduct(**item) for item in cache_data.get("candidates", [])]
-        except Exception as e:
+        except (Exception, CacheDecodeError) as e:
             logger.error(f"Error getting cached candidates for {user_id}: {e}")
             return None
 
@@ -651,7 +642,7 @@ class FeatureStore:
                 pipeline.setex(
                     key,
                     self.cache_config.product_metadata_ttl,
-                    json.dumps(metadata),
+                    json_dumps(metadata),
                 )
             await pipeline.execute()
         except Exception as e:
@@ -691,7 +682,7 @@ class FeatureStore:
                     if not value:
                         continue
                     try:
-                        decoded = json.loads(value.decode() if isinstance(value, bytes) else value)
+                        decoded = json_loads(value)
                         metadata_map[product_id] = decoded
                         self._product_metadata_memory_cache[product_id] = decoded
                     except Exception:
@@ -715,7 +706,7 @@ class FeatureStore:
             await self.redis_client.setex(
                 key,
                 self.cache_config.serving_pool_ttl,
-                pickle.dumps(payload),
+                pack_cache_payload("trending_pool", payload),
             )
         except Exception as e:
             logger.error(f"Error storing trending pool {pool_name}: {e}")
@@ -734,7 +725,7 @@ class FeatureStore:
                 key = f"{self.prefixes['trending_products']}{pool_name}"
                 raw = await self.redis_client.get(key)
                 if raw:
-                    payload = pickle.loads(raw)
+                    payload = unpack_cache_payload(raw, "trending_pool")
                     cached = [CandidateProduct(**item) for item in payload]
                     self._trending_pool_memory_cache[pool_name] = cached
                 else:
@@ -745,7 +736,7 @@ class FeatureStore:
                 for candidate in cached
                 if candidate.product_id not in exclude_items
             ][:limit]
-        except Exception as e:
+        except (Exception, CacheDecodeError) as e:
             logger.error(f"Error getting trending pool {pool_name}: {e}")
             return []
 
@@ -768,7 +759,7 @@ class FeatureStore:
                 pipeline.setex(
                     key,
                     self.cache_config.serving_pool_ttl,
-                    pickle.dumps(payload),
+                    pack_cache_payload("category_pool", payload),
                 )
             await pipeline.execute()
         except Exception as e:
@@ -788,7 +779,7 @@ class FeatureStore:
                 key = f"{self.prefixes['category_pool']}{category}"
                 raw = await self.redis_client.get(key)
                 if raw:
-                    payload = pickle.loads(raw)
+                    payload = unpack_cache_payload(raw, "category_pool")
                     cached = [CandidateProduct(**item) for item in payload]
                     self._category_pool_memory_cache[category] = cached
                 else:
@@ -799,7 +790,7 @@ class FeatureStore:
                 for candidate in cached
                 if candidate.product_id not in exclude_items
             ][:limit]
-        except Exception as e:
+        except (Exception, CacheDecodeError) as e:
             logger.error(f"Error getting category pool {category}: {e}")
             return []
     
@@ -817,12 +808,12 @@ class FeatureStore:
             cached_data = await self.redis_client.get(key)
             
             if cached_data:
-                cache_data = pickle.loads(cached_data)
+                cache_data = unpack_cache_payload(cached_data, "recommendations_cache")
                 return cache_data.get('recommendations')
             
             return None
             
-        except Exception as e:
+        except (Exception, CacheDecodeError) as e:
             logger.error(f"Error getting cached recommendations for {user_id}: {e}")
             return None
     
@@ -959,6 +950,54 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error getting analytics: {e}")
             return {'error': str(e)}
+
+    async def write_service_heartbeat(
+        self,
+        service_name: str,
+        instance_id: str,
+        ttl_seconds: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Publish a worker heartbeat entry for readiness checks."""
+        payload = {
+            "service": service_name,
+            "instance_id": instance_id,
+            "updated_at": time.time(),
+            "metadata": metadata or {},
+        }
+        key = f"{self.prefixes['health']}heartbeat:{service_name}:{instance_id}"
+        await self.redis_client.setex(key, ttl_seconds, json_dumps(payload))
+
+    async def get_service_heartbeat_status(
+        self,
+        service_name: str,
+    ) -> Dict[str, Any]:
+        """Get readiness summary for all live heartbeat keys of a service."""
+        pattern = f"{self.prefixes['health']}heartbeat:{service_name}:*"
+        heartbeats: List[Dict[str, Any]] = []
+        async for key in self.redis_client.scan_iter(match=pattern, count=100):
+            raw = await self.redis_client.get(key)
+            if not raw:
+                continue
+            try:
+                heartbeats.append(json_loads(raw))
+            except Exception:
+                continue
+
+        if not heartbeats:
+            return {
+                "status": "unhealthy",
+                "live_instances": 0,
+                "service": service_name,
+            }
+
+        latest = max(heartbeat.get("updated_at", 0.0) for heartbeat in heartbeats)
+        return {
+            "status": "healthy",
+            "live_instances": len(heartbeats),
+            "latest_heartbeat_at": latest,
+            "service": service_name,
+        }
     
     # Health Check
     async def health_check(self) -> Dict[str, Any]:
@@ -1057,8 +1096,7 @@ class FeatureStore:
                     user_id = key_str[prefix_len:]
                     cached = await self.redis_client.get(key)
                     if cached:
-                        import pickle as _pkl
-                        data = _pkl.loads(cached)
+                        data = unpack_cache_payload(cached, "user_features")
                         result[user_id] = data
                 except Exception:
                     continue

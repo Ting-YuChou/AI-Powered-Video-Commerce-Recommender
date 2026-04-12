@@ -6,11 +6,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+import socket
 
 from config import Config
 from feature_store import FeatureStore
+from ranking import RankingModel
 from recommender import RecommendationEngine
+from system_store import SystemStore
 from vector_search import VectorSearchEngine
 
 logger = logging.getLogger(__name__)
@@ -24,11 +28,25 @@ class ModelTrainerService:
         self.feature_store: FeatureStore | None = None
         self.vector_search: VectorSearchEngine | None = None
         self.recommendation_engine: RecommendationEngine | None = None
+        self.ranking_model: RankingModel | None = None
+        self.system_store: SystemStore | None = None
         self.running = False
+        self._heartbeat_task: asyncio.Task | None = None
+        self.instance_id = f"model-trainer-{socket.gethostname()}-{os.getpid()}"
+
+    def _ensure_heartbeat_task(self) -> None:
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._publish_heartbeat())
 
     async def initialize(self):
         self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
         await self.feature_store.initialize()
+        self.running = True
+        self._ensure_heartbeat_task()
+
+        if self.config.database_config.enable:
+            self.system_store = SystemStore(self.config.database_config)
+            await self.system_store.initialize()
 
         self.vector_search = VectorSearchEngine(self.config.vector_config)
         await self.vector_search.load_index()
@@ -40,24 +58,101 @@ class ModelTrainerService:
         )
         await self.recommendation_engine.load_models()
 
+        self.ranking_model = RankingModel(self.config.ranking_config)
+        await self.ranking_model.load_model(self.config.model_config.ranking_model_path)
+
+        if self.config.ranking_config.enable_periodic_training:
+            await self._train_ranking_model(trigger="startup")
+        else:
+            logger.info("Ranking periodic training disabled")
+
+    async def _publish_heartbeat(self) -> None:
+        interval = self.config.monitoring_config.worker_heartbeat_interval_seconds
+        ttl = self.config.monitoring_config.worker_heartbeat_ttl_seconds
+        while self.running:
+            try:
+                await self.feature_store.write_service_heartbeat(
+                    "model-trainer",
+                    self.instance_id,
+                    ttl,
+                    {"pid": os.getpid()},
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to publish trainer heartbeat: {exc}")
+            await asyncio.sleep(interval)
+
     async def run(self):
         self.running = True
         interval = self.config.service_topology_config.trainer_interval_seconds
         logger.info(f"Model trainer service running with interval={interval}s")
+        self._ensure_heartbeat_task()
         while self.running:
             try:
                 await asyncio.sleep(interval)
                 await self.recommendation_engine.update_models()
+                await self._train_ranking_model(trigger="scheduled")
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.error(f"Model trainer iteration failed: {exc}")
                 await asyncio.sleep(60)
 
+    async def _train_ranking_model(self, trigger: str) -> None:
+        """Retrain the ranking model from stored interaction logs and persist a checkpoint."""
+        if not self.config.ranking_config.enable_periodic_training:
+            return
+        if not self.feature_store or not self.ranking_model:
+            return
+
+        if self.system_store:
+            interactions = await self.system_store.get_training_interactions(limit=50000)
+        else:
+            interactions = await self.feature_store.get_training_interactions(limit=50000)
+        if len(interactions) < self.config.ranking_config.training_min_samples:
+            logger.info(
+                "Skipping ranking retrain due to insufficient samples",
+                extra={
+                    "trigger": trigger,
+                    "sample_count": len(interactions),
+                    "min_samples": self.config.ranking_config.training_min_samples,
+                },
+            )
+            return
+
+        logger.info(
+            "Starting ranking retrain",
+            extra={
+                "trigger": trigger,
+                "sample_count": len(interactions),
+                "model_path": self.config.model_config.ranking_model_path,
+            },
+        )
+        await self.ranking_model.train_model(interactions)
+        if self.system_store and self.ranking_model.is_trained:
+            await self.system_store.record_model_checkpoint(
+                model_name="ranking_model",
+                model_version=self.ranking_model.model_version,
+                checkpoint_path=self.ranking_model.loaded_model_path or self.config.model_config.ranking_model_path,
+                payload={
+                    "trigger": trigger,
+                    "sample_count": len(interactions),
+                    "last_training_time": self.ranking_model.last_training_time,
+                },
+            )
+
     async def shutdown(self):
         self.running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
         if self.feature_store:
             await self.feature_store.close()
+        if self.system_store:
+            await self.system_store.close()
 
 
 async def main():

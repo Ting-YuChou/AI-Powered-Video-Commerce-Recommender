@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 import psutil
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
+    CollectorRegistry,
     Counter,
     Gauge,
     Histogram,
@@ -126,54 +127,78 @@ class ObservabilityManager:
     """Prometheus metrics collector and request instrumentation."""
 
     def __init__(self) -> None:
+        self.registry = CollectorRegistry(auto_describe=True)
         self.http_requests_total = Counter(
             "video_commerce_http_requests_total",
             "HTTP requests processed by the API",
             ["method", "path", "status"],
+            registry=self.registry,
         )
         self.http_request_duration_seconds = Histogram(
             "video_commerce_http_request_duration_seconds",
             "HTTP request latency in seconds",
             ["method", "path"],
             buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+            registry=self.registry,
         )
         self.http_requests_in_progress = Gauge(
             "video_commerce_http_requests_in_progress",
             "HTTP requests currently being processed",
+            registry=self.registry,
         )
         self.http_request_exceptions_total = Counter(
             "video_commerce_http_request_exceptions_total",
             "Unhandled HTTP request exceptions",
             ["method", "path", "exception_type"],
+            registry=self.registry,
         )
         self.process_cpu_percent = Gauge(
             "video_commerce_process_cpu_percent",
             "Process CPU utilization percentage",
+            registry=self.registry,
         )
         self.process_resident_memory_bytes = Gauge(
             "video_commerce_process_resident_memory_bytes",
             "Resident memory size in bytes",
+            registry=self.registry,
         )
         self.redis_ops_per_sec = Gauge(
             "video_commerce_redis_ops_per_sec",
             "Redis instantaneous operations per second",
+            registry=self.registry,
         )
         self.redis_connected_clients = Gauge(
             "video_commerce_redis_connected_clients",
             "Redis connected clients",
+            registry=self.registry,
         )
         self.redis_used_memory_bytes = Gauge(
             "video_commerce_redis_used_memory_bytes",
             "Redis used memory in bytes",
+            registry=self.registry,
         )
         self.kafka_producer_connected = Gauge(
             "video_commerce_kafka_producer_connected",
             "Kafka producer connection status",
+            registry=self.registry,
         )
         self.kafka_consumer_lag = Gauge(
             "video_commerce_kafka_consumer_lag",
             "Kafka consumer lag by consumer group (-1 when unavailable)",
             ["group_id"],
+            registry=self.registry,
+        )
+        self.worker_live_instances = Gauge(
+            "video_commerce_worker_live_instances",
+            "Number of live worker instances observed via Redis heartbeats",
+            ["service"],
+            registry=self.registry,
+        )
+        self.worker_status = Gauge(
+            "video_commerce_worker_status",
+            "Worker health status observed via Redis heartbeats (1=healthy, 0=unhealthy)",
+            ["service"],
+            registry=self.registry,
         )
         self._process = psutil.Process()
 
@@ -193,6 +218,7 @@ class ObservabilityManager:
         self,
         feature_store=None,
         kafka_manager=None,
+        worker_statuses: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         """Refresh gauges from the current process and backing services."""
         self.process_cpu_percent.set(self._process.cpu_percent())
@@ -214,6 +240,15 @@ class ObservabilityManager:
         else:
             self.kafka_producer_connected.set(0)
             self.kafka_consumer_lag.labels(group_id="none").set(-1)
+
+        if worker_statuses:
+            for service_name, status in worker_statuses.items():
+                self.worker_live_instances.labels(service=service_name).set(
+                    status.get("live_instances", 0)
+                )
+                self.worker_status.labels(service=service_name).set(
+                    1 if status.get("status") == "healthy" else 0
+                )
 
     async def _collect_kafka_consumer_lag(self, kafka_manager) -> None:
         if not kafka_manager._consumers:
@@ -247,7 +282,7 @@ class ObservabilityManager:
             self.kafka_consumer_lag.labels(group_id=group_id).set(lag_value)
 
     def prometheus_payload(self) -> bytes:
-        return generate_latest()
+        return generate_latest(self.registry)
 
     @property
     def prometheus_content_type(self) -> str:

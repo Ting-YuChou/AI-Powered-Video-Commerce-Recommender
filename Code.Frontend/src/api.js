@@ -176,7 +176,7 @@ export const utils = {
   
   // Validate video file
   validateVideoFile: (file) => {
-    const maxSize = 500 * 1024 * 1024; // 500MB
+    const maxSize = 100 * 1024 * 1024; // 100MB
     const allowedTypes = new Set([
       'video/mp4',
       'video/quicktime',
@@ -189,7 +189,7 @@ export const utils = {
     const hasAllowedExtension = allowedExtensions.some((extension) => fileName.endsWith(extension));
     
     if (file.size > maxSize) {
-      return { valid: false, error: 'File size exceeds 500MB limit' };
+      return { valid: false, error: 'File size exceeds 100MB limit' };
     }
     
     if (file.type && !allowedTypes.has(file.type) && !hasAllowedExtension) {
@@ -232,9 +232,14 @@ export const utils = {
 
   getErrorMessage: (error, fallbackMessage) => {
     const detail = error?.response?.data?.detail;
+    const envelopeMessage = error?.response?.data?.error?.message;
 
     if (typeof detail === 'string' && detail.trim()) {
       return detail;
+    }
+
+    if (typeof envelopeMessage === 'string' && envelopeMessage.trim()) {
+      return envelopeMessage;
     }
 
     if (typeof error?.message === 'string' && error.message.trim()) {
