@@ -241,6 +241,8 @@ site/
 *.md
 !README.md
 !LICENSE
+!docs/
+!docs/**/*.md
 
 # Dataset files and directories
 # ------------------------------
@@ -252,6 +254,12 @@ datasets/
 *.npz
 video_embeddings_*.npy
 load_dataset.py
+
+# Generated reports and load test outputs
+# ---------------------------------------
+output/
+loadtest/results/
+loadtest/k6/*.json
 
 # Keep important config templates
 # --------------------------------

@@ -285,6 +285,10 @@ class RankingModel:
             'avg_inference_time': 0.0,
             'batch_inference_time': 0.0
         }
+        self.loaded_model_path: Optional[str] = None
+        self.loaded_checkpoint_mtime: float = 0.0
+        self.checkpoint_reload_count = 0
+        self._checkpoint_reload_lock = asyncio.Lock()
         self.torch_inference_available = True
         self.enable_profiling_logs = False
         self.profiling_log_min_duration_ms = 250.0
@@ -294,14 +298,16 @@ class RankingModel:
     async def load_model(self, model_path: str = None):
         """Load or initialize the ranking model."""
         try:
+            resolved_model_path = model_path or self.loaded_model_path
+
             # Initialize model
             input_dim = self.feature_extractor.total_feature_dim
             self.model = MultiObjectiveRankingModel(input_dim, self.config).to(self.device)
             
             # Load pre-trained weights if available
-            if model_path and Path(model_path).exists():
-                logger.info(f"Loading model from {model_path}")
-                state_dict = torch.load(model_path, map_location=self.device)
+            if resolved_model_path and Path(resolved_model_path).exists():
+                logger.info(f"Loading model from {resolved_model_path}")
+                state_dict = torch.load(resolved_model_path, map_location=self.device)
                 load_result = self.model.load_state_dict(state_dict, strict=False)
                 if load_result.missing_keys or load_result.unexpected_keys:
                     logger.warning(
@@ -309,9 +315,11 @@ class RankingModel:
                         f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
                     )
                 self.is_trained = True
+                self.loaded_checkpoint_mtime = Path(resolved_model_path).stat().st_mtime
             else:
                 logger.info("Initializing new model")
                 self.is_trained = False
+                self.loaded_checkpoint_mtime = 0.0
             
             # Initialize optimizer
             self.optimizer = optim.Adam(
@@ -322,12 +330,46 @@ class RankingModel:
             
             # Set to evaluation mode initially
             self.model.eval()
+            self.loaded_model_path = resolved_model_path
             
             logger.info("Ranking model loaded successfully")
             
         except Exception as e:
             logger.error(f"Error loading ranking model: {e}")
             raise
+
+    async def reload_model_if_updated(self, model_path: str = None) -> bool:
+        """Reload the ranking checkpoint when a newer file is available."""
+        resolved_model_path = model_path or self.loaded_model_path
+        if not resolved_model_path:
+            return False
+
+        checkpoint_path = Path(resolved_model_path)
+        if not checkpoint_path.exists():
+            return False
+
+        checkpoint_mtime = checkpoint_path.stat().st_mtime
+        if checkpoint_mtime <= self.loaded_checkpoint_mtime:
+            return False
+
+        async with self._checkpoint_reload_lock:
+            checkpoint_mtime = checkpoint_path.stat().st_mtime
+            if checkpoint_mtime <= self.loaded_checkpoint_mtime:
+                return False
+
+            previous_mtime = self.loaded_checkpoint_mtime
+            await self.load_model(str(checkpoint_path))
+            if previous_mtime > 0:
+                self.checkpoint_reload_count += 1
+            logger.info(
+                "ranking_checkpoint_reloaded",
+                extra={
+                    "model_path": str(checkpoint_path),
+                    "checkpoint_mtime": checkpoint_mtime,
+                    "reload_count": self.checkpoint_reload_count,
+                },
+            )
+            return True
 
     def prepare_request_matrix(
         self,
@@ -646,68 +688,69 @@ class RankingModel:
     async def train_model(self, training_data: List[Dict[str, Any]]):
         """Train the ranking model on user interaction data."""
         try:
-            if not self.model or len(training_data) < 100:
-                logger.warning("Insufficient data or model not loaded for training")
-                return
-            
-            logger.info(f"Training ranking model on {len(training_data)} samples")
-            
-            # Prepare training data
-            features, labels = self._prepare_training_data(training_data)
-            
-            if features.size(0) == 0:
-                logger.warning("No valid training samples prepared")
-                return
-            
-            # Training loop
-            self.model.train()
-            
-            for epoch in range(self.config.epochs):
-                epoch_loss = 0.0
-                num_batches = 0
-                
-                # Batch training
-                for i in range(0, features.size(0), self.config.batch_size):
-                    batch_features = features[i:i+self.config.batch_size]
-                    batch_labels = {
-                        key: value[i:i+self.config.batch_size] 
-                        for key, value in labels.items()
-                    }
-                    
-                    # Forward pass
-                    self.optimizer.zero_grad()
-                    predictions = self.model(batch_features)
-                    
-                    # Compute multi-objective loss
-                    loss = self._compute_loss(predictions, batch_labels)
-                    
-                    # Backward pass
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-                    
-                    epoch_loss += loss.item()
-                    num_batches += 1
-                
-                avg_loss = epoch_loss / max(num_batches, 1)
-                
-                if epoch % 10 == 0:
-                    logger.info(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}")
-                
-                # Early stopping check (simplified)
-                if avg_loss < 0.01:
-                    logger.info(f"Early stopping at epoch {epoch}")
-                    break
-            
-            # Set back to evaluation mode
-            self.model.eval()
-            self.is_trained = True
-            self.last_training_time = time.time()
-            
-            logger.info("Model training completed")
+            saved_model_path = await asyncio.to_thread(
+                self._train_model_sync,
+                training_data,
+            )
+            if saved_model_path:
+                await self.save_model(saved_model_path)
             
         except Exception as e:
             logger.error(f"Error training model: {e}")
+
+    def _train_model_sync(self, training_data: List[Dict[str, Any]]) -> Optional[str]:
+        if not self.model or len(training_data) < self.config.training_min_samples:
+            logger.warning("Insufficient data or model not loaded for training")
+            return None
+
+        logger.info(f"Training ranking model on {len(training_data)} samples")
+
+        # Prepare training data
+        features, labels = self._prepare_training_data(training_data)
+
+        if features.size(0) == 0:
+            logger.warning("No valid training samples prepared")
+            return None
+
+        self.model.train()
+
+        for epoch in range(self.config.epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+
+            for i in range(0, features.size(0), self.config.batch_size):
+                batch_features = features[i:i+self.config.batch_size]
+                batch_labels = {
+                    key: value[i:i+self.config.batch_size]
+                    for key, value in labels.items()
+                }
+
+                self.optimizer.zero_grad()
+                predictions = self.model(batch_features)
+                loss = self._compute_loss(predictions, batch_labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                epoch_loss += loss.item()
+                num_batches += 1
+
+            avg_loss = epoch_loss / max(num_batches, 1)
+
+            if epoch % 10 == 0:
+                logger.info(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}")
+
+            if avg_loss < 0.01:
+                logger.info(f"Early stopping at epoch {epoch}")
+                break
+
+        self.model.eval()
+        self.is_trained = True
+        self.last_training_time = time.time()
+        self.model_version = f"ranking-{int(self.last_training_time)}"
+
+        logger.info("Model training completed")
+        return self.loaded_model_path
     
     def _prepare_training_data(self, training_data: List[Dict[str, Any]]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Prepare training data from interaction logs."""
@@ -784,6 +827,8 @@ class RankingModel:
             if self.model and self.is_trained:
                 Path(model_path).parent.mkdir(parents=True, exist_ok=True)
                 torch.save(self.model.state_dict(), model_path)
+                self.loaded_model_path = model_path
+                self.loaded_checkpoint_mtime = Path(model_path).stat().st_mtime
                 logger.info(f"Model saved to {model_path}")
             
         except Exception as e:
@@ -795,6 +840,9 @@ class RankingModel:
             'is_trained': self.is_trained,
             'model_version': self.model_version,
             'last_training_time': self.last_training_time,
+            'loaded_model_path': self.loaded_model_path,
+            'loaded_checkpoint_mtime': self.loaded_checkpoint_mtime,
+            'checkpoint_reload_count': self.checkpoint_reload_count,
             'device': str(self.device),
             'inference_stats': self.inference_stats.copy(),
             'model_parameters': sum(p.numel() for p in self.model.parameters()) if self.model else 0,
@@ -808,6 +856,9 @@ class RankingModel:
                 'status': 'healthy' if self.model else 'unhealthy',
                 'model_loaded': self.model is not None,
                 'is_trained': self.is_trained,
+                'loaded_model_path': self.loaded_model_path,
+                'loaded_checkpoint_mtime': self.loaded_checkpoint_mtime,
+                'checkpoint_reload_count': self.checkpoint_reload_count,
                 'device': str(self.device),
                 'feature_dim': self.feature_extractor.total_feature_dim,
                 'torch_inference_available': self.torch_inference_available,

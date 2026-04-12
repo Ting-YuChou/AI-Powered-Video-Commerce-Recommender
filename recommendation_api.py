@@ -24,11 +24,15 @@ from ranking import RankingModel
 from recommender import RecommendationEngine
 from service_common import (
     build_health_response,
+    build_liveness_payload,
     build_metrics_response,
+    build_readiness_response,
     component_health,
     configure_service_logging,
     create_service_app,
+    require_internal_service_auth,
 )
+from system_store import SystemStore
 from vector_search import VectorSearchEngine
 
 logger = logging.getLogger(__name__)
@@ -45,6 +49,14 @@ recommendation_engine: Optional[RecommendationEngine] = None
 ranking_model: Optional[RankingModel] = None
 ranking_batcher: Optional[RankingBatcher] = None
 kafka_manager = None
+system_store: Optional[SystemStore] = None
+ranking_checkpoint_sync_task: Optional[asyncio.Task] = None
+
+
+@app.middleware("http")
+async def internal_auth(request: Request, call_next):
+    require_internal_service_auth(request, app.state.runtime)
+    return await call_next(request)
 
 
 def _build_candidate_cache_context(payload: RecommendationRequest, k_per_source: int) -> dict:
@@ -62,6 +74,8 @@ def _build_candidate_cache_context(payload: RecommendationRequest, k_per_source:
 @app.on_event("startup")
 async def startup_event():
     global feature_store, vector_search, recommendation_engine, ranking_model, ranking_batcher, kafka_manager
+    global system_store
+    global ranking_checkpoint_sync_task
 
     runtime = app.state.runtime
     runtime.config = Config()
@@ -71,9 +85,15 @@ async def startup_event():
     feature_store = FeatureStore(runtime.config.redis_config, runtime.config.cache_config)
     await feature_store.initialize()
 
+    if runtime.config.database_config.enable:
+        system_store = SystemStore(runtime.config.database_config)
+        await system_store.initialize()
+
     vector_search = VectorSearchEngine(runtime.config.vector_config)
     await vector_search.load_index()
     await feature_store.store_product_metadata_batch(vector_search.product_metadata)
+    if system_store:
+        await system_store.store_product_catalog_snapshot_batch(vector_search.product_metadata)
 
     recommendation_engine = RecommendationEngine(
         feature_store,
@@ -90,6 +110,11 @@ async def startup_event():
     )
     ranking_batcher = RankingBatcher(ranking_model, runtime.config.ranking_config)
     await ranking_batcher.start()
+    if runtime.config.ranking_config.checkpoint_sync_interval_seconds > 0:
+        ranking_checkpoint_sync_task = asyncio.create_task(
+            _periodic_ranking_checkpoint_sync(runtime),
+            name="ranking-checkpoint-sync",
+        )
 
     if runtime.config.kafka_config.enable:
         try:
@@ -112,10 +137,21 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global ranking_checkpoint_sync_task
+
+    if ranking_checkpoint_sync_task:
+        ranking_checkpoint_sync_task.cancel()
+        try:
+            await ranking_checkpoint_sync_task
+        except asyncio.CancelledError:
+            pass
+        ranking_checkpoint_sync_task = None
     if ranking_batcher:
         await ranking_batcher.close()
     if feature_store:
         await feature_store.close()
+    if system_store:
+        await system_store.close()
     if kafka_manager:
         await close_kafka()
 
@@ -126,7 +162,53 @@ async def root():
         "service": "recommendation-service",
         "version": "1.0.0",
         "health": "/health",
+        "livez": "/livez",
+        "readyz": "/readyz",
     }
+
+
+@app.get("/livez")
+async def livez():
+    return build_liveness_payload(app.state.runtime)
+
+
+@app.get("/readyz")
+async def readyz():
+    runtime = app.state.runtime
+    feature_store_health = await feature_store.health_check()
+    ranking_health = ranking_model.health_check()
+    vector_health = vector_search.health_check()
+    database_health = {"status": "healthy", "response_time_ms": 0.0}
+    if system_store:
+        database_status = await system_store.health_check()
+        database_health = {
+            "status": database_status.status,
+            "response_time_ms": database_status.response_time_ms,
+            "error": database_status.error,
+        }
+
+    kafka_health = {"status": "healthy", "response_time_ms": 0.0}
+    if kafka_manager:
+        kafka_status = await kafka_manager.health_check()
+        producer_health = kafka_status.get("producer", {})
+        kafka_health = {
+            "status": producer_health.get("status", "healthy"),
+            "response_time_ms": 0.0,
+            "error": None if producer_health.get("connected") else "Kafka producer unavailable",
+        }
+    elif runtime.config.kafka_config.enable:
+        kafka_health = {"status": "degraded", "error": "Kafka producer unavailable"}
+
+    return build_readiness_response(
+        runtime,
+        {
+            "redis": feature_store_health,
+            "database": database_health,
+            "vector_search": vector_health,
+            "ranking_model": ranking_health,
+            "kafka": kafka_health,
+        },
+    )
 
 
 @app.post("/api/recommendations", response_model=RecommendationResponse)
@@ -329,6 +411,7 @@ async def get_recommendations(
                     user_id=payload.user_id,
                     recommendations=[item.product_id for item in ranked_recommendations],
                     response_time_ms=int(response_time * 1000),
+                    request_id=getattr(http_request.state, "request_id", None),
                     metadata={
                         "content_id": payload.content_id,
                         "candidate_count": len(candidates),
@@ -374,7 +457,7 @@ async def get_recommendations(
                     "total_candidates": len(trending_recommendations),
                     "response_time_ms": int((time.time() - start_time) * 1000),
                     "fallback": True,
-                    "error": str(exc),
+                    "fallback_reason": "serving_error",
                     **(
                         {"profile": profile}
                         if runtime.config.monitoring_config.enable_profiling_logs
@@ -384,8 +467,8 @@ async def get_recommendations(
             )
         except Exception as fallback_exc:
             raise HTTPException(
-                status_code=500,
-                detail=f"Recommendation service unavailable: {fallback_exc}",
+                status_code=503,
+                detail="Recommendation service unavailable",
             ) from fallback_exc
 
 
@@ -438,6 +521,21 @@ def _configure_torch_runtime(runtime) -> None:
     )
 
 
+async def _periodic_ranking_checkpoint_sync(runtime) -> None:
+    interval_seconds = max(1, int(runtime.config.ranking_config.checkpoint_sync_interval_seconds))
+    model_path = runtime.config.model_config.ranking_model_path
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            if ranking_model and model_path:
+                await ranking_model.reload_model_if_updated(model_path)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error(f"Ranking checkpoint sync failed: {exc}")
+            await asyncio.sleep(min(interval_seconds, 60))
+
+
 def _detect_cgroup_cpu_limit() -> int:
     cpu_max_path = "/sys/fs/cgroup/cpu.max"
     if os.path.exists(cpu_max_path):
@@ -487,6 +585,25 @@ async def health_check():
     recommendation_health = recommendation_engine.health_check()
     ranking_health = ranking_model.health_check()
     vector_health = vector_search.health_check()
+    database_health = {"status": "healthy", "response_time_ms": 0.0}
+    if system_store:
+        database_status = await system_store.health_check()
+        database_health = {
+            "status": database_status.status,
+            "response_time_ms": database_status.response_time_ms,
+            "error": database_status.error,
+        }
+    kafka_health = {"status": "healthy", "response_time_ms": 0.0}
+    if kafka_manager:
+        kafka_status = await kafka_manager.health_check()
+        producer_health = kafka_status.get("producer", {})
+        kafka_health = {
+            "status": producer_health.get("status", "healthy"),
+            "response_time_ms": 0.0,
+            "error": None if producer_health.get("connected") else "Kafka producer unavailable",
+        }
+    elif app.state.runtime.config.kafka_config.enable:
+        kafka_health = {"status": "degraded", "error": "Kafka producer unavailable"}
 
     return build_health_response(
         {
@@ -503,9 +620,19 @@ async def health_check():
                 ranking_health.get("status", "unhealthy"),
                 error_message=ranking_health.get("error"),
             ),
+            "database": component_health(
+                database_health.get("status", "unhealthy"),
+                database_health.get("response_time_ms"),
+                database_health.get("error"),
+            ),
             "vector_search": component_health(
                 vector_health.get("status", "unhealthy"),
                 error_message=vector_health.get("error"),
+            ),
+            "kafka": component_health(
+                kafka_health.get("status", "healthy"),
+                kafka_health.get("response_time_ms"),
+                kafka_health.get("error"),
             ),
         },
         app.state.runtime.started_at,

@@ -19,6 +19,20 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _load_secret_file_env() -> None:
+    """Resolve `*_FILE` environment variables into their target values."""
+    for env_name, file_path in list(os.environ.items()):
+        if not env_name.endswith("_FILE"):
+            continue
+        target_name = env_name[:-5]
+        if os.getenv(target_name):
+            continue
+        if not file_path:
+            continue
+        with open(file_path, "r", encoding="utf-8") as secret_handle:
+            os.environ[target_name] = secret_handle.read().strip()
+
 class RedisConfig(BaseSettings):
     """Redis database configuration."""
     host: str = Field("localhost", description="Redis host address")
@@ -209,6 +223,18 @@ class RankingConfig(BaseSettings):
     epochs: int = Field(100, description="Training epochs")
     batch_size: int = Field(1024, description="Training batch size")
     early_stopping_patience: int = Field(10, description="Early stopping patience")
+    enable_periodic_training: bool = Field(
+        False,
+        description="Enable background retraining of the ranking model checkpoint",
+    )
+    training_min_samples: int = Field(
+        100,
+        description="Minimum interaction samples required before ranking retraining runs",
+    )
+    checkpoint_sync_interval_seconds: int = Field(
+        60,
+        description="How often recommendation workers check for a newer ranking checkpoint",
+    )
     
     class Config:
         env_prefix = "RANKING_"
@@ -235,6 +261,17 @@ class APIConfig(BaseSettings):
     
     class Config:
         env_prefix = "API_"
+
+        @classmethod
+        def parse_env_var(cls, field_name: str, raw_val: Any):
+            if field_name == "cors_origins" and isinstance(raw_val, str):
+                value = raw_val.strip()
+                if not value:
+                    return []
+                if value.startswith("["):
+                    return json.loads(value)
+                return [item.strip() for item in value.split(",") if item.strip()]
+            return super().parse_env_var(field_name, raw_val)
 
 class CacheConfig(BaseSettings):
     """Caching configuration."""
@@ -289,6 +326,14 @@ class MonitoringConfig(BaseSettings):
         250.0,
         description="Minimum end-to-end request duration before detailed timing logs are emitted",
     )
+    worker_heartbeat_interval_seconds: int = Field(
+        15,
+        description="How often workers publish heartbeat records to Redis",
+    )
+    worker_heartbeat_ttl_seconds: int = Field(
+        45,
+        description="Heartbeat TTL for worker readiness evaluation",
+    )
     
     # Alerting thresholds
     error_rate_threshold: float = Field(0.05, description="Error rate alert threshold")
@@ -334,6 +379,64 @@ class KafkaConfig(BaseSettings):
     
     class Config:
         env_prefix = "KAFKA_"
+
+
+class SecurityConfig(BaseSettings):
+    """Internal service authentication configuration."""
+    auth_mode: str = Field(
+        "api_key",
+        description="Client auth mode: disabled, api_key, bearer, or api_key_or_bearer",
+    )
+    internal_service_key: Optional[str] = Field(
+        None,
+        description="Shared secret used for service-to-service HTTP calls",
+    )
+    internal_service_header: str = Field(
+        "X-Internal-Service-Key",
+        description="Header name used for service-to-service authentication",
+    )
+    oidc_enabled: bool = Field(
+        False,
+        description="Enable bearer token authentication backed by OIDC/JWT validation",
+    )
+    oidc_required: bool = Field(
+        False,
+        description="Require bearer auth when OIDC/JWT validation is enabled",
+    )
+    oidc_issuer: Optional[str] = Field(
+        None,
+        description="Expected issuer claim for bearer tokens",
+    )
+    oidc_audience: Optional[str] = Field(
+        None,
+        description="Expected audience claim for bearer tokens",
+    )
+    oidc_jwks_url: Optional[str] = Field(
+        None,
+        description="JWKS URL used to validate bearer tokens signed by an external IdP",
+    )
+    jwt_shared_secret: Optional[str] = Field(
+        None,
+        description="Fallback shared secret for HS256 bearer validation in local/test environments",
+    )
+    jwt_algorithms: List[str] = Field(
+        ["RS256"],
+        description="Allowed bearer token algorithms",
+    )
+
+    class Config:
+        env_prefix = "SECURITY_"
+
+        @classmethod
+        def parse_env_var(cls, field_name: str, raw_val: Any):
+            if field_name == "jwt_algorithms" and isinstance(raw_val, str):
+                value = raw_val.strip()
+                if not value:
+                    return []
+                if value.startswith("["):
+                    return json.loads(value)
+                return [item.strip() for item in value.split(",") if item.strip()]
+            return super().parse_env_var(field_name, raw_val)
 
 
 class ServiceTopologyConfig(BaseSettings):
@@ -416,8 +519,22 @@ class DataConfig(BaseSettings):
     upload_dir: str = Field("/tmp/uploads", description="File upload directory")
     max_file_size: int = Field(500 * 1024 * 1024, description="Max upload file size (500MB)")
     allowed_extensions: List[str] = Field(
-        [".mp4", ".avi", ".mov", ".mkv"], 
+        [".mp4", ".avi", ".mov", ".mkv", ".webm"],
         description="Allowed video file extensions"
+    )
+    allowed_mime_types: List[str] = Field(
+        [
+            "video/mp4",
+            "video/quicktime",
+            "video/x-msvideo",
+            "video/x-matroska",
+            "video/webm",
+        ],
+        description="Allowed upload MIME types",
+    )
+    upload_chunk_size_bytes: int = Field(
+        1024 * 1024,
+        description="Chunk size for streaming uploads to disk",
     )
     
     # Data processing
@@ -427,12 +544,76 @@ class DataConfig(BaseSettings):
     class Config:
         env_prefix = "DATA_"
 
+
+class ObjectStorageConfig(BaseSettings):
+    """Remote object storage configuration for upload durability."""
+    backend: str = Field(
+        "local",
+        description="Upload storage backend: local or s3",
+    )
+    endpoint_url: Optional[str] = Field(
+        None,
+        description="S3-compatible endpoint URL such as http://minio:9000",
+    )
+    region: str = Field("us-east-1", description="Object storage region")
+    bucket: Optional[str] = Field(
+        None,
+        description="Bucket used for uploaded videos and related assets",
+    )
+    access_key_id: Optional[str] = Field(
+        None,
+        description="Access key ID for the object storage backend",
+    )
+    secret_access_key: Optional[str] = Field(
+        None,
+        description="Secret access key for the object storage backend",
+    )
+    prefix: str = Field(
+        "uploads",
+        description="Object key prefix for uploaded files",
+    )
+    create_bucket_on_startup: bool = Field(
+        False,
+        description="Create the configured bucket on startup if it does not already exist",
+    )
+    force_path_style: bool = Field(
+        True,
+        description="Force path-style S3 requests for compatibility with MinIO and similar stores",
+    )
+    download_dir: str = Field(
+        "/tmp/object-storage",
+        description="Temporary directory used when materializing remote objects for processing",
+    )
+
+    class Config:
+        env_prefix = "OBJECT_STORAGE_"
+
+
+class DatabaseConfig(BaseSettings):
+    """Postgres system-of-record configuration."""
+    enable: bool = Field(False, description="Enable Postgres persistence layer")
+    url: str = Field(
+        "postgresql+asyncpg://video_commerce:video_commerce@postgres:5432/video_commerce",
+        description="Async SQLAlchemy database URL",
+    )
+    pool_size: int = Field(10, description="Database connection pool size")
+    max_overflow: int = Field(20, description="Database connection pool overflow")
+    auto_create_schema: bool = Field(
+        True,
+        description="Create required tables automatically on startup",
+    )
+    echo_sql: bool = Field(False, description="Enable SQLAlchemy SQL logging")
+
+    class Config:
+        env_prefix = "DATABASE_"
+
 class Config:
     """Main configuration class that combines all configuration sections."""
     
     def __init__(self, config_file: Optional[str] = None):
         """Initialize configuration from environment variables and optional config file."""
         self.config_file = config_file
+        _load_secret_file_env()
         
         # Load configuration sections
         self.redis_config = RedisConfig()
@@ -444,8 +625,11 @@ class Config:
         self.cache_config = CacheConfig()
         self.monitoring_config = MonitoringConfig()
         self.data_config = DataConfig()
+        self.object_storage_config = ObjectStorageConfig()
         self.kafka_config = KafkaConfig()
+        self.security_config = SecurityConfig()
         self.service_topology_config = ServiceTopologyConfig()
+        self.database_config = DatabaseConfig()
         
         # Load additional config from file if provided
         if config_file and os.path.exists(config_file):
@@ -483,6 +667,12 @@ class Config:
         # Ensure cache directory exists
         os.makedirs(self.model_config.cache_dir, exist_ok=True)
         os.makedirs(self.data_config.upload_dir, exist_ok=True)
+        os.makedirs(self.object_storage_config.download_dir, exist_ok=True)
+
+        if not self.model_config.ranking_model_path:
+            self.model_config.ranking_model_path = str(
+                Path(self.model_config.cache_dir) / "ranking_model.pt"
+            )
         
         # Set embedding dimension consistency
         if self.vector_config.embedding_dim != self.model_config.embedding_dim:
@@ -526,6 +716,18 @@ class Config:
                 os.makedirs(os.path.dirname(self.model_config.cache_dir), exist_ok=True)
             except Exception as e:
                 errors.append(f"Cannot create model cache directory: {e}")
+
+        if self.object_storage_config.backend not in {"local", "s3"}:
+            errors.append(
+                f"Object storage backend must be 'local' or 's3', got {self.object_storage_config.backend}"
+            )
+        if self.object_storage_config.backend == "s3":
+            if not self.object_storage_config.bucket:
+                errors.append("Object storage bucket is required when OBJECT_STORAGE_BACKEND=s3")
+        if self.security_config.auth_mode not in {"disabled", "api_key", "bearer", "api_key_or_bearer"}:
+            errors.append(
+                "Security auth mode must be disabled, api_key, bearer, or api_key_or_bearer"
+            )
         
         if errors:
             logger.error("Configuration validation failed:")
@@ -561,6 +763,14 @@ class Config:
                         config_dict[attr_name]['password'] = "***"
                     if 'api_key' in config_dict[attr_name]:
                         config_dict[attr_name]['api_key'] = "***"
+                    if 'internal_service_key' in config_dict[attr_name]:
+                        config_dict[attr_name]['internal_service_key'] = "***"
+                    if 'secret_access_key' in config_dict[attr_name]:
+                        config_dict[attr_name]['secret_access_key'] = "***"
+                    if 'access_key_id' in config_dict[attr_name]:
+                        config_dict[attr_name]['access_key_id'] = "***"
+                    if 'jwt_shared_secret' in config_dict[attr_name]:
+                        config_dict[attr_name]['jwt_shared_secret'] = "***"
         
         return config_dict
     
@@ -614,6 +824,11 @@ def get_api_config() -> APIConfig:
 def get_kafka_config() -> KafkaConfig:
     """Get Kafka configuration."""
     return get_config().kafka_config
+
+
+def get_database_config() -> DatabaseConfig:
+    """Get database configuration."""
+    return get_config().database_config
 
 # Environment detection
 def is_production() -> bool:

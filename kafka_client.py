@@ -19,13 +19,54 @@ import logging
 from typing import Dict, Any, Optional, Callable, List
 from datetime import datetime
 import time
+import uuid
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from aiokafka.errors import KafkaConnectionError, KafkaError
 
 from config import KafkaConfig
+from observability import request_id_ctx_var
 
 logger = logging.getLogger(__name__)
+
+EVENT_SCHEMA_VERSION = 1
+
+
+def _build_event_payload(
+    event_type: str,
+    *,
+    request_id: Optional[str] = None,
+    occurred_at: Optional[float] = None,
+    **payload: Any,
+) -> Dict[str, Any]:
+    event_time = occurred_at or time.time()
+    return {
+        "schema_version": EVENT_SCHEMA_VERSION,
+        "event_id": str(uuid.uuid4()),
+        "event_type": event_type,
+        "request_id": request_id,
+        "occurred_at": event_time,
+        **payload,
+    }
+
+
+def _build_headers(request_id: Optional[str], event_id: str) -> List[tuple]:
+    headers = [
+        ("x-event-id", event_id.encode("utf-8")),
+        ("x-schema-version", str(EVENT_SCHEMA_VERSION).encode("utf-8")),
+    ]
+    if request_id:
+        headers.append(("x-request-id", request_id.encode("utf-8")))
+    return headers
+
+
+def _extract_header(headers: Optional[List[tuple]], name: str) -> Optional[str]:
+    if not headers:
+        return None
+    for key, value in headers:
+        if key == name and value is not None:
+            return value.decode("utf-8")
+    return None
 
 
 class KafkaProducerClient:
@@ -331,14 +372,18 @@ class KafkaConsumerClient:
                     key = message.key
                     value = message.value
                     headers = message.headers
-                    
-                    # Get registered handler for topic
-                    handler = self._handlers.get(topic)
-                    if handler:
-                        await handler(topic, key, value, headers)
-                    else:
-                        logger.warning(f"No handler registered for topic: {topic}")
-                    
+                    request_id = _extract_header(headers, "x-request-id") or value.get("request_id")
+                    request_id_token = request_id_ctx_var.set(request_id or "-")
+
+                    try:
+                        # Get registered handler for topic
+                        handler = self._handlers.get(topic)
+                        if handler:
+                            await handler(topic, key, value, headers)
+                        else:
+                            logger.warning(f"No handler registered for topic: {topic}")
+                    finally:
+                        request_id_ctx_var.reset(request_id_token)
                 except Exception as e:
                     logger.error(f"Error processing message from {message.topic}: {e}")
                     
@@ -425,7 +470,9 @@ class KafkaManager:
         user_id: str,
         product_id: str,
         action: str,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> bool:
         """
         Send a user interaction event to Kafka.
@@ -439,19 +486,22 @@ class KafkaManager:
         Returns:
             True if sent successfully
         """
-        event = {
-            'event_type': 'user_interaction',
-            'user_id': user_id,
-            'product_id': product_id,
-            'action': action,
-            'context': context or {},
-            'timestamp': time.time()
-        }
+        event = _build_event_payload(
+            "user_interaction",
+            request_id=request_id,
+            occurred_at=timestamp,
+            user_id=user_id,
+            product_id=product_id,
+            action=action,
+            context=context or {},
+            timestamp=timestamp or time.time(),
+        )
         
         return await self.producer.send(
             topic=self.config.user_interactions_topic,
             value=event,
-            key=user_id  # Partition by user for ordering
+            key=user_id,  # Partition by user for ordering
+            headers=_build_headers(request_id, event["event_id"]),
         )
 
     async def send_user_interaction_async(
@@ -461,21 +511,25 @@ class KafkaManager:
         action: str,
         context: Optional[Dict[str, Any]] = None,
         timestamp: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> bool:
         """Enqueue a user interaction event without waiting for broker ack."""
-        event = {
-            'event_type': 'user_interaction',
-            'user_id': user_id,
-            'product_id': product_id,
-            'action': action,
-            'context': context or {},
-            'timestamp': timestamp or time.time()
-        }
+        event = _build_event_payload(
+            "user_interaction",
+            request_id=request_id,
+            occurred_at=timestamp,
+            user_id=user_id,
+            product_id=product_id,
+            action=action,
+            context=context or {},
+            timestamp=timestamp or time.time(),
+        )
 
         return await self.producer.send_nowait(
             topic=self.config.user_interactions_topic,
             value=event,
-            key=user_id
+            key=user_id,
+            headers=_build_headers(request_id, event["event_id"]),
         )
     
     # ==================== Video Processing Tasks ====================
@@ -484,8 +538,10 @@ class KafkaManager:
         self,
         content_id: str,
         file_path: str,
+        filename: Optional[str] = None,
         user_id: Optional[str] = None,
-        priority: str = "normal"
+        priority: str = "normal",
+        request_id: Optional[str] = None,
     ) -> bool:
         """
         Send a video processing task to Kafka.
@@ -499,20 +555,23 @@ class KafkaManager:
         Returns:
             True if sent successfully
         """
-        task = {
-            'event_type': 'video_processing_task',
-            'content_id': content_id,
-            'file_path': file_path,
-            'user_id': user_id,
-            'priority': priority,
-            'timestamp': time.time(),
-            'status': 'pending'
-        }
+        task = _build_event_payload(
+            "video_processing_task",
+            request_id=request_id,
+            content_id=content_id,
+            file_path=file_path,
+            filename=filename,
+            user_id=user_id,
+            priority=priority,
+            timestamp=time.time(),
+            status="pending",
+        )
         
         return await self.producer.send(
             topic=self.config.video_processing_topic,
             value=task,
-            key=content_id
+            key=content_id,
+            headers=_build_headers(request_id, task["event_id"]),
         )
     
     # ==================== Recommendation Events ====================
@@ -522,7 +581,8 @@ class KafkaManager:
         user_id: str,
         recommendations: List[str],
         response_time_ms: int,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
     ) -> bool:
         """
         Send a recommendation event to Kafka.
@@ -536,20 +596,22 @@ class KafkaManager:
         Returns:
             True if sent successfully
         """
-        event = {
-            'event_type': 'recommendation',
-            'user_id': user_id,
-            'recommendations': recommendations,
-            'num_recommendations': len(recommendations),
-            'response_time_ms': response_time_ms,
-            'metadata': metadata or {},
-            'timestamp': time.time()
-        }
+        event = _build_event_payload(
+            "recommendation",
+            request_id=request_id,
+            user_id=user_id,
+            recommendations=recommendations,
+            num_recommendations=len(recommendations),
+            response_time_ms=response_time_ms,
+            metadata=metadata or {},
+            timestamp=time.time(),
+        )
         
         return await self.producer.send(
             topic=self.config.recommendation_events_topic,
             value=event,
-            key=user_id
+            key=user_id,
+            headers=_build_headers(request_id, event["event_id"]),
         )
     
     # ==================== Feature Update Events ====================
@@ -558,7 +620,8 @@ class KafkaManager:
         self,
         entity_type: str,
         entity_id: str,
-        feature_updates: Dict[str, Any]
+        feature_updates: Dict[str, Any],
+        request_id: Optional[str] = None,
     ) -> bool:
         """
         Send a feature update event to Kafka.
@@ -571,18 +634,20 @@ class KafkaManager:
         Returns:
             True if sent successfully
         """
-        event = {
-            'event_type': 'feature_update',
-            'entity_type': entity_type,
-            'entity_id': entity_id,
-            'updates': feature_updates,
-            'timestamp': time.time()
-        }
+        event = _build_event_payload(
+            "feature_update",
+            request_id=request_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            updates=feature_updates,
+            timestamp=time.time(),
+        )
         
         return await self.producer.send(
             topic=self.config.feature_updates_topic,
             value=event,
-            key=f"{entity_type}:{entity_id}"
+            key=f"{entity_type}:{entity_id}",
+            headers=_build_headers(request_id, event["event_id"]),
         )
     
     # ==================== Consumer Management ====================

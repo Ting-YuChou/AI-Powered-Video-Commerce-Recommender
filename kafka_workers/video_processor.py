@@ -15,6 +15,9 @@ import logging
 import signal
 import sys
 import os
+from pathlib import Path
+import socket
+import time
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,6 +27,8 @@ from kafka_client import KafkaConsumerClient, KafkaManager, get_kafka_manager
 from config import Config, KafkaConfig
 from content_processor import ContentProcessor
 from feature_store import FeatureStore
+from object_storage import ObjectStorage
+from system_store import SystemStore
 from vector_search import VectorSearchEngine
 
 # Configure logging
@@ -52,10 +57,14 @@ class VideoProcessorWorker:
         self.content_processor: Optional[ContentProcessor] = None
         self.feature_store: Optional[FeatureStore] = None
         self.vector_search: Optional[VectorSearchEngine] = None
+        self.system_store: Optional[SystemStore] = None
+        self.object_storage: Optional[ObjectStorage] = None
         self.consumer: Optional[KafkaConsumerClient] = None
         
         self.is_running = False
         self._shutdown_event = asyncio.Event()
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self.instance_id = f"content-worker-{socket.gethostname()}-{os.getpid()}"
         
         logger.info("VideoProcessorWorker initialized")
     
@@ -64,8 +73,15 @@ class VideoProcessorWorker:
         logger.info("Initializing video processor components...")
         
         # Initialize feature store (Redis)
-        self.feature_store = FeatureStore(self.config.redis_config)
+        self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
         await self.feature_store.initialize()
+
+        if self.config.database_config.enable:
+            self.system_store = SystemStore(self.config.database_config)
+            await self.system_store.initialize()
+
+        self.object_storage = ObjectStorage(self.config.object_storage_config)
+        await self.object_storage.initialize()
         
         # Initialize content processor
         self.content_processor = ContentProcessor(self.config.model_config)
@@ -107,23 +123,62 @@ class VideoProcessorWorker:
         """
         content_id = value.get('content_id')
         file_path = value.get('file_path')
+        filename = value.get('filename')
         user_id = value.get('user_id')
         priority = value.get('priority', 'normal')
+        request_id = value.get('request_id')
         
-        logger.info(f"Processing video task: {content_id} (priority: {priority})")
+        logger.info(
+            "Processing video task",
+            extra={
+                "content_id": content_id,
+                "priority": priority,
+                "filename": filename,
+                "request_id": request_id,
+            },
+        )
         
+        processing_path = file_path
+        cleanup_processing_path = False
         try:
             # Update status to processing
             await self.feature_store.update_content_status(content_id, "processing")
+            if self.system_store:
+                await self.system_store.update_content_job_status(
+                    content_id,
+                    "processing",
+                    storage_path=file_path,
+                    payload={
+                        "request_id": request_id,
+                        "filename": filename,
+                    },
+                )
             
+            if self.object_storage:
+                processing_path, cleanup_processing_path = await self.object_storage.materialize_for_processing(
+                    file_path,
+                    suggested_suffix=Path(filename or file_path).suffix,
+                )
+
             # Check if file exists
-            if not os.path.exists(file_path):
+            if not processing_path or not os.path.exists(processing_path):
                 logger.error(f"Video file not found: {file_path}")
                 await self.feature_store.update_content_status(content_id, "failed")
+                if self.system_store:
+                    await self.system_store.update_content_job_status(
+                        content_id,
+                        "failed",
+                        error_message="Uploaded file missing before processing",
+                        storage_path=file_path,
+                        payload={
+                            "request_id": request_id,
+                            "filename": filename,
+                        },
+                    )
                 return
             
             # Extract features from video
-            features = await self.content_processor.process_video(file_path, content_id)
+            features = await self.content_processor.process_video(processing_path, content_id)
             
             # Store features in Redis
             await self.feature_store.store_content_features(content_id, features)
@@ -137,6 +192,17 @@ class VideoProcessorWorker:
             
             # Update status to completed
             await self.feature_store.update_content_status(content_id, "completed")
+            if self.system_store:
+                await self.system_store.update_content_job_status(
+                    content_id,
+                    "completed",
+                    storage_path=file_path,
+                    payload={
+                        "request_id": request_id,
+                        "filename": filename,
+                        "processing_time": features.processing_time,
+                    },
+                )
             
             logger.info(f"Video processing completed: {content_id}")
             
@@ -151,21 +217,57 @@ class VideoProcessorWorker:
                         'has_visual_embedding': features.visual_embedding is not None,
                         'detected_objects': features.detected_objects,
                         'processing_time': features.processing_time
-                    }
+                    },
+                    request_id=request_id,
                 )
             
         except Exception as e:
             logger.error(f"Error processing video {content_id}: {e}")
             await self.feature_store.update_content_status(content_id, "failed")
+            if self.system_store:
+                await self.system_store.update_content_job_status(
+                    content_id,
+                    "failed",
+                    error_message=str(e),
+                    storage_path=file_path,
+                    payload={
+                        "request_id": request_id,
+                        "filename": filename,
+                    },
+                )
         
         finally:
             # Cleanup temporary file
             try:
-                if file_path and os.path.exists(file_path):
+                if cleanup_processing_path and processing_path and os.path.exists(processing_path):
+                    os.remove(processing_path)
+                    logger.debug(f"Cleaned up materialized file: {processing_path}")
+                elif (
+                    self.config.data_config.cleanup_temp_files
+                    and file_path
+                    and file_path == processing_path
+                    and os.path.exists(file_path)
+                ):
                     os.remove(file_path)
                     logger.debug(f"Cleaned up temporary file: {file_path}")
             except Exception as e:
-                logger.warning(f"Failed to cleanup file {file_path}: {e}")
+                logger.warning(f"Failed to cleanup file {processing_path or file_path}: {e}")
+
+    async def _publish_heartbeat(self):
+        """Publish worker liveness into Redis for readiness checks."""
+        interval = self.config.monitoring_config.worker_heartbeat_interval_seconds
+        ttl = self.config.monitoring_config.worker_heartbeat_ttl_seconds
+        while self.is_running:
+            try:
+                await self.feature_store.write_service_heartbeat(
+                    "content-worker",
+                    self.instance_id,
+                    ttl,
+                    {"pid": os.getpid()},
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to publish content worker heartbeat: {exc}")
+            await asyncio.sleep(interval)
     
     async def run(self):
         """Run the video processor worker."""
@@ -174,6 +276,7 @@ class VideoProcessorWorker:
         
         try:
             # Start consuming messages
+            self._heartbeat_task = asyncio.create_task(self._publish_heartbeat())
             await self.consumer.consume()
             
         except asyncio.CancelledError:
@@ -193,6 +296,15 @@ class VideoProcessorWorker:
         
         if self.feature_store:
             await self.feature_store.close()
+        if self.system_store:
+            await self.system_store.close()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
         
         self._shutdown_event.set()
         logger.info("Video processor worker shutdown complete")

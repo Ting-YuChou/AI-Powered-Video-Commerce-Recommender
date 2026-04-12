@@ -114,7 +114,7 @@ ENV DATA_UPLOAD_DIR=/app/uploads
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${API_PORT:-8000}/health || exit 1
+    CMD curl -f http://localhost:${API_PORT:-8000}/readyz || exit 1
 
 # Expose port
 EXPOSE 8000
@@ -162,7 +162,20 @@ EXPOSE 8000 8888
 CMD ["python", "-m", "uvicorn", "gateway_api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
 # =============================================================================
-# Stage 6: GPU-Enabled Runtime
+# Stage 6: Test Runtime
+# =============================================================================
+FROM app-build as test
+
+COPY requirements-dev.txt* ./
+RUN if [ -f requirements-dev.txt ]; then pip install --no-cache-dir -r requirements-dev.txt; fi
+
+ENV PYTHONPATH=/app
+ENV ENVIRONMENT=test
+
+CMD ["pytest", "-q", "tests"]
+
+# =============================================================================
+# Stage 7: GPU-Enabled Runtime
 # =============================================================================
 FROM nvidia/cuda:11.8-runtime-ubuntu20.04 as gpu-runtime
 
@@ -208,7 +221,7 @@ USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/readyz || exit 1
 
 EXPOSE 8000
 CMD ["python", "-m", "uvicorn", "gateway_api:app", "--host", "0.0.0.0", "--port", "8000"]
