@@ -14,7 +14,6 @@ import faiss
 import logging
 from typing import Dict, List, Any, Optional, Set, Tuple
 import time
-import json
 from collections import defaultdict
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from models import (
     InteractionType
 )
 from feature_store import FeatureStore
+from model_artifacts import ModelArtifactManager
 from vector_search import VectorSearchEngine
 from config import RecommendationConfig
 from two_tower import TwoTowerTrainer
@@ -74,6 +74,7 @@ class TwoTowerRetrievalEngine:
 
         self.is_trained = False
         self.last_training_time: float = 0
+        self.model_version: Optional[str] = None
         self._item_popularity: Dict[str, float] = {}
 
         logger.info("Two-Tower retrieval engine initialized")
@@ -173,6 +174,7 @@ class TwoTowerRetrievalEngine:
 
             self.is_trained = True
             self.last_training_time = time.time()
+            self.model_version = f"two-tower-{int(self.last_training_time)}"
 
             logger.info(
                 f"Two-Tower model trained in {training_time:.1f}s — "
@@ -396,10 +398,12 @@ class RecommendationEngine:
         feature_store: FeatureStore,
         vector_search: VectorSearchEngine,
         config: RecommendationConfig,
+        artifact_manager: Optional[ModelArtifactManager] = None,
     ):
         self.feature_store = feature_store
         self.vector_search = vector_search
         self.config = config
+        self.artifact_manager = artifact_manager
 
         # Recommendation engines
         self.cf_engine = TwoTowerRetrievalEngine(config, vector_search)
@@ -408,6 +412,7 @@ class RecommendationEngine:
         # Model state
         self.is_initialized = False
         self.last_model_update = 0
+        self.loaded_two_tower_version: Optional[str] = None
 
         logger.info("Recommendation engine initialized (Two-Tower retrieval)")
 
@@ -451,6 +456,10 @@ class RecommendationEngine:
     async def _try_load_cf_index(self):
         """Attempt to load a previously saved CF FAISS index for fast cold start."""
         try:
+            checkpoint_record = None
+            if self.artifact_manager:
+                checkpoint_record = await self.artifact_manager.sync_latest_two_tower_artifacts()
+
             result = VectorSearchEngine.load_cf_index(self.config.cf_index_path)
             if result is not None:
                 index, metadata = result
@@ -460,11 +469,18 @@ class RecommendationEngine:
                 self.cf_engine.cf_index_map = {int(k): v for k, v in index_map_raw.items()}
 
                 # Load trainer checkpoint
-                checkpoint_path = self.config.cf_index_path.replace(".faiss", ".pt")
+                checkpoint_path = (
+                    self.artifact_manager.two_tower_local_checkpoint_path
+                    if self.artifact_manager
+                    else self.config.cf_index_path.replace(".faiss", ".pt")
+                )
                 if self.cf_engine.trainer.load_checkpoint(checkpoint_path):
                     self.cf_engine.user_mapping = dict(self.cf_engine.trainer.user_mapping)
                     self.cf_engine.item_mapping = dict(self.cf_engine.trainer.item_mapping)
                     self.cf_engine.is_trained = True
+                    if checkpoint_record:
+                        self.cf_engine.model_version = checkpoint_record.model_version
+                        self.loaded_two_tower_version = checkpoint_record.model_version
                     logger.info("Loaded pre-existing Two-Tower model and CF index")
         except Exception as e:
             logger.warning(f"Could not load pre-existing CF index: {e}")
@@ -472,18 +488,12 @@ class RecommendationEngine:
     async def _update_models_from_interactions(self):
         """Update models using recent interaction data."""
         try:
-            # Prefer the larger training-data list; fall back to global_interactions
-            interactions = await self.feature_store.get_training_interactions(limit=50000)
-            if not interactions:
-                interactions_data = await self.feature_store.redis_client.lrange(
-                    "global_interactions", 0, 9999
-                )
-                interactions = []
-                for data in interactions_data:
-                    try:
-                        interactions.append(json.loads(data.decode()))
-                    except Exception:
-                        continue
+            if not self.artifact_manager or not self.artifact_manager.system_store:
+                await self.refresh_serving_pools()
+                logger.warning("Skipping Two-Tower retraining because Postgres system store is unavailable")
+                return
+
+            interactions = await self.artifact_manager.system_store.get_training_interactions(limit=50000)
 
             if interactions:
                 # Gather user features for the trainer
@@ -493,9 +503,25 @@ class RecommendationEngine:
                 await self.cf_engine.train_model(
                     interactions, user_features_map=user_features_map
                 )
+                if self.cf_engine.is_trained:
+                    checkpoint_path = self.artifact_manager.two_tower_local_checkpoint_path
+                    index_path = self.artifact_manager.two_tower_local_index_path
+                    metadata_path = self.artifact_manager.two_tower_local_metadata_path
+                    model_version = self.cf_engine.model_version or f"two-tower-{int(time.time())}"
+                    artifact_record = await self.artifact_manager.persist_two_tower_artifacts(
+                        checkpoint_path=checkpoint_path,
+                        index_path=index_path,
+                        metadata_path=metadata_path,
+                        model_version=model_version,
+                        payload={
+                            "sample_count": len(interactions),
+                            "last_training_time": self.cf_engine.last_training_time,
+                        },
+                    )
+                    self.loaded_two_tower_version = artifact_record.model_version if artifact_record else model_version
 
                 # Update trending scores (use last 1K for recency)
-                await self.trending_engine.update_trending_scores(interactions[-1000:])
+                await self.trending_engine.update_trending_scores(interactions[:1000])
                 await self.refresh_serving_pools()
 
                 self.last_model_update = time.time()
@@ -506,6 +532,22 @@ class RecommendationEngine:
 
         except Exception as e:
             logger.error(f"Error updating models from interactions: {e}")
+
+    async def sync_serving_artifacts_if_updated(self) -> bool:
+        """Reload Two-Tower serving artifacts when a newer checkpoint is available."""
+        if not self.artifact_manager:
+            return False
+
+        latest_record = await self.artifact_manager.get_latest_model_checkpoint(
+            ModelArtifactManager.TWO_TOWER_MODEL_NAME
+        )
+        if not latest_record:
+            return False
+        if latest_record.model_version == self.loaded_two_tower_version:
+            return False
+
+        await self._try_load_cf_index()
+        return self.loaded_two_tower_version == latest_record.model_version
 
     def _compute_serving_pool_score(
         self,
@@ -932,6 +974,7 @@ class RecommendationEngine:
             "is_initialized": self.is_initialized,
             "last_model_update": self.last_model_update,
             "cf_trained": self.cf_engine.is_trained,
+            "cf_model_version": self.cf_engine.model_version,
             "cf_users": len(self.cf_engine.user_mapping),
             "cf_items": len(self.cf_engine.item_mapping),
             "cf_embedding_dim": self.config.tt_embedding_dim,

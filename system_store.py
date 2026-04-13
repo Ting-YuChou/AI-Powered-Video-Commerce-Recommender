@@ -7,9 +7,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import time
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import DateTime, Integer, JSON, String, Text, func, select, text
+from sqlalchemy import DateTime, Integer, JSON, String, Text, desc, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -225,6 +226,52 @@ class SystemStore:
             )
         return interactions
 
+    async def get_analytics_summary(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {
+                "total_interactions": 0,
+                "unique_users": 0,
+                "unique_products": 0,
+                "action_counts": {},
+                "ctr": 0.0,
+                "conversion_rate": 0.0,
+                "timestamp": time.time(),
+                "source": "postgres",
+            }
+
+        async with self.session_factory() as session:
+            totals_result = await session.execute(
+                select(
+                    func.count(InteractionEvent.event_id),
+                    func.count(func.distinct(InteractionEvent.user_id)),
+                    func.count(func.distinct(InteractionEvent.product_id)),
+                )
+            )
+            total_interactions, unique_users, unique_products = totals_result.one()
+
+            action_rows = await session.execute(
+                select(InteractionEvent.action, func.count(InteractionEvent.event_id))
+                .group_by(InteractionEvent.action)
+            )
+
+        action_counts = Counter({action: count for action, count in action_rows.all()})
+        clicks = action_counts.get("click", 0)
+        purchases = action_counts.get("purchase", 0)
+        views = action_counts.get("view", 0)
+        ctr = clicks / max(views, 1)
+        conversion_rate = purchases / max(clicks, 1)
+
+        return {
+            "total_interactions": int(total_interactions or 0),
+            "unique_users": int(unique_users or 0),
+            "unique_products": int(unique_products or 0),
+            "action_counts": dict(action_counts),
+            "ctr": round(ctr, 4),
+            "conversion_rate": round(conversion_rate, 4),
+            "timestamp": time.time(),
+            "source": "postgres",
+        }
+
     async def upsert_content_job(
         self,
         content_id: str,
@@ -369,3 +416,28 @@ class SystemStore:
                     payload=payload or {},
                 )
             )
+
+    async def get_latest_model_checkpoint(self, model_name: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelCheckpoint)
+                .where(ModelCheckpoint.model_name == model_name)
+                .order_by(desc(ModelCheckpoint.created_at), desc(ModelCheckpoint.id))
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+
+        if row is None:
+            return None
+
+        return {
+            "id": row.id,
+            "model_name": row.model_name,
+            "model_version": row.model_version,
+            "checkpoint_path": row.checkpoint_path,
+            "payload": row.payload or {},
+            "created_at": row.created_at.timestamp() if row.created_at else None,
+        }

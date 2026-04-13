@@ -12,6 +12,8 @@ import socket
 
 from config import Config
 from feature_store import FeatureStore
+from model_artifacts import ModelArtifactManager
+from object_storage import ObjectStorage
 from ranking import RankingModel
 from recommender import RecommendationEngine
 from system_store import SystemStore
@@ -30,6 +32,8 @@ class ModelTrainerService:
         self.recommendation_engine: RecommendationEngine | None = None
         self.ranking_model: RankingModel | None = None
         self.system_store: SystemStore | None = None
+        self.object_storage: ObjectStorage | None = None
+        self.artifact_manager: ModelArtifactManager | None = None
         self.running = False
         self._heartbeat_task: asyncio.Task | None = None
         self.instance_id = f"model-trainer-{socket.gethostname()}-{os.getpid()}"
@@ -48,6 +52,15 @@ class ModelTrainerService:
             self.system_store = SystemStore(self.config.database_config)
             await self.system_store.initialize()
 
+        self.object_storage = ObjectStorage(self.config.object_storage_config)
+        await self.object_storage.initialize()
+        self.artifact_manager = ModelArtifactManager(
+            system_store=self.system_store,
+            object_storage=self.object_storage,
+            model_config=self.config.model_config,
+            recommendation_config=self.config.recommendation_config,
+        )
+
         self.vector_search = VectorSearchEngine(self.config.vector_config)
         await self.vector_search.load_index()
 
@@ -55,11 +68,17 @@ class ModelTrainerService:
             self.feature_store,
             self.vector_search,
             self.config.recommendation_config,
+            artifact_manager=self.artifact_manager,
         )
         await self.recommendation_engine.load_models()
 
         self.ranking_model = RankingModel(self.config.ranking_config)
+        ranking_checkpoint = None
+        if self.artifact_manager:
+            ranking_checkpoint = await self.artifact_manager.sync_latest_ranking_checkpoint()
         await self.ranking_model.load_model(self.config.model_config.ranking_model_path)
+        if ranking_checkpoint:
+            self.ranking_model.model_version = ranking_checkpoint.model_version
 
         if self.config.ranking_config.enable_periodic_training:
             await self._train_ranking_model(trigger="startup")
@@ -103,11 +122,11 @@ class ModelTrainerService:
             return
         if not self.feature_store or not self.ranking_model:
             return
+        if not self.system_store:
+            logger.warning("Skipping ranking retrain because Postgres system store is unavailable")
+            return
 
-        if self.system_store:
-            interactions = await self.system_store.get_training_interactions(limit=50000)
-        else:
-            interactions = await self.feature_store.get_training_interactions(limit=50000)
+        interactions = await self.system_store.get_training_interactions(limit=50000)
         if len(interactions) < self.config.ranking_config.training_min_samples:
             logger.info(
                 "Skipping ranking retrain due to insufficient samples",
@@ -128,17 +147,18 @@ class ModelTrainerService:
             },
         )
         await self.ranking_model.train_model(interactions)
-        if self.system_store and self.ranking_model.is_trained:
-            await self.system_store.record_model_checkpoint(
-                model_name="ranking_model",
+        if self.ranking_model.is_trained and self.artifact_manager:
+            record = await self.artifact_manager.persist_ranking_checkpoint(
+                local_path=self.ranking_model.loaded_model_path or self.config.model_config.ranking_model_path,
                 model_version=self.ranking_model.model_version,
-                checkpoint_path=self.ranking_model.loaded_model_path or self.config.model_config.ranking_model_path,
                 payload={
                     "trigger": trigger,
                     "sample_count": len(interactions),
                     "last_training_time": self.ranking_model.last_training_time,
                 },
             )
+            if record:
+                self.ranking_model.model_version = record.model_version
 
     async def shutdown(self):
         self.running = False

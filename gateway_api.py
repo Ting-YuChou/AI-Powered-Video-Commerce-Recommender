@@ -392,8 +392,18 @@ async def content_status(content_id: str):
 
 
 @app.get("/api/analytics")
-async def analytics():
-    return await feature_store.get_analytics()
+async def analytics(request: Request):
+    if system_store:
+        return await system_store.get_analytics_summary()
+
+    request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
+    return build_error_response(
+        status_code=503,
+        code="SYSTEM_STORE_UNAVAILABLE",
+        message="Analytics require the Postgres-backed system store",
+        request_id=request_id,
+        headers={app.state.runtime.config.monitoring_config.request_id_header: request_id},
+    )
 
 
 @app.get("/health")

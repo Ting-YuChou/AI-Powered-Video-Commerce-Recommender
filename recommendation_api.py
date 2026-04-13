@@ -18,7 +18,9 @@ import torch
 from config import Config
 from feature_store import FeatureStore
 from kafka_client import close_kafka, init_kafka
+from model_artifacts import ModelArtifactManager
 from models import RecommendationRequest, RecommendationResponse
+from object_storage import ObjectStorage
 from ranking_batcher import RankingBatcher
 from ranking import RankingModel
 from recommender import RecommendationEngine
@@ -51,6 +53,8 @@ ranking_batcher: Optional[RankingBatcher] = None
 kafka_manager = None
 system_store: Optional[SystemStore] = None
 ranking_checkpoint_sync_task: Optional[asyncio.Task] = None
+object_storage: Optional[ObjectStorage] = None
+artifact_manager: Optional[ModelArtifactManager] = None
 
 
 @app.middleware("http")
@@ -76,6 +80,7 @@ async def startup_event():
     global feature_store, vector_search, recommendation_engine, ranking_model, ranking_batcher, kafka_manager
     global system_store
     global ranking_checkpoint_sync_task
+    global object_storage, artifact_manager
 
     runtime = app.state.runtime
     runtime.config = Config()
@@ -89,6 +94,15 @@ async def startup_event():
         system_store = SystemStore(runtime.config.database_config)
         await system_store.initialize()
 
+    object_storage = ObjectStorage(runtime.config.object_storage_config)
+    await object_storage.initialize()
+    artifact_manager = ModelArtifactManager(
+        system_store=system_store,
+        object_storage=object_storage,
+        model_config=runtime.config.model_config,
+        recommendation_config=runtime.config.recommendation_config,
+    )
+
     vector_search = VectorSearchEngine(runtime.config.vector_config)
     await vector_search.load_index()
     await feature_store.store_product_metadata_batch(vector_search.product_metadata)
@@ -99,11 +113,17 @@ async def startup_event():
         feature_store,
         vector_search,
         runtime.config.recommendation_config,
+        artifact_manager=artifact_manager,
     )
     await recommendation_engine.load_serving_state()
 
     ranking_model = RankingModel(runtime.config.ranking_config)
+    ranking_checkpoint = None
+    if artifact_manager:
+        ranking_checkpoint = await artifact_manager.sync_latest_ranking_checkpoint()
     await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
+    if ranking_checkpoint:
+        ranking_model.model_version = ranking_checkpoint.model_version
     ranking_model.enable_profiling_logs = runtime.config.monitoring_config.enable_profiling_logs
     ranking_model.profiling_log_min_duration_ms = (
         runtime.config.monitoring_config.profiling_log_min_duration_ms
@@ -524,11 +544,21 @@ def _configure_torch_runtime(runtime) -> None:
 async def _periodic_ranking_checkpoint_sync(runtime) -> None:
     interval_seconds = max(1, int(runtime.config.ranking_config.checkpoint_sync_interval_seconds))
     model_path = runtime.config.model_config.ranking_model_path
+    last_ranking_version: Optional[str] = ranking_model.model_version if ranking_model else None
     while True:
         try:
             await asyncio.sleep(interval_seconds)
-            if ranking_model and model_path:
-                await ranking_model.reload_model_if_updated(model_path)
+            if ranking_model and model_path and artifact_manager:
+                latest_ranking = await artifact_manager.get_latest_model_checkpoint(
+                    ModelArtifactManager.RANKING_MODEL_NAME
+                )
+                if latest_ranking and latest_ranking.model_version != last_ranking_version:
+                    await artifact_manager.sync_latest_ranking_checkpoint()
+                    if await ranking_model.reload_model_if_updated(model_path):
+                        ranking_model.model_version = latest_ranking.model_version
+                        last_ranking_version = latest_ranking.model_version
+            if recommendation_engine:
+                await recommendation_engine.sync_serving_artifacts_if_updated()
         except asyncio.CancelledError:
             break
         except Exception as exc:

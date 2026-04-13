@@ -363,7 +363,7 @@ class FeatureStore:
         action: str, 
         context: Dict[str, Any] = None
     ):
-        """Log user interaction for analytics and model training."""
+        """Log recent user interaction for online serving state only."""
         try:
             interaction_data = {
                 'user_id': user_id,
@@ -373,23 +373,12 @@ class FeatureStore:
                 'context': context or {}
             }
             
-            # Store in time-ordered list for analytics
             key = f"{self.prefixes['user_interactions']}{user_id}"
             await self.redis_client.lpush(key, json.dumps(interaction_data))
             
-            # Keep only recent interactions (last 1000)
             await self.redis_client.ltrim(key, 0, 999)
             await self.redis_client.expire(key, 86400 * 30)  # 30 days
-            
-            # Also store globally for system analytics
-            global_key = "global_interactions"
-            await self.redis_client.lpush(global_key, json.dumps(interaction_data))
-            await self.redis_client.ltrim(global_key, 0, 9999)  # Keep last 10k
-            await self.redis_client.expire(global_key, 86400 * 7)  # 7 days
-            
-            # Store for Two-Tower training (larger retention window)
-            await self.store_training_interaction(interaction_data)
-            
+
             logger.debug(f"Logged interaction: {user_id} -> {action} -> {product_id}")
             
         except Exception as e:
@@ -400,7 +389,7 @@ class FeatureStore:
         user_id: str,
         interactions: List[Dict[str, Any]],
     ):
-        """Batch-log interactions for a single user with one Redis pipeline."""
+        """Batch-log recent interactions for a single user with one Redis pipeline."""
         try:
             if not interactions:
                 return
@@ -419,21 +408,10 @@ class FeatureStore:
             ]
 
             user_key = f"{self.prefixes['user_interactions']}{user_id}"
-            global_key = "global_interactions"
-            training_key = "tt_training_interactions"
-
             pipeline = self.redis_client.pipeline(transaction=False)
             pipeline.lpush(user_key, *serialized)
             pipeline.ltrim(user_key, 0, 999)
             pipeline.expire(user_key, 86400 * 30)
-
-            pipeline.lpush(global_key, *serialized)
-            pipeline.ltrim(global_key, 0, 9999)
-            pipeline.expire(global_key, 86400 * 7)
-
-            pipeline.lpush(training_key, *serialized)
-            pipeline.ltrim(training_key, 0, 99999)
-            pipeline.expire(training_key, 86400 * 30)
             await pipeline.execute()
         except Exception as e:
             logger.error(f"Error batch-logging interactions for {user_id}: {e}")

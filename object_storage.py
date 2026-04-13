@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Optional, Tuple
 from urllib.parse import urlparse
@@ -94,6 +95,51 @@ class ObjectStorage:
         filename = f"{content_id}{suffix}"
         return f"{prefix}/{filename}" if prefix else filename
 
+    def build_artifact_object_name(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+        filename: str,
+    ) -> str:
+        prefix = self.config.prefix.strip("/")
+        safe_model_name = self._sanitize_path_segment(model_name)
+        safe_model_version = self._sanitize_path_segment(model_version or "latest")
+        safe_filename = Path(filename).name
+        object_name = f"artifacts/{safe_model_name}/{safe_model_version}/{safe_filename}"
+        return f"{prefix}/{object_name}" if prefix else object_name
+
+    async def sync_to_local_path(
+        self,
+        storage_path: str,
+        local_path: str,
+    ) -> str:
+        target_path = Path(local_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.is_remote and self.is_remote_uri(storage_path):
+            bucket, key = self._parse_s3_uri(storage_path)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(target_path.parent),
+                prefix=f"{target_path.stem}.",
+                suffix=target_path.suffix,
+            )
+            os.close(tmp_fd)
+            try:
+                await asyncio.to_thread(self._client.download_file, bucket, key, tmp_path)
+                os.replace(tmp_path, target_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            return str(target_path)
+
+        source_path = Path(storage_path)
+        if source_path.resolve() == target_path.resolve():
+            return str(target_path)
+
+        await asyncio.to_thread(shutil.copy2, str(source_path), str(target_path))
+        return str(target_path)
+
     def _ensure_bucket_exists(self) -> None:
         assert self._client is not None
         bucket = self.config.bucket
@@ -115,3 +161,8 @@ class ObjectStorage:
         if not bucket or not key:
             raise ValueError(f"Invalid S3 URI: {storage_path}")
         return bucket, key
+
+    @staticmethod
+    def _sanitize_path_segment(value: str) -> str:
+        sanitized = value.replace("\\", "-").replace("/", "-").strip()
+        return sanitized or "artifact"
