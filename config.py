@@ -365,9 +365,13 @@ class KafkaConfig(BaseSettings):
     # Consumer settings
     consumer_group_id: str = Field("video-commerce-group", description="Consumer group ID")
     consumer_auto_offset_reset: str = Field("earliest", description="Auto offset reset policy")
-    consumer_enable_auto_commit: bool = Field(True, description="Enable auto commit")
+    consumer_enable_auto_commit: bool = Field(False, description="Enable auto commit")
     consumer_auto_commit_interval_ms: int = Field(5000, description="Auto commit interval")
     consumer_max_poll_records: int = Field(500, description="Max records per poll")
+    consumer_handler_retries: int = Field(3, description="Handler retry attempts before DLQ/fail")
+    consumer_handler_retry_backoff_ms: int = Field(250, description="Handler retry backoff in milliseconds")
+    dead_letter_enable: bool = Field(True, description="Publish poison messages to a dead-letter topic")
+    dead_letter_topic: str = Field("dead-letter-events", description="Kafka dead-letter topic")
     
     # Timeout settings
     request_timeout_ms: int = Field(30000, description="Request timeout in milliseconds")
@@ -580,6 +584,26 @@ class ObjectStorageConfig(BaseSettings):
         True,
         description="Force path-style S3 requests for compatibility with MinIO and similar stores",
     )
+    connect_timeout_seconds: int = Field(
+        5,
+        description="S3 client connect timeout in seconds",
+    )
+    read_timeout_seconds: int = Field(
+        60,
+        description="S3 client read timeout in seconds",
+    )
+    max_attempts: int = Field(
+        3,
+        description="Maximum S3 client retry attempts",
+    )
+    checksum_algorithm: Optional[str] = Field(
+        None,
+        description="Optional S3 upload checksum algorithm, for example CRC32 or SHA256",
+    )
+    server_side_encryption: Optional[str] = Field(
+        None,
+        description="Optional S3 server-side encryption algorithm, for example AES256",
+    )
     download_dir: str = Field(
         "/tmp/object-storage",
         description="Temporary directory used when materializing remote objects for processing",
@@ -596,8 +620,8 @@ class DatabaseConfig(BaseSettings):
         "postgresql+asyncpg://video_commerce:video_commerce@postgres:5432/video_commerce",
         description="Async SQLAlchemy database URL",
     )
-    pool_size: int = Field(10, description="Database connection pool size")
-    max_overflow: int = Field(20, description="Database connection pool overflow")
+    pool_size: int = Field(5, description="Database connection pool size")
+    max_overflow: int = Field(5, description="Database connection pool overflow")
     auto_create_schema: bool = Field(
         True,
         description="Create required tables automatically on startup",
@@ -673,6 +697,20 @@ class Config:
             self.model_config.ranking_model_path = str(
                 Path(self.model_config.cache_dir) / "ranking_model.pt"
             )
+        if (
+            "VECTOR_INDEX_PATH" not in os.environ
+            and self.vector_config.index_path == "/tmp/vector_index.faiss"
+        ):
+            self.vector_config.index_path = str(
+                Path(self.model_config.cache_dir) / "vector_index.faiss"
+            )
+        if (
+            "RECOMMENDATION_CF_INDEX_PATH" not in os.environ
+            and self.recommendation_config.cf_index_path == "/tmp/cf_vector_index.faiss"
+        ):
+            self.recommendation_config.cf_index_path = str(
+                Path(self.model_config.cache_dir) / "cf_vector_index.faiss"
+            )
         
         # Set embedding dimension consistency
         if self.vector_config.embedding_dim != self.model_config.embedding_dim:
@@ -724,10 +762,37 @@ class Config:
         if self.object_storage_config.backend == "s3":
             if not self.object_storage_config.bucket:
                 errors.append("Object storage bucket is required when OBJECT_STORAGE_BACKEND=s3")
+            if self.object_storage_config.max_attempts <= 0:
+                errors.append("Object storage max attempts must be positive")
+            if os.getenv("ENVIRONMENT", "").lower() == "production":
+                if not self.object_storage_config.access_key_id:
+                    errors.append("Object storage access key is required in production when S3 is enabled")
+                if not self.object_storage_config.secret_access_key:
+                    errors.append("Object storage secret key is required in production when S3 is enabled")
+                if self.object_storage_config.access_key_id == "minioadmin":
+                    errors.append("Default MinIO access key is not allowed in production")
+                if self.object_storage_config.secret_access_key == "minioadmin":
+                    errors.append("Default MinIO secret key is not allowed in production")
         if self.security_config.auth_mode not in {"disabled", "api_key", "bearer", "api_key_or_bearer"}:
             errors.append(
                 "Security auth mode must be disabled, api_key, bearer, or api_key_or_bearer"
             )
+        if self.database_config.enable and not self.database_config.url:
+            errors.append("DATABASE_URL or DATABASE_URL_FILE is required when DATABASE_ENABLE=true")
+
+        if os.getenv("ENVIRONMENT", "").lower() == "production":
+            if self.security_config.auth_mode == "disabled":
+                errors.append("SECURITY_AUTH_MODE=disabled is not allowed in production")
+            if self.security_config.auth_mode in {"api_key", "api_key_or_bearer"} and not self.api_config.api_key:
+                errors.append("API_API_KEY or API_API_KEY_FILE is required in production")
+            if not self.security_config.internal_service_key:
+                errors.append("SECURITY_INTERNAL_SERVICE_KEY or SECURITY_INTERNAL_SERVICE_KEY_FILE is required in production")
+            if self.security_config.internal_service_key == "change-me-in-production":
+                errors.append("Default internal service key is not allowed in production")
+            if not self.redis_config.password:
+                errors.append("REDIS_PASSWORD or REDIS_PASSWORD_FILE is required in production")
+            if "video_commerce:video_commerce@" in self.database_config.url:
+                errors.append("Default Postgres credentials are not allowed in production")
         
         if errors:
             logger.error("Configuration validation failed:")

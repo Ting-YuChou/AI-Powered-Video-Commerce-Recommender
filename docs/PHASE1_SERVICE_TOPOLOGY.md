@@ -20,8 +20,8 @@ serving process:
 
 - `interaction-ingest-service`
   - Accepts interaction events quickly
-  - Enqueues to Kafka without waiting for broker ack
-  - Falls back to a Redis stream if Kafka is unavailable
+  - Enqueues to Kafka and waits for broker acknowledgment before returning `202`
+  - Returns `503` when Kafka is unavailable so clients can retry without silent data loss
   - Does not synchronously update user features on the request path
 
 - `content-worker`
@@ -51,4 +51,5 @@ serving process:
 - Internal service ports are `8001` for `recommendation-service` and `8002` for `interaction-ingest-service`.
 - Worker communication uses Kafka.
 - Redis remains a single node in local compose for simplicity; production should replace it with Redis Cluster / managed equivalent.
+- Kafka consumers use manual offset commits by default; handler success or DLQ publish is required before offsets are committed.
 - `docker-compose.yml` removes the old single `app` service and deploys the split topology.

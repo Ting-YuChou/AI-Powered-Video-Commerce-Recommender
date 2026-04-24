@@ -1,6 +1,8 @@
 import asyncio
 import os
 
+import pytest
+
 from config import ObjectStorageConfig
 from object_storage import ObjectStorage
 
@@ -65,3 +67,27 @@ def test_local_object_storage_syncs_file_to_fixed_cache_path(tmp_path):
 
     assert synced == str(target_file)
     assert target_file.read_bytes() == b"checkpoint"
+
+
+def test_remote_object_storage_cleans_temp_file_on_download_failure(tmp_path):
+    class FailingClient:
+        def download_file(self, bucket, key, filename):
+            assert bucket == "bucket"
+            assert key == "uploads/video.mp4"
+            assert os.path.exists(filename)
+            raise RuntimeError("download failed")
+
+    download_dir = tmp_path / "downloads"
+    storage = ObjectStorage(
+        ObjectStorageConfig(
+            backend="s3",
+            bucket="bucket",
+            download_dir=str(download_dir),
+        )
+    )
+    storage._client = FailingClient()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(storage.materialize_for_processing("s3://bucket/uploads/video.mp4"))
+
+    assert list(download_dir.iterdir()) == []

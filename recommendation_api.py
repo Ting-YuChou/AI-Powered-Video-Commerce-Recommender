@@ -314,26 +314,38 @@ async def get_recommendations(
                 },
             )
 
-        content_features = None
-        if payload.content_id:
-            stage_started = time.perf_counter()
-            content_features = await feature_store.get_content_features(payload.content_id)
-            profile["content_features_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-
-        stage_started = time.perf_counter()
-        user_features = await feature_store.get_user_features(payload.user_id)
-        profile["user_features_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-
         k_per_source = min(payload.k * 10, 500)
         candidate_cache_key = feature_store.generate_context_hash(
             _build_candidate_cache_context(payload, k_per_source)
         )
-        stage_started = time.perf_counter()
-        candidates = await feature_store.get_cached_candidate_products(
-            payload.user_id,
-            candidate_cache_key,
+        user_features_task = asyncio.create_task(
+            _timed_awaitable(feature_store.get_user_features(payload.user_id)),
+            name="recommendation-user-features",
         )
-        profile["candidate_cache_lookup_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+        candidate_cache_task = asyncio.create_task(
+            _timed_awaitable(
+                feature_store.get_cached_candidate_products(
+                    payload.user_id,
+                    candidate_cache_key,
+                )
+            ),
+            name="recommendation-candidate-cache",
+        )
+        content_features_task = None
+        if payload.content_id:
+            content_features_task = asyncio.create_task(
+                _timed_awaitable(feature_store.get_content_features(payload.content_id)),
+                name="recommendation-content-features",
+            )
+
+        (user_features, profile["user_features_ms"]), (
+            candidates,
+            profile["candidate_cache_lookup_ms"],
+        ) = await asyncio.gather(user_features_task, candidate_cache_task)
+        content_features = None
+        if content_features_task:
+            content_features, profile["content_features_ms"] = await content_features_task
+
         candidate_profile = {"path": "candidate_cache", "candidate_count": len(candidates or [])}
         if candidates is not None:
             profile["candidate_cache_hit"] = True
@@ -346,13 +358,18 @@ async def get_recommendations(
                 context=payload.context,
                 k_per_source=k_per_source,
                 include_profile=True,
+                user_features=user_features,
             )
             profile["candidate_generation_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
             stage_started = time.perf_counter()
-            await feature_store.cache_candidate_products(
-                payload.user_id,
-                candidate_cache_key,
-                candidates,
+            _schedule_best_effort_task(
+                "cache_candidate_products",
+                feature_store.cache_candidate_products(
+                    payload.user_id,
+                    candidate_cache_key,
+                    candidates,
+                    user_features=user_features,
+                ),
             )
             profile["candidate_cache_write_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
         profile["candidate_count"] = len(candidates)
@@ -409,24 +426,32 @@ async def get_recommendations(
         response_time = time.time() - start_time
 
         stage_started = time.perf_counter()
-        await feature_store.cache_recommendations(
-            payload.user_id,
-            cache_key,
-            [recommendation.dict() for recommendation in ranked_recommendations],
+        _schedule_best_effort_task(
+            "cache_recommendations",
+            feature_store.cache_recommendations(
+                payload.user_id,
+                cache_key,
+                [recommendation.dict() for recommendation in ranked_recommendations],
+                user_features=user_features,
+            ),
         )
         profile["cache_write_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
 
         stage_started = time.perf_counter()
-        await feature_store.log_recommendation_request(
-            payload.user_id,
-            len(ranked_recommendations),
-            response_time,
+        _schedule_best_effort_task(
+            "log_recommendation_request",
+            feature_store.log_recommendation_request(
+                payload.user_id,
+                len(ranked_recommendations),
+                response_time,
+            ),
         )
         profile["analytics_log_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
 
         if kafka_manager:
             stage_started = time.perf_counter()
-            asyncio.create_task(
+            _schedule_best_effort_task(
+                "send_recommendation_event",
                 kafka_manager.send_recommendation_event(
                     user_id=payload.user_id,
                     recommendations=[item.product_id for item in ranked_recommendations],
@@ -500,6 +525,34 @@ def _attach_profile_headers(response: Response, profile: dict) -> None:
     response.headers["X-Recommendation-Total-Ms"] = str(profile["total_ms"])
     response.headers["X-Torch-Num-Threads"] = str(profile["torch_num_threads"])
     response.headers["X-Torch-Num-Interop-Threads"] = str(profile["torch_num_interop_threads"])
+
+
+async def _timed_awaitable(awaitable):
+    started_at = time.perf_counter()
+    result = await awaitable
+    return result, round((time.perf_counter() - started_at) * 1000, 2)
+
+
+def _schedule_best_effort_task(
+    task_name: str,
+    awaitable,
+    timeout_seconds: float = 0.25,
+) -> None:
+    asyncio.create_task(
+        _run_best_effort_task(task_name, awaitable, timeout_seconds),
+        name=f"best-effort-{task_name}",
+    )
+
+
+async def _run_best_effort_task(task_name: str, awaitable, timeout_seconds: float) -> None:
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        logger.warning("%s_timed_out", task_name)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("%s_failed: %s", task_name, exc)
 
 
 def _configure_torch_runtime(runtime) -> None:

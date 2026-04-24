@@ -675,6 +675,7 @@ class RecommendationEngine:
         context: Optional[Dict[str, Any]] = None,
         k_per_source: int = 100,
         include_profile: bool = False,
+        user_features: Optional[UserFeatures] = None,
     ) -> List[CandidateProduct]:
         """
         Generate candidate products from multiple recommendation sources.
@@ -716,7 +717,7 @@ class RecommendationEngine:
 
             # Get user features once for reuse
             stage_started = time.perf_counter()
-            user_features_obj = await self.feature_store.get_user_features(user_id)
+            user_features_obj = user_features or await self.feature_store.get_user_features(user_id)
             profile["user_features_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
             user_features_dict = user_features_obj.dict() if user_features_obj else {}
             preferred_categories = self._resolve_preferred_categories(user_features_obj, context)

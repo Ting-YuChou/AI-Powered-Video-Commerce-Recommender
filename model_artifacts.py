@@ -58,7 +58,7 @@ class ModelArtifactManager:
 
     @property
     def two_tower_local_metadata_path(self) -> str:
-        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".metadata.json"))
+        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_meta.json"))
 
     async def get_latest_model_checkpoint(
         self,
@@ -192,6 +192,10 @@ class ModelArtifactManager:
         model_version: str,
         content_type: Optional[str] = None,
     ) -> str:
+        artifact_path = Path(local_path)
+        if not artifact_path.exists():
+            raise FileNotFoundError(f"Model artifact does not exist: {local_path}")
+
         if not self.object_storage:
             return local_path
 

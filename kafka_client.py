@@ -23,6 +23,10 @@ import uuid
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from aiokafka.errors import KafkaConnectionError, KafkaError
+try:
+    from aiokafka import TopicPartition
+except ImportError:
+    from kafka.structs import TopicPartition
 
 from config import KafkaConfig
 from observability import request_id_ctx_var
@@ -67,6 +71,20 @@ def _extract_header(headers: Optional[List[tuple]], name: str) -> Optional[str]:
         if key == name and value is not None:
             return value.decode("utf-8")
     return None
+
+
+def _serialize_headers(headers: Optional[List[tuple]]) -> Dict[str, str]:
+    if not headers:
+        return {}
+    serialized = {}
+    for key, value in headers:
+        if value is None:
+            serialized[key] = ""
+        elif isinstance(value, bytes):
+            serialized[key] = value.decode("utf-8", errors="replace")
+        else:
+            serialized[key] = str(value)
+    return serialized
 
 
 class KafkaProducerClient:
@@ -278,6 +296,7 @@ class KafkaConsumerClient:
         self.config = config
         self.group_id = group_id or config.consumer_group_id
         self.consumer: Optional[AIOKafkaConsumer] = None
+        self.dlq_producer: Optional[AIOKafkaProducer] = None
         self.is_connected = False
         self.is_running = False
         self._lock = asyncio.Lock()
@@ -322,6 +341,19 @@ class KafkaConsumerClient:
                 )
                 
                 await self.consumer.start()
+                if self.config.dead_letter_enable:
+                    self.dlq_producer = AIOKafkaProducer(
+                        bootstrap_servers=self.config.bootstrap_servers,
+                        acks=self.config.producer_acks,
+                        max_batch_size=self.config.producer_batch_size,
+                        linger_ms=self.config.producer_linger_ms,
+                        compression_type=self.config.producer_compression_type,
+                        request_timeout_ms=self.config.request_timeout_ms,
+                        retry_backoff_ms=self.config.retry_backoff_ms,
+                        key_serializer=lambda k: k.encode('utf-8') if k else None,
+                        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                    )
+                    await self.dlq_producer.start()
                 self.is_connected = True
                 logger.info(f"Kafka consumer connected, subscribed to topics: {topics}")
                 
@@ -347,7 +379,15 @@ class KafkaConsumerClient:
                     logger.error(f"Error stopping Kafka consumer: {e}")
                 finally:
                     self.consumer = None
-                    self.is_connected = False
+            if self.dlq_producer:
+                try:
+                    await self.dlq_producer.stop()
+                    logger.info("Kafka DLQ producer stopped")
+                except Exception as e:
+                    logger.error(f"Error stopping Kafka DLQ producer: {e}")
+                finally:
+                    self.dlq_producer = None
+            self.is_connected = False
     
     async def consume(self):
         """
@@ -366,26 +406,15 @@ class KafkaConsumerClient:
             async for message in self.consumer:
                 if not self.is_running:
                     break
-                
-                try:
-                    topic = message.topic
-                    key = message.key
-                    value = message.value
-                    headers = message.headers
-                    request_id = _extract_header(headers, "x-request-id") or value.get("request_id")
-                    request_id_token = request_id_ctx_var.set(request_id or "-")
 
-                    try:
-                        # Get registered handler for topic
-                        handler = self._handlers.get(topic)
-                        if handler:
-                            await handler(topic, key, value, headers)
-                        else:
-                            logger.warning(f"No handler registered for topic: {topic}")
-                    finally:
-                        request_id_ctx_var.reset(request_id_token)
-                except Exception as e:
-                    logger.error(f"Error processing message from {message.topic}: {e}")
+                handled = await self._process_message_with_retries(message)
+                if not handled:
+                    raise RuntimeError(
+                        f"Message processing failed without DLQ commit: "
+                        f"{message.topic}[{message.partition}]@{message.offset}"
+                    )
+                if not self.config.consumer_enable_auto_commit:
+                    await self._commit_message(message)
                     
         except asyncio.CancelledError:
             logger.info("Consumer loop cancelled")
@@ -393,6 +422,102 @@ class KafkaConsumerClient:
             logger.error(f"Error in consumer loop: {e}")
         finally:
             self.is_running = False
+
+    async def _process_message_with_retries(self, message) -> bool:
+        max_attempts = max(1, int(self.config.consumer_handler_retries))
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self._process_message_once(message)
+                return True
+            except Exception as exc:
+                last_error = exc
+                logger.error(
+                    "Error processing Kafka message",
+                    extra={
+                        "topic": message.topic,
+                        "partition": message.partition,
+                        "offset": message.offset,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "error": str(exc),
+                    },
+                )
+                if attempt < max_attempts:
+                    backoff_seconds = (
+                        max(0, self.config.consumer_handler_retry_backoff_ms) / 1000.0
+                    ) * attempt
+                    await asyncio.sleep(backoff_seconds)
+
+        if last_error and self.config.dead_letter_enable:
+            return await self._publish_dead_letter(message, last_error)
+        return False
+
+    async def _process_message_once(self, message) -> None:
+        topic = message.topic
+        key = message.key
+        value = message.value
+        headers = message.headers
+        request_id = _extract_header(headers, "x-request-id")
+        if not request_id and isinstance(value, dict):
+            request_id = value.get("request_id")
+        request_id_token = request_id_ctx_var.set(request_id or "-")
+        try:
+            handler = self._handlers.get(topic)
+            if not handler:
+                logger.warning(f"No handler registered for topic: {topic}")
+                return
+            await handler(topic, key, value, headers)
+        finally:
+            request_id_ctx_var.reset(request_id_token)
+
+    async def _commit_message(self, message) -> None:
+        if not self.consumer:
+            return
+        topic_partition = TopicPartition(message.topic, message.partition)
+        await self.consumer.commit({topic_partition: message.offset + 1})
+
+    async def _publish_dead_letter(self, message, exc: Exception) -> bool:
+        if not self.dlq_producer:
+            return False
+        request_id = _extract_header(message.headers, "x-request-id") or (
+            message.value.get("request_id") if isinstance(message.value, dict) else None
+        )
+        payload = {
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "event_id": str(uuid.uuid4()),
+            "event_type": "dead_letter",
+            "request_id": request_id,
+            "source_topic": message.topic,
+            "source_partition": message.partition,
+            "source_offset": message.offset,
+            "source_key": message.key,
+            "source_value": message.value,
+            "source_headers": _serialize_headers(message.headers),
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "occurred_at": time.time(),
+        }
+        try:
+            await self.dlq_producer.send_and_wait(
+                topic=self.config.dead_letter_topic,
+                value=payload,
+                key=f"{message.topic}:{message.partition}:{message.offset}",
+                headers=_build_headers(request_id, payload["event_id"]),
+            )
+            logger.error(
+                "Kafka message sent to DLQ",
+                extra={
+                    "source_topic": message.topic,
+                    "source_partition": message.partition,
+                    "source_offset": message.offset,
+                    "dead_letter_topic": self.config.dead_letter_topic,
+                },
+            )
+            return True
+        except Exception as dlq_exc:
+            logger.error(f"Failed to publish Kafka message to DLQ: {dlq_exc}")
+            return False
     
     async def consume_batch(self, timeout_ms: int = 1000) -> List[Dict[str, Any]]:
         """

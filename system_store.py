@@ -10,7 +10,7 @@ import time
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import DateTime, Integer, JSON, String, Text, desc, func, select, text
+from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, desc, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -96,6 +96,15 @@ class ModelCheckpoint(Base):
     )
 
 
+Index("ix_interaction_events_occurred_at_desc", InteractionEvent.occurred_at.desc())
+Index(
+    "ix_model_checkpoints_latest",
+    ModelCheckpoint.model_name,
+    ModelCheckpoint.created_at.desc(),
+    ModelCheckpoint.id.desc(),
+)
+
+
 @dataclass
 class DatabaseHealth:
     status: str
@@ -132,8 +141,23 @@ class SystemStore:
         if self.config.auto_create_schema:
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
+                await self._ensure_operational_indexes(conn)
 
         self.is_connected = True
+
+    async def _ensure_operational_indexes(self, conn) -> None:
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_interaction_events_occurred_at_desc "
+                "ON interaction_events (occurred_at DESC)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_model_checkpoints_latest "
+                "ON model_checkpoints (model_name, created_at DESC, id DESC)"
+            )
+        )
 
     async def close(self) -> None:
         if self.engine is not None:

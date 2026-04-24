@@ -15,12 +15,24 @@ x-common-service: &common-service
     REDIS_HOST: redis
     REDIS_PORT: 6379
     REDIS_DB: 0
+    REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    REDIS_PASSWORD_FILE: ${REDIS_PASSWORD_FILE:-}
     KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     KAFKA_ENABLE: "true"
+    KAFKA_CONSUMER_ENABLE_AUTO_COMMIT: ${KAFKA_CONSUMER_ENABLE_AUTO_COMMIT:-false}
+    KAFKA_CONSUMER_HANDLER_RETRIES: ${KAFKA_CONSUMER_HANDLER_RETRIES:-3}
+    KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS: ${KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS:-250}
+    KAFKA_DEAD_LETTER_ENABLE: ${KAFKA_DEAD_LETTER_ENABLE:-true}
+    KAFKA_DEAD_LETTER_TOPIC: ${KAFKA_DEAD_LETTER_TOPIC:-dead-letter-events}
     DATABASE_ENABLE: "true"
-    DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://video_commerce:video_commerce@postgres:5432/video_commerce}
+    DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://video_commerce:${POSTGRES_PASSWORD:-video_commerce}@postgres:5432/video_commerce}
+    DATABASE_URL_FILE: ${DATABASE_URL_FILE:-}
+    DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
+    DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-5}
     DATABASE_AUTO_CREATE_SCHEMA: "true"
     MODEL_CACHE_DIR: /app/models
+    VECTOR_INDEX_PATH: /app/models/vector_index.faiss
+    RECOMMENDATION_CF_INDEX_PATH: /app/models/cf_vector_index.faiss
     DATA_UPLOAD_DIR: /app/uploads
     DATA_LOAD_SAMPLE_DATA: "false"
     DATA_MAX_FILE_SIZE: ${DATA_MAX_FILE_SIZE:-104857600}
@@ -33,7 +45,7 @@ x-common-service: &common-service
     SERVICE_RECOMMENDATION_SERVICE_URL: http://recommendation-service:8001
     SERVICE_INTERACTION_INGEST_SERVICE_URL: http://interaction-ingest-service:8002
     SECURITY_AUTH_MODE: ${SECURITY_AUTH_MODE:-api_key}
-    SECURITY_INTERNAL_SERVICE_KEY: ${SECURITY_INTERNAL_SERVICE_KEY:-change-me-in-production}
+    SECURITY_INTERNAL_SERVICE_KEY: ${SECURITY_INTERNAL_SERVICE_KEY:-}
     SECURITY_INTERNAL_SERVICE_KEY_FILE: ${SECURITY_INTERNAL_SERVICE_KEY_FILE:-}
     SECURITY_INTERNAL_SERVICE_HEADER: X-Internal-Service-Key
     SECURITY_OIDC_ENABLED: ${SECURITY_OIDC_ENABLED:-false}
@@ -55,6 +67,11 @@ x-common-service: &common-service
     OBJECT_STORAGE_PREFIX: ${OBJECT_STORAGE_PREFIX:-uploads}
     OBJECT_STORAGE_FORCE_PATH_STYLE: ${OBJECT_STORAGE_FORCE_PATH_STYLE:-true}
     OBJECT_STORAGE_CREATE_BUCKET_ON_STARTUP: ${OBJECT_STORAGE_CREATE_BUCKET_ON_STARTUP:-false}
+    OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS: ${OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS:-5}
+    OBJECT_STORAGE_READ_TIMEOUT_SECONDS: ${OBJECT_STORAGE_READ_TIMEOUT_SECONDS:-60}
+    OBJECT_STORAGE_MAX_ATTEMPTS: ${OBJECT_STORAGE_MAX_ATTEMPTS:-3}
+    OBJECT_STORAGE_CHECKSUM_ALGORITHM: ${OBJECT_STORAGE_CHECKSUM_ALGORITHM:-}
+    OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION: ${OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION:-}
   volumes:
     - models_data:/app/models
     - upload_data:/app/uploads
@@ -259,21 +276,40 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: >
-      redis-server
-      --appendonly yes
-      --appendfsync everysec
-      --maxmemory 1gb
-      --maxmemory-policy allkeys-lru
-      --save 900 1
-      --save 300 10
-      --save 60 10000
+    command:
+      - sh
+      - -lc
+      - |
+        if [ -z "$${REDIS_PASSWORD:-}" ] && [ -n "$${REDIS_PASSWORD_FILE:-}" ]; then
+          REDIS_PASSWORD="$$(cat "$${REDIS_PASSWORD_FILE}")"
+          export REDIS_PASSWORD
+        fi
+        auth_args=""
+        if [ -n "$${REDIS_PASSWORD:-}" ]; then
+          auth_args="--requirepass $${REDIS_PASSWORD}"
+        fi
+        exec redis-server \
+          --appendonly yes \
+          --appendfsync everysec \
+          --maxmemory 1gb \
+          --maxmemory-policy noeviction \
+          --save 900 1 \
+          --save 300 10 \
+          --save 60 10000 \
+          $${auth_args}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_PASSWORD_FILE: ${REDIS_PASSWORD_FILE:-}
     volumes:
       - redis_data:/data
     networks:
       - video-commerce-network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        - CMD-SHELL
+        - |
+          if [ -z "$${REDIS_PASSWORD:-}" ] && [ -n "$${REDIS_PASSWORD_FILE:-}" ]; then REDIS_PASSWORD="$$(cat "$${REDIS_PASSWORD_FILE}")"; fi
+          if [ -n "$${REDIS_PASSWORD:-}" ]; then redis-cli -a "$${REDIS_PASSWORD}" ping; else redis-cli ping; fi
       interval: 10s
       timeout: 5s
       retries: 5
@@ -282,15 +318,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: video_commerce
-      POSTGRES_PASSWORD: video_commerce
-      POSTGRES_DB: video_commerce
+      POSTGRES_USER: ${POSTGRES_USER:-video_commerce}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-video_commerce}
+      POSTGRES_DB: ${POSTGRES_DB:-video_commerce}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - video-commerce-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U video_commerce -d video_commerce"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -354,6 +390,7 @@ services:
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic video-processing-tasks --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic recommendation-events --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-updates --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic dead-letter-events --partitions 3 --replication-factor 1
     networks:
       - video-commerce-network
     restart: "no"

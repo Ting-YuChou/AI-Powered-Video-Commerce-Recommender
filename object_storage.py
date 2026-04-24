@@ -38,7 +38,12 @@ class ObjectStorage:
             region_name=self.config.region,
             aws_access_key_id=self.config.access_key_id,
             aws_secret_access_key=self.config.secret_access_key,
-            config=BotoConfig(s3={"addressing_style": "path" if self.config.force_path_style else "virtual"}),
+            config=BotoConfig(
+                s3={"addressing_style": "path" if self.config.force_path_style else "virtual"},
+                connect_timeout=self.config.connect_timeout_seconds,
+                read_timeout=self.config.read_timeout_seconds,
+                retries={"max_attempts": self.config.max_attempts, "mode": "standard"},
+            ),
         )
         if self.config.create_bucket_on_startup:
             await asyncio.to_thread(self._ensure_bucket_exists)
@@ -50,14 +55,20 @@ class ObjectStorage:
         object_name: str,
         content_type: Optional[str] = None,
     ) -> str:
+        if not Path(local_path).exists():
+            raise FileNotFoundError(f"Staged file does not exist: {local_path}")
         if not self.is_remote:
             return local_path
+        upload_kwargs = {}
+        extra_args = self._build_upload_extra_args(content_type)
+        if extra_args:
+            upload_kwargs["ExtraArgs"] = extra_args
         await asyncio.to_thread(
             self._client.upload_file,
             local_path,
             self.config.bucket,
             object_name,
-            ExtraArgs={"ContentType": content_type} if content_type else None,
+            **upload_kwargs,
         )
         return f"s3://{self.config.bucket}/{object_name}"
 
@@ -75,7 +86,12 @@ class ObjectStorage:
         fd, temp_path = tempfile.mkstemp(dir=self.config.download_dir, suffix=suffix)
         os.close(fd)
         bucket, key = self._parse_s3_uri(storage_path)
-        await asyncio.to_thread(self._client.download_file, bucket, key, temp_path)
+        try:
+            await asyncio.to_thread(self._client.download_file, bucket, key, temp_path)
+        except Exception:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
         return temp_path, True
 
     async def delete_uploaded_object(self, storage_path: str) -> None:
@@ -145,13 +161,32 @@ class ObjectStorage:
         bucket = self.config.bucket
         try:
             self._client.head_bucket(Bucket=bucket)
-        except Exception:
+        except Exception as exc:
+            error_code = self._get_s3_error_code(exc)
+            if error_code not in {"404", "NoSuchBucket", "NotFound"}:
+                raise
             create_kwargs = {"Bucket": bucket}
             if self.config.region and self.config.region != "us-east-1":
                 create_kwargs["CreateBucketConfiguration"] = {
                     "LocationConstraint": self.config.region
                 }
             self._client.create_bucket(**create_kwargs)
+
+    def _build_upload_extra_args(self, content_type: Optional[str]) -> dict:
+        extra_args = {}
+        if content_type:
+            extra_args["ContentType"] = content_type
+        if self.config.checksum_algorithm:
+            extra_args["ChecksumAlgorithm"] = self.config.checksum_algorithm
+        if self.config.server_side_encryption:
+            extra_args["ServerSideEncryption"] = self.config.server_side_encryption
+        return extra_args
+
+    @staticmethod
+    def _get_s3_error_code(exc: Exception) -> str:
+        response = getattr(exc, "response", {}) or {}
+        error = response.get("Error", {}) if isinstance(response, dict) else {}
+        return str(error.get("Code", ""))
 
     @staticmethod
     def _parse_s3_uri(storage_path: str) -> Tuple[str, str]:

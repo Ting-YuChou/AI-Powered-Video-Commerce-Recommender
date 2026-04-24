@@ -518,7 +518,8 @@ class FeatureStore:
         self, 
         user_id: str, 
         context_hash: str, 
-        recommendations: List[Dict[str, Any]]
+        recommendations: List[Dict[str, Any]],
+        user_features: Optional[UserFeatures] = None,
     ):
         """Cache recommendation results."""
         try:
@@ -533,7 +534,7 @@ class FeatureStore:
             }
             
             # Use user-specific TTL
-            user_features = await self.get_user_features(user_id)
+            user_features = user_features or await self.get_user_features(user_id)
             ttl = self._calculate_adaptive_ttl(user_features)
             
             await self.redis_client.setex(
@@ -550,6 +551,7 @@ class FeatureStore:
         user_id: str,
         context_hash: str,
         candidates: List[CandidateProduct],
+        user_features: Optional[UserFeatures] = None,
     ):
         """Cache pre-ranked candidate products for reuse across requests."""
         try:
@@ -557,7 +559,7 @@ class FeatureStore:
                 return
 
             key = f"{self.prefixes['candidate_cache']}{user_id}:{context_hash}"
-            user_features = await self.get_user_features(user_id)
+            user_features = user_features or await self.get_user_features(user_id)
             ttl = min(
                 self._calculate_adaptive_ttl(user_features),
                 self.cache_config.candidate_ttl,
@@ -828,14 +830,12 @@ class FeatureStore:
         try:
             current_minute = int(time.time() // 60)
             key = f"{self.prefixes['system_metrics']}requests:{current_minute}"
-            
-            # Increment request count
-            await self.redis_client.hincrby(key, 'count', 1)
-            await self.redis_client.hincrby(key, 'total_recommendations', num_recommendations)
-            await self.redis_client.hincrby(key, 'total_response_time', int(response_time * 1000))
-            
-            # Set expiration for cleanup
-            await self.redis_client.expire(key, 86400)  # 24 hours
+            pipeline = self.redis_client.pipeline(transaction=False)
+            pipeline.hincrby(key, 'count', 1)
+            pipeline.hincrby(key, 'total_recommendations', num_recommendations)
+            pipeline.hincrby(key, 'total_response_time', int(response_time * 1000))
+            pipeline.expire(key, 86400)  # 24 hours
+            await pipeline.execute()
             
         except Exception as e:
             logger.error(f"Error logging recommendation request: {e}")

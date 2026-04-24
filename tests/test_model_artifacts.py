@@ -59,7 +59,7 @@ def test_sync_latest_two_tower_artifacts_copies_to_local_cache(tmp_path):
     remote_dir.mkdir()
     checkpoint = remote_dir / "two_tower.pt"
     index = remote_dir / "two_tower.faiss"
-    metadata = remote_dir / "two_tower.metadata.json"
+    metadata = remote_dir / "two_tower.cf_meta.json"
     checkpoint.write_bytes(b"pt")
     index.write_bytes(b"faiss")
     metadata.write_text("{}", encoding="utf-8")
@@ -93,4 +93,4 @@ def test_sync_latest_two_tower_artifacts_copies_to_local_cache(tmp_path):
     assert record is not None
     assert (tmp_path / "cache" / "cf_index.pt").read_bytes() == b"pt"
     assert local_index.read_bytes() == b"faiss"
-    assert local_index.with_suffix(".metadata.json").read_text(encoding="utf-8") == "{}"
+    assert local_index.with_suffix(".cf_meta.json").read_text(encoding="utf-8") == "{}"
