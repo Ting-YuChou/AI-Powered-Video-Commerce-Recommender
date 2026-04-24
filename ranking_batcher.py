@@ -38,6 +38,7 @@ class RankingBatcher:
         self.enabled = config.enable_async_batching
         self.max_batch_requests = max(1, config.batch_max_requests)
         self.batch_wait_seconds = max(config.batch_wait_ms, 0.0) / 1000.0
+        self.offload_inference_to_thread = getattr(config, "offload_inference_to_thread", True)
         self.queue: asyncio.Queue[Optional[RankingBatchRequest]] = asyncio.Queue(
             maxsize=max(1, config.batch_queue_size)
         )
@@ -156,64 +157,88 @@ class RankingBatcher:
     async def _fulfill_batch(self, batch: List[RankingBatchRequest]) -> None:
         batch_started = time.perf_counter()
         try:
-            prepared = []
-            feature_matrices = []
-            total_batch_candidates = 0
+            if self.offload_inference_to_thread:
+                results = await asyncio.to_thread(
+                    self._build_batch_results,
+                    batch,
+                    batch_started,
+                )
+            else:
+                results = self._build_batch_results(batch, batch_started)
+            for request, recommendations, profile in results:
+                self._set_result(request, recommendations, profile)
 
+        except Exception as exc:
+            logger.error(f"ranking_microbatch_failed: {exc}")
             for request in batch:
-                feature_matrix, valid_candidates, feature_extraction_ms = (
-                    self.ranking_model.prepare_request_matrix(
-                        request.candidates,
-                        request.user_features,
-                        request.context,
-                        product_metadata_map=request.product_metadata_map,
-                    )
-                )
-                prepared.append(
-                    {
-                        "request": request,
-                        "feature_matrix": feature_matrix,
-                        "valid_candidates": valid_candidates,
-                        "feature_extraction_ms": feature_extraction_ms,
-                    }
-                )
-                if feature_matrix is not None:
-                    feature_matrices.append(feature_matrix)
-                    total_batch_candidates += feature_matrix.shape[0]
+                await self._fulfill_single(request)
 
-            if not feature_matrices:
-                for item in prepared:
-                    self._set_result(
-                        item["request"],
-                        [],
-                        {
-                            "path": "torch_microbatch_empty",
-                            "batch_request_count": len(batch),
-                            "batch_candidate_count": 0,
-                            "batch_wait_ms": round(
-                                (batch_started - item["request"].enqueued_at) * 1000, 2
-                            ),
-                            "feature_extraction_ms": item["feature_extraction_ms"],
-                            "tensor_prep_ms": 0.0,
-                            "model_forward_ms": 0.0,
-                            "response_build_ms": 0.0,
-                            "total_ms": round((time.perf_counter() - batch_started) * 1000, 2),
-                            "candidate_count": len(item["request"].candidates),
-                            "ranked_count": 0,
-                        },
-                    )
-                return
+    def _build_batch_results(
+        self,
+        batch: List[RankingBatchRequest],
+        batch_started: float,
+    ) -> List[Tuple[RankingBatchRequest, List[ProductRecommendation], Dict[str, Any]]]:
+        prepared = []
+        feature_matrices = []
+        total_batch_candidates = 0
 
-            predictions, inference_profile = self.ranking_model.run_inference_batch(
-                np.vstack(feature_matrices)
+        for request in batch:
+            feature_matrix, valid_candidates, feature_extraction_ms = (
+                self.ranking_model.prepare_request_matrix(
+                    request.candidates,
+                    request.user_features,
+                    request.context,
+                    product_metadata_map=request.product_metadata_map,
+                )
             )
+            prepared.append(
+                {
+                    "request": request,
+                    "feature_matrix": feature_matrix,
+                    "valid_candidates": valid_candidates,
+                    "feature_extraction_ms": feature_extraction_ms,
+                }
+            )
+            if feature_matrix is not None:
+                feature_matrices.append(feature_matrix)
+                total_batch_candidates += feature_matrix.shape[0]
 
-            offset = 0
-            for item in prepared:
-                request = item["request"]
-                feature_matrix = item["feature_matrix"]
-                if feature_matrix is None:
-                    self._set_result(
+        if not feature_matrices:
+            return [
+                (
+                    item["request"],
+                    [],
+                    {
+                        "path": "torch_microbatch_empty",
+                        "batch_request_count": len(batch),
+                        "batch_candidate_count": 0,
+                        "batch_wait_ms": round(
+                            (batch_started - item["request"].enqueued_at) * 1000, 2
+                        ),
+                        "feature_extraction_ms": item["feature_extraction_ms"],
+                        "tensor_prep_ms": 0.0,
+                        "model_forward_ms": 0.0,
+                        "response_build_ms": 0.0,
+                        "total_ms": round((time.perf_counter() - batch_started) * 1000, 2),
+                        "candidate_count": len(item["request"].candidates),
+                        "ranked_count": 0,
+                    },
+                )
+                for item in prepared
+            ]
+
+        predictions, inference_profile = self.ranking_model.run_inference_batch(
+            np.vstack(feature_matrices)
+        )
+
+        results: List[Tuple[RankingBatchRequest, List[ProductRecommendation], Dict[str, Any]]] = []
+        offset = 0
+        for item in prepared:
+            request = item["request"]
+            feature_matrix = item["feature_matrix"]
+            if feature_matrix is None:
+                results.append(
+                    (
                         request,
                         [],
                         {
@@ -232,22 +257,24 @@ class RankingBatcher:
                             "ranked_count": 0,
                         },
                     )
-                    continue
-
-                size = feature_matrix.shape[0]
-                request_predictions = {
-                    key: values[offset : offset + size]
-                    for key, values in predictions.items()
-                }
-                offset += size
-                recommendations, response_build_ms = (
-                    self.ranking_model.build_recommendations_from_predictions(
-                        item["valid_candidates"],
-                        request_predictions,
-                        request.k,
-                    )
                 )
-                self._set_result(
+                continue
+
+            size = feature_matrix.shape[0]
+            request_predictions = {
+                key: values[offset : offset + size]
+                for key, values in predictions.items()
+            }
+            offset += size
+            recommendations, response_build_ms = (
+                self.ranking_model.build_recommendations_from_predictions(
+                    item["valid_candidates"],
+                    request_predictions,
+                    request.k,
+                )
+            )
+            results.append(
+                (
                     request,
                     recommendations,
                     {
@@ -267,11 +294,8 @@ class RankingBatcher:
                         "ranked_count": len(recommendations),
                     },
                 )
-
-        except Exception as exc:
-            logger.error(f"ranking_microbatch_failed: {exc}")
-            for request in batch:
-                await self._fulfill_single(request)
+            )
+        return results
 
     def _set_result(
         self,

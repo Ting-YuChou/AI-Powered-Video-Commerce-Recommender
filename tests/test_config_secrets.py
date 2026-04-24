@@ -22,6 +22,17 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     monkeypatch.delenv("VECTOR_INDEX_PATH", raising=False)
     monkeypatch.delenv("RECOMMENDATION_CF_INDEX_PATH", raising=False)
     monkeypatch.delenv("ENVIRONMENT", raising=False)
+    for env_name in (
+        "REDIS_CACHE_HOST",
+        "REDIS_CACHE_PORT",
+        "REDIS_CACHE_DB",
+        "REDIS_CACHE_PASSWORD",
+        "REDIS_CACHE_PASSWORD_FILE",
+        "REDIS_CACHE_MAX_CONNECTIONS",
+        "REDIS_CACHE_SOCKET_TIMEOUT",
+        "REDIS_CACHE_SOCKET_CONNECT_TIMEOUT",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("MODEL_CACHE_DIR", str(tmp_path / "models"))
 
     reset_config()
@@ -31,6 +42,26 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     assert config.recommendation_config.cf_index_path == str(
         tmp_path / "models" / "cf_vector_index.faiss"
     )
+    assert config.cache_config.hot_path_read_timeout_ms == 150.0
+    assert config.recommendation_config.preload_product_metadata_on_startup is False
+    assert config.recommendation_config.publish_catalog_snapshot_on_startup is False
+    assert config.redis_config.cache_host is None
+
+    reset_config()
+
+
+def test_config_reads_separate_cache_redis_env(monkeypatch):
+    monkeypatch.setenv("REDIS_CACHE_HOST", "redis-cache")
+    monkeypatch.setenv("REDIS_CACHE_DB", "2")
+    monkeypatch.setenv("REDIS_CACHE_SOCKET_TIMEOUT", "0.25")
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.redis_config.cache_host == "redis-cache"
+    assert config.redis_config.cache_db == 2
+    assert config.redis_config.cache_socket_timeout == 0.25
 
     reset_config()
 

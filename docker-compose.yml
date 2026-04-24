@@ -7,7 +7,7 @@ x-common-service: &common-service
       PYTHON_VERSION: "3.10"
       BUILD_ENV: production
   environment: &common-env
-    ENVIRONMENT: production
+    ENVIRONMENT: ${ENVIRONMENT:-production}
     API_API_KEY: ${API_API_KEY:-}
     API_API_KEY_FILE: ${API_API_KEY_FILE:-}
     API_CORS_ORIGINS: ${API_CORS_ORIGINS:-https://localhost,http://localhost,https://127.0.0.1,http://127.0.0.1}
@@ -17,6 +17,14 @@ x-common-service: &common-service
     REDIS_DB: 0
     REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     REDIS_PASSWORD_FILE: ${REDIS_PASSWORD_FILE:-}
+    REDIS_CACHE_HOST: ${REDIS_CACHE_HOST:-redis-cache}
+    REDIS_CACHE_PORT: ${REDIS_CACHE_PORT:-6379}
+    REDIS_CACHE_DB: ${REDIS_CACHE_DB:-0}
+    REDIS_CACHE_PASSWORD: ${REDIS_CACHE_PASSWORD:-${REDIS_PASSWORD:-}}
+    REDIS_CACHE_PASSWORD_FILE: ${REDIS_CACHE_PASSWORD_FILE:-}
+    REDIS_CACHE_MAX_CONNECTIONS: ${REDIS_CACHE_MAX_CONNECTIONS:-200}
+    REDIS_CACHE_SOCKET_TIMEOUT: ${REDIS_CACHE_SOCKET_TIMEOUT:-1}
+    REDIS_CACHE_SOCKET_CONNECT_TIMEOUT: ${REDIS_CACHE_SOCKET_CONNECT_TIMEOUT:-1}
     KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     KAFKA_ENABLE: "true"
     KAFKA_CONSUMER_ENABLE_AUTO_COMMIT: ${KAFKA_CONSUMER_ENABLE_AUTO_COMMIT:-false}
@@ -37,9 +45,13 @@ x-common-service: &common-service
     DATA_LOAD_SAMPLE_DATA: "false"
     DATA_MAX_FILE_SIZE: ${DATA_MAX_FILE_SIZE:-104857600}
     MODEL_LAZY_LOAD: "true"
+    MODEL_TORCH_NUM_THREADS: ${MODEL_TORCH_NUM_THREADS:-0}
+    MODEL_TORCH_NUM_INTEROP_THREADS: ${MODEL_TORCH_NUM_INTEROP_THREADS:-1}
     MONITORING_LOG_LEVEL: INFO
     MONITORING_ENABLE_METRICS: "true"
     MONITORING_ENABLE_PROMETHEUS_METRICS: "true"
+    MONITORING_ENABLE_PROFILING_LOGS: ${MONITORING_ENABLE_PROFILING_LOGS:-false}
+    MONITORING_PROFILING_LOG_MIN_DURATION_MS: ${MONITORING_PROFILING_LOG_MIN_DURATION_MS:-250}
     MONITORING_WORKER_HEARTBEAT_INTERVAL_SECONDS: "15"
     MONITORING_WORKER_HEARTBEAT_TTL_SECONDS: "45"
     SERVICE_RECOMMENDATION_SERVICE_URL: http://recommendation-service:8001
@@ -116,6 +128,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      redis-cache:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       kafka:
@@ -154,6 +168,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      redis-cache:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       kafka-init:
@@ -189,6 +205,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      redis-cache:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       kafka:
@@ -221,6 +239,8 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      redis-cache:
+        condition: service_healthy
       postgres:
         condition: service_healthy
     healthcheck:
@@ -244,6 +264,8 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      redis-cache:
+        condition: service_healthy
       postgres:
         condition: service_healthy
     healthcheck:
@@ -263,6 +285,8 @@ services:
       SERVICE_TRAINER_INTERVAL_SECONDS: ${SERVICE_TRAINER_INTERVAL_SECONDS:-3600}
     depends_on:
       redis:
+        condition: service_healthy
+      redis-cache:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -310,6 +334,44 @@ services:
         - |
           if [ -z "$${REDIS_PASSWORD:-}" ] && [ -n "$${REDIS_PASSWORD_FILE:-}" ]; then REDIS_PASSWORD="$$(cat "$${REDIS_PASSWORD_FILE}")"; fi
           if [ -n "$${REDIS_PASSWORD:-}" ]; then redis-cli -a "$${REDIS_PASSWORD}" ping; else redis-cli ping; fi
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis-cache:
+    image: redis:7-alpine
+    command:
+      - sh
+      - -lc
+      - |
+        if [ -z "$${REDIS_CACHE_PASSWORD:-}" ] && [ -n "$${REDIS_CACHE_PASSWORD_FILE:-}" ]; then
+          REDIS_CACHE_PASSWORD="$$(cat "$${REDIS_CACHE_PASSWORD_FILE}")"
+          export REDIS_CACHE_PASSWORD
+        fi
+        auth_args=""
+        if [ -n "$${REDIS_CACHE_PASSWORD:-}" ]; then
+          auth_args="--requirepass $${REDIS_CACHE_PASSWORD}"
+        fi
+        exec redis-server \
+          --appendonly no \
+          --maxmemory ${REDIS_CACHE_MAXMEMORY:-2gb} \
+          --maxmemory-policy allkeys-lru \
+          --save "" \
+          $${auth_args}
+    environment:
+      REDIS_CACHE_PASSWORD: ${REDIS_CACHE_PASSWORD:-${REDIS_PASSWORD:-}}
+      REDIS_CACHE_PASSWORD_FILE: ${REDIS_CACHE_PASSWORD_FILE:-}
+    volumes:
+      - redis_cache_data:/data
+    networks:
+      - video-commerce-network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          if [ -z "$${REDIS_CACHE_PASSWORD:-}" ] && [ -n "$${REDIS_CACHE_PASSWORD_FILE:-}" ]; then REDIS_CACHE_PASSWORD="$$(cat "$${REDIS_CACHE_PASSWORD_FILE}")"; fi
+          if [ -n "$${REDIS_CACHE_PASSWORD:-}" ]; then redis-cli -a "$${REDIS_CACHE_PASSWORD}" ping; else redis-cli ping; fi
       interval: 10s
       timeout: 5s
       retries: 5
@@ -496,6 +558,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      redis-cache:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       kafka:
@@ -532,6 +596,7 @@ volumes:
   upload_data:
   logs_data:
   redis_data:
+  redis_cache_data:
   postgres_data:
   kafka_data:
   prometheus_data:

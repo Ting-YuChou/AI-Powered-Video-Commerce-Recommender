@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import ModelConfig, RecommendationConfig
 from object_storage import ObjectStorage
@@ -84,7 +85,16 @@ class ModelArtifactManager:
         if not record:
             return None
 
-        await self._sync_path_to_local(record.checkpoint_path, self.ranking_local_path)
+        checkpoint_sha256 = self._extract_artifact_sha256(
+            record.payload,
+            "checkpoint",
+            legacy_key="artifact_sha256",
+        )
+        await self._sync_path_to_local(
+            record.checkpoint_path,
+            self.ranking_local_path,
+            expected_sha256=checkpoint_sha256,
+        )
         return record
 
     async def sync_latest_two_tower_artifacts(self) -> Optional[ModelArtifactRecord]:
@@ -93,13 +103,47 @@ class ModelArtifactManager:
             return None
 
         payload = record.payload
-        await self._sync_path_to_local(record.checkpoint_path, self.two_tower_local_checkpoint_path)
         cf_index_path = payload.get("cf_index_path")
         cf_metadata_path = payload.get("cf_index_metadata_path")
+        if not cf_index_path or not cf_metadata_path:
+            logger.warning(
+                "Two-Tower artifact record is incomplete; skipping sync",
+                extra={
+                    "model_version": record.model_version,
+                    "has_checkpoint": bool(record.checkpoint_path),
+                    "has_cf_index": bool(cf_index_path),
+                    "has_cf_metadata": bool(cf_metadata_path),
+                },
+            )
+            return None
+        artifact_specs: List[Tuple[str, str, Optional[str]]] = [
+            (
+                record.checkpoint_path,
+                self.two_tower_local_checkpoint_path,
+                self._extract_artifact_sha256(payload, "checkpoint"),
+            )
+        ]
         if cf_index_path:
-            await self._sync_path_to_local(cf_index_path, self.two_tower_local_index_path)
+            artifact_specs.append(
+                (
+                    cf_index_path,
+                    self.two_tower_local_index_path,
+                    self._extract_artifact_sha256(payload, "cf_index", legacy_key="cf_index_sha256"),
+                )
+            )
         if cf_metadata_path:
-            await self._sync_path_to_local(cf_metadata_path, self.two_tower_local_metadata_path)
+            artifact_specs.append(
+                (
+                    cf_metadata_path,
+                    self.two_tower_local_metadata_path,
+                    self._extract_artifact_sha256(
+                        payload,
+                        "cf_index_metadata",
+                        legacy_key="cf_index_metadata_sha256",
+                    ),
+                )
+            )
+        await self._sync_paths_to_local_atomically(artifact_specs)
         return record
 
     async def persist_ranking_checkpoint(
@@ -112,13 +156,26 @@ class ModelArtifactManager:
         if not self.system_store:
             return None
 
+        artifact_sha256 = ObjectStorage.calculate_sha256(local_path)
         persisted_path = await self._persist_artifact(
             local_path=local_path,
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
         )
         record_payload = dict(payload or {})
-        record_payload["local_cache_path"] = self.ranking_local_path
+        record_payload.update(
+            {
+                "local_cache_path": self.ranking_local_path,
+                "artifact_sha256": artifact_sha256,
+                "artifact_manifest": {
+                    "checkpoint": {
+                        "path": persisted_path,
+                        "sha256": artifact_sha256,
+                        "local_cache_path": self.ranking_local_path,
+                    }
+                },
+            }
+        )
         await self.system_store.record_model_checkpoint(
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
@@ -144,6 +201,10 @@ class ModelArtifactManager:
         if not self.system_store:
             return None
 
+        checkpoint_sha256 = ObjectStorage.calculate_sha256(checkpoint_path)
+        index_sha256 = ObjectStorage.calculate_sha256(index_path)
+        metadata_sha256 = ObjectStorage.calculate_sha256(metadata_path)
+
         persisted_checkpoint = await self._persist_artifact(
             local_path=checkpoint_path,
             model_name=self.TWO_TOWER_MODEL_NAME,
@@ -166,9 +227,28 @@ class ModelArtifactManager:
             {
                 "cf_index_path": persisted_index,
                 "cf_index_metadata_path": persisted_metadata,
+                "cf_index_sha256": index_sha256,
+                "cf_index_metadata_sha256": metadata_sha256,
                 "local_cache_checkpoint_path": self.two_tower_local_checkpoint_path,
                 "local_cache_index_path": self.two_tower_local_index_path,
                 "local_cache_metadata_path": self.two_tower_local_metadata_path,
+                "artifact_manifest": {
+                    "checkpoint": {
+                        "path": persisted_checkpoint,
+                        "sha256": checkpoint_sha256,
+                        "local_cache_path": self.two_tower_local_checkpoint_path,
+                    },
+                    "cf_index": {
+                        "path": persisted_index,
+                        "sha256": index_sha256,
+                        "local_cache_path": self.two_tower_local_index_path,
+                    },
+                    "cf_index_metadata": {
+                        "path": persisted_metadata,
+                        "sha256": metadata_sha256,
+                        "local_cache_path": self.two_tower_local_metadata_path,
+                    },
+                },
             }
         )
         await self.system_store.record_model_checkpoint(
@@ -210,13 +290,23 @@ class ModelArtifactManager:
             content_type=content_type,
         )
 
-    async def _sync_path_to_local(self, storage_path: str, local_path: str) -> str:
+    async def _sync_path_to_local(
+        self,
+        storage_path: str,
+        local_path: str,
+        *,
+        expected_sha256: Optional[str] = None,
+    ) -> str:
         if not storage_path:
             raise ValueError("storage_path is required to sync a model artifact")
         if not self.object_storage:
             return storage_path
         try:
-            return await self.object_storage.sync_to_local_path(storage_path, local_path)
+            return await self.object_storage.sync_to_local_path(
+                storage_path,
+                local_path,
+                expected_sha256=expected_sha256,
+            )
         except Exception as exc:
             logger.error(
                 "Failed to sync model artifact",
@@ -227,3 +317,54 @@ class ModelArtifactManager:
                 },
             )
             raise
+
+    async def _sync_paths_to_local_atomically(
+        self,
+        artifact_specs: List[Tuple[str, str, Optional[str]]],
+    ) -> None:
+        if not artifact_specs:
+            return
+        if not self.object_storage:
+            return
+
+        staged: List[Tuple[str, str]] = []
+        try:
+            for storage_path, local_path, expected_sha256 in artifact_specs:
+                staged_path = await self.object_storage.stage_to_local_temp(
+                    storage_path,
+                    local_path,
+                    expected_sha256=expected_sha256,
+                )
+                staged.append((staged_path, local_path))
+
+            for staged_path, local_path in staged:
+                target_path = Path(local_path)
+                if Path(staged_path).resolve() == target_path.resolve():
+                    continue
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(staged_path, target_path)
+        except Exception:
+            logger.error("Failed to atomically sync model artifact set")
+            raise
+        finally:
+            for staged_path, local_path in staged:
+                if Path(staged_path).resolve() == Path(local_path).resolve():
+                    continue
+                if os.path.exists(staged_path):
+                    os.remove(staged_path)
+
+    @staticmethod
+    def _extract_artifact_sha256(
+        payload: Dict[str, Any],
+        manifest_key: str,
+        *,
+        legacy_key: Optional[str] = None,
+    ) -> Optional[str]:
+        manifest = payload.get("artifact_manifest") or {}
+        artifact_entry = manifest.get(manifest_key) or {}
+        checksum = artifact_entry.get("sha256")
+        if checksum:
+            return str(checksum)
+        if legacy_key and payload.get(legacy_key):
+            return str(payload[legacy_key])
+        return None

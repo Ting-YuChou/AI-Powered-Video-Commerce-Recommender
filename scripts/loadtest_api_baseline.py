@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional output JSON path. Defaults to loadtest/results/httpx-baseline-<mode>.json",
     )
     parser.add_argument("--api-key", help="Optional X-API-Key header")
+    parser.add_argument("--internal-key", help="Optional X-Internal-Service-Key header")
     return parser.parse_args()
 
 
@@ -87,6 +88,9 @@ async def run_load(args: argparse.Namespace) -> List[RequestResult]:
     api_key = args.api_key or os.environ.get("API_API_KEY")
     if api_key:
         headers["x-api-key"] = api_key
+    internal_key = args.internal_key or os.environ.get("SECURITY_INTERNAL_SERVICE_KEY")
+    if internal_key:
+        headers["x-internal-service-key"] = internal_key
 
     semaphore = asyncio.Semaphore(args.concurrency)
     timeout = httpx.Timeout(args.timeout)

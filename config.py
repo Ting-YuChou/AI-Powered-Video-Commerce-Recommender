@@ -41,9 +41,32 @@ class RedisConfig(BaseSettings):
     password: Optional[str] = Field(None, description="Redis password")
     decode_responses: bool = Field(True, description="Decode Redis responses")
     max_connections: int = Field(100, description="Maximum Redis connections")
-    socket_timeout: int = Field(30, description="Socket timeout in seconds")
-    socket_connect_timeout: int = Field(30, description="Socket connect timeout")
+    socket_timeout: float = Field(30, description="Socket timeout in seconds")
+    socket_connect_timeout: float = Field(30, description="Socket connect timeout")
     retry_on_timeout: bool = Field(True, description="Retry on timeout")
+    cache_host: Optional[str] = Field(
+        None,
+        description="Optional separate Redis host for recommendation caches and serving pools",
+    )
+    cache_port: Optional[int] = Field(None, description="Optional separate cache Redis port")
+    cache_db: Optional[int] = Field(None, description="Optional separate cache Redis DB")
+    cache_password: Optional[str] = Field(None, description="Optional separate cache Redis password")
+    cache_max_connections: Optional[int] = Field(
+        None,
+        description="Optional separate cache Redis max connections",
+    )
+    cache_socket_timeout: Optional[float] = Field(
+        None,
+        description="Optional separate cache Redis socket timeout",
+    )
+    cache_socket_connect_timeout: Optional[float] = Field(
+        None,
+        description="Optional separate cache Redis connect timeout",
+    )
+    cache_retry_on_timeout: Optional[bool] = Field(
+        None,
+        description="Optional separate cache Redis retry-on-timeout setting",
+    )
     
     class Config:
         env_prefix = "REDIS_"
@@ -154,6 +177,22 @@ class RecommendationConfig(BaseSettings):
         10,
         description="Maximum random fallback candidates to merge per request",
     )
+    interaction_history_timeout_ms: float = Field(
+        50.0,
+        description="Maximum time to spend reading recent user interactions on the serving path",
+    )
+    candidate_source_timeout_ms: float = Field(
+        250.0,
+        description="Maximum time to spend on one live candidate source on the serving path",
+    )
+    preload_product_metadata_on_startup: bool = Field(
+        False,
+        description="Preload product metadata into Redis during recommendation service startup",
+    )
+    publish_catalog_snapshot_on_startup: bool = Field(
+        False,
+        description="Publish product catalog snapshots to Postgres during recommendation service startup",
+    )
     
     # Ranking weights
     cf_weight: float = Field(0.4, description="Collaborative filtering weight")
@@ -211,6 +250,10 @@ class RankingConfig(BaseSettings):
     batch_queue_size: int = Field(
         2048,
         description="Maximum queued ranking requests per worker",
+    )
+    offload_inference_to_thread: bool = Field(
+        True,
+        description="Run ranking feature preparation and inference off the asyncio event loop",
     )
 
     # Multi-objective settings
@@ -283,6 +326,14 @@ class CacheConfig(BaseSettings):
     candidate_ttl: int = Field(300, description="Candidate cache TTL in seconds")
     product_metadata_ttl: int = Field(86400, description="Product metadata cache TTL in seconds")
     serving_pool_ttl: int = Field(1800, description="Serving pool cache TTL in seconds")
+    hot_path_read_timeout_ms: float = Field(
+        150.0,
+        description="Maximum time to spend on optional Redis reads in the recommendation request path",
+    )
+    background_write_timeout_ms: float = Field(
+        250.0,
+        description="Maximum time to spend on best-effort cache/analytics writes in the request path",
+    )
     
     # Cache size limits
     max_cache_size: int = Field(10000, description="Maximum cache entries")
@@ -626,6 +677,34 @@ class DatabaseConfig(BaseSettings):
         True,
         description="Create required tables automatically on startup",
     )
+    analytics_window_hours: int = Field(
+        24,
+        description="Time window used by online Postgres analytics summaries",
+    )
+    interaction_retention_days: int = Field(
+        90,
+        description="Retention window for raw interaction_events rows",
+    )
+    enable_retention_cleanup: bool = Field(
+        False,
+        description="Enable periodic interaction_events retention cleanup",
+    )
+    interaction_events_partitioned: bool = Field(
+        False,
+        description="Set true after applying the interaction_events time-partition migration",
+    )
+    partition_backfill_months: int = Field(
+        1,
+        description="Months of historical interaction_events partitions to create on startup",
+    )
+    partition_premake_months: int = Field(
+        6,
+        description="Months of future interaction_events partitions to create on startup",
+    )
+    retention_cleanup_interval_seconds: int = Field(
+        3600,
+        description="How often to run interaction_events retention cleanup",
+    )
     echo_sql: bool = Field(False, description="Enable SQLAlchemy SQL logging")
 
     class Config:
@@ -791,6 +870,10 @@ class Config:
                 errors.append("Default internal service key is not allowed in production")
             if not self.redis_config.password:
                 errors.append("REDIS_PASSWORD or REDIS_PASSWORD_FILE is required in production")
+            if self.redis_config.cache_host and not (
+                self.redis_config.cache_password or self.redis_config.password
+            ):
+                errors.append("REDIS_CACHE_PASSWORD, REDIS_CACHE_PASSWORD_FILE, or REDIS_PASSWORD is required in production when cache Redis is separate")
             if "video_commerce:video_commerce@" in self.database_config.url:
                 errors.append("Default Postgres credentials are not allowed in production")
         

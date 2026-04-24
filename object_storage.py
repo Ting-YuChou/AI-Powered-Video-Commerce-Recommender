@@ -5,6 +5,7 @@ Object storage abstraction for local and S3-compatible upload persistence.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -129,32 +130,97 @@ class ObjectStorage:
         self,
         storage_path: str,
         local_path: str,
+        *,
+        expected_sha256: Optional[str] = None,
     ) -> str:
         target_path = Path(local_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if self.is_remote and self.is_remote_uri(storage_path):
-            bucket, key = self._parse_s3_uri(storage_path)
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=str(target_path.parent),
-                prefix=f"{target_path.stem}.",
-                suffix=target_path.suffix,
-            )
-            os.close(tmp_fd)
-            try:
-                await asyncio.to_thread(self._client.download_file, bucket, key, tmp_path)
-                os.replace(tmp_path, target_path)
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+        staged_path = await self.stage_to_local_temp(
+            storage_path,
+            local_path,
+            expected_sha256=expected_sha256,
+        )
+        if Path(staged_path).resolve() == target_path.resolve():
             return str(target_path)
 
-        source_path = Path(storage_path)
-        if source_path.resolve() == target_path.resolve():
-            return str(target_path)
-
-        await asyncio.to_thread(shutil.copy2, str(source_path), str(target_path))
+        try:
+            os.replace(staged_path, target_path)
+        finally:
+            if os.path.exists(staged_path):
+                os.remove(staged_path)
         return str(target_path)
+
+    async def stage_to_local_temp(
+        self,
+        storage_path: str,
+        local_path: str,
+        *,
+        expected_sha256: Optional[str] = None,
+    ) -> str:
+        """Download/copy an artifact into target directory without activating it."""
+        target_path = Path(local_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(target_path.parent),
+            prefix=f"{target_path.stem}.",
+            suffix=target_path.suffix,
+        )
+        os.close(tmp_fd)
+        try:
+            if self.is_remote and self.is_remote_uri(storage_path):
+                bucket, key = self._parse_s3_uri(storage_path)
+                await asyncio.to_thread(self._client.download_file, bucket, key, tmp_path)
+            else:
+                source_path = Path(storage_path)
+                if source_path.resolve() == target_path.resolve():
+                    if expected_sha256:
+                        await asyncio.to_thread(
+                            self.verify_sha256,
+                            str(target_path),
+                            expected_sha256,
+                        )
+                    os.remove(tmp_path)
+                    return str(target_path)
+                await asyncio.to_thread(shutil.copy2, str(source_path), tmp_path)
+
+            if expected_sha256:
+                await asyncio.to_thread(self.verify_sha256, tmp_path, expected_sha256)
+            return tmp_path
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    @staticmethod
+    def calculate_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def verify_sha256(cls, path: str, expected_sha256: str) -> None:
+        actual_sha256 = cls.calculate_sha256(path)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"Artifact checksum mismatch for {path}: expected {expected_sha256}, got {actual_sha256}"
+            )
+
+    async def sync_local_file_atomically(
+        self,
+        source_path: str,
+        target_path: str,
+        *,
+        expected_sha256: Optional[str] = None,
+    ) -> str:
+        return await self.sync_to_local_path(
+            source_path,
+            target_path,
+            expected_sha256=expected_sha256,
+        )
 
     def _ensure_bucket_exists(self) -> None:
         assert self._client is not None

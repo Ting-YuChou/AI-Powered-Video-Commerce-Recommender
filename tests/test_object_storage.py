@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 
 import pytest
@@ -67,6 +68,29 @@ def test_local_object_storage_syncs_file_to_fixed_cache_path(tmp_path):
 
     assert synced == str(target_file)
     assert target_file.read_bytes() == b"checkpoint"
+
+
+def test_local_object_storage_rejects_checksum_mismatch_without_replacing_target(tmp_path):
+    source_file = tmp_path / "source.pt"
+    target_file = tmp_path / "cache" / "ranking.pt"
+    source_file.write_bytes(b"new checkpoint")
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_bytes(b"old checkpoint")
+
+    storage = ObjectStorage(
+        ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+    )
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            storage.sync_to_local_path(
+                str(source_file),
+                str(target_file),
+                expected_sha256=hashlib.sha256(b"different").hexdigest(),
+            )
+        )
+
+    assert target_file.read_bytes() == b"old checkpoint"
 
 
 def test_remote_object_storage_cleans_temp_file_on_download_failure(tmp_path):
