@@ -4,17 +4,22 @@ Durable Postgres-backed system store for operational state and training data.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import logging
 import time
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import DateTime, Integer, JSON, String, Text, func, select, text
+from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, delete, desc, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from config import DatabaseConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -95,6 +100,20 @@ class ModelCheckpoint(Base):
     )
 
 
+Index("ix_interaction_events_occurred_at_desc", InteractionEvent.occurred_at.desc())
+Index(
+    "ix_interaction_events_action_occurred_at",
+    InteractionEvent.action,
+    InteractionEvent.occurred_at.desc(),
+)
+Index(
+    "ix_model_checkpoints_latest",
+    ModelCheckpoint.model_name,
+    ModelCheckpoint.created_at.desc(),
+    ModelCheckpoint.id.desc(),
+)
+
+
 @dataclass
 class DatabaseHealth:
     status: str
@@ -110,6 +129,7 @@ class SystemStore:
         self.engine: AsyncEngine | None = None
         self.session_factory: async_sessionmaker | None = None
         self.is_connected = False
+        self._retention_cleanup_task: asyncio.Task | None = None
 
     @property
     def enabled(self) -> bool:
@@ -130,11 +150,143 @@ class SystemStore:
 
         if self.config.auto_create_schema:
             async with self.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+                if self.config.interaction_events_partitioned:
+                    await conn.run_sync(
+                        lambda sync_conn: Base.metadata.create_all(
+                            sync_conn,
+                            tables=[
+                                table
+                                for table in Base.metadata.sorted_tables
+                                if table.name != InteractionEvent.__tablename__
+                            ],
+                        )
+                    )
+                    await self._ensure_partitioned_interaction_events(conn)
+                else:
+                    await conn.run_sync(Base.metadata.create_all)
+                await self._ensure_operational_indexes(conn)
 
         self.is_connected = True
+        if self.config.enable_retention_cleanup:
+            await self.prune_interaction_events()
+            self._retention_cleanup_task = asyncio.create_task(
+                self._run_periodic_retention_cleanup(),
+                name="postgres-interaction-retention-cleanup",
+            )
+
+    async def _ensure_operational_indexes(self, conn) -> None:
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_interaction_events_occurred_at_desc "
+                "ON interaction_events (occurred_at DESC)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_interaction_events_action_occurred_at "
+                "ON interaction_events (action, occurred_at DESC)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_model_checkpoints_latest "
+                "ON model_checkpoints (model_name, created_at DESC, id DESC)"
+            )
+        )
+
+    async def _ensure_partitioned_interaction_events(self, conn) -> None:
+        relation_result = await conn.execute(
+            text(
+                """
+                SELECT c.relkind
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND c.relname = 'interaction_events'
+                """
+            )
+        )
+        relkind = relation_result.scalar_one_or_none()
+        if relkind == "r":
+            raise RuntimeError(
+                "interaction_events already exists as a non-partitioned table; "
+                "run migrations/postgres/001_partition_interaction_events.sql before "
+                "setting DATABASE_INTERACTION_EVENTS_PARTITIONED=true"
+            )
+
+        if relkind is None:
+            await conn.execute(
+                text(
+                    """
+                    CREATE TABLE interaction_events (
+                        event_id VARCHAR(64) NOT NULL,
+                        schema_version INTEGER NOT NULL DEFAULT 1,
+                        request_id VARCHAR(64),
+                        user_id VARCHAR(255) NOT NULL,
+                        product_id VARCHAR(255) NOT NULL,
+                        action VARCHAR(64) NOT NULL,
+                        context JSON NOT NULL DEFAULT '{}'::json,
+                        occurred_at TIMESTAMPTZ NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        PRIMARY KEY (event_id, occurred_at)
+                    ) PARTITION BY RANGE (occurred_at)
+                    """
+                )
+            )
+            await conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS interaction_events_default
+                    PARTITION OF interaction_events DEFAULT
+                    """
+                )
+            )
+        elif relkind != "p":
+            raise RuntimeError(
+                f"interaction_events has unsupported Postgres relkind {relkind!r}"
+            )
+
+        await self._ensure_interaction_event_partitions(conn)
+
+    async def _ensure_interaction_event_partitions(self, conn) -> None:
+        backfill_months = max(0, int(self.config.partition_backfill_months))
+        premake_months = max(1, int(self.config.partition_premake_months))
+        await conn.execute(
+            text(
+                f"""
+                DO $$
+                DECLARE
+                    partition_start DATE := date_trunc('month', now())::date - INTERVAL '{backfill_months} months';
+                    partition_end DATE := date_trunc('month', now())::date + INTERVAL '{premake_months} months';
+                    current_start DATE;
+                    current_end DATE;
+                    partition_name TEXT;
+                BEGIN
+                    current_start := partition_start;
+                    WHILE current_start < partition_end LOOP
+                        current_end := current_start + INTERVAL '1 month';
+                        partition_name := format('interaction_events_%s', to_char(current_start, 'YYYY_MM'));
+                        EXECUTE format(
+                            'CREATE TABLE IF NOT EXISTS %I PARTITION OF interaction_events FOR VALUES FROM (%L) TO (%L)',
+                            partition_name,
+                            current_start,
+                            current_end
+                        );
+                        current_start := current_end;
+                    END LOOP;
+                END $$;
+                """
+            )
+        )
 
     async def close(self) -> None:
+        if self._retention_cleanup_task:
+            self._retention_cleanup_task.cancel()
+            try:
+                await self._retention_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._retention_cleanup_task = None
         if self.engine is not None:
             await self.engine.dispose()
         self.engine = None
@@ -159,6 +311,38 @@ class SystemStore:
                 response_time_ms=round((time.time() - started_at) * 1000, 2),
                 error=str(exc),
             )
+
+    async def prune_interaction_events(self) -> int:
+        """Delete raw interaction events older than the configured retention window."""
+        if not self.enabled:
+            return 0
+        retention_days = int(self.config.interaction_retention_days)
+        if retention_days <= 0:
+            return 0
+
+        cutoff = _utc_now() - timedelta(days=retention_days)
+        stmt = delete(InteractionEvent).where(InteractionEvent.occurred_at < cutoff)
+        async with self.session_factory.begin() as session:
+            result = await session.execute(stmt)
+        deleted_count = int(result.rowcount or 0)
+        return deleted_count
+
+    async def _run_periodic_retention_cleanup(self) -> None:
+        interval_seconds = max(60, int(self.config.retention_cleanup_interval_seconds))
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                deleted_count = await self.prune_interaction_events()
+                if deleted_count:
+                    logger.info(
+                        "interaction_events_retention_deleted",
+                        extra={"deleted_count": deleted_count},
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("interaction_events_retention_cleanup_failed: %s", exc)
+                await asyncio.sleep(min(interval_seconds, 300))
 
     async def record_interaction_events_batch(
         self,
@@ -192,7 +376,10 @@ class SystemStore:
             return
 
         stmt = pg_insert(InteractionEvent).values(rows)
-        stmt = stmt.on_conflict_do_nothing(index_elements=[InteractionEvent.event_id])
+        if self.config.interaction_events_partitioned:
+            stmt = stmt.on_conflict_do_nothing()
+        else:
+            stmt = stmt.on_conflict_do_nothing(index_elements=[InteractionEvent.event_id])
         async with self.session_factory.begin() as session:
             await session.execute(stmt)
 
@@ -224,6 +411,58 @@ class SystemStore:
                 }
             )
         return interactions
+
+    async def get_analytics_summary(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {
+                "total_interactions": 0,
+                "unique_users": 0,
+                "unique_products": 0,
+                "action_counts": {},
+                "ctr": 0.0,
+                "conversion_rate": 0.0,
+                "timestamp": time.time(),
+                "source": "postgres",
+            }
+
+        window_hours = max(1, int(self.config.analytics_window_hours))
+        cutoff = _utc_now() - timedelta(hours=window_hours)
+
+        async with self.session_factory() as session:
+            totals_result = await session.execute(
+                select(
+                    func.count(InteractionEvent.event_id),
+                    func.count(func.distinct(InteractionEvent.user_id)),
+                    func.count(func.distinct(InteractionEvent.product_id)),
+                )
+                .where(InteractionEvent.occurred_at >= cutoff)
+            )
+            total_interactions, unique_users, unique_products = totals_result.one()
+
+            action_rows = await session.execute(
+                select(InteractionEvent.action, func.count(InteractionEvent.event_id))
+                .where(InteractionEvent.occurred_at >= cutoff)
+                .group_by(InteractionEvent.action)
+            )
+
+        action_counts = Counter({action: count for action, count in action_rows.all()})
+        clicks = action_counts.get("click", 0)
+        purchases = action_counts.get("purchase", 0)
+        views = action_counts.get("view", 0)
+        ctr = clicks / max(views, 1)
+        conversion_rate = purchases / max(clicks, 1)
+
+        return {
+            "total_interactions": int(total_interactions or 0),
+            "unique_users": int(unique_users or 0),
+            "unique_products": int(unique_products or 0),
+            "action_counts": dict(action_counts),
+            "ctr": round(ctr, 4),
+            "conversion_rate": round(conversion_rate, 4),
+            "timestamp": time.time(),
+            "source": "postgres",
+            "window_hours": window_hours,
+        }
 
     async def upsert_content_job(
         self,
@@ -369,3 +608,28 @@ class SystemStore:
                     payload=payload or {},
                 )
             )
+
+    async def get_latest_model_checkpoint(self, model_name: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelCheckpoint)
+                .where(ModelCheckpoint.model_name == model_name)
+                .order_by(desc(ModelCheckpoint.created_at), desc(ModelCheckpoint.id))
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+
+        if row is None:
+            return None
+
+        return {
+            "id": row.id,
+            "model_name": row.model_name,
+            "model_version": row.model_version,
+            "checkpoint_path": row.checkpoint_path,
+            "payload": row.payload or {},
+            "created_at": row.created_at.timestamp() if row.created_at else None,
+        }

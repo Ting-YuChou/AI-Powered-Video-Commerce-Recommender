@@ -444,12 +444,26 @@ class RankingModel:
         """Convert raw model predictions into ranked recommendation objects."""
         response_stage_started = time.perf_counter()
         recommendations: List[ProductRecommendation] = []
+        if not valid_candidates or k <= 0:
+            return [], round((time.perf_counter() - response_stage_started) * 1000, 2)
 
-        for i, (candidate, metadata) in enumerate(valid_candidates):
+        ranking_scores = np.asarray(predictions["ranking_score"]).reshape(-1)
+        top_count = min(k, len(valid_candidates), ranking_scores.shape[0])
+        if top_count <= 0:
+            return [], round((time.perf_counter() - response_stage_started) * 1000, 2)
+
+        if ranking_scores.shape[0] > top_count:
+            top_indices = np.argpartition(-ranking_scores, top_count - 1)[:top_count]
+            top_indices = top_indices[np.argsort(-ranking_scores[top_indices])]
+        else:
+            top_indices = np.argsort(-ranking_scores)
+
+        for i in top_indices:
+            candidate, metadata = valid_candidates[int(i)]
             ctr_score = float(predictions["ctr"][i])
             cvr_score = float(predictions["cvr"][i])
             gmv_score = float(predictions["gmv"][i])
-            ranking_score = float(predictions["ranking_score"][i])
+            ranking_score = float(ranking_scores[i])
 
             if self.config.enable_multi_objective:
                 confidence_score = (
@@ -481,8 +495,7 @@ class RankingModel:
                 )
             )
 
-        recommendations.sort(key=lambda item: item.ranking_score, reverse=True)
-        return recommendations[:k], round(
+        return recommendations, round(
             (time.perf_counter() - response_stage_started) * 1000,
             2,
         )
@@ -502,6 +515,34 @@ class RankingModel:
         }
     
     async def rank_candidates(
+        self,
+        candidates: List[CandidateProduct],
+        user_features: UserFeatures,
+        context: Dict[str, Any],
+        k: int = 10,
+        include_profile: bool = False,
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[ProductRecommendation]:
+        if getattr(self.config, "offload_inference_to_thread", True):
+            return await asyncio.to_thread(
+                self._rank_candidates_sync,
+                candidates,
+                user_features,
+                context,
+                k,
+                include_profile,
+                product_metadata_map,
+            )
+        return self._rank_candidates_sync(
+            candidates,
+            user_features,
+            context,
+            k,
+            include_profile,
+            product_metadata_map,
+        )
+
+    def _rank_candidates_sync(
         self,
         candidates: List[CandidateProduct],
         user_features: UserFeatures,

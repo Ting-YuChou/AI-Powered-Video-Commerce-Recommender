@@ -14,7 +14,6 @@ import faiss
 import logging
 from typing import Dict, List, Any, Optional, Set, Tuple
 import time
-import json
 from collections import defaultdict
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from models import (
     InteractionType
 )
 from feature_store import FeatureStore
+from model_artifacts import ModelArtifactManager
 from vector_search import VectorSearchEngine
 from config import RecommendationConfig
 from two_tower import TwoTowerTrainer
@@ -74,6 +74,7 @@ class TwoTowerRetrievalEngine:
 
         self.is_trained = False
         self.last_training_time: float = 0
+        self.model_version: Optional[str] = None
         self._item_popularity: Dict[str, float] = {}
 
         logger.info("Two-Tower retrieval engine initialized")
@@ -173,6 +174,7 @@ class TwoTowerRetrievalEngine:
 
             self.is_trained = True
             self.last_training_time = time.time()
+            self.model_version = f"two-tower-{int(self.last_training_time)}"
 
             logger.info(
                 f"Two-Tower model trained in {training_time:.1f}s — "
@@ -203,6 +205,21 @@ class TwoTowerRetrievalEngine:
             exclude_items: product_ids to exclude
             user_features: optional user features dict (avoids redundant lookups)
         """
+        return await asyncio.to_thread(
+            self._get_user_recommendations_sync,
+            user_id,
+            k,
+            exclude_items,
+            user_features,
+        )
+
+    def _get_user_recommendations_sync(
+        self,
+        user_id: str,
+        k: int = 100,
+        exclude_items: Optional[Set[str]] = None,
+        user_features: Optional[Dict[str, Any]] = None,
+    ) -> List[CandidateProduct]:
         try:
             if not self.is_trained or self.cf_index is None or self.cf_index.ntotal == 0:
                 logger.warning("Two-Tower model not trained, returning empty recommendations")
@@ -210,14 +227,11 @@ class TwoTowerRetrievalEngine:
 
             exclude_items = exclude_items or set()
             user_features = user_features or {}
-
-            # Encode user via UserTower
             user_embedding = self.trainer.encode_user(user_id, user_features)
 
             if user_embedding is None:
-                return await self._get_popular_items_fallback(k, exclude_items)
+                return self._get_popular_items_fallback_sync(k, exclude_items)
 
-            # ANN search
             query = user_embedding.reshape(1, -1).astype(np.float32)
             search_k = min(k * 3, self.cf_index.ntotal)
             scores, indices = self.cf_index.search(query, search_k)
@@ -230,15 +244,15 @@ class TwoTowerRetrievalEngine:
                     continue
                 product_id = self.cf_index_map.get(int(idx))
                 if product_id and product_id not in exclude_items:
-                    # FAISS inner-product scores from HNSW; normalise to [0, 1]
                     norm_score = float(max(min((score + 1.0) / 2.0, 1.0), 0.0))
-                    candidate = CandidateProduct(
-                        product_id=product_id,
-                        collaborative_score=norm_score,
-                        combined_score=norm_score,
-                        source="collaborative_filtering",
+                    candidates.append(
+                        CandidateProduct(
+                            product_id=product_id,
+                            collaborative_score=norm_score,
+                            combined_score=norm_score,
+                            source="collaborative_filtering",
+                        )
                     )
-                    candidates.append(candidate)
 
             logger.debug(f"Generated {len(candidates)} Two-Tower recommendations for user {user_id}")
             return candidates
@@ -248,6 +262,12 @@ class TwoTowerRetrievalEngine:
             return []
 
     async def _get_popular_items_fallback(
+        self, k: int, exclude_items: Optional[Set[str]] = None
+    ) -> List[CandidateProduct]:
+        """Fallback to popular items for cold-start users."""
+        return self._get_popular_items_fallback_sync(k, exclude_items)
+
+    def _get_popular_items_fallback_sync(
         self, k: int, exclude_items: Optional[Set[str]] = None
     ) -> List[CandidateProduct]:
         """Fallback to popular items for cold-start users."""
@@ -396,10 +416,12 @@ class RecommendationEngine:
         feature_store: FeatureStore,
         vector_search: VectorSearchEngine,
         config: RecommendationConfig,
+        artifact_manager: Optional[ModelArtifactManager] = None,
     ):
         self.feature_store = feature_store
         self.vector_search = vector_search
         self.config = config
+        self.artifact_manager = artifact_manager
 
         # Recommendation engines
         self.cf_engine = TwoTowerRetrievalEngine(config, vector_search)
@@ -408,6 +430,7 @@ class RecommendationEngine:
         # Model state
         self.is_initialized = False
         self.last_model_update = 0
+        self.loaded_two_tower_version: Optional[str] = None
 
         logger.info("Recommendation engine initialized (Two-Tower retrieval)")
 
@@ -451,7 +474,14 @@ class RecommendationEngine:
     async def _try_load_cf_index(self):
         """Attempt to load a previously saved CF FAISS index for fast cold start."""
         try:
-            result = VectorSearchEngine.load_cf_index(self.config.cf_index_path)
+            checkpoint_record = None
+            if self.artifact_manager:
+                checkpoint_record = await self.artifact_manager.sync_latest_two_tower_artifacts()
+
+            result = await asyncio.to_thread(
+                VectorSearchEngine.load_cf_index,
+                self.config.cf_index_path,
+            )
             if result is not None:
                 index, metadata = result
                 # Restore index map
@@ -460,11 +490,18 @@ class RecommendationEngine:
                 self.cf_engine.cf_index_map = {int(k): v for k, v in index_map_raw.items()}
 
                 # Load trainer checkpoint
-                checkpoint_path = self.config.cf_index_path.replace(".faiss", ".pt")
-                if self.cf_engine.trainer.load_checkpoint(checkpoint_path):
+                checkpoint_path = (
+                    self.artifact_manager.two_tower_local_checkpoint_path
+                    if self.artifact_manager
+                    else self.config.cf_index_path.replace(".faiss", ".pt")
+                )
+                if await asyncio.to_thread(self.cf_engine.trainer.load_checkpoint, checkpoint_path):
                     self.cf_engine.user_mapping = dict(self.cf_engine.trainer.user_mapping)
                     self.cf_engine.item_mapping = dict(self.cf_engine.trainer.item_mapping)
                     self.cf_engine.is_trained = True
+                    if checkpoint_record:
+                        self.cf_engine.model_version = checkpoint_record.model_version
+                        self.loaded_two_tower_version = checkpoint_record.model_version
                     logger.info("Loaded pre-existing Two-Tower model and CF index")
         except Exception as e:
             logger.warning(f"Could not load pre-existing CF index: {e}")
@@ -472,18 +509,12 @@ class RecommendationEngine:
     async def _update_models_from_interactions(self):
         """Update models using recent interaction data."""
         try:
-            # Prefer the larger training-data list; fall back to global_interactions
-            interactions = await self.feature_store.get_training_interactions(limit=50000)
-            if not interactions:
-                interactions_data = await self.feature_store.redis_client.lrange(
-                    "global_interactions", 0, 9999
-                )
-                interactions = []
-                for data in interactions_data:
-                    try:
-                        interactions.append(json.loads(data.decode()))
-                    except Exception:
-                        continue
+            if not self.artifact_manager or not self.artifact_manager.system_store:
+                await self.refresh_serving_pools()
+                logger.warning("Skipping Two-Tower retraining because Postgres system store is unavailable")
+                return
+
+            interactions = await self.artifact_manager.system_store.get_training_interactions(limit=50000)
 
             if interactions:
                 # Gather user features for the trainer
@@ -493,9 +524,25 @@ class RecommendationEngine:
                 await self.cf_engine.train_model(
                     interactions, user_features_map=user_features_map
                 )
+                if self.cf_engine.is_trained:
+                    checkpoint_path = self.artifact_manager.two_tower_local_checkpoint_path
+                    index_path = self.artifact_manager.two_tower_local_index_path
+                    metadata_path = self.artifact_manager.two_tower_local_metadata_path
+                    model_version = self.cf_engine.model_version or f"two-tower-{int(time.time())}"
+                    artifact_record = await self.artifact_manager.persist_two_tower_artifacts(
+                        checkpoint_path=checkpoint_path,
+                        index_path=index_path,
+                        metadata_path=metadata_path,
+                        model_version=model_version,
+                        payload={
+                            "sample_count": len(interactions),
+                            "last_training_time": self.cf_engine.last_training_time,
+                        },
+                    )
+                    self.loaded_two_tower_version = artifact_record.model_version if artifact_record else model_version
 
                 # Update trending scores (use last 1K for recency)
-                await self.trending_engine.update_trending_scores(interactions[-1000:])
+                await self.trending_engine.update_trending_scores(interactions[:1000])
                 await self.refresh_serving_pools()
 
                 self.last_model_update = time.time()
@@ -506,6 +553,22 @@ class RecommendationEngine:
 
         except Exception as e:
             logger.error(f"Error updating models from interactions: {e}")
+
+    async def sync_serving_artifacts_if_updated(self) -> bool:
+        """Reload Two-Tower serving artifacts when a newer checkpoint is available."""
+        if not self.artifact_manager:
+            return False
+
+        latest_record = await self.artifact_manager.get_latest_model_checkpoint(
+            ModelArtifactManager.TWO_TOWER_MODEL_NAME
+        )
+        if not latest_record:
+            return False
+        if latest_record.model_version == self.loaded_two_tower_version:
+            return False
+
+        await self._try_load_cf_index()
+        return self.loaded_two_tower_version == latest_record.model_version
 
     def _compute_serving_pool_score(
         self,
@@ -633,6 +696,7 @@ class RecommendationEngine:
         context: Optional[Dict[str, Any]] = None,
         k_per_source: int = 100,
         include_profile: bool = False,
+        user_features: Optional[UserFeatures] = None,
     ) -> List[CandidateProduct]:
         """
         Generate candidate products from multiple recommendation sources.
@@ -666,16 +730,55 @@ class RecommendationEngine:
                 "source_counts": {},
             }
 
-            # Get user's interaction history to exclude already seen items
-            stage_started = time.perf_counter()
-            user_interactions = await self.feature_store.get_user_interactions(user_id, limit=200)
-            profile["user_interactions_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-            exclude_items = {interaction["product_id"] for interaction in user_interactions}
+            async def timed_stage(
+                metric_name: str,
+                awaitable,
+                fallback,
+                timeout_ms: Optional[float],
+            ):
+                stage_started = time.perf_counter()
+                try:
+                    if timeout_ms and timeout_ms > 0:
+                        return await asyncio.wait_for(awaitable, timeout=timeout_ms / 1000.0)
+                    return await awaitable
+                except asyncio.TimeoutError:
+                    logger.warning("%s_timed_out", metric_name)
+                    return fallback
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("%s_failed: %s", metric_name, exc)
+                    return fallback
+                finally:
+                    profile[metric_name] = round((time.perf_counter() - stage_started) * 1000, 2)
 
-            # Get user features once for reuse
-            stage_started = time.perf_counter()
-            user_features_obj = await self.feature_store.get_user_features(user_id)
-            profile["user_features_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+            interaction_task = asyncio.create_task(
+                timed_stage(
+                    "user_interactions_ms",
+                    self.feature_store.get_user_interactions(user_id, limit=200),
+                    [],
+                    self.config.interaction_history_timeout_ms,
+                ),
+                name="candidate-user-interactions",
+            )
+            if user_features is not None:
+                user_features_obj = user_features
+            else:
+                user_features_obj = await timed_stage(
+                    "user_features_ms",
+                    self.feature_store.get_user_features(user_id, cache_default=False),
+                    UserFeatures(user_id=user_id),
+                    self.feature_store.cache_config.hot_path_read_timeout_ms,
+                )
+            if user_features is not None:
+                profile["user_features_ms"] = 0.0
+
+            user_interactions = await interaction_task
+            exclude_items = {
+                interaction.get("product_id")
+                for interaction in user_interactions
+                if interaction.get("product_id")
+            }
             user_features_dict = user_features_obj.dict() if user_features_obj else {}
             preferred_categories = self._resolve_preferred_categories(user_features_obj, context)
             profile["preferred_categories"] = preferred_categories
@@ -684,66 +787,96 @@ class RecommendationEngine:
                 self.config.max_total_candidates,
             )
 
-            # 1. Collaborative Filtering via Two-Tower ANN Retrieval
-            stage_started = time.perf_counter()
-            if self.cf_engine.is_trained:
-                cf_candidates = await self.cf_engine.get_user_recommendations(
+            async def fetch_cf_candidates() -> List[CandidateProduct]:
+                if not self.cf_engine.is_trained:
+                    return []
+                return await self.cf_engine.get_user_recommendations(
                     user_id,
                     min(target_candidates, self.config.max_live_cf_candidates),
                     exclude_items,
                     user_features=user_features_dict,
                 )
-                for candidate in cf_candidates:
-                    self._merge_candidate(all_candidates, candidate)
-                profile["source_counts"]["cf"] = len(cf_candidates)
-            profile["cf_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
 
-            # 2. Content-Based Recommendations (if content provided)
-            stage_started = time.perf_counter()
-            if content_features and content_features.visual_embedding:
-                try:
-                    content_candidates = await self.vector_search.search_similar_products(
-                        np.array(content_features.visual_embedding),
-                        k=min(target_candidates, self.config.max_live_content_candidates),
-                    )
-                    for candidate in content_candidates:
-                        if candidate.product_id not in exclude_items:
-                            self._merge_candidate(all_candidates, candidate)
-                    profile["source_counts"]["content"] = len(content_candidates)
-                except Exception as e:
-                    logger.warning(f"Error getting content-based recommendations: {e}")
-            profile["content_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+            async def fetch_content_candidates() -> List[CandidateProduct]:
+                if not content_features or not content_features.visual_embedding:
+                    return []
+                candidates = await self.vector_search.search_similar_products(
+                    np.array(content_features.visual_embedding),
+                    k=min(target_candidates, self.config.max_live_content_candidates),
+                )
+                return [
+                    candidate
+                    for candidate in candidates
+                    if candidate.product_id not in exclude_items
+                ]
 
-            # 3. Precomputed Trending Pool
-            stage_started = time.perf_counter()
-            trending_candidates = await self.feature_store.get_trending_pool(
-                min(target_candidates, self.config.max_pool_trending_candidates),
-                exclude_items=exclude_items.union(all_candidates.keys()),
-            )
-            for candidate in trending_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["trending_pool"] = len(trending_candidates)
-            profile["trending_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+            async def fetch_trending_candidates() -> List[CandidateProduct]:
+                return await self.feature_store.get_trending_pool(
+                    min(target_candidates, self.config.max_pool_trending_candidates),
+                    exclude_items=exclude_items,
+                )
 
-            # 4. Preferred Category Pools
-            stage_started = time.perf_counter()
-            category_pool_candidates = 0
-            if preferred_categories:
+            async def fetch_category_candidates() -> List[CandidateProduct]:
+                if not preferred_categories:
+                    return []
                 per_category_limit = max(
                     1,
                     self.config.max_pool_category_candidates // max(len(preferred_categories), 1),
                 )
-                for category in preferred_categories:
-                    category_candidates = await self.feature_store.get_category_pool(
+                category_tasks = [
+                    self.feature_store.get_category_pool(
                         category,
                         per_category_limit,
-                        exclude_items=exclude_items.union(all_candidates.keys()),
+                        exclude_items=exclude_items,
                     )
-                    for candidate in category_candidates:
-                        self._merge_candidate(all_candidates, candidate)
-                    category_pool_candidates += len(category_candidates)
-            profile["source_counts"]["category_pool"] = category_pool_candidates
-            profile["category_pool_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+                    for category in preferred_categories
+                ]
+                category_results = await asyncio.gather(*category_tasks, return_exceptions=True)
+                category_candidates: List[CandidateProduct] = []
+                for result in category_results:
+                    if isinstance(result, Exception):
+                        logger.warning("category_pool_fetch_failed: %s", result)
+                        continue
+                    category_candidates.extend(result)
+                return category_candidates
+
+            source_timeout_ms = self.config.candidate_source_timeout_ms
+            cf_task = asyncio.create_task(
+                timed_stage("cf_candidates_ms", fetch_cf_candidates(), [], source_timeout_ms),
+                name="candidate-source-cf",
+            )
+            content_task = asyncio.create_task(
+                timed_stage("content_candidates_ms", fetch_content_candidates(), [], source_timeout_ms),
+                name="candidate-source-content",
+            )
+            trending_task = asyncio.create_task(
+                timed_stage("trending_candidates_ms", fetch_trending_candidates(), [], source_timeout_ms),
+                name="candidate-source-trending",
+            )
+            category_task = asyncio.create_task(
+                timed_stage("category_pool_ms", fetch_category_candidates(), [], source_timeout_ms),
+                name="candidate-source-category",
+            )
+
+            cf_candidates, content_candidates, trending_candidates, category_candidates = (
+                await asyncio.gather(cf_task, content_task, trending_task, category_task)
+            )
+
+            for candidate in cf_candidates:
+                self._merge_candidate(all_candidates, candidate)
+            profile["source_counts"]["cf"] = len(cf_candidates)
+
+            for candidate in content_candidates:
+                self._merge_candidate(all_candidates, candidate)
+            profile["source_counts"]["content"] = len(content_candidates)
+
+            for candidate in trending_candidates:
+                self._merge_candidate(all_candidates, candidate)
+            profile["source_counts"]["trending_pool"] = len(trending_candidates)
+
+            for candidate in category_candidates:
+                self._merge_candidate(all_candidates, candidate)
+            profile["source_counts"]["category_pool"] = len(category_candidates)
 
             # 5. Small random fallback only if stronger sources are still thin
             stage_started = time.perf_counter()
@@ -757,9 +890,14 @@ class RecommendationEngine:
                         random_target,
                         self.config.cold_start_random_candidate_cap,
                     )
-                random_candidates = await self.vector_search.get_random_products(
-                    k=random_target
-                )
+                random_candidates = []
+                if random_target > 0:
+                    random_candidates = await timed_stage(
+                        "random_candidates_ms",
+                        self.vector_search.get_random_products(k=random_target),
+                        [],
+                        source_timeout_ms,
+                    )
                 for candidate in random_candidates:
                     if (
                         candidate.product_id not in exclude_items
@@ -767,7 +905,11 @@ class RecommendationEngine:
                     ):
                         all_candidates[candidate.product_id] = candidate
                 profile["source_counts"]["random"] = len(random_candidates)
-            profile["random_candidates_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+            elif profile["random_candidates_ms"] == 0.0:
+                profile["random_candidates_ms"] = round(
+                    (time.perf_counter() - stage_started) * 1000,
+                    2,
+                )
 
             # Combine scores for final ranking
             stage_started = time.perf_counter()
@@ -841,6 +983,10 @@ class RecommendationEngine:
 
             diverse_candidates: List[CandidateProduct] = []
             max_per_category = self.config.max_items_per_category
+            for group in category_groups.values():
+                group.sort(key=lambda x: x.combined_score, reverse=True)
+            ungrouped_candidates.sort(key=lambda x: x.combined_score, reverse=True)
+            category_counts: Dict[str, int] = defaultdict(int)
 
             while len(diverse_candidates) < len(candidates) and (
                 category_groups or ungrouped_candidates
@@ -848,19 +994,11 @@ class RecommendationEngine:
                 added_in_round = 0
                 for category in list(category_groups.keys()):
                     if category_groups[category]:
-                        category_groups[category].sort(
-                            key=lambda x: x.combined_score, reverse=True
-                        )
                         c = category_groups[category].pop(0)
                         diverse_candidates.append(c)
                         added_in_round += 1
-
-                        category_count = sum(
-                            1
-                            for dc in diverse_candidates
-                            if self._get_candidate_category(dc) == category
-                        )
-                        if category_count >= max_per_category:
+                        category_counts[category] += 1
+                        if category_counts[category] >= max_per_category:
                             del category_groups[category]
 
                 if ungrouped_candidates and added_in_round < 3:
@@ -932,6 +1070,7 @@ class RecommendationEngine:
             "is_initialized": self.is_initialized,
             "last_model_update": self.last_model_update,
             "cf_trained": self.cf_engine.is_trained,
+            "cf_model_version": self.cf_engine.model_version,
             "cf_users": len(self.cf_engine.user_mapping),
             "cf_items": len(self.cf_engine.item_mapping),
             "cf_embedding_dim": self.config.tt_embedding_dim,

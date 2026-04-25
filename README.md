@@ -23,6 +23,8 @@ Production-oriented single-VM deployment for a video commerce recommendation sys
 
 ```bash
 cp .env.example .env 2>/dev/null || true
+# Fill production secrets in .env before starting:
+# API_API_KEY, SECURITY_INTERNAL_SERVICE_KEY, REDIS_PASSWORD, POSTGRES_PASSWORD
 chmod +x startup.sh
 ./startup.sh start
 ./startup.sh status
@@ -50,6 +52,7 @@ The default public edge URL is `http://localhost`. Set `CADDY_SITE_ADDRESS=your.
 - Uploads are streamed to disk and queued to Kafka; they no longer read the entire file into memory.
 - `*_FILE` environment variables are supported for secret injection.
 - Optional `OBJECT_STORAGE_BACKEND=s3` enables durable upload persistence via an S3-compatible backend.
+- Production startup fails fast when API/internal keys, Redis password, or non-default Postgres credentials are missing.
 
 ## Environment Variables
 
@@ -58,7 +61,11 @@ Important overrides for production:
 ```bash
 API_API_KEY=replace-with-client-api-key
 SECURITY_INTERNAL_SERVICE_KEY=replace-with-internal-service-secret
-DATABASE_URL=postgresql+asyncpg://video_commerce:video_commerce@postgres:5432/video_commerce
+REDIS_PASSWORD=replace-with-redis-password
+POSTGRES_PASSWORD=replace-with-postgres-password
+DATABASE_URL=postgresql+asyncpg://video_commerce:replace-with-postgres-password@postgres:5432/video_commerce
+DATABASE_POOL_SIZE=5
+DATABASE_MAX_OVERFLOW=5
 DATA_MAX_FILE_SIZE=104857600
 CADDY_SITE_ADDRESS=your.domain.com
 GRAFANA_ADMIN_USER=grafana
@@ -66,6 +73,11 @@ GRAFANA_ADMIN_PASSWORD=replace-with-strong-password
 OBJECT_STORAGE_BACKEND=s3
 OBJECT_STORAGE_ENDPOINT_URL=http://minio:9000
 OBJECT_STORAGE_BUCKET=video-commerce-assets
+OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS=5
+OBJECT_STORAGE_READ_TIMEOUT_SECONDS=60
+OBJECT_STORAGE_MAX_ATTEMPTS=3
+OBJECT_STORAGE_CHECKSUM_ALGORITHM=SHA256
+OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION=AES256
 SECURITY_AUTH_MODE=api_key_or_bearer
 SECURITY_OIDC_ENABLED=true
 SECURITY_OIDC_ISSUER=https://issuer.example.com/

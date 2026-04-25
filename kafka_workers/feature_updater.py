@@ -133,7 +133,11 @@ class FeatureUpdaterWorker:
         total_pending = sum(len(updates) for updates in self._pending_updates.values())
         time_since_flush = time.time() - self._last_flush_time
         
-        if total_pending >= self.batch_size or time_since_flush >= self.batch_timeout_seconds:
+        if (
+            not self.kafka_config.consumer_enable_auto_commit
+            or total_pending >= self.batch_size
+            or time_since_flush >= self.batch_timeout_seconds
+        ):
             await self._flush_pending_updates()
     
     async def _flush_pending_updates(self):
@@ -145,15 +149,15 @@ class FeatureUpdaterWorker:
         
         try:
             # Process updates for each user
-            for user_id, interactions in self._pending_updates.items():
+            for user_id, interactions in list(self._pending_updates.items()):
                 await self._process_user_interactions(user_id, interactions)
+                self._pending_updates.pop(user_id, None)
             
-            # Clear pending updates
-            self._pending_updates.clear()
             self._last_flush_time = time.time()
             
         except Exception as e:
             logger.error(f"Error flushing updates: {e}")
+            raise
     
     async def _process_user_interactions(
         self,
@@ -206,6 +210,7 @@ class FeatureUpdaterWorker:
             
         except Exception as e:
             logger.error(f"Error processing interactions for user {user_id}: {e}")
+            raise
     
     async def _periodic_flush(self):
         """Periodically flush pending updates."""

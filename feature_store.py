@@ -48,11 +48,20 @@ class FeatureStore:
     - Intelligent caching with adaptive TTL
     """
     
+    CACHE_KEY_TYPES = {
+        "recommendations_cache",
+        "candidate_cache",
+        "product_metadata",
+        "trending_products",
+        "category_pool",
+    }
+
     def __init__(self, redis_config: RedisConfig, cache_config: CacheConfig = None):
         """Initialize the feature store with Redis configuration."""
         self.redis_config = redis_config
         self.cache_config = cache_config or CacheConfig()
         self.redis_client: Optional[redis.Redis] = None
+        self.cache_redis_client: Optional[redis.Redis] = None
         self.is_connected = False
         
         # Key prefixes for different data types
@@ -80,27 +89,26 @@ class FeatureStore:
     async def initialize(self):
         """Initialize Redis connection."""
         try:
-            self.redis_client = redis.Redis(
-                host=self.redis_config.host,
-                port=self.redis_config.port,
-                db=self.redis_config.db,
-                password=self.redis_config.password,
-                decode_responses=False,  # We handle encoding manually
-                socket_timeout=self.redis_config.socket_timeout,
-                socket_connect_timeout=self.redis_config.socket_connect_timeout,
-                retry_on_timeout=self.redis_config.retry_on_timeout,
-                max_connections=self.redis_config.max_connections,
-                health_check_interval=30
+            self.redis_client = self._build_redis_client(cache_role=False)
+            self.cache_redis_client = (
+                self._build_redis_client(cache_role=True)
+                if self._uses_separate_cache_redis()
+                else self.redis_client
             )
             
             # Test connection
             await self.redis_client.ping()
+            if self.cache_redis_client is not self.redis_client:
+                await self.cache_redis_client.ping()
             self.is_connected = True
             
             # Initialize default data if needed
             await self._initialize_default_data()
             
-            logger.info("Redis connection established successfully")
+            logger.info(
+                "Redis connection established successfully",
+                extra={"separate_cache_redis": self.cache_redis_client is not self.redis_client},
+            )
             
         except Exception as e:
             logger.error(f"Failed to connect to Redis: {e}")
@@ -109,17 +117,110 @@ class FeatureStore:
     
     async def close(self):
         """Close Redis connection."""
+        if self.cache_redis_client and self.cache_redis_client is not self.redis_client:
+            await self.cache_redis_client.close()
+            self.cache_redis_client = None
         if self.redis_client:
             await self.redis_client.close()
             self.is_connected = False
             logger.info("Redis connection closed")
+
+    def _build_redis_client(self, *, cache_role: bool) -> redis.Redis:
+        if not cache_role:
+            return redis.Redis(
+                host=self.redis_config.host,
+                port=self.redis_config.port,
+                db=self.redis_config.db,
+                password=self.redis_config.password,
+                decode_responses=False,
+                socket_timeout=self.redis_config.socket_timeout,
+                socket_connect_timeout=self.redis_config.socket_connect_timeout,
+                retry_on_timeout=self.redis_config.retry_on_timeout,
+                max_connections=self.redis_config.max_connections,
+                health_check_interval=30,
+            )
+
+        return redis.Redis(
+            host=self._resolve_cache_setting(self.redis_config.cache_host, self.redis_config.host),
+            port=self._resolve_cache_setting(self.redis_config.cache_port, self.redis_config.port),
+            db=self.redis_config.cache_db if self.redis_config.cache_db is not None else self.redis_config.db,
+            password=self._resolve_cache_setting(
+                self.redis_config.cache_password,
+                self.redis_config.password,
+            ),
+            decode_responses=False,
+            socket_timeout=(
+                self.redis_config.cache_socket_timeout
+                if self.redis_config.cache_socket_timeout is not None
+                else self.redis_config.socket_timeout
+            ),
+            socket_connect_timeout=(
+                self.redis_config.cache_socket_connect_timeout
+                if self.redis_config.cache_socket_connect_timeout is not None
+                else self.redis_config.socket_connect_timeout
+            ),
+            retry_on_timeout=(
+                self.redis_config.cache_retry_on_timeout
+                if self.redis_config.cache_retry_on_timeout is not None
+                else self.redis_config.retry_on_timeout
+            ),
+            max_connections=(
+                self.redis_config.cache_max_connections
+                if self.redis_config.cache_max_connections is not None
+                else self.redis_config.max_connections
+            ),
+            health_check_interval=30,
+        )
+
+    def _uses_separate_cache_redis(self) -> bool:
+        state_settings = (
+            self.redis_config.host,
+            self.redis_config.port,
+            self.redis_config.db,
+            self.redis_config.password,
+            self.redis_config.max_connections,
+            self.redis_config.socket_timeout,
+            self.redis_config.socket_connect_timeout,
+            self.redis_config.retry_on_timeout,
+        )
+        cache_settings = (
+            self._resolve_cache_setting(self.redis_config.cache_host, self.redis_config.host),
+            self._resolve_cache_setting(self.redis_config.cache_port, self.redis_config.port),
+            self.redis_config.cache_db if self.redis_config.cache_db is not None else self.redis_config.db,
+            self._resolve_cache_setting(self.redis_config.cache_password, self.redis_config.password),
+            self.redis_config.cache_max_connections
+            if self.redis_config.cache_max_connections is not None
+            else self.redis_config.max_connections,
+            self.redis_config.cache_socket_timeout
+            if self.redis_config.cache_socket_timeout is not None
+            else self.redis_config.socket_timeout,
+            self.redis_config.cache_socket_connect_timeout
+            if self.redis_config.cache_socket_connect_timeout is not None
+            else self.redis_config.socket_connect_timeout,
+            self.redis_config.cache_retry_on_timeout
+            if self.redis_config.cache_retry_on_timeout is not None
+            else self.redis_config.retry_on_timeout,
+        )
+        return cache_settings != state_settings
+
+    @staticmethod
+    def _resolve_cache_setting(value, fallback):
+        if value == "":
+            return fallback
+        return fallback if value is None else value
+
+    def _client_for_key_type(self, key_type: str):
+        if key_type in self.CACHE_KEY_TYPES:
+            return self.cache_redis_client or self.redis_client
+        return self.redis_client
     
     # User Features Management
-    async def get_user_features(self, user_id: str) -> UserFeatures:
+    async def get_user_features(self, user_id: str, cache_default: bool = True) -> UserFeatures:
         """Get user features from cache or create default."""
         try:
             key = f"{self.prefixes['user_features']}{user_id}"
-            cached_data = await self.redis_client.get(key)
+            client = self._client_for_key_type("user_features")
+            cached_data = await client.get(key)
             
             if cached_data:
                 data = unpack_cache_payload(cached_data, "user_features")
@@ -138,8 +239,8 @@ class FeatureStore:
                     demographics={}
                 )
                 
-                # Cache default features
-                await self._set_user_features(user_id, default_features)
+                if cache_default:
+                    await self._set_user_features(user_id, default_features)
                 return default_features
                 
         except Exception as e:
@@ -155,7 +256,7 @@ class FeatureStore:
             # Use adaptive TTL based on user activity
             ttl = self._calculate_adaptive_ttl(features)
             
-            await self.redis_client.setex(key, ttl, data)
+            await self._client_for_key_type("user_features").setex(key, ttl, data)
             
         except Exception as e:
             logger.error(f"Error setting user features for {user_id}: {e}")
@@ -166,7 +267,7 @@ class FeatureStore:
             if not features_map:
                 return
 
-            pipeline = self.redis_client.pipeline(transaction=False)
+            pipeline = self._client_for_key_type("user_features").pipeline(transaction=False)
             for user_id, features in features_map.items():
                 key = f"{self.prefixes['user_features']}{user_id}"
                 ttl = self._calculate_adaptive_ttl(features)
@@ -240,7 +341,7 @@ class FeatureStore:
         """Get user statistic from cache."""
         try:
             key = f"user_stats:{user_id}:{stat_name}"
-            value = await self.redis_client.get(key)
+            value = await self._client_for_key_type("user_features").get(key)
             return int(value) if value else None
         except:
             return None
@@ -249,7 +350,7 @@ class FeatureStore:
         """Set user statistic in cache."""
         try:
             key = f"user_stats:{user_id}:{stat_name}"
-            await self.redis_client.setex(key, 86400 * 7, str(value))  # 1 week TTL
+            await self._client_for_key_type("user_features").setex(key, 86400 * 7, str(value))
         except Exception as e:
             logger.error(f"Error setting user stat {stat_name} for {user_id}: {e}")
     
@@ -275,7 +376,7 @@ class FeatureStore:
             key = f"{self.prefixes['content_features']}{content_id}"
             data = pack_cache_payload("content_features", features.dict())
             
-            await self.redis_client.setex(
+            await self._client_for_key_type("content_features").setex(
                 key, 
                 self.cache_config.content_features_ttl, 
                 data
@@ -293,7 +394,7 @@ class FeatureStore:
         """Get content features from cache."""
         try:
             key = f"{self.prefixes['content_features']}{content_id}"
-            cached_data = await self.redis_client.get(key)
+            cached_data = await self._client_for_key_type("content_features").get(key)
             
             if cached_data:
                 data = unpack_cache_payload(cached_data, "content_features")
@@ -314,7 +415,7 @@ class FeatureStore:
                 'updated_at': time.time()
             }
             
-            await self.redis_client.setex(
+            await self._client_for_key_type("content_status").setex(
                 key, 
                 86400,  # 24 hours
                 json_dumps(status_data)
@@ -327,7 +428,7 @@ class FeatureStore:
         """Get content processing status."""
         try:
             key = f"{self.prefixes['content_status']}{content_id}"
-            data = await self.redis_client.get(key)
+            data = await self._client_for_key_type("content_status").get(key)
             
             if data:
                 status_data = json_loads(data)
@@ -343,7 +444,7 @@ class FeatureStore:
         """Get content processing completion time."""
         try:
             key = f"{self.prefixes['content_status']}{content_id}"
-            data = await self.redis_client.get(key)
+            data = await self._client_for_key_type("content_status").get(key)
             
             if data:
                 status_data = json_loads(data)
@@ -363,7 +464,7 @@ class FeatureStore:
         action: str, 
         context: Dict[str, Any] = None
     ):
-        """Log user interaction for analytics and model training."""
+        """Log recent user interaction for online serving state only."""
         try:
             interaction_data = {
                 'user_id': user_id,
@@ -373,23 +474,13 @@ class FeatureStore:
                 'context': context or {}
             }
             
-            # Store in time-ordered list for analytics
             key = f"{self.prefixes['user_interactions']}{user_id}"
-            await self.redis_client.lpush(key, json.dumps(interaction_data))
+            client = self._client_for_key_type("user_interactions")
+            await client.lpush(key, json.dumps(interaction_data))
             
-            # Keep only recent interactions (last 1000)
-            await self.redis_client.ltrim(key, 0, 999)
-            await self.redis_client.expire(key, 86400 * 30)  # 30 days
-            
-            # Also store globally for system analytics
-            global_key = "global_interactions"
-            await self.redis_client.lpush(global_key, json.dumps(interaction_data))
-            await self.redis_client.ltrim(global_key, 0, 9999)  # Keep last 10k
-            await self.redis_client.expire(global_key, 86400 * 7)  # 7 days
-            
-            # Store for Two-Tower training (larger retention window)
-            await self.store_training_interaction(interaction_data)
-            
+            await client.ltrim(key, 0, 999)
+            await client.expire(key, 86400 * 30)  # 30 days
+
             logger.debug(f"Logged interaction: {user_id} -> {action} -> {product_id}")
             
         except Exception as e:
@@ -400,7 +491,7 @@ class FeatureStore:
         user_id: str,
         interactions: List[Dict[str, Any]],
     ):
-        """Batch-log interactions for a single user with one Redis pipeline."""
+        """Batch-log recent interactions for a single user with one Redis pipeline."""
         try:
             if not interactions:
                 return
@@ -419,21 +510,10 @@ class FeatureStore:
             ]
 
             user_key = f"{self.prefixes['user_interactions']}{user_id}"
-            global_key = "global_interactions"
-            training_key = "tt_training_interactions"
-
-            pipeline = self.redis_client.pipeline(transaction=False)
+            pipeline = self._client_for_key_type("user_interactions").pipeline(transaction=False)
             pipeline.lpush(user_key, *serialized)
             pipeline.ltrim(user_key, 0, 999)
             pipeline.expire(user_key, 86400 * 30)
-
-            pipeline.lpush(global_key, *serialized)
-            pipeline.ltrim(global_key, 0, 9999)
-            pipeline.expire(global_key, 86400 * 7)
-
-            pipeline.lpush(training_key, *serialized)
-            pipeline.ltrim(training_key, 0, 99999)
-            pipeline.expire(training_key, 86400 * 30)
             await pipeline.execute()
         except Exception as e:
             logger.error(f"Error batch-logging interactions for {user_id}: {e}")
@@ -442,7 +522,7 @@ class FeatureStore:
         """Get recent user interactions."""
         try:
             key = f"{self.prefixes['user_interactions']}{user_id}"
-            interactions_data = await self.redis_client.lrange(key, 0, limit - 1)
+            interactions_data = await self._client_for_key_type("user_interactions").lrange(key, 0, limit - 1)
             
             interactions = []
             for data in interactions_data:
@@ -508,7 +588,8 @@ class FeatureStore:
 
             stat_names = ("total_views", "total_clicks", "total_purchases")
             stat_keys = [f"user_stats:{user_id}:{name}" for name in stat_names]
-            stat_values = await self.redis_client.mget(stat_keys)
+            state_client = self._client_for_key_type("user_features")
+            stat_values = await state_client.mget(stat_keys)
             stats = {
                 name: int(value) if value else 0
                 for name, value in zip(stat_names, stat_values)
@@ -520,7 +601,7 @@ class FeatureStore:
             features.click_through_rate = stats["total_clicks"] / max(stats["total_views"], 1)
             features.conversion_rate = stats["total_purchases"] / max(stats["total_clicks"], 1)
 
-            pipeline = self.redis_client.pipeline(transaction=False)
+            pipeline = state_client.pipeline(transaction=False)
             ttl = self._calculate_adaptive_ttl(features)
             pipeline.setex(
                 f"{self.prefixes['user_features']}{user_id}",
@@ -540,7 +621,8 @@ class FeatureStore:
         self, 
         user_id: str, 
         context_hash: str, 
-        recommendations: List[Dict[str, Any]]
+        recommendations: List[Dict[str, Any]],
+        user_features: Optional[UserFeatures] = None,
     ):
         """Cache recommendation results."""
         try:
@@ -555,10 +637,10 @@ class FeatureStore:
             }
             
             # Use user-specific TTL
-            user_features = await self.get_user_features(user_id)
+            user_features = user_features or await self.get_user_features(user_id)
             ttl = self._calculate_adaptive_ttl(user_features)
             
-            await self.redis_client.setex(
+            await self._client_for_key_type("recommendations_cache").setex(
                 key, 
                 min(ttl, self.cache_config.recommendations_ttl),
                 pack_cache_payload("recommendations_cache", cache_data)
@@ -572,6 +654,7 @@ class FeatureStore:
         user_id: str,
         context_hash: str,
         candidates: List[CandidateProduct],
+        user_features: Optional[UserFeatures] = None,
     ):
         """Cache pre-ranked candidate products for reuse across requests."""
         try:
@@ -579,7 +662,7 @@ class FeatureStore:
                 return
 
             key = f"{self.prefixes['candidate_cache']}{user_id}:{context_hash}"
-            user_features = await self.get_user_features(user_id)
+            user_features = user_features or await self.get_user_features(user_id)
             ttl = min(
                 self._calculate_adaptive_ttl(user_features),
                 self.cache_config.candidate_ttl,
@@ -589,7 +672,7 @@ class FeatureStore:
                 "cached_at": time.time(),
                 "user_id": user_id,
             }
-            await self.redis_client.setex(
+            await self._client_for_key_type("candidate_cache").setex(
                 key,
                 ttl,
                 pack_cache_payload("candidate_cache", payload),
@@ -608,7 +691,7 @@ class FeatureStore:
                 return None
 
             key = f"{self.prefixes['candidate_cache']}{user_id}:{context_hash}"
-            cached_data = await self.redis_client.get(key)
+            cached_data = await self._client_for_key_type("candidate_cache").get(key)
             if not cached_data:
                 return None
 
@@ -626,6 +709,14 @@ class FeatureStore:
         """Store product metadata in the local and Redis-backed metadata cache."""
         await self.store_product_metadata_batch({product_id: metadata})
 
+    def prime_product_metadata_memory_cache(
+        self,
+        metadata_map: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Prime per-process metadata cache without writing Redis."""
+        if metadata_map:
+            self._product_metadata_memory_cache.update(metadata_map)
+
     async def store_product_metadata_batch(
         self,
         metadata_map: Dict[str, Dict[str, Any]],
@@ -636,7 +727,7 @@ class FeatureStore:
                 return
 
             self._product_metadata_memory_cache.update(metadata_map)
-            pipeline = self.redis_client.pipeline(transaction=False)
+            pipeline = self._client_for_key_type("product_metadata").pipeline(transaction=False)
             for product_id, metadata in metadata_map.items():
                 key = f"{self.prefixes['product_metadata']}{product_id}"
                 pipeline.setex(
@@ -677,7 +768,7 @@ class FeatureStore:
 
             if missing_ids:
                 keys = [f"{self.prefixes['product_metadata']}{product_id}" for product_id in missing_ids]
-                values = await self.redis_client.mget(keys)
+                values = await self._client_for_key_type("product_metadata").mget(keys)
                 for product_id, value in zip(missing_ids, values):
                     if not value:
                         continue
@@ -703,7 +794,7 @@ class FeatureStore:
             key = f"{self.prefixes['trending_products']}{pool_name}"
             payload = [candidate.dict() for candidate in candidates]
             self._trending_pool_memory_cache[pool_name] = [CandidateProduct(**item) for item in payload]
-            await self.redis_client.setex(
+            await self._client_for_key_type("trending_products").setex(
                 key,
                 self.cache_config.serving_pool_ttl,
                 pack_cache_payload("trending_pool", payload),
@@ -723,7 +814,7 @@ class FeatureStore:
             cached = self._trending_pool_memory_cache.get(pool_name)
             if cached is None:
                 key = f"{self.prefixes['trending_products']}{pool_name}"
-                raw = await self.redis_client.get(key)
+                raw = await self._client_for_key_type("trending_products").get(key)
                 if raw:
                     payload = unpack_cache_payload(raw, "trending_pool")
                     cached = [CandidateProduct(**item) for item in payload]
@@ -749,7 +840,7 @@ class FeatureStore:
             if not pools:
                 return
 
-            pipeline = self.redis_client.pipeline(transaction=False)
+            pipeline = self._client_for_key_type("category_pool").pipeline(transaction=False)
             for category, candidates in pools.items():
                 payload = [candidate.dict() for candidate in candidates]
                 self._category_pool_memory_cache[category] = [
@@ -777,7 +868,7 @@ class FeatureStore:
             cached = self._category_pool_memory_cache.get(category)
             if cached is None:
                 key = f"{self.prefixes['category_pool']}{category}"
-                raw = await self.redis_client.get(key)
+                raw = await self._client_for_key_type("category_pool").get(key)
                 if raw:
                     payload = unpack_cache_payload(raw, "category_pool")
                     cached = [CandidateProduct(**item) for item in payload]
@@ -805,7 +896,7 @@ class FeatureStore:
                 return None
             
             key = f"{self.prefixes['recommendations_cache']}{user_id}:{context_hash}"
-            cached_data = await self.redis_client.get(key)
+            cached_data = await self._client_for_key_type("recommendations_cache").get(key)
             
             if cached_data:
                 cache_data = unpack_cache_payload(cached_data, "recommendations_cache")
@@ -820,13 +911,20 @@ class FeatureStore:
     async def invalidate_user_cache(self, user_id: str):
         """Invalidate all cache entries for a user."""
         try:
-            patterns = [
+            cache_patterns = [
                 f"{self.prefixes['recommendations_cache']}{user_id}:*",
                 f"{self.prefixes['candidate_cache']}{user_id}:*",
-                f"{self.prefixes['user_features']}{user_id}"
             ]
+            state_patterns = [f"{self.prefixes['user_features']}{user_id}"]
 
-            await self._delete_matching_keys(patterns)
+            await self._delete_matching_keys(
+                cache_patterns,
+                client=self._client_for_key_type("recommendations_cache"),
+            )
+            await self._delete_matching_keys(
+                state_patterns,
+                client=self._client_for_key_type("user_features"),
+            )
             
             logger.info(f"Invalidated cache for user {user_id}")
             
@@ -840,7 +938,10 @@ class FeatureStore:
                 f"{self.prefixes['recommendations_cache']}{user_id}:*",
                 f"{self.prefixes['candidate_cache']}{user_id}:*",
             ]
-            await self._delete_matching_keys(patterns)
+            await self._delete_matching_keys(
+                patterns,
+                client=self._client_for_key_type("recommendations_cache"),
+            )
         except Exception as e:
             logger.error(f"Error invalidating serving cache for {user_id}: {e}")
     
@@ -850,14 +951,12 @@ class FeatureStore:
         try:
             current_minute = int(time.time() // 60)
             key = f"{self.prefixes['system_metrics']}requests:{current_minute}"
-            
-            # Increment request count
-            await self.redis_client.hincrby(key, 'count', 1)
-            await self.redis_client.hincrby(key, 'total_recommendations', num_recommendations)
-            await self.redis_client.hincrby(key, 'total_response_time', int(response_time * 1000))
-            
-            # Set expiration for cleanup
-            await self.redis_client.expire(key, 86400)  # 24 hours
+            pipeline = self._client_for_key_type("system_metrics").pipeline(transaction=False)
+            pipeline.hincrby(key, 'count', 1)
+            pipeline.hincrby(key, 'total_recommendations', num_recommendations)
+            pipeline.hincrby(key, 'total_response_time', int(response_time * 1000))
+            pipeline.expire(key, 86400)  # 24 hours
+            await pipeline.execute()
             
         except Exception as e:
             logger.error(f"Error logging recommendation request: {e}")
@@ -882,7 +981,7 @@ class FeatureStore:
                 minute = (current_time // 60) - minutes_ago
                 key = f"{self.prefixes['system_metrics']}requests:{minute}"
                 
-                minute_data = await self.redis_client.hgetall(key)
+                minute_data = await self._client_for_key_type("system_metrics").hgetall(key)
                 if minute_data:
                     count = int(minute_data.get(b'count', 0))
                     response_time = int(minute_data.get(b'total_response_time', 0))
@@ -896,7 +995,10 @@ class FeatureStore:
             
             # Count total users (approximate)
             user_pattern = f"{self.prefixes['user_features']}*"
-            metrics['total_users'] = await self._count_matching_keys(user_pattern)
+            metrics['total_users'] = await self._count_matching_keys(
+                user_pattern,
+                client=self._client_for_key_type("user_features"),
+            )
             
             return metrics
             
@@ -908,7 +1010,7 @@ class FeatureStore:
         """Get comprehensive analytics data."""
         try:
             # Get recent interactions
-            interactions_data = await self.redis_client.lrange("global_interactions", 0, 999)
+            interactions_data = await self._client_for_key_type("analytics").lrange("global_interactions", 0, 999)
             
             interactions = []
             for data in interactions_data:
@@ -966,7 +1068,7 @@ class FeatureStore:
             "metadata": metadata or {},
         }
         key = f"{self.prefixes['health']}heartbeat:{service_name}:{instance_id}"
-        await self.redis_client.setex(key, ttl_seconds, json_dumps(payload))
+        await self._client_for_key_type("health").setex(key, ttl_seconds, json_dumps(payload))
 
     async def get_service_heartbeat_status(
         self,
@@ -975,8 +1077,9 @@ class FeatureStore:
         """Get readiness summary for all live heartbeat keys of a service."""
         pattern = f"{self.prefixes['health']}heartbeat:{service_name}:*"
         heartbeats: List[Dict[str, Any]] = []
-        async for key in self.redis_client.scan_iter(match=pattern, count=100):
-            raw = await self.redis_client.get(key)
+        client = self._client_for_key_type("health")
+        async for key in client.scan_iter(match=pattern, count=100):
+            raw = await client.get(key)
             if not raw:
                 continue
             try:
@@ -1008,20 +1111,27 @@ class FeatureStore:
             # Test basic operations
             test_key = "health_check_test"
             test_value = "test_value"
+            state_client = self._client_for_key_type("health")
+            cache_client = self._client_for_key_type("recommendations_cache")
             
             # Test write
-            await self.redis_client.set(test_key, test_value, ex=60)
+            await state_client.set(test_key, test_value, ex=60)
             
             # Test read
-            retrieved_value = await self.redis_client.get(test_key)
+            retrieved_value = await state_client.get(test_key)
             
             # Test delete
-            await self.redis_client.delete(test_key)
+            await state_client.delete(test_key)
             
             response_time = (time.time() - start_time) * 1000
             
             # Get Redis info
-            redis_info = await self.redis_client.info()
+            redis_info = await state_client.info()
+            cache_info = (
+                await cache_client.info()
+                if cache_client is not state_client
+                else redis_info
+            )
             
             return {
                 'status': 'healthy',
@@ -1030,6 +1140,9 @@ class FeatureStore:
                 'redis_version': redis_info.get('redis_version', 'unknown'),
                 'used_memory': redis_info.get('used_memory_human', 'unknown'),
                 'connected_clients': redis_info.get('connected_clients', 0),
+                'cache_redis_separate': cache_client is not state_client,
+                'cache_used_memory': cache_info.get('used_memory_human', 'unknown'),
+                'cache_connected_clients': cache_info.get('connected_clients', 0),
                 'test_passed': retrieved_value.decode() == test_value if retrieved_value else False
             }
             
@@ -1050,9 +1163,10 @@ class FeatureStore:
         """
         try:
             key = "tt_training_interactions"
-            await self.redis_client.lpush(key, json.dumps(interaction))
-            await self.redis_client.ltrim(key, 0, 99999)  # Keep 100K interactions
-            await self.redis_client.expire(key, 86400 * 30)  # 30 days
+            client = self._client_for_key_type("analytics")
+            await client.lpush(key, json.dumps(interaction))
+            await client.ltrim(key, 0, 99999)  # Keep 100K interactions
+            await client.expire(key, 86400 * 30)  # 30 days
         except Exception as e:
             logger.error(f"Error storing training interaction: {e}")
 
@@ -1063,7 +1177,7 @@ class FeatureStore:
         """
         try:
             key = "tt_training_interactions"
-            data = await self.redis_client.lrange(key, 0, limit - 1)
+            data = await self._client_for_key_type("analytics").lrange(key, 0, limit - 1)
             interactions = []
             for item in data:
                 try:
@@ -1083,7 +1197,8 @@ class FeatureStore:
         """
         try:
             pattern = f"{self.prefixes['user_features']}*"
-            keys = await self._collect_matching_keys(pattern)
+            client = self._client_for_key_type("user_features")
+            keys = await self._collect_matching_keys(pattern, client=client)
             if not keys:
                 return {}
 
@@ -1094,7 +1209,7 @@ class FeatureStore:
                 try:
                     key_str = key.decode() if isinstance(key, bytes) else key
                     user_id = key_str[prefix_len:]
-                    cached = await self.redis_client.get(key)
+                    cached = await client.get(key)
                     if cached:
                         data = unpack_cache_payload(cached, "user_features")
                         result[user_id] = data
@@ -1111,8 +1226,9 @@ class FeatureStore:
         try:
             # Initialize system counters if they don't exist
             counters_key = "system_counters"
-            if not await self.redis_client.exists(counters_key):
-                await self.redis_client.hset(counters_key, mapping={
+            client = self._client_for_key_type("system_metrics")
+            if not await client.exists(counters_key):
+                await client.hset(counters_key, mapping={
                     'total_users': 0,
                     'total_recommendations': 0,
                     'total_interactions': 0
@@ -1123,26 +1239,29 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error initializing default data: {e}")
 
-    async def _collect_matching_keys(self, pattern: str) -> List[Union[str, bytes]]:
+    async def _collect_matching_keys(self, pattern: str, client=None) -> List[Union[str, bytes]]:
         """Collect Redis keys with SCAN to avoid blocking KEYS."""
+        client = client or self.redis_client
         results: List[Union[str, bytes]] = []
-        async for key in self.redis_client.scan_iter(match=pattern, count=500):
+        async for key in client.scan_iter(match=pattern, count=500):
             results.append(key)
         return results
 
-    async def _count_matching_keys(self, pattern: str) -> int:
+    async def _count_matching_keys(self, pattern: str, client=None) -> int:
         """Count Redis keys with SCAN to avoid blocking KEYS."""
+        client = client or self.redis_client
         count = 0
-        async for _ in self.redis_client.scan_iter(match=pattern, count=500):
+        async for _ in client.scan_iter(match=pattern, count=500):
             count += 1
         return count
 
-    async def _delete_matching_keys(self, patterns: List[str]):
+    async def _delete_matching_keys(self, patterns: List[str], client=None):
         """Delete groups of keys discovered via SCAN."""
+        client = client or self.redis_client
         for pattern in patterns:
-            keys = await self._collect_matching_keys(pattern)
+            keys = await self._collect_matching_keys(pattern, client=client)
             if keys:
-                await self.redis_client.delete(*keys)
+                await client.delete(*keys)
     
     # Utility methods
     def generate_context_hash(self, context: Dict[str, Any]) -> str:
