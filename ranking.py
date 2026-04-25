@@ -19,6 +19,7 @@ import json
 import time
 from pathlib import Path
 import pickle
+import threading
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import ndcg_score, roc_auc_score
 
@@ -334,6 +335,7 @@ class RankingModel:
             Tuple[str, Tuple[Any, ...]],
             Tuple[np.ndarray, float],
         ] = OrderedDict()
+        self._product_feature_cache_lock = threading.RLock()
         
         logger.info(f"RankingModel initialized on device: {self.device}")
     
@@ -422,7 +424,6 @@ class RankingModel:
     ) -> Tuple[Optional[np.ndarray], List[Tuple[CandidateProduct, Dict[str, Any]]], float]:
         """Prepare a request's ranking feature matrix and candidate metadata."""
         feature_stage_started = time.perf_counter()
-        feature_vectors = []
         valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]] = []
         product_metadata_map = product_metadata_map or {}
 
@@ -435,6 +436,16 @@ class RankingModel:
             context,
             current_time,
         )
+        user_dim = self.feature_extractor.user_feature_dim
+        product_dim = self.feature_extractor.product_feature_dim
+        context_dim = self.feature_extractor.context_feature_dim
+        candidate_dim = self.feature_extractor.candidate_feature_dim
+        total_dim = self.feature_extractor.total_feature_dim
+        product_start = user_dim
+        context_start = product_start + product_dim
+        candidate_start = context_start + context_dim
+        feature_matrix = np.empty((len(candidates), total_dim), dtype=np.float32)
+        row_count = 0
 
         for candidate in candidates:
             try:
@@ -445,19 +456,12 @@ class RankingModel:
                     current_time,
                 )
                 candidate_feats = self.feature_extractor.extract_candidate_features(candidate)
-                features = np.concatenate([
-                    user_feats,
-                    product_feats,
-                    context_feats,
-                    candidate_feats,
-                ])
-                features = np.nan_to_num(
-                    features,
-                    nan=0.0,
-                    copy=False,
-                )
-                feature_vectors.append(features)
+                feature_matrix[row_count, :user_dim] = user_feats
+                feature_matrix[row_count, product_start:context_start] = product_feats
+                feature_matrix[row_count, context_start:candidate_start] = context_feats
+                feature_matrix[row_count, candidate_start:candidate_start + candidate_dim] = candidate_feats
                 valid_candidates.append((candidate, product_metadata))
+                row_count += 1
             except Exception as e:
                 logger.warning(
                     f"Error extracting features for candidate {candidate.product_id}: {e}"
@@ -466,17 +470,20 @@ class RankingModel:
         feature_extraction_ms = round(
             (time.perf_counter() - feature_stage_started) * 1000, 2
         )
-        if not feature_vectors:
+        if row_count == 0:
             return None, [], feature_extraction_ms
 
-        return np.vstack(feature_vectors), valid_candidates, feature_extraction_ms
+        if row_count < len(candidates):
+            feature_matrix = feature_matrix[:row_count]
+        np.nan_to_num(feature_matrix, nan=0.0, copy=False)
+        return feature_matrix, valid_candidates, feature_extraction_ms
 
     def run_inference_batch(
         self,
         feature_matrix: np.ndarray,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
         """Run one Torch forward pass for a feature matrix."""
-        with torch.no_grad():
+        with torch.inference_mode():
             tensor_stage_started = time.perf_counter()
             features_tensor = torch.as_tensor(
                 feature_matrix,
@@ -605,18 +612,23 @@ class RankingModel:
             product_id,
             self._product_metadata_fingerprint(product_metadata),
         )
-        cached = self._product_feature_cache.get(cache_key)
-        if cached is not None:
-            static_features, created_at = cached
-            self._product_feature_cache.move_to_end(cache_key)
-        else:
+        with self._product_feature_cache_lock:
+            cached = self._product_feature_cache.get(cache_key)
+            if cached is not None:
+                static_features, created_at = cached
+                self._product_feature_cache.move_to_end(cache_key)
+            else:
+                static_features = None
+
+        if cached is None:
             static_features, created_at = (
                 self.feature_extractor.extract_static_product_features(product_metadata)
             )
-            if self._product_feature_cache_max_size > 0:
-                self._product_feature_cache[cache_key] = (static_features, created_at)
-                if len(self._product_feature_cache) > self._product_feature_cache_max_size:
-                    self._product_feature_cache.popitem(last=False)
+            with self._product_feature_cache_lock:
+                if self._product_feature_cache_max_size > 0:
+                    self._product_feature_cache[cache_key] = (static_features, created_at)
+                    if len(self._product_feature_cache) > self._product_feature_cache_max_size:
+                        self._product_feature_cache.popitem(last=False)
 
         product_features = static_features.copy()
         product_features[4] = (current_time - created_at) / 86400

@@ -177,6 +177,14 @@ class RecommendationConfig(BaseSettings):
         10,
         description="Maximum random fallback candidates to merge per request",
     )
+    user_embedding_cache_size: int = Field(
+        20000,
+        description="Per-process LRU cache entries for Two-Tower user embeddings",
+    )
+    user_embedding_cache_time_bucket_seconds: float = Field(
+        1.0,
+        description="Time bucket used in Two-Tower user embedding cache keys",
+    )
     interaction_history_timeout_ms: float = Field(
         50.0,
         description="Maximum time to spend reading recent user interactions on the serving path",

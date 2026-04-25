@@ -46,16 +46,21 @@ class UserFeatureEncoder:
     FEATURE_DIM = 10
 
     @staticmethod
-    def encode(user_features: Dict[str, Any]) -> np.ndarray:
+    def encode(
+        user_features: Dict[str, Any],
+        current_time: Optional[float] = None,
+    ) -> np.ndarray:
+        if current_time is None:
+            current_time = time.time()
         total_interactions = float(user_features.get("total_interactions", 0))
         avg_session = float(user_features.get("avg_session_length", 0.0))
         price_sens = float(user_features.get("price_sensitivity", 0.5))
         ctr = float(user_features.get("click_through_rate", 0.0))
         cvr = float(user_features.get("conversion_rate", 0.0))
         preferred_cats = user_features.get("preferred_categories", [])
-        last_active = float(user_features.get("last_active", time.time()))
+        last_active = float(user_features.get("last_active", current_time))
 
-        hours_since_active = max((time.time() - last_active) / 3600.0, 0.0)
+        hours_since_active = max((current_time - last_active) / 3600.0, 0.0)
 
         features = np.array(
             [
@@ -655,12 +660,17 @@ class TwoTowerTrainer:
         return index, idx_map
 
     @torch.no_grad()
-    def encode_user(self, user_id: str, user_features: Dict[str, Any]) -> Optional[np.ndarray]:
+    def encode_user(
+        self,
+        user_id: str,
+        user_features: Dict[str, Any],
+        current_time: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
         if self.model is None:
             return None
         self.model.eval()
         u_idx = self.user_mapping.get(user_id, 0)
-        u_feat = UserFeatureEncoder.encode(user_features)
+        u_feat = UserFeatureEncoder.encode(user_features, current_time=current_time)
         ids_t = torch.tensor([u_idx], dtype=torch.long, device=self.device)
         feat_t = torch.tensor([u_feat], device=self.device)
         return self.model.encode_users(ids_t, feat_t).cpu().numpy()[0]
