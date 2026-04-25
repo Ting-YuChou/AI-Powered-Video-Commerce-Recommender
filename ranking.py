@@ -13,6 +13,7 @@ import torch.optim as optim
 import numpy as np
 import asyncio
 import logging
+from collections import OrderedDict
 from typing import Dict, List, Any, Optional, Tuple
 import json
 import time
@@ -167,8 +168,13 @@ class FeatureExtractor:
             self.candidate_feature_dim
         )
     
-    def extract_user_features(self, user_features: UserFeatures) -> np.ndarray:
+    def extract_user_features(
+        self,
+        user_features: UserFeatures,
+        current_time: Optional[float] = None,
+    ) -> np.ndarray:
         """Extract numerical features from user profile."""
+        current_time = current_time or time.time()
         features = np.array([
             user_features.total_interactions / 1000,  # Normalize
             user_features.avg_session_length / 3600,  # Hours
@@ -176,7 +182,7 @@ class FeatureExtractor:
             user_features.click_through_rate,
             user_features.conversion_rate,
             len(user_features.preferred_categories) / 10,  # Normalize
-            (time.time() - user_features.last_active) / 86400,  # Days since active
+            (current_time - user_features.last_active) / 86400,  # Days since active
             1.0 if user_features.total_interactions > 100 else 0.0,  # Heavy user
             1.0 if user_features.conversion_rate > 0.05 else 0.0,  # High converter
             1.0 if user_features.click_through_rate > 0.1 else 0.0,  # High engagement
@@ -184,24 +190,51 @@ class FeatureExtractor:
         
         return features
     
-    def extract_product_features(self, product_metadata: Dict[str, Any]) -> np.ndarray:
+    def extract_product_features(
+        self,
+        product_metadata: Dict[str, Any],
+        current_time: Optional[float] = None,
+    ) -> np.ndarray:
         """Extract features from product metadata."""
+        current_time = current_time or time.time()
         features = np.array([
             np.log1p(product_metadata.get('price', 1.0)),  # Log price
             product_metadata.get('rating', 3.0) / 5.0,  # Normalized rating
             np.log1p(product_metadata.get('num_reviews', 1)),  # Log review count
             1.0 if product_metadata.get('in_stock', True) else 0.0,  # Stock status
-            (time.time() - product_metadata.get('created_at', time.time())) / 86400,  # Age in days
+            (current_time - product_metadata.get('created_at', current_time)) / 86400,  # Age in days
             len(product_metadata.get('tags', [])) / 10,  # Tag count normalized
             1.0 if product_metadata.get('price', 0) > 100 else 0.0,  # Premium product
             hash(product_metadata.get('brand', '')) % 100 / 100,  # Brand embedding (simple)
         ], dtype=np.float32)
         
         return features
+
+    def extract_static_product_features(
+        self,
+        product_metadata: Dict[str, Any],
+    ) -> Tuple[np.ndarray, float]:
+        """Extract product features whose values do not depend on request time."""
+        created_at = float(product_metadata.get("created_at") or time.time())
+        features = np.array([
+            np.log1p(product_metadata.get("price", 1.0)),
+            product_metadata.get("rating", 3.0) / 5.0,
+            np.log1p(product_metadata.get("num_reviews", 1)),
+            1.0 if product_metadata.get("in_stock", True) else 0.0,
+            0.0,  # Filled with age-in-days at request time.
+            len(product_metadata.get("tags", [])) / 10,
+            1.0 if product_metadata.get("price", 0) > 100 else 0.0,
+            hash(product_metadata.get("brand", "")) % 100 / 100,
+        ], dtype=np.float32)
+        return features, created_at
     
-    def extract_context_features(self, context: Dict[str, Any]) -> np.ndarray:
+    def extract_context_features(
+        self,
+        context: Dict[str, Any],
+        current_time: Optional[float] = None,
+    ) -> np.ndarray:
         """Extract features from request context."""
-        current_time = time.time()
+        current_time = current_time or time.time()
         dt = time.localtime(current_time)
         
         features = np.array([
@@ -236,9 +269,10 @@ class FeatureExtractor:
         """Create complete feature vector for ranking."""
         try:
             # Extract individual feature groups
-            user_feats = self.extract_user_features(user_features)
-            product_feats = self.extract_product_features(product_metadata)
-            context_feats = self.extract_context_features(context)
+            current_time = time.time()
+            user_feats = self.extract_user_features(user_features, current_time)
+            product_feats = self.extract_product_features(product_metadata, current_time)
+            context_feats = self.extract_context_features(context, current_time)
             candidate_feats = self.extract_candidate_features(candidate)
             
             # Concatenate all features
@@ -292,6 +326,14 @@ class RankingModel:
         self.torch_inference_available = True
         self.enable_profiling_logs = False
         self.profiling_log_min_duration_ms = 250.0
+        self._product_feature_cache_max_size = max(
+            0,
+            getattr(config, "product_feature_cache_size", 50000),
+        )
+        self._product_feature_cache: OrderedDict[
+            Tuple[str, Tuple[Any, ...]],
+            Tuple[np.ndarray, float],
+        ] = OrderedDict()
         
         logger.info(f"RankingModel initialized on device: {self.device}")
     
@@ -384,14 +426,35 @@ class RankingModel:
         valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]] = []
         product_metadata_map = product_metadata_map or {}
 
+        current_time = time.time()
+        user_feats = self.feature_extractor.extract_user_features(
+            user_features,
+            current_time,
+        )
+        context_feats = self.feature_extractor.extract_context_features(
+            context,
+            current_time,
+        )
+
         for candidate in candidates:
             try:
                 product_metadata = product_metadata_map.get(candidate.product_id) or self._build_product_metadata(candidate)
-                features = self.feature_extractor.create_ranking_features(
-                    user_features,
+                product_feats = self._get_product_feature_vector(
+                    candidate.product_id,
                     product_metadata,
-                    context,
-                    candidate,
+                    current_time,
+                )
+                candidate_feats = self.feature_extractor.extract_candidate_features(candidate)
+                features = np.concatenate([
+                    user_feats,
+                    product_feats,
+                    context_feats,
+                    candidate_feats,
+                ])
+                features = np.nan_to_num(
+                    features,
+                    nan=0.0,
+                    copy=False,
                 )
                 feature_vectors.append(features)
                 valid_candidates.append((candidate, product_metadata))
@@ -513,6 +576,51 @@ class RankingModel:
             "tags": [],
             "brand": "Unknown",
         }
+
+    @staticmethod
+    def _product_metadata_fingerprint(product_metadata: Dict[str, Any]) -> Tuple[Any, ...]:
+        tags = product_metadata.get("tags", [])
+        if isinstance(tags, (list, tuple, set)):
+            normalized_tags = tuple(str(tag) for tag in tags)
+        else:
+            normalized_tags = (str(tags),)
+        return (
+            product_metadata.get("price", 1.0),
+            product_metadata.get("rating", 3.0),
+            product_metadata.get("num_reviews", 1),
+            bool(product_metadata.get("in_stock", True)),
+            product_metadata.get("created_at"),
+            normalized_tags,
+            product_metadata.get("brand", ""),
+        )
+
+    def _get_product_feature_vector(
+        self,
+        product_id: str,
+        product_metadata: Dict[str, Any],
+        current_time: float,
+    ) -> np.ndarray:
+        """Return product features while preserving request-time freshness for age."""
+        cache_key = (
+            product_id,
+            self._product_metadata_fingerprint(product_metadata),
+        )
+        cached = self._product_feature_cache.get(cache_key)
+        if cached is not None:
+            static_features, created_at = cached
+            self._product_feature_cache.move_to_end(cache_key)
+        else:
+            static_features, created_at = (
+                self.feature_extractor.extract_static_product_features(product_metadata)
+            )
+            if self._product_feature_cache_max_size > 0:
+                self._product_feature_cache[cache_key] = (static_features, created_at)
+                if len(self._product_feature_cache) > self._product_feature_cache_max_size:
+                    self._product_feature_cache.popitem(last=False)
+
+        product_features = static_features.copy()
+        product_features[4] = (current_time - created_at) / 86400
+        return product_features
     
     async def rank_candidates(
         self,

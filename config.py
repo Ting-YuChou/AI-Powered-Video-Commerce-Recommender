@@ -251,9 +251,21 @@ class RankingConfig(BaseSettings):
         2048,
         description="Maximum queued ranking requests per worker",
     )
+    batch_runner_count: int = Field(
+        1,
+        description="Number of concurrent micro-batch runners per recommendation worker",
+    )
+    inference_executor_workers: int = Field(
+        0,
+        description="Dedicated per-process thread workers for ranking feature prep and inference; 0 uses asyncio's default executor",
+    )
     offload_inference_to_thread: bool = Field(
         True,
         description="Run ranking feature preparation and inference off the asyncio event loop",
+    )
+    product_feature_cache_size: int = Field(
+        50000,
+        description="Per-process cache size for static product ranking feature components",
     )
 
     # Multi-objective settings
@@ -527,7 +539,7 @@ class ServiceTopologyConfig(BaseSettings):
         description="HTTP write timeout from gateway to internal services",
     )
     proxy_pool_timeout_seconds: float = Field(
-        15.0,
+        5.0,
         description="HTTP connection-pool acquisition timeout in the gateway",
     )
     proxy_max_connections: int = Field(
@@ -535,11 +547,11 @@ class ServiceTopologyConfig(BaseSettings):
         description="Maximum concurrent upstream HTTP connections per gateway worker",
     )
     proxy_max_keepalive_connections: int = Field(
-        100,
+        250,
         description="Maximum idle keepalive upstream HTTP connections per gateway worker",
     )
     proxy_keepalive_expiry_seconds: float = Field(
-        5.0,
+        30.0,
         description="Idle keepalive expiry for upstream HTTP connections in the gateway",
     )
     trainer_interval_seconds: int = Field(

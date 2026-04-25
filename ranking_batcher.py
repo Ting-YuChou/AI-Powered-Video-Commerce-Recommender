@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,24 +40,41 @@ class RankingBatcher:
         self.max_batch_requests = max(1, config.batch_max_requests)
         self.batch_wait_seconds = max(config.batch_wait_ms, 0.0) / 1000.0
         self.offload_inference_to_thread = getattr(config, "offload_inference_to_thread", True)
+        self.runner_count = max(1, getattr(config, "batch_runner_count", 1))
+        self.executor_workers = max(0, getattr(config, "inference_executor_workers", 0))
         self.queue: asyncio.Queue[Optional[RankingBatchRequest]] = asyncio.Queue(
             maxsize=max(1, config.batch_queue_size)
         )
-        self._runner_task: Optional[asyncio.Task] = None
+        self._runner_tasks: List[asyncio.Task] = []
+        self._executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(
+                max_workers=self.executor_workers,
+                thread_name_prefix="ranking-inference",
+            )
+            if self.offload_inference_to_thread and self.executor_workers > 0
+            else None
+        )
         self._closing = False
 
     async def start(self) -> None:
-        if not self.enabled or self._runner_task:
+        if not self.enabled or self._runner_tasks:
             return
-        self._runner_task = asyncio.create_task(self._run(), name="ranking-batcher")
+        self._runner_tasks = [
+            asyncio.create_task(self._run(runner_id), name=f"ranking-batcher-{runner_id}")
+            for runner_id in range(self.runner_count)
+        ]
 
     async def close(self) -> None:
-        if not self._runner_task:
-            return
+        if self._runner_tasks:
+            self._closing = True
+            for _ in self._runner_tasks:
+                await self.queue.put(None)
+            await asyncio.gather(*self._runner_tasks, return_exceptions=True)
+            self._runner_tasks = []
         self._closing = True
-        await self.queue.put(None)
-        await self._runner_task
-        self._runner_task = None
+        if self._executor:
+            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._executor = None
 
     async def rank_candidates(
         self,
@@ -69,7 +87,7 @@ class RankingBatcher:
     ):
         product_metadata_map = product_metadata_map or {}
         if not self.enabled:
-            return await self.ranking_model.rank_candidates(
+            return await self._rank_direct(
                 candidates=candidates,
                 user_features=user_features,
                 context=context,
@@ -95,7 +113,7 @@ class RankingBatcher:
             self.queue.put_nowait(request)
         except asyncio.QueueFull:
             logger.warning("ranking_batch_queue_full_fallback_direct")
-            return await self.ranking_model.rank_candidates(
+            return await self._rank_direct(
                 candidates=candidates,
                 user_features=user_features,
                 context=context,
@@ -106,7 +124,7 @@ class RankingBatcher:
 
         return await future
 
-    async def _run(self) -> None:
+    async def _run(self, runner_id: int) -> None:
         while True:
             first = await self.queue.get()
             if first is None:
@@ -138,7 +156,7 @@ class RankingBatcher:
 
     async def _fulfill_single(self, request: RankingBatchRequest) -> None:
         try:
-            result = await self.ranking_model.rank_candidates(
+            result = await self._rank_direct(
                 candidates=request.candidates,
                 user_features=request.user_features,
                 context=request.context,
@@ -154,17 +172,41 @@ class RankingBatcher:
         if not request.future.done():
             request.future.set_result(result)
 
+    async def _rank_direct(
+        self,
+        candidates: List[CandidateProduct],
+        user_features: UserFeatures,
+        context: Dict[str, Any],
+        product_metadata_map: Dict[str, Dict[str, Any]],
+        k: int,
+        include_profile: bool,
+    ):
+        return await self._run_blocking(
+            self.ranking_model._rank_candidates_sync,
+            candidates,
+            user_features,
+            context,
+            k,
+            include_profile,
+            product_metadata_map,
+        )
+
+    async def _run_blocking(self, func, *args):
+        if self._executor is not None:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._executor, func, *args)
+        if self.offload_inference_to_thread:
+            return await asyncio.to_thread(func, *args)
+        return func(*args)
+
     async def _fulfill_batch(self, batch: List[RankingBatchRequest]) -> None:
         batch_started = time.perf_counter()
         try:
-            if self.offload_inference_to_thread:
-                results = await asyncio.to_thread(
-                    self._build_batch_results,
-                    batch,
-                    batch_started,
-                )
-            else:
-                results = self._build_batch_results(batch, batch_started)
+            results = await self._run_blocking(
+                self._build_batch_results,
+                batch,
+                batch_started,
+            )
             for request, recommendations, profile in results:
                 self._set_result(request, recommendations, profile)
 

@@ -10,7 +10,8 @@ import math
 import os
 import time
 import traceback
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from fastapi import Body, HTTPException, Request, Response
 import torch
@@ -73,6 +74,72 @@ def _build_candidate_cache_context(payload: RecommendationRequest, k_per_source:
         "category": context.get("product_category") or context.get("category"),
         "k_per_source": k_per_source,
     }
+
+
+def _build_recommendation_cache_context(
+    payload: RecommendationRequest,
+    *,
+    current_time: Optional[float] = None,
+) -> dict:
+    """Build an exact-enough cache context from fields used by serving logic."""
+    context = payload.context or {}
+    current_time = current_time or time.time()
+    return {
+        **_build_candidate_cache_context(payload, min(payload.k * 10, 500)),
+        "k": payload.k,
+        "device": context.get("device"),
+        "session_position": context.get("session_position", 1),
+        "time_on_page": context.get("time_on_page", 0),
+        "ranking_time_hour": int(current_time // 3600),
+    }
+
+
+def _user_feature_cache_token(user_features: UserFeatures) -> Dict[str, Any]:
+    """Return the personalization inputs that make a cached result fresh enough."""
+    has_personalization_signal = (
+        user_features.total_interactions > 0
+        or bool(user_features.preferred_categories)
+        or user_features.click_through_rate > 0
+        or user_features.conversion_rate > 0
+    )
+    return {
+        "total_interactions": int(user_features.total_interactions),
+        "avg_session_length": round(float(user_features.avg_session_length), 3),
+        "preferred_categories": list(user_features.preferred_categories),
+        "price_sensitivity": round(float(user_features.price_sensitivity), 6),
+        "click_through_rate": round(float(user_features.click_through_rate), 6),
+        "conversion_rate": round(float(user_features.conversion_rate), 6),
+        "last_active": int(user_features.last_active) if has_personalization_signal else 0,
+    }
+
+
+def _serving_version_context(runtime) -> Dict[str, Any]:
+    ranking_path = runtime.config.model_config.ranking_model_path
+    vector_path = runtime.config.vector_config.index_path
+    return {
+        "ranking_model": ranking_model.model_version if ranking_model else None,
+        "ranking_checkpoint_mtime": _safe_file_mtime(ranking_path),
+        "two_tower_model": (
+            recommendation_engine.loaded_two_tower_version
+            if recommendation_engine
+            else None
+        ),
+        "cf_model": (
+            recommendation_engine.cf_engine.model_version
+            if recommendation_engine
+            else None
+        ),
+        "vector_index_mtime": _safe_file_mtime(vector_path),
+    }
+
+
+def _safe_file_mtime(path: Optional[str]) -> Optional[int]:
+    if not path:
+        return None
+    try:
+        return int(Path(path).stat().st_mtime)
+    except OSError:
+        return None
 
 
 @app.on_event("startup")
@@ -282,11 +349,27 @@ async def get_recommendations(
     }
 
     try:
+        stage_started = time.perf_counter()
+        user_features = await _bounded_hot_path_read(
+            runtime,
+            "user_features",
+            feature_store.get_user_features(payload.user_id, cache_default=False),
+            None,
+        )
+        profile["user_features_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+        if user_features is None:
+            user_features = _default_user_features(payload.user_id)
+
+        serving_versions = _serving_version_context(runtime)
+        user_feature_token = _user_feature_cache_token(user_features)
         cache_key = feature_store.generate_context_hash(
             {
-                "content_id": payload.content_id,
-                "context": payload.context,
-                "k": payload.k,
+                **_build_recommendation_cache_context(
+                    payload,
+                    current_time=start_time,
+                ),
+                "serving_versions": serving_versions,
+                "user_feature_token": user_feature_token,
             }
         )
         stage_started = time.perf_counter()
@@ -312,6 +395,7 @@ async def get_recommendations(
                     "response_time_ms": int((time.time() - start_time) * 1000),
                     "model_version": "v1.0.0",
                     "cache_hit": True,
+                    "cache_freshness": "model_and_user_feature_versioned",
                     "content_processed": payload.content_id is not None,
                     **(
                         {"profile": profile}
@@ -323,18 +407,11 @@ async def get_recommendations(
 
         k_per_source = min(payload.k * 10, 500)
         candidate_cache_key = feature_store.generate_context_hash(
-            _build_candidate_cache_context(payload, k_per_source)
-        )
-        user_features_task = asyncio.create_task(
-            _timed_awaitable(
-                _bounded_hot_path_read(
-                    runtime,
-                    "user_features",
-                    feature_store.get_user_features(payload.user_id, cache_default=False),
-                    None,
-                )
-            ),
-            name="recommendation-user-features",
+            {
+                **_build_candidate_cache_context(payload, k_per_source),
+                "serving_versions": serving_versions,
+                "user_feature_token": user_feature_token,
+            }
         )
         candidate_cache_task = asyncio.create_task(
             _timed_awaitable(
@@ -364,12 +441,7 @@ async def get_recommendations(
                 name="recommendation-content-features",
             )
 
-        (user_features, profile["user_features_ms"]), (
-            candidates,
-            profile["candidate_cache_lookup_ms"],
-        ) = await asyncio.gather(user_features_task, candidate_cache_task)
-        if user_features is None:
-            user_features = _default_user_features(payload.user_id)
+        candidates, profile["candidate_cache_lookup_ms"] = await candidate_cache_task
         content_features = None
         if content_features_task:
             content_features, profile["content_features_ms"] = await content_features_task
@@ -518,6 +590,7 @@ async def get_recommendations(
                 "total_candidates": len(candidates),
                 "response_time_ms": int(response_time * 1000),
                 "model_version": "v1.0.0",
+                "cache_freshness": "model_and_user_feature_versioned",
                 "cache_hit": False,
                 "content_processed": payload.content_id is not None,
                 **(

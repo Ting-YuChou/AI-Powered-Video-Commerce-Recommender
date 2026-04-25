@@ -4,6 +4,7 @@ Dedicated high-throughput interaction ingest API.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -129,6 +130,11 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
     if not success:
         raise HTTPException(status_code=503, detail="Failed to publish interaction event to Kafka")
 
+    asyncio.create_task(
+        _invalidate_user_serving_cache(request.user_id),
+        name=f"invalidate-serving-cache-{request.user_id}",
+    )
+
     return JSONResponse(
         status_code=202,
         content={
@@ -137,6 +143,21 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
             "processing_mode": "async",
         },
     )
+
+
+async def _invalidate_user_serving_cache(user_id: str) -> None:
+    try:
+        await asyncio.wait_for(
+            feature_store.invalidate_user_serving_cache(user_id),
+            timeout=0.25,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("serving_cache_invalidation_timed_out", extra={"user_id": user_id})
+    except Exception as exc:
+        logger.warning(
+            "serving_cache_invalidation_failed",
+            extra={"user_id": user_id, "error": str(exc)},
+        )
 
 
 @app.get("/health")
