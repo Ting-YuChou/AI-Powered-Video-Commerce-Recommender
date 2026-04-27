@@ -27,6 +27,8 @@ from kafka_client import KafkaConsumerClient, KafkaManager, get_kafka_manager
 from config import Config, KafkaConfig
 from feature_store import FeatureStore
 from system_store import SystemStore
+from observability import ObservabilityManager, configure_logging, start_worker_metrics_server
+from telemetry import configure_tracing
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +54,7 @@ class FeatureUpdaterWorker:
         self.feature_store: Optional[FeatureStore] = None
         self.system_store: Optional[SystemStore] = None
         self.consumer: Optional[KafkaConsumerClient] = None
+        self.observability = ObservabilityManager()
         
         # Batch processing settings
         self.batch_size = 100
@@ -69,19 +72,32 @@ class FeatureUpdaterWorker:
     async def initialize(self):
         """Initialize all components."""
         logger.info("Initializing feature updater components...")
+        configure_logging(self.config.monitoring_config)
+        configure_tracing("feature-worker", self.config.monitoring_config)
+        metrics_port = start_worker_metrics_server(
+            self.observability,
+            self.config.monitoring_config,
+            default_port=9102,
+        )
+        if metrics_port:
+            logger.info("feature_worker_metrics_server_started", extra={"port": metrics_port})
         
         # Initialize feature store (Redis)
         self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
         await self.feature_store.initialize()
 
         if self.config.database_config.enable:
-            self.system_store = SystemStore(self.config.database_config)
+            self.system_store = SystemStore(
+                self.config.database_config,
+                observability=self.observability,
+            )
             await self.system_store.initialize()
         
         # Initialize Kafka consumer
         self.consumer = KafkaConsumerClient(
             self.kafka_config,
-            group_id=f"{self.kafka_config.consumer_group_id}-feature-updater"
+            group_id=f"{self.kafka_config.consumer_group_id}-feature-updater",
+            observability=self.observability,
         )
         self.consumer.register_handler(
             self.kafka_config.user_interactions_topic,
@@ -113,6 +129,8 @@ class FeatureUpdaterWorker:
         action = value.get('action')
         context = value.get('context', {})
         timestamp = value.get('timestamp', time.time())
+        started_at = time.perf_counter()
+        status = "success"
         
         logger.debug(f"Received interaction: {user_id} -> {action} -> {product_id}")
         
@@ -138,7 +156,25 @@ class FeatureUpdaterWorker:
             or total_pending >= self.batch_size
             or time_since_flush >= self.batch_timeout_seconds
         ):
-            await self._flush_pending_updates()
+            try:
+                await self._flush_pending_updates()
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                self.observability.record_worker_message(
+                    "feature-worker",
+                    topic,
+                    status,
+                    time.perf_counter() - started_at,
+                )
+        else:
+            self.observability.record_worker_message(
+                "feature-worker",
+                topic,
+                status,
+                time.perf_counter() - started_at,
+            )
     
     async def _flush_pending_updates(self):
         """Flush pending updates to the feature store."""
@@ -194,7 +230,7 @@ class FeatureUpdaterWorker:
             logger.debug(f"Processed {len(interactions)} interactions for user {user_id}")
             
             # Send feature update notification
-            kafka_manager = get_kafka_manager()
+            kafka_manager = get_kafka_manager(observability=self.observability)
             if kafka_manager:
                 await kafka_manager.send_feature_update(
                     entity_type='user',
@@ -231,6 +267,7 @@ class FeatureUpdaterWorker:
                     ttl,
                     {"pid": os.getpid()},
                 )
+                self.observability.update_worker_heartbeat("feature-worker", self.instance_id)
             except Exception as exc:
                 logger.warning(f"Failed to publish feature worker heartbeat: {exc}")
             await asyncio.sleep(interval)

@@ -1,28 +1,28 @@
 groups:
   - name: video-commerce-slo
     rules:
-      - record: job:video_commerce_gateway_5xx_rate:5m
+      - record: job:video_commerce_http_5xx_rate:5m
         expr: |
-          sum(rate(video_commerce_http_requests_total{job="gateway-api",status=~"5.."}[5m]))
+          sum by (job) (rate(video_commerce_http_requests_total{status=~"5.."}[5m]))
           /
-          clamp_min(sum(rate(video_commerce_http_requests_total{job="gateway-api"}[5m])), 1)
+          clamp_min(sum by (job) (rate(video_commerce_http_requests_total[5m])), 1)
 
-      - alert: GatewayErrorBudgetBurn
-        expr: job:video_commerce_gateway_5xx_rate:5m > 0.05
+      - alert: ServiceErrorBudgetBurn
+        expr: job:video_commerce_http_5xx_rate:5m > 0.05
         for: 10m
         labels:
           severity: critical
           slo: availability
         annotations:
-          summary: Gateway 5xx rate is above the 5% error budget burn threshold
-          description: The gateway has exceeded the 5xx error budget for at least 10 minutes.
+          summary: "{{ $labels.job }} 5xx rate is above the 5% error budget burn threshold"
+          description: "{{ $labels.job }} has exceeded the 5xx error budget for at least 10 minutes."
 
-      - alert: GatewayP95LatencyHigh
+      - alert: ServiceP95LatencyHigh
         expr: |
           histogram_quantile(
             0.95,
-            sum by (le) (
-              rate(video_commerce_http_request_duration_seconds_bucket{job="gateway-api"}[5m])
+            sum by (job, le) (
+              rate(video_commerce_http_request_duration_seconds_bucket[5m])
             )
           ) > 1.0
         for: 10m
@@ -30,8 +30,24 @@ groups:
           severity: warning
           slo: latency
         annotations:
-          summary: Gateway p95 latency is above 1 second
-          description: The gateway p95 latency has stayed above 1 second for 10 minutes.
+          summary: "{{ $labels.job }} p95 latency is above 1 second"
+          description: "{{ $labels.job }} p95 latency has stayed above 1 second for 10 minutes."
+
+      - alert: ServiceP99LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (job, le) (
+              rate(video_commerce_http_request_duration_seconds_bucket[5m])
+            )
+          ) > 2.5
+        for: 10m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "{{ $labels.job }} p99 latency is above 2.5 seconds"
+          description: "{{ $labels.job }} p99 latency has stayed above 2.5 seconds for 10 minutes."
 
   - name: video-commerce-dependencies
     rules:
@@ -63,13 +79,34 @@ groups:
           description: The interaction ingest service scrape target is down.
 
       - alert: WorkerHeartbeatMissing
-        expr: video_commerce_worker_live_instances < 1
+        expr: video_commerce_worker_live_instances{job="gateway-api"} < 1
         for: 2m
         labels:
           severity: critical
         annotations:
           summary: Background worker heartbeat missing
-          description: A worker service has reported zero live instances for more than 2 minutes.
+          description: "{{ $labels.service }} has reported zero live instances for more than 2 minutes."
+
+      - alert: WorkerMetricsTargetDown
+        expr: up{job=~"content-worker|feature-worker|model-trainer"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} metrics endpoint is unavailable"
+          description: Prometheus cannot scrape the worker metrics endpoint.
+
+      - alert: WorkerProcessingFailures
+        expr: |
+          sum by (job, service, topic) (
+            rate(video_commerce_worker_messages_processed_total{status="error"}[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} is failing message processing"
+          description: "{{ $labels.service }} has message processing errors on {{ $labels.topic }}."
 
       - alert: KafkaProducerDisconnected
         expr: max(video_commerce_kafka_producer_connected) < 1
@@ -80,11 +117,68 @@ groups:
           summary: Kafka producer is disconnected
           description: The gateway Kafka producer has not been connected for at least 5 minutes.
 
-      - alert: RedisMemoryHigh
-        expr: max(video_commerce_redis_used_memory_bytes) > 8e8
+      - alert: KafkaConsumerLagHigh
+        expr: |
+          max by (consumergroup, topic) (kafka_consumergroup_lag) > 1000
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: Redis memory usage is above 800MB
-          description: Redis memory use has exceeded the configured warning threshold.
+          summary: Kafka consumer lag is high for {{ $labels.consumergroup }}
+          description: Consumer group {{ $labels.consumergroup }} has more than 1000 pending messages on {{ $labels.topic }}.
+
+      - alert: KafkaDeadLetterTraffic
+        expr: rate(video_commerce_kafka_dead_letter_messages_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Kafka dead-letter traffic detected
+          description: Messages are being published to the dead-letter topic.
+
+      - alert: RedisMemoryHigh
+        expr: |
+          max by (job, role) (
+            video_commerce_redis_used_memory_bytes
+            /
+            clamp_min(video_commerce_redis_maxmemory_bytes, 1)
+          ) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Redis memory usage is above 80%
+          description: "{{ $labels.job }} role={{ $labels.role }} has exceeded 80% of configured maxmemory."
+
+      - alert: PostgresExporterDown
+        expr: up{job="postgres"} == 0 or pg_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Postgres exporter or database is unavailable
+          description: Prometheus cannot scrape Postgres metrics or the database is not accepting connections.
+
+      - alert: DatabaseErrors
+        expr: rate(video_commerce_database_queries_total{status="error"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Application database errors detected
+          description: Application-level Postgres operations are failing.
+
+      - alert: DatabaseP95LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (job, le) (
+              rate(video_commerce_database_query_duration_seconds_bucket[5m])
+            )
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Database p95 latency is high
+          description: Application-observed Postgres p95 latency is above 500ms.

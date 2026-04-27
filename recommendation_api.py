@@ -253,7 +253,10 @@ async def startup_event():
     await feature_store.initialize()
 
     if runtime.config.database_config.enable:
-        system_store = SystemStore(runtime.config.database_config)
+        system_store = SystemStore(
+            runtime.config.database_config,
+            observability=runtime.observability,
+        )
         await system_store.initialize()
 
     object_storage = ObjectStorage(runtime.config.object_storage_config)
@@ -302,7 +305,10 @@ async def startup_event():
 
     if runtime.config.kafka_config.enable:
         try:
-            kafka_manager = await init_kafka(runtime.config.kafka_config)
+            kafka_manager = await init_kafka(
+                runtime.config.kafka_config,
+                observability=runtime.observability,
+            )
         except Exception as exc:
             logger.warning(f"Recommendation service Kafka init failed: {exc}")
             kafka_manager = None
@@ -1015,6 +1021,13 @@ def _detect_cgroup_cpu_limit() -> int:
 
 
 def _log_recommendation_profile(runtime, request, profile: dict, level: str = "info") -> None:
+    runtime.observability.record_recommendation(
+        result="error" if profile.get("error") else "success",
+        cache_hit=bool(profile.get("cache_hit")),
+        serving_path=str(profile.get("serving_path", "unknown")),
+        candidate_count=int(profile.get("candidate_count") or 0),
+        ranked_count=int(profile.get("ranked_count") or 0),
+    )
     if not (
         runtime.config.monitoring_config.enable_profiling_logs
         or profile["total_ms"] >= runtime.config.monitoring_config.profiling_log_min_duration_ms
@@ -1099,4 +1112,5 @@ async def metrics():
         app.state.runtime,
         feature_store=feature_store,
         kafka_manager=kafka_manager,
+        system_store=system_store,
     )

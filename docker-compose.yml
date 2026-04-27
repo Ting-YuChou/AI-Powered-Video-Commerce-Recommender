@@ -59,6 +59,13 @@ x-common-service: &common-service
     MONITORING_PROFILING_LOG_MIN_DURATION_MS: ${MONITORING_PROFILING_LOG_MIN_DURATION_MS:-250}
     MONITORING_WORKER_HEARTBEAT_INTERVAL_SECONDS: "15"
     MONITORING_WORKER_HEARTBEAT_TTL_SECONDS: "45"
+    MONITORING_ENABLE_TRACING: ${MONITORING_ENABLE_TRACING:-true}
+    MONITORING_TRACING_SAMPLE_RATE: ${MONITORING_TRACING_SAMPLE_RATE:-1.0}
+    MONITORING_WORKER_METRICS_HOST: 0.0.0.0
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+    OTEL_EXPORTER_OTLP_INSECURE: "true"
+    OTEL_TRACES_SAMPLER: parentbased_traceidratio
+    OTEL_TRACES_SAMPLER_ARG: ${MONITORING_TRACING_SAMPLE_RATE:-1.0}
     SERVICE_RECOMMENDATION_SERVICE_URL: http://recommendation-service:8001
     SERVICE_INTERACTION_INGEST_SERVICE_URL: http://interaction-ingest-service:8002
     SERVICE_PROXY_POOL_TIMEOUT_SECONDS: ${SERVICE_PROXY_POOL_TIMEOUT_SECONDS:-5}
@@ -241,6 +248,9 @@ services:
       <<: *common-env
       MODEL_LAZY_LOAD: "false"
       WORKER_TYPE: content_processor
+      MONITORING_WORKER_METRICS_PORT: 9101
+    expose:
+      - "9101"
     depends_on:
       kafka:
         condition: service_healthy
@@ -266,6 +276,9 @@ services:
     environment:
       <<: *common-env
       WORKER_TYPE: feature_updater
+      MONITORING_WORKER_METRICS_PORT: 9102
+    expose:
+      - "9102"
     depends_on:
       kafka:
         condition: service_healthy
@@ -292,6 +305,9 @@ services:
       <<: *common-env
       RANKING_ENABLE_PERIODIC_TRAINING: "true"
       SERVICE_TRAINER_INTERVAL_SECONDS: ${SERVICE_TRAINER_INTERVAL_SECONDS:-3600}
+      MONITORING_WORKER_METRICS_PORT: 9103
+    expose:
+      - "9103"
     depends_on:
       redis:
         condition: service_healthy
@@ -483,6 +499,88 @@ services:
       - video-commerce-network
     restart: unless-stopped
 
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-video_commerce}:${POSTGRES_PASSWORD:-video_commerce}@postgres:5432/${POSTGRES_DB:-video_commerce}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "9187"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    command:
+      - --redis.addr=redis://redis:6379
+      - --redis.password=${REDIS_PASSWORD:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    expose:
+      - "9121"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  redis-cache-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    command:
+      - --redis.addr=redis://redis-cache:6379
+      - --redis.password=${REDIS_CACHE_PASSWORD:-${REDIS_PASSWORD:-}}
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+    expose:
+      - "9121"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    command:
+      - --kafka.server=kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    expose:
+      - "9308"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    command: ["--config=/etc/otel-collector.yaml"]
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    volumes:
+      - ./monitoring/otel-collector.yaml:/etc/otel-collector.yaml:ro
+    depends_on:
+      - jaeger
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"
+    expose:
+      - "4317"
+      - "4318"
+      - "14250"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
   alertmanager:
     image: prom/alertmanager:latest
     command:
@@ -508,6 +606,9 @@ services:
       GF_SECURITY_COOKIE_SECURE: "true"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     networks:
       - video-commerce-network
     depends_on:

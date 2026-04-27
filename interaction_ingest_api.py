@@ -57,7 +57,10 @@ async def startup_event():
 
     if runtime.config.kafka_config.enable:
         try:
-            kafka_manager = await init_kafka(runtime.config.kafka_config)
+            kafka_manager = await init_kafka(
+                runtime.config.kafka_config,
+                observability=runtime.observability,
+            )
         except Exception as exc:
             logger.warning(f"Interaction ingest Kafka init failed: {exc}")
             kafka_manager = None
@@ -117,6 +120,7 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
     action = request.action.value if hasattr(request.action, "value") else str(request.action)
 
     if not kafka_manager or not app.state.runtime.config.kafka_config.enable:
+        app.state.runtime.observability.record_interaction_ingest(action, "kafka_unavailable")
         raise HTTPException(status_code=503, detail="Interaction ingest requires Kafka to be available")
 
     success = await kafka_manager.send_user_interaction(
@@ -128,7 +132,9 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         request_id=http_request.state.request_id,
     )
     if not success:
+        app.state.runtime.observability.record_interaction_ingest(action, "publish_failed")
         raise HTTPException(status_code=503, detail="Failed to publish interaction event to Kafka")
+    app.state.runtime.observability.record_interaction_ingest(action, "accepted")
 
     asyncio.create_task(
         _invalidate_user_serving_cache(request.user_id),

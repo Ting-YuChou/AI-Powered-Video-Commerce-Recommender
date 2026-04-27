@@ -7,6 +7,8 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
+import time
 from typing import Any, Dict, Optional
 
 import psutil
@@ -17,6 +19,7 @@ from prometheus_client import (
     Gauge,
     Histogram,
     generate_latest,
+    start_http_server,
 )
 
 
@@ -58,6 +61,10 @@ class RequestContextFilter(logging.Filter):
             record.request_id = request_id_ctx_var.get()
         if not hasattr(record, "service"):
             record.service = "video-commerce-api"
+        trace_context = get_current_trace_context()
+        if trace_context:
+            record.trace_id = trace_context["trace_id"]
+            record.span_id = trace_context["span_id"]
         return True
 
 
@@ -73,6 +80,10 @@ class JsonFormatter(logging.Formatter):
             "request_id": getattr(record, "request_id", request_id_ctx_var.get()),
             "service": getattr(record, "service", "video-commerce-api"),
         }
+        if getattr(record, "trace_id", None):
+            payload["trace_id"] = record.trace_id
+        if getattr(record, "span_id", None):
+            payload["span_id"] = record.span_id
 
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
@@ -88,6 +99,26 @@ class JsonFormatter(logging.Formatter):
                 payload[key] = str(value)
 
         return json.dumps(payload, ensure_ascii=True)
+
+
+def get_current_trace_context() -> Optional[Dict[str, str]]:
+    """Return active OpenTelemetry trace identifiers when tracing is enabled."""
+    try:
+        from opentelemetry import trace
+        from opentelemetry.trace import INVALID_SPAN_CONTEXT
+    except Exception:
+        return None
+
+    span = trace.get_current_span()
+    if not span:
+        return None
+    context = span.get_span_context()
+    if not context or context == INVALID_SPAN_CONTEXT or not context.is_valid:
+        return None
+    return {
+        "trace_id": format(context.trace_id, "032x"),
+        "span_id": format(context.span_id, "016x"),
+    }
 
 
 def configure_logging(monitoring_config) -> None:
@@ -165,21 +196,67 @@ class ObservabilityManager:
         self.redis_ops_per_sec = Gauge(
             "video_commerce_redis_ops_per_sec",
             "Redis instantaneous operations per second",
+            ["role"],
             registry=self.registry,
         )
         self.redis_connected_clients = Gauge(
             "video_commerce_redis_connected_clients",
             "Redis connected clients",
+            ["role"],
             registry=self.registry,
         )
         self.redis_used_memory_bytes = Gauge(
             "video_commerce_redis_used_memory_bytes",
             "Redis used memory in bytes",
+            ["role"],
+            registry=self.registry,
+        )
+        self.redis_maxmemory_bytes = Gauge(
+            "video_commerce_redis_maxmemory_bytes",
+            "Redis configured max memory in bytes",
+            ["role"],
+            registry=self.registry,
+        )
+        self.redis_memory_fragmentation_ratio = Gauge(
+            "video_commerce_redis_memory_fragmentation_ratio",
+            "Redis memory fragmentation ratio",
+            ["role"],
             registry=self.registry,
         )
         self.kafka_producer_connected = Gauge(
             "video_commerce_kafka_producer_connected",
             "Kafka producer connection status",
+            registry=self.registry,
+        )
+        self.kafka_messages_produced_total = Counter(
+            "video_commerce_kafka_messages_produced_total",
+            "Kafka messages produced by topic and status",
+            ["topic", "status"],
+            registry=self.registry,
+        )
+        self.kafka_messages_consumed_total = Counter(
+            "video_commerce_kafka_messages_consumed_total",
+            "Kafka messages consumed by topic, group, and status",
+            ["topic", "group_id", "status"],
+            registry=self.registry,
+        )
+        self.kafka_message_processing_seconds = Histogram(
+            "video_commerce_kafka_message_processing_seconds",
+            "Kafka message processing latency in seconds",
+            ["topic", "group_id"],
+            buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60),
+            registry=self.registry,
+        )
+        self.kafka_message_retries_total = Counter(
+            "video_commerce_kafka_message_retries_total",
+            "Kafka message handler retry attempts",
+            ["topic", "group_id"],
+            registry=self.registry,
+        )
+        self.kafka_dead_letter_messages_total = Counter(
+            "video_commerce_kafka_dead_letter_messages_total",
+            "Kafka messages published to the dead-letter topic",
+            ["source_topic", "dead_letter_topic"],
             registry=self.registry,
         )
         self.kafka_consumer_lag = Gauge(
@@ -200,6 +277,82 @@ class ObservabilityManager:
             ["service"],
             registry=self.registry,
         )
+        self.worker_heartbeat_timestamp_seconds = Gauge(
+            "video_commerce_worker_heartbeat_timestamp_seconds",
+            "Unix timestamp of the latest worker heartbeat observed by the worker itself",
+            ["service", "instance_id"],
+            registry=self.registry,
+        )
+        self.worker_messages_processed_total = Counter(
+            "video_commerce_worker_messages_processed_total",
+            "Messages processed by background workers",
+            ["service", "topic", "status"],
+            registry=self.registry,
+        )
+        self.worker_message_processing_seconds = Histogram(
+            "video_commerce_worker_message_processing_seconds",
+            "Worker message processing latency in seconds",
+            ["service", "topic"],
+            buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300),
+            registry=self.registry,
+        )
+        self.worker_training_runs_total = Counter(
+            "video_commerce_worker_training_runs_total",
+            "Model trainer runs by trigger and status",
+            ["trigger", "status"],
+            registry=self.registry,
+        )
+        self.worker_training_duration_seconds = Histogram(
+            "video_commerce_worker_training_duration_seconds",
+            "Model trainer run duration in seconds",
+            ["trigger"],
+            buckets=(1, 5, 10, 30, 60, 120, 300, 600, 1200, 3600),
+            registry=self.registry,
+        )
+        self.database_query_duration_seconds = Histogram(
+            "video_commerce_database_query_duration_seconds",
+            "Postgres operation latency in seconds",
+            ["operation", "status"],
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
+            registry=self.registry,
+        )
+        self.database_queries_total = Counter(
+            "video_commerce_database_queries_total",
+            "Postgres operations by operation and status",
+            ["operation", "status"],
+            registry=self.registry,
+        )
+        self.database_pool_connections = Gauge(
+            "video_commerce_database_pool_connections",
+            "SQLAlchemy pool connection counts",
+            ["state"],
+            registry=self.registry,
+        )
+        self.recommendation_requests_total = Counter(
+            "video_commerce_recommendation_requests_total",
+            "Recommendation requests by outcome, cache state, and serving path",
+            ["result", "cache_hit", "serving_path"],
+            registry=self.registry,
+        )
+        self.recommendation_candidates = Histogram(
+            "video_commerce_recommendation_candidates",
+            "Candidate counts seen by recommendation serving",
+            ["stage"],
+            buckets=(0, 1, 5, 10, 25, 50, 100, 250, 500, 1000),
+            registry=self.registry,
+        )
+        self.interactions_ingested_total = Counter(
+            "video_commerce_interactions_ingested_total",
+            "Interaction ingest events by action and status",
+            ["action", "status"],
+            registry=self.registry,
+        )
+        self.content_uploads_total = Counter(
+            "video_commerce_content_uploads_total",
+            "Content upload enqueue outcomes by priority and status",
+            ["priority", "status"],
+            registry=self.registry,
+        )
         self._process = psutil.Process()
 
     def record_request(self, method: str, path: str, status_code: int, duration: float) -> None:
@@ -214,10 +367,98 @@ class ObservabilityManager:
             exception_type=exception_type,
         ).inc()
 
+    def record_database_query(self, operation: str, duration: float, status: str = "success") -> None:
+        self.database_queries_total.labels(operation=operation, status=status).inc()
+        self.database_query_duration_seconds.labels(
+            operation=operation,
+            status=status,
+        ).observe(duration)
+
+    def update_database_pool_metrics(self, system_store) -> None:
+        engine = getattr(system_store, "engine", None)
+        if engine is None:
+            return
+        pool = getattr(engine.sync_engine, "pool", None)
+        if pool is None:
+            return
+        for state, getter in {
+            "checked_out": getattr(pool, "checkedout", None),
+            "checked_in": getattr(pool, "checkedin", None),
+            "overflow": getattr(pool, "overflow", None),
+            "size": getattr(pool, "size", None),
+        }.items():
+            if callable(getter):
+                self.database_pool_connections.labels(state=state).set(getter())
+
+    def record_kafka_produce(self, topic: str, status: str) -> None:
+        self.kafka_messages_produced_total.labels(topic=topic, status=status).inc()
+
+    def record_kafka_consume(self, topic: str, group_id: str, status: str, duration: float) -> None:
+        self.kafka_messages_consumed_total.labels(
+            topic=topic,
+            group_id=group_id,
+            status=status,
+        ).inc()
+        self.kafka_message_processing_seconds.labels(
+            topic=topic,
+            group_id=group_id,
+        ).observe(duration)
+
+    def record_kafka_retry(self, topic: str, group_id: str) -> None:
+        self.kafka_message_retries_total.labels(topic=topic, group_id=group_id).inc()
+
+    def record_kafka_dead_letter(self, source_topic: str, dead_letter_topic: str) -> None:
+        self.kafka_dead_letter_messages_total.labels(
+            source_topic=source_topic,
+            dead_letter_topic=dead_letter_topic,
+        ).inc()
+
+    def record_worker_message(self, service: str, topic: str, status: str, duration: float) -> None:
+        self.worker_messages_processed_total.labels(
+            service=service,
+            topic=topic,
+            status=status,
+        ).inc()
+        self.worker_message_processing_seconds.labels(service=service, topic=topic).observe(duration)
+
+    def update_worker_heartbeat(self, service: str, instance_id: str) -> None:
+        self.worker_heartbeat_timestamp_seconds.labels(
+            service=service,
+            instance_id=instance_id,
+        ).set(time.time())
+
+    def record_training_run(self, trigger: str, status: str, duration: float) -> None:
+        self.worker_training_runs_total.labels(trigger=trigger, status=status).inc()
+        self.worker_training_duration_seconds.labels(trigger=trigger).observe(duration)
+
+    def record_recommendation(
+        self,
+        *,
+        result: str,
+        cache_hit: bool,
+        serving_path: str,
+        candidate_count: int = 0,
+        ranked_count: int = 0,
+    ) -> None:
+        self.recommendation_requests_total.labels(
+            result=result,
+            cache_hit=str(bool(cache_hit)).lower(),
+            serving_path=serving_path,
+        ).inc()
+        self.recommendation_candidates.labels(stage="retrieved").observe(candidate_count)
+        self.recommendation_candidates.labels(stage="ranked").observe(ranked_count)
+
+    def record_interaction_ingest(self, action: str, status: str) -> None:
+        self.interactions_ingested_total.labels(action=action, status=status).inc()
+
+    def record_content_upload(self, priority: str, status: str) -> None:
+        self.content_uploads_total.labels(priority=priority, status=status).inc()
+
     async def collect_runtime_metrics(
         self,
         feature_store=None,
         kafka_manager=None,
+        system_store=None,
         worker_statuses: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         """Refresh gauges from the current process and backing services."""
@@ -225,13 +466,10 @@ class ObservabilityManager:
         self.process_resident_memory_bytes.set(self._process.memory_info().rss)
 
         if feature_store and getattr(feature_store, "redis_client", None):
-            try:
-                redis_info = await feature_store.redis_client.info()
-                self.redis_ops_per_sec.set(redis_info.get("instantaneous_ops_per_sec", 0))
-                self.redis_connected_clients.set(redis_info.get("connected_clients", 0))
-                self.redis_used_memory_bytes.set(redis_info.get("used_memory", 0))
-            except Exception:
-                pass
+            await self._collect_redis_metrics("state", feature_store.redis_client)
+            cache_client = getattr(feature_store, "cache_redis_client", None)
+            if cache_client is not None and cache_client is not feature_store.redis_client:
+                await self._collect_redis_metrics("cache", cache_client)
 
         if kafka_manager:
             producer_connected = 1 if kafka_manager.producer.is_connected else 0
@@ -249,6 +487,26 @@ class ObservabilityManager:
                 self.worker_status.labels(service=service_name).set(
                     1 if status.get("status") == "healthy" else 0
                 )
+
+        if system_store:
+            self.update_database_pool_metrics(system_store)
+
+    async def _collect_redis_metrics(self, role: str, redis_client) -> None:
+        try:
+            redis_info = await redis_client.info()
+            self.redis_ops_per_sec.labels(role=role).set(
+                redis_info.get("instantaneous_ops_per_sec", 0)
+            )
+            self.redis_connected_clients.labels(role=role).set(
+                redis_info.get("connected_clients", 0)
+            )
+            self.redis_used_memory_bytes.labels(role=role).set(redis_info.get("used_memory", 0))
+            self.redis_maxmemory_bytes.labels(role=role).set(redis_info.get("maxmemory", 0))
+            self.redis_memory_fragmentation_ratio.labels(role=role).set(
+                redis_info.get("mem_fragmentation_ratio", 0)
+            )
+        except Exception:
+            pass
 
     async def _collect_kafka_consumer_lag(self, kafka_manager) -> None:
         if not kafka_manager._consumers:
@@ -287,3 +545,26 @@ class ObservabilityManager:
     @property
     def prometheus_content_type(self) -> str:
         return CONTENT_TYPE_LATEST
+
+    def start_metrics_server(self, port: int, addr: str = "0.0.0.0") -> None:
+        start_http_server(port, addr=addr, registry=self.registry)
+
+
+def start_worker_metrics_server(
+    observability: ObservabilityManager,
+    monitoring_config,
+    *,
+    default_port: int,
+) -> Optional[int]:
+    """Start a standalone Prometheus endpoint for a non-HTTP worker."""
+    if not getattr(monitoring_config, "enable_prometheus_metrics", True):
+        return None
+    configured_port = int(os.getenv("MONITORING_WORKER_METRICS_PORT", default_port))
+    if configured_port <= 0:
+        return None
+    host = os.getenv(
+        "MONITORING_WORKER_METRICS_HOST",
+        getattr(monitoring_config, "worker_metrics_host", "0.0.0.0"),
+    )
+    observability.start_metrics_server(configured_port, addr=host)
+    return configured_port

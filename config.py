@@ -381,6 +381,9 @@ class MonitoringConfig(BaseSettings):
     enable_metrics: bool = Field(True, description="Enable metrics collection")
     enable_prometheus_metrics: bool = Field(True, description="Expose Prometheus metrics")
     metrics_interval: int = Field(60, description="Metrics collection interval")
+    worker_metrics_host: str = Field("0.0.0.0", description="Host for worker Prometheus endpoints")
+    enable_tracing: bool = Field(False, description="Enable OpenTelemetry tracing")
+    tracing_sample_rate: float = Field(1.0, description="OpenTelemetry trace sampling rate")
     
     # Health checks
     health_check_interval: int = Field(30, description="Health check interval")

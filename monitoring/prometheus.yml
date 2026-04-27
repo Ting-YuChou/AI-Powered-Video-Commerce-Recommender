@@ -25,3 +25,38 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["interaction-ingest-service:8002"]
+
+  - job_name: content-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["content-worker:9101"]
+
+  - job_name: feature-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["feature-worker:9102"]
+
+  - job_name: model-trainer
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["model-trainer:9103"]
+
+  - job_name: postgres
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  - job_name: redis-state
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  - job_name: redis-cache
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["redis-cache-exporter:9121"]
+
+  - job_name: kafka
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["kafka-exporter:9308"]

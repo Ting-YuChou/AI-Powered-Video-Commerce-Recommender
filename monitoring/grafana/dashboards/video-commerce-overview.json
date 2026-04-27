@@ -1,0 +1,136 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [
+        {
+          "expr": "sum by (job) (rate(video_commerce_http_requests_total[5m]))",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "title": "Service RPS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+      "id": 2,
+      "targets": [
+        {
+          "expr": "sum by (job) (rate(video_commerce_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum by (job) (rate(video_commerce_http_requests_total[5m])), 1)",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "title": "Service 5xx Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+      "id": 3,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (job, le) (rate(video_commerce_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{job}} p95"
+        }
+      ],
+      "title": "Service Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "id": 4,
+      "targets": [
+        {
+          "expr": "video_commerce_worker_live_instances{job=\"gateway-api\"}",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "title": "Worker Live Instances",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "id": 5,
+      "targets": [
+        {
+          "expr": "sum by (job, service, topic, status) (rate(video_commerce_worker_messages_processed_total[5m]))",
+          "legendFormat": "{{service}} {{topic}} {{status}}"
+        }
+      ],
+      "title": "Worker Message Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "id": 6,
+      "targets": [
+        {
+          "expr": "max by (consumergroup, topic) (kafka_consumergroup_lag)",
+          "legendFormat": "{{consumergroup}} {{topic}}"
+        }
+      ],
+      "title": "Kafka Consumer Lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 7,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (job, le) (rate(video_commerce_database_query_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "title": "Application DB p95 Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "id": 8,
+      "targets": [
+        {
+          "expr": "max by (job, role) (video_commerce_redis_used_memory_bytes / clamp_min(video_commerce_redis_maxmemory_bytes, 1))",
+          "legendFormat": "{{job}} {{role}}"
+        }
+      ],
+      "title": "Redis Memory Utilization",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["video-commerce", "observability"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Video Commerce Overview",
+  "uid": "video-commerce-overview",
+  "version": 1,
+  "weekStart": ""
+}

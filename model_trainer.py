@@ -18,6 +18,8 @@ from ranking import RankingModel
 from recommender import RecommendationEngine
 from system_store import SystemStore
 from vector_search import VectorSearchEngine
+from observability import ObservabilityManager, configure_logging, start_worker_metrics_server
+from telemetry import configure_tracing
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,7 @@ class ModelTrainerService:
         self.system_store: SystemStore | None = None
         self.object_storage: ObjectStorage | None = None
         self.artifact_manager: ModelArtifactManager | None = None
+        self.observability = ObservabilityManager()
         self.running = False
         self._heartbeat_task: asyncio.Task | None = None
         self.instance_id = f"model-trainer-{socket.gethostname()}-{os.getpid()}"
@@ -43,13 +46,26 @@ class ModelTrainerService:
             self._heartbeat_task = asyncio.create_task(self._publish_heartbeat())
 
     async def initialize(self):
+        configure_logging(self.config.monitoring_config)
+        configure_tracing("model-trainer", self.config.monitoring_config)
+        metrics_port = start_worker_metrics_server(
+            self.observability,
+            self.config.monitoring_config,
+            default_port=9103,
+        )
+        if metrics_port:
+            logger.info("model_trainer_metrics_server_started", extra={"port": metrics_port})
+
         self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
         await self.feature_store.initialize()
         self.running = True
         self._ensure_heartbeat_task()
 
         if self.config.database_config.enable:
-            self.system_store = SystemStore(self.config.database_config)
+            self.system_store = SystemStore(
+                self.config.database_config,
+                observability=self.observability,
+            )
             await self.system_store.initialize()
 
         self.object_storage = ObjectStorage(self.config.object_storage_config)
@@ -96,6 +112,7 @@ class ModelTrainerService:
                     ttl,
                     {"pid": os.getpid()},
                 )
+                self.observability.update_worker_heartbeat("model-trainer", self.instance_id)
             except Exception as exc:
                 logger.warning(f"Failed to publish trainer heartbeat: {exc}")
             await asyncio.sleep(interval)
@@ -118,6 +135,7 @@ class ModelTrainerService:
 
     async def _train_ranking_model(self, trigger: str) -> None:
         """Retrain the ranking model from stored interaction logs and persist a checkpoint."""
+        started_at = asyncio.get_running_loop().time()
         if not self.config.ranking_config.enable_periodic_training:
             return
         if not self.feature_store or not self.ranking_model:
@@ -128,6 +146,11 @@ class ModelTrainerService:
 
         interactions = await self.system_store.get_training_interactions(limit=50000)
         if len(interactions) < self.config.ranking_config.training_min_samples:
+            self.observability.record_training_run(
+                trigger,
+                "skipped_insufficient_samples",
+                asyncio.get_running_loop().time() - started_at,
+            )
             logger.info(
                 "Skipping ranking retrain due to insufficient samples",
                 extra={
@@ -146,19 +169,30 @@ class ModelTrainerService:
                 "model_path": self.config.model_config.ranking_model_path,
             },
         )
-        await self.ranking_model.train_model(interactions)
-        if self.ranking_model.is_trained and self.artifact_manager:
-            record = await self.artifact_manager.persist_ranking_checkpoint(
-                local_path=self.ranking_model.loaded_model_path or self.config.model_config.ranking_model_path,
-                model_version=self.ranking_model.model_version,
-                payload={
-                    "trigger": trigger,
-                    "sample_count": len(interactions),
-                    "last_training_time": self.ranking_model.last_training_time,
-                },
+        status = "success"
+        try:
+            await self.ranking_model.train_model(interactions)
+            if self.ranking_model.is_trained and self.artifact_manager:
+                record = await self.artifact_manager.persist_ranking_checkpoint(
+                    local_path=self.ranking_model.loaded_model_path or self.config.model_config.ranking_model_path,
+                    model_version=self.ranking_model.model_version,
+                    payload={
+                        "trigger": trigger,
+                        "sample_count": len(interactions),
+                        "last_training_time": self.ranking_model.last_training_time,
+                    },
+                )
+                if record:
+                    self.ranking_model.model_version = record.model_version
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            self.observability.record_training_run(
+                trigger,
+                status,
+                asyncio.get_running_loop().time() - started_at,
             )
-            if record:
-                self.ranking_model.model_version = record.model_version
 
     async def shutdown(self):
         self.running = False

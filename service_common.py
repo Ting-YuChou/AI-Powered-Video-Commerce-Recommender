@@ -21,6 +21,7 @@ from observability import (
     configure_logging,
     request_id_ctx_var,
 )
+from telemetry import configure_tracing, http_server_span
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class ServiceRuntime:
 
     def __init__(self, service_name: str):
         self.service_name = service_name
+        self.app: FastAPI | None = None
         self.config = None
         self.observability = ObservabilityManager()
         self.started_at = time.time()
@@ -163,6 +165,8 @@ def create_service_app(
         redoc_url=redoc_url,
     )
     app.state.runtime = ServiceRuntime(service_name)
+    app.state.runtime.app = app
+    configure_tracing(service_name, app=app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins,
@@ -191,7 +195,12 @@ def create_service_app(
         runtime.observability.http_requests_in_progress.inc()
 
         try:
-            response = await call_next(request)
+            with http_server_span(
+                method=request.method,
+                path=request.url.path,
+                headers=request.headers.items(),
+            ):
+                response = await call_next(request)
         except Exception as exc:
             duration = time.perf_counter() - request.state.request_started_at
             path = _get_route_template(request)
@@ -284,12 +293,18 @@ def configure_service_logging(runtime: ServiceRuntime) -> None:
     """Configure structured logging once config has been loaded."""
     if runtime.config:
         configure_logging(runtime.config.monitoring_config)
+        configure_tracing(
+            runtime.service_name,
+            runtime.config.monitoring_config,
+            app=runtime.app,
+        )
 
 
 async def build_metrics_response(
     runtime: ServiceRuntime,
     feature_store=None,
     kafka_manager=None,
+    system_store=None,
     worker_statuses: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Response:
     """Return Prometheus metrics for the current service."""
@@ -297,6 +312,7 @@ async def build_metrics_response(
         await runtime.observability.collect_runtime_metrics(
             feature_store=feature_store,
             kafka_manager=kafka_manager,
+            system_store=system_store,
             worker_statuses=worker_statuses,
         )
     return Response(
