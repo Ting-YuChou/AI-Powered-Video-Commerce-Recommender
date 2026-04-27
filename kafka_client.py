@@ -30,6 +30,7 @@ except ImportError:
 
 from config import KafkaConfig
 from observability import request_id_ctx_var
+from telemetry import inject_trace_headers, kafka_consumer_span
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ def _build_headers(request_id: Optional[str], event_id: str) -> List[tuple]:
     ]
     if request_id:
         headers.append(("x-request-id", request_id.encode("utf-8")))
-    return headers
+    return inject_trace_headers(headers)
 
 
 def _extract_header(headers: Optional[List[tuple]], name: str) -> Optional[str]:
@@ -95,9 +96,10 @@ class KafkaProducerClient:
     JSON serialization and delivery confirmation.
     """
     
-    def __init__(self, config: KafkaConfig):
+    def __init__(self, config: KafkaConfig, observability=None):
         """Initialize the Kafka producer with configuration."""
         self.config = config
+        self.observability = observability
         self.producer: Optional[AIOKafkaProducer] = None
         self.is_connected = False
         self._lock = asyncio.Lock()
@@ -174,6 +176,7 @@ class KafkaProducerClient:
         """
         if not self.config.enable:
             logger.debug(f"Kafka disabled, skipping message to topic: {topic}")
+            self._record_produce(topic, "disabled")
             return True
         
         if not self.is_connected or not self.producer:
@@ -182,6 +185,7 @@ class KafkaProducerClient:
                 await self.start()
             except Exception as e:
                 logger.error(f"Failed to reconnect Kafka producer: {e}")
+                self._record_produce(topic, "error")
                 return False
         
         try:
@@ -198,13 +202,16 @@ class KafkaProducerClient:
             )
             
             logger.debug(f"Message sent to topic '{topic}' with key '{key}'")
+            self._record_produce(topic, "success")
             return True
             
         except KafkaError as e:
             logger.error(f"Failed to send message to topic '{topic}': {e}")
+            self._record_produce(topic, "error")
             return False
         except Exception as e:
             logger.error(f"Unexpected error sending message: {e}")
+            self._record_produce(topic, "error")
             return False
 
     async def send_nowait(
@@ -217,6 +224,7 @@ class KafkaProducerClient:
         """Enqueue a message to Kafka without waiting for broker acknowledgment."""
         if not self.config.enable:
             logger.debug(f"Kafka disabled, skipping async enqueue to topic: {topic}")
+            self._record_produce(topic, "disabled")
             return True
 
         if not self.is_connected or not self.producer:
@@ -225,6 +233,7 @@ class KafkaProducerClient:
                 await self.start()
             except Exception as e:
                 logger.error(f"Failed to reconnect Kafka producer: {e}")
+                self._record_produce(topic, "error")
                 return False
 
         try:
@@ -237,12 +246,15 @@ class KafkaProducerClient:
                 headers=headers,
             )
             logger.debug(f"Message enqueued to topic '{topic}' with key '{key}'")
+            self._record_produce(topic, "success")
             return True
         except KafkaError as e:
             logger.error(f"Failed to enqueue message to topic '{topic}': {e}")
+            self._record_produce(topic, "error")
             return False
         except Exception as e:
             logger.error(f"Unexpected error enqueueing message: {e}")
+            self._record_produce(topic, "error")
             return False
     
     async def send_batch(
@@ -282,6 +294,10 @@ class KafkaProducerClient:
             'enabled': self.config.enable
         }
 
+    def _record_produce(self, topic: str, status: str) -> None:
+        if self.observability is not None:
+            self.observability.record_kafka_produce(topic, status)
+
 
 class KafkaConsumerClient:
     """
@@ -291,10 +307,11 @@ class KafkaConsumerClient:
     and callback-based message handling.
     """
     
-    def __init__(self, config: KafkaConfig, group_id: Optional[str] = None):
+    def __init__(self, config: KafkaConfig, group_id: Optional[str] = None, observability=None):
         """Initialize the Kafka consumer with configuration."""
         self.config = config
         self.group_id = group_id or config.consumer_group_id
+        self.observability = observability
         self.consumer: Optional[AIOKafkaConsumer] = None
         self.dlq_producer: Optional[AIOKafkaProducer] = None
         self.is_connected = False
@@ -432,6 +449,8 @@ class KafkaConsumerClient:
                 return True
             except Exception as exc:
                 last_error = exc
+                if self.observability is not None:
+                    self.observability.record_kafka_retry(message.topic, self.group_id)
                 logger.error(
                     "Error processing Kafka message",
                     extra={
@@ -454,6 +473,7 @@ class KafkaConsumerClient:
         return False
 
     async def _process_message_once(self, message) -> None:
+        started_at = time.perf_counter()
         topic = message.topic
         key = message.key
         value = message.value
@@ -463,11 +483,35 @@ class KafkaConsumerClient:
             request_id = value.get("request_id")
         request_id_token = request_id_ctx_var.set(request_id or "-")
         try:
-            handler = self._handlers.get(topic)
-            if not handler:
-                logger.warning(f"No handler registered for topic: {topic}")
-                return
-            await handler(topic, key, value, headers)
+            with kafka_consumer_span(topic=topic, group_id=self.group_id, headers=headers):
+                handler = self._handlers.get(topic)
+                if not handler:
+                    logger.warning(f"No handler registered for topic: {topic}")
+                    if self.observability is not None:
+                        self.observability.record_kafka_consume(
+                            topic,
+                            self.group_id,
+                            "unhandled",
+                            time.perf_counter() - started_at,
+                        )
+                    return
+                await handler(topic, key, value, headers)
+            if self.observability is not None:
+                self.observability.record_kafka_consume(
+                    topic,
+                    self.group_id,
+                    "success",
+                    time.perf_counter() - started_at,
+                )
+        except Exception:
+            if self.observability is not None:
+                self.observability.record_kafka_consume(
+                    topic,
+                    self.group_id,
+                    "error",
+                    time.perf_counter() - started_at,
+                )
+            raise
         finally:
             request_id_ctx_var.reset(request_id_token)
 
@@ -505,6 +549,11 @@ class KafkaConsumerClient:
                 key=f"{message.topic}:{message.partition}:{message.offset}",
                 headers=_build_headers(request_id, payload["event_id"]),
             )
+            if self.observability is not None:
+                self.observability.record_kafka_dead_letter(
+                    message.topic,
+                    self.config.dead_letter_topic,
+                )
             logger.error(
                 "Kafka message sent to DLQ",
                 extra={
@@ -570,10 +619,11 @@ class KafkaManager:
     user interactions, video processing tasks, and recommendation events.
     """
     
-    def __init__(self, config: KafkaConfig):
+    def __init__(self, config: KafkaConfig, observability=None):
         """Initialize the Kafka manager."""
         self.config = config
-        self.producer = KafkaProducerClient(config)
+        self.observability = observability
+        self.producer = KafkaProducerClient(config, observability=observability)
         self._consumers: Dict[str, KafkaConsumerClient] = {}
         
         logger.info("KafkaManager initialized")
@@ -779,7 +829,7 @@ class KafkaManager:
     
     def create_consumer(self, group_id: str) -> KafkaConsumerClient:
         """Create a new consumer with a specific group ID."""
-        consumer = KafkaConsumerClient(self.config, group_id)
+        consumer = KafkaConsumerClient(self.config, group_id, observability=self.observability)
         self._consumers[group_id] = consumer
         return consumer
     
@@ -804,7 +854,7 @@ class KafkaManager:
 _kafka_manager: Optional[KafkaManager] = None
 
 
-def get_kafka_manager(config: Optional[KafkaConfig] = None) -> KafkaManager:
+def get_kafka_manager(config: Optional[KafkaConfig] = None, observability=None) -> KafkaManager:
     """Get the global Kafka manager instance."""
     global _kafka_manager
     
@@ -812,14 +862,17 @@ def get_kafka_manager(config: Optional[KafkaConfig] = None) -> KafkaManager:
         if config is None:
             from config import get_kafka_config
             config = get_kafka_config()
-        _kafka_manager = KafkaManager(config)
+        _kafka_manager = KafkaManager(config, observability=observability)
+    elif observability is not None and getattr(_kafka_manager, "observability", None) is None:
+        _kafka_manager.observability = observability
+        _kafka_manager.producer.observability = observability
     
     return _kafka_manager
 
 
-async def init_kafka(config: KafkaConfig) -> KafkaManager:
+async def init_kafka(config: KafkaConfig, observability=None) -> KafkaManager:
     """Initialize and start the global Kafka manager."""
-    manager = get_kafka_manager(config)
+    manager = get_kafka_manager(config, observability=observability)
     await manager.start()
     return manager
 

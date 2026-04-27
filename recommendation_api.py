@@ -10,7 +10,8 @@ import math
 import os
 import time
 import traceback
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Body, HTTPException, Request, Response
 import torch
@@ -55,6 +56,8 @@ system_store: Optional[SystemStore] = None
 ranking_checkpoint_sync_task: Optional[asyncio.Task] = None
 object_storage: Optional[ObjectStorage] = None
 artifact_manager: Optional[ModelArtifactManager] = None
+_recommendation_singleflight: Dict[str, asyncio.Future] = {}
+_recommendation_singleflight_lock = asyncio.Lock()
 
 
 @app.middleware("http")
@@ -75,6 +78,165 @@ def _build_candidate_cache_context(payload: RecommendationRequest, k_per_source:
     }
 
 
+def _build_recommendation_cache_context(
+    payload: RecommendationRequest,
+    *,
+    current_time: Optional[float] = None,
+) -> dict:
+    """Build an exact-enough cache context from fields used by serving logic."""
+    context = payload.context or {}
+    current_time = current_time or time.time()
+    return {
+        **_build_candidate_cache_context(payload, min(payload.k * 10, 500)),
+        "k": payload.k,
+        "device": context.get("device"),
+        "session_position": context.get("session_position", 1),
+        "time_on_page": context.get("time_on_page", 0),
+        "ranking_time_hour": int(current_time // 3600),
+    }
+
+
+def _user_feature_cache_token(user_features: UserFeatures) -> Dict[str, Any]:
+    """Return the personalization inputs that make a cached result fresh enough."""
+    has_personalization_signal = (
+        user_features.total_interactions > 0
+        or bool(user_features.preferred_categories)
+        or user_features.click_through_rate > 0
+        or user_features.conversion_rate > 0
+    )
+    return {
+        "total_interactions": int(user_features.total_interactions),
+        "avg_session_length": round(float(user_features.avg_session_length), 3),
+        "preferred_categories": list(user_features.preferred_categories),
+        "price_sensitivity": round(float(user_features.price_sensitivity), 6),
+        "click_through_rate": round(float(user_features.click_through_rate), 6),
+        "conversion_rate": round(float(user_features.conversion_rate), 6),
+        "last_active": int(user_features.last_active) if has_personalization_signal else 0,
+    }
+
+
+def _serving_version_context(runtime) -> Dict[str, Any]:
+    ranking_path = runtime.config.model_config.ranking_model_path
+    vector_path = runtime.config.vector_config.index_path
+    return {
+        "ranking_model": ranking_model.model_version if ranking_model else None,
+        "ranking_checkpoint_mtime": _safe_file_mtime(ranking_path),
+        "two_tower_model": (
+            recommendation_engine.loaded_two_tower_version
+            if recommendation_engine
+            else None
+        ),
+        "cf_model": (
+            recommendation_engine.cf_engine.model_version
+            if recommendation_engine
+            else None
+        ),
+        "vector_index_mtime": _safe_file_mtime(vector_path),
+        "catalog": _catalog_serving_version_context(),
+    }
+
+
+def _catalog_serving_version_context() -> Dict[str, Any]:
+    if vector_search is None:
+        return {"catalog_version": None, "last_updated": None, "product_count": 0}
+    if hasattr(vector_search, "get_catalog_version_context"):
+        return vector_search.get_catalog_version_context()
+    return {
+        "catalog_version": int(getattr(vector_search, "last_updated", 0) or 0),
+        "last_updated": int(getattr(vector_search, "last_updated", 0) or 0),
+        "product_count": len(getattr(vector_search, "product_metadata", {}) or {}),
+    }
+
+
+def _safe_file_mtime(path: Optional[str]) -> Optional[int]:
+    if not path:
+        return None
+    try:
+        return int(Path(path).stat().st_mtime)
+    except OSError:
+        return None
+
+
+async def _join_or_create_recommendation_singleflight(
+    key: str,
+) -> Tuple[asyncio.Future, bool]:
+    loop = asyncio.get_running_loop()
+    async with _recommendation_singleflight_lock:
+        existing = _recommendation_singleflight.get(key)
+        if existing is not None:
+            return existing, False
+        future = loop.create_future()
+        _recommendation_singleflight[key] = future
+        return future, True
+
+
+async def _resolve_recommendation_singleflight(
+    key: Optional[str],
+    future: Optional[asyncio.Future],
+    *,
+    result: Optional[Dict[str, Any]] = None,
+    exception: Optional[BaseException] = None,
+) -> None:
+    if key is None or future is None:
+        return
+    async with _recommendation_singleflight_lock:
+        if _recommendation_singleflight.get(key) is future:
+            _recommendation_singleflight.pop(key, None)
+    if future.done():
+        return
+    if exception is not None:
+        future.set_exception(exception)
+        future.add_done_callback(_consume_singleflight_exception)
+    else:
+        future.set_result(result or {})
+
+
+def _build_singleflight_result(
+    recommendations: List[Any],
+    *,
+    total_candidates: int,
+    content_processed: bool,
+    fallback: bool = False,
+    fallback_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "recommendations": recommendations,
+        "total_candidates": total_candidates,
+        "content_processed": content_processed,
+        "fallback": fallback,
+        "fallback_reason": fallback_reason,
+    }
+
+
+def _consume_singleflight_exception(future: asyncio.Future) -> None:
+    try:
+        future.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
+
+
+def _is_recommendable_product(metadata: Optional[Dict[str, Any]]) -> bool:
+    if not metadata:
+        return True
+    return not (
+        metadata.get("active") is False
+        or metadata.get("in_stock") is False
+        or metadata.get("deleted") is True
+        or metadata.get("is_deleted") is True
+    )
+
+
+def _filter_recommendable_candidates(
+    candidates: List[Any],
+    metadata_map: Dict[str, Dict[str, Any]],
+) -> List[Any]:
+    return [
+        candidate
+        for candidate in candidates
+        if _is_recommendable_product(metadata_map.get(candidate.product_id))
+    ]
+
+
 @app.on_event("startup")
 async def startup_event():
     global feature_store, vector_search, recommendation_engine, ranking_model, ranking_batcher, kafka_manager
@@ -91,7 +253,10 @@ async def startup_event():
     await feature_store.initialize()
 
     if runtime.config.database_config.enable:
-        system_store = SystemStore(runtime.config.database_config)
+        system_store = SystemStore(
+            runtime.config.database_config,
+            observability=runtime.observability,
+        )
         await system_store.initialize()
 
     object_storage = ObjectStorage(runtime.config.object_storage_config)
@@ -140,7 +305,10 @@ async def startup_event():
 
     if runtime.config.kafka_config.enable:
         try:
-            kafka_manager = await init_kafka(runtime.config.kafka_config)
+            kafka_manager = await init_kafka(
+                runtime.config.kafka_config,
+                observability=runtime.observability,
+            )
         except Exception as exc:
             logger.warning(f"Recommendation service Kafka init failed: {exc}")
             kafka_manager = None
@@ -278,15 +446,37 @@ async def get_recommendations(
         "cache_hit": False,
         "candidate_cache_hit": False,
         "metadata_cache_miss_count": 0,
+        "filtered_unavailable_candidates": 0,
+        "singleflight_joined": False,
+        "singleflight_wait_ms": 0.0,
         "serving_path": "live_candidates_then_rank",
     }
+    singleflight_key: Optional[str] = None
+    singleflight_future: Optional[asyncio.Future] = None
+    owns_singleflight = False
 
     try:
+        stage_started = time.perf_counter()
+        user_features = await _bounded_hot_path_read(
+            runtime,
+            "user_features",
+            feature_store.get_user_features(payload.user_id, cache_default=False),
+            None,
+        )
+        profile["user_features_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+        if user_features is None:
+            user_features = _default_user_features(payload.user_id)
+
+        serving_versions = _serving_version_context(runtime)
+        user_feature_token = _user_feature_cache_token(user_features)
         cache_key = feature_store.generate_context_hash(
             {
-                "content_id": payload.content_id,
-                "context": payload.context,
-                "k": payload.k,
+                **_build_recommendation_cache_context(
+                    payload,
+                    current_time=start_time,
+                ),
+                "serving_versions": serving_versions,
+                "user_feature_token": user_feature_token,
             }
         )
         stage_started = time.perf_counter()
@@ -312,7 +502,58 @@ async def get_recommendations(
                     "response_time_ms": int((time.time() - start_time) * 1000),
                     "model_version": "v1.0.0",
                     "cache_hit": True,
+                    "cache_freshness": "model_user_and_catalog_versioned",
                     "content_processed": payload.content_id is not None,
+                    **(
+                        {"profile": profile}
+                        if runtime.config.monitoring_config.enable_profiling_logs
+                        else {}
+                    ),
+                },
+            )
+
+        singleflight_key = f"{payload.user_id}:{cache_key}"
+        singleflight_future, owns_singleflight = await _join_or_create_recommendation_singleflight(
+            singleflight_key
+        )
+        if not owns_singleflight:
+            stage_started = time.perf_counter()
+            shared_result = await asyncio.shield(singleflight_future)
+            profile["singleflight_joined"] = True
+            profile["singleflight_wait_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000,
+                2,
+            )
+            profile["serving_path"] = "singleflight_joined"
+            profile["ranked_count"] = len(shared_result.get("recommendations", []))
+            profile["candidate_count"] = shared_result.get("total_candidates", 0)
+            profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+            _attach_profile_headers(response, profile)
+            _log_recommendation_profile(runtime, payload, profile)
+            return RecommendationResponse(
+                user_id=payload.user_id,
+                recommendations=shared_result.get("recommendations", []),
+                metadata={
+                    "total_candidates": shared_result.get("total_candidates", 0),
+                    "response_time_ms": int((time.time() - start_time) * 1000),
+                    "model_version": "v1.0.0",
+                    "cache_hit": False,
+                    "cache_freshness": "model_user_and_catalog_versioned",
+                    "singleflight_joined": True,
+                    "content_processed": shared_result.get(
+                        "content_processed",
+                        payload.content_id is not None,
+                    ),
+                    **(
+                        {"fallback": True}
+                        if shared_result.get("fallback")
+                        else {}
+                    ),
+                    **(
+                        {"fallback_reason": shared_result["fallback_reason"]}
+                        if shared_result.get("fallback_reason")
+                        else {}
+                    ),
                     **(
                         {"profile": profile}
                         if runtime.config.monitoring_config.enable_profiling_logs
@@ -323,18 +564,11 @@ async def get_recommendations(
 
         k_per_source = min(payload.k * 10, 500)
         candidate_cache_key = feature_store.generate_context_hash(
-            _build_candidate_cache_context(payload, k_per_source)
-        )
-        user_features_task = asyncio.create_task(
-            _timed_awaitable(
-                _bounded_hot_path_read(
-                    runtime,
-                    "user_features",
-                    feature_store.get_user_features(payload.user_id, cache_default=False),
-                    None,
-                )
-            ),
-            name="recommendation-user-features",
+            {
+                **_build_candidate_cache_context(payload, k_per_source),
+                "serving_versions": serving_versions,
+                "user_feature_token": user_feature_token,
+            }
         )
         candidate_cache_task = asyncio.create_task(
             _timed_awaitable(
@@ -364,12 +598,7 @@ async def get_recommendations(
                 name="recommendation-content-features",
             )
 
-        (user_features, profile["user_features_ms"]), (
-            candidates,
-            profile["candidate_cache_lookup_ms"],
-        ) = await asyncio.gather(user_features_task, candidate_cache_task)
-        if user_features is None:
-            user_features = _default_user_features(payload.user_id)
+        candidates, profile["candidate_cache_lookup_ms"] = await candidate_cache_task
         content_features = None
         if content_features_task:
             content_features, profile["content_features_ms"] = await content_features_task
@@ -408,6 +637,17 @@ async def get_recommendations(
             profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
             _attach_profile_headers(response, profile)
             _log_recommendation_profile(runtime, payload, profile)
+            await _resolve_recommendation_singleflight(
+                singleflight_key,
+                singleflight_future if owns_singleflight else None,
+                result=_build_singleflight_result(
+                    [],
+                    total_candidates=0,
+                    content_processed=payload.content_id is not None,
+                    fallback=True,
+                    fallback_reason="no_candidates",
+                ),
+            )
             return RecommendationResponse(
                 user_id=payload.user_id,
                 recommendations=[],
@@ -434,11 +674,7 @@ async def get_recommendations(
         )
         missing_product_ids = [product_id for product_id in product_ids if product_id not in product_metadata_map]
         if missing_product_ids:
-            fetched_metadata = {}
-            for product_id in missing_product_ids:
-                metadata = await vector_search.get_product_metadata(product_id)
-                if metadata:
-                    fetched_metadata[product_id] = metadata
+            fetched_metadata = await vector_search.get_product_metadata_batch(missing_product_ids)
             if fetched_metadata:
                 feature_store.prime_product_metadata_memory_cache(fetched_metadata)
                 _schedule_best_effort_task(
@@ -449,6 +685,42 @@ async def get_recommendations(
                 product_metadata_map.update(fetched_metadata)
             profile["metadata_cache_miss_count"] = len(missing_product_ids) - len(fetched_metadata)
         profile["metadata_lookup_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+        ranked_candidate_count = len(candidates)
+        candidates = _filter_recommendable_candidates(candidates, product_metadata_map)
+        profile["candidate_count_before_eligibility_filter"] = ranked_candidate_count
+        profile["candidate_count"] = len(candidates)
+        profile["filtered_unavailable_candidates"] = ranked_candidate_count - len(candidates)
+
+        if not candidates:
+            profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+            _attach_profile_headers(response, profile)
+            _log_recommendation_profile(runtime, payload, profile)
+            await _resolve_recommendation_singleflight(
+                singleflight_key,
+                singleflight_future if owns_singleflight else None,
+                result=_build_singleflight_result(
+                    [],
+                    total_candidates=ranked_candidate_count,
+                    content_processed=payload.content_id is not None,
+                    fallback=True,
+                    fallback_reason="no_eligible_candidates",
+                ),
+            )
+            return RecommendationResponse(
+                user_id=payload.user_id,
+                recommendations=[],
+                metadata={
+                    "total_candidates": ranked_candidate_count,
+                    "response_time_ms": int((time.time() - start_time) * 1000),
+                    "fallback_reason": "no_eligible_candidates",
+                    "cache_hit": False,
+                    **(
+                        {"profile": profile}
+                        if runtime.config.monitoring_config.enable_profiling_logs
+                        else {}
+                    ),
+                },
+            )
 
         stage_started = time.perf_counter()
         ranked_recommendations, ranking_profile = await ranking_batcher.rank_candidates(
@@ -510,6 +782,15 @@ async def get_recommendations(
         profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
         _attach_profile_headers(response, profile)
         _log_recommendation_profile(runtime, payload, profile)
+        await _resolve_recommendation_singleflight(
+            singleflight_key,
+            singleflight_future if owns_singleflight else None,
+            result=_build_singleflight_result(
+                ranked_recommendations,
+                total_candidates=len(candidates),
+                content_processed=payload.content_id is not None,
+            ),
+        )
 
         return RecommendationResponse(
             user_id=payload.user_id,
@@ -518,6 +799,7 @@ async def get_recommendations(
                 "total_candidates": len(candidates),
                 "response_time_ms": int(response_time * 1000),
                 "model_version": "v1.0.0",
+                "cache_freshness": "model_user_and_catalog_versioned",
                 "cache_hit": False,
                 "content_processed": payload.content_id is not None,
                 **(
@@ -528,6 +810,13 @@ async def get_recommendations(
             },
         )
 
+    except asyncio.CancelledError as exc:
+        await _resolve_recommendation_singleflight(
+            singleflight_key,
+            singleflight_future if owns_singleflight else None,
+            exception=exc,
+        )
+        raise
     except Exception as exc:
         logger.error(f"Recommendation request failed: {exc}")
         logger.error(traceback.format_exc())
@@ -537,6 +826,17 @@ async def get_recommendations(
         _log_recommendation_profile(runtime, payload, profile, level="error")
         try:
             trending_recommendations = await recommendation_engine.get_trending_recommendations(payload.k)
+            await _resolve_recommendation_singleflight(
+                singleflight_key,
+                singleflight_future if owns_singleflight else None,
+                result=_build_singleflight_result(
+                    trending_recommendations,
+                    total_candidates=len(trending_recommendations),
+                    content_processed=payload.content_id is not None,
+                    fallback=True,
+                    fallback_reason="serving_error",
+                ),
+            )
             return RecommendationResponse(
                 user_id=payload.user_id,
                 recommendations=trending_recommendations,
@@ -553,6 +853,11 @@ async def get_recommendations(
                 },
             )
         except Exception as fallback_exc:
+            await _resolve_recommendation_singleflight(
+                singleflight_key,
+                singleflight_future if owns_singleflight else None,
+                exception=fallback_exc,
+            )
             raise HTTPException(
                 status_code=503,
                 detail="Recommendation service unavailable",
@@ -716,6 +1021,13 @@ def _detect_cgroup_cpu_limit() -> int:
 
 
 def _log_recommendation_profile(runtime, request, profile: dict, level: str = "info") -> None:
+    runtime.observability.record_recommendation(
+        result="error" if profile.get("error") else "success",
+        cache_hit=bool(profile.get("cache_hit")),
+        serving_path=str(profile.get("serving_path", "unknown")),
+        candidate_count=int(profile.get("candidate_count") or 0),
+        ranked_count=int(profile.get("ranked_count") or 0),
+    )
     if not (
         runtime.config.monitoring_config.enable_profiling_logs
         or profile["total_ms"] >= runtime.config.monitoring_config.profiling_log_min_duration_ms
@@ -800,4 +1112,5 @@ async def metrics():
         app.state.runtime,
         feature_store=feature_store,
         kafka_manager=kafka_manager,
+        system_store=system_store,
     )

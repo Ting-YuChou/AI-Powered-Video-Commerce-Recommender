@@ -12,10 +12,13 @@ import asyncio
 import numpy as np
 import faiss
 import logging
+import hashlib
+import json
 from typing import Dict, List, Any, Optional, Set, Tuple
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
+import threading
 
 # Local imports
 from models import (
@@ -76,6 +79,19 @@ class TwoTowerRetrievalEngine:
         self.last_training_time: float = 0
         self.model_version: Optional[str] = None
         self._item_popularity: Dict[str, float] = {}
+        self._user_embedding_cache_max_size = max(
+            0,
+            int(getattr(config, "user_embedding_cache_size", 20000)),
+        )
+        self._user_embedding_cache_time_bucket_seconds = max(
+            0.001,
+            float(getattr(config, "user_embedding_cache_time_bucket_seconds", 1.0)),
+        )
+        self._user_embedding_cache: OrderedDict[
+            Tuple[Any, ...],
+            np.ndarray,
+        ] = OrderedDict()
+        self._user_embedding_cache_lock = threading.RLock()
 
         logger.info("Two-Tower retrieval engine initialized")
 
@@ -175,6 +191,7 @@ class TwoTowerRetrievalEngine:
             self.is_trained = True
             self.last_training_time = time.time()
             self.model_version = f"two-tower-{int(self.last_training_time)}"
+            self.clear_user_embedding_cache()
 
             logger.info(
                 f"Two-Tower model trained in {training_time:.1f}s — "
@@ -227,7 +244,12 @@ class TwoTowerRetrievalEngine:
 
             exclude_items = exclude_items or set()
             user_features = user_features or {}
-            user_embedding = self.trainer.encode_user(user_id, user_features)
+            current_time = time.time()
+            user_embedding = self._get_user_embedding(
+                user_id,
+                user_features,
+                current_time,
+            )
 
             if user_embedding is None:
                 return self._get_popular_items_fallback_sync(k, exclude_items)
@@ -260,6 +282,65 @@ class TwoTowerRetrievalEngine:
         except Exception as e:
             logger.error(f"Error getting Two-Tower recommendations for {user_id}: {e}")
             return []
+
+    def clear_user_embedding_cache(self) -> None:
+        with self._user_embedding_cache_lock:
+            self._user_embedding_cache.clear()
+
+    def _get_user_embedding(
+        self,
+        user_id: str,
+        user_features: Dict[str, Any],
+        current_time: float,
+    ) -> Optional[np.ndarray]:
+        cache_key = self._user_embedding_cache_key(user_id, user_features, current_time)
+        with self._user_embedding_cache_lock:
+            cached = self._user_embedding_cache.get(cache_key)
+            if cached is not None:
+                self._user_embedding_cache.move_to_end(cache_key)
+                return cached.copy()
+
+        user_embedding = self.trainer.encode_user(
+            user_id,
+            user_features,
+            current_time=current_time,
+        )
+        if user_embedding is None or self._user_embedding_cache_max_size <= 0:
+            return user_embedding
+
+        with self._user_embedding_cache_lock:
+            self._user_embedding_cache[cache_key] = user_embedding.copy()
+            if len(self._user_embedding_cache) > self._user_embedding_cache_max_size:
+                self._user_embedding_cache.popitem(last=False)
+        return user_embedding
+
+    def _user_embedding_cache_key(
+        self,
+        user_id: str,
+        user_features: Dict[str, Any],
+        current_time: float,
+    ) -> Tuple[Any, ...]:
+        time_bucket = int(
+            current_time / self._user_embedding_cache_time_bucket_seconds
+        )
+        normalized_features = {
+            "total_interactions": int(user_features.get("total_interactions", 0)),
+            "avg_session_length": round(float(user_features.get("avg_session_length", 0.0)), 3),
+            "preferred_categories": list(user_features.get("preferred_categories", [])),
+            "price_sensitivity": round(float(user_features.get("price_sensitivity", 0.5)), 6),
+            "click_through_rate": round(float(user_features.get("click_through_rate", 0.0)), 6),
+            "conversion_rate": round(float(user_features.get("conversion_rate", 0.0)), 6),
+            "last_active": round(float(user_features.get("last_active", current_time)), 3),
+        }
+        feature_hash = hashlib.sha256(
+            json.dumps(normalized_features, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        return (
+            self.model_version,
+            user_id,
+            time_bucket,
+            feature_hash,
+        )
 
     async def _get_popular_items_fallback(
         self, k: int, exclude_items: Optional[Set[str]] = None
@@ -502,6 +583,7 @@ class RecommendationEngine:
                     if checkpoint_record:
                         self.cf_engine.model_version = checkpoint_record.model_version
                         self.loaded_two_tower_version = checkpoint_record.model_version
+                    self.cf_engine.clear_user_embedding_cache()
                     logger.info("Loaded pre-existing Two-Tower model and CF index")
         except Exception as e:
             logger.warning(f"Could not load pre-existing CF index: {e}")

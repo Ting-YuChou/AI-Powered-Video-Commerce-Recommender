@@ -12,7 +12,7 @@ import time
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, delete, desc, func, select, text
+from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, delete, desc, event, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -124,8 +124,9 @@ class DatabaseHealth:
 class SystemStore:
     """Operational persistence layer backed by Postgres."""
 
-    def __init__(self, config: DatabaseConfig):
+    def __init__(self, config: DatabaseConfig, observability=None):
         self.config = config
+        self.observability = observability
         self.engine: AsyncEngine | None = None
         self.session_factory: async_sessionmaker | None = None
         self.is_connected = False
@@ -146,6 +147,7 @@ class SystemStore:
             max_overflow=self.config.max_overflow,
             echo=self.config.echo_sql,
         )
+        self._install_metrics_listeners()
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
         if self.config.auto_create_schema:
@@ -167,6 +169,7 @@ class SystemStore:
                 await self._ensure_operational_indexes(conn)
 
         self.is_connected = True
+        self._update_pool_metrics()
         if self.config.enable_retention_cleanup:
             await self.prune_interaction_events()
             self._retention_cleanup_task = asyncio.create_task(
@@ -293,6 +296,34 @@ class SystemStore:
         self.session_factory = None
         self.is_connected = False
 
+    def _install_metrics_listeners(self) -> None:
+        if self.engine is None or self.observability is None:
+            return
+
+        @event.listens_for(self.engine.sync_engine, "before_cursor_execute")
+        def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+            conn.info.setdefault("video_commerce_query_start_time", []).append(time.perf_counter())
+
+        @event.listens_for(self.engine.sync_engine, "after_cursor_execute")
+        def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+            started_stack = conn.info.get("video_commerce_query_start_time", [])
+            started_at = started_stack.pop(-1) if started_stack else time.perf_counter()
+            operation = _sql_operation(statement)
+            self.observability.record_database_query(
+                operation,
+                time.perf_counter() - started_at,
+                "success",
+            )
+
+        @event.listens_for(self.engine.sync_engine, "handle_error")
+        def handle_error(exception_context):
+            operation = _sql_operation(exception_context.statement)
+            self.observability.record_database_query(operation, 0.0, "error")
+
+    def _update_pool_metrics(self) -> None:
+        if self.observability is not None:
+            self.observability.update_database_pool_metrics(self)
+
     async def health_check(self) -> DatabaseHealth:
         if not self.enabled:
             return DatabaseHealth(status="healthy", response_time_ms=0.0)
@@ -301,11 +332,13 @@ class SystemStore:
         try:
             async with self.session_factory() as session:
                 await session.execute(text("SELECT 1"))
+            self._update_pool_metrics()
             return DatabaseHealth(
                 status="healthy",
                 response_time_ms=round((time.time() - started_at) * 1000, 2),
             )
         except Exception as exc:
+            self._update_pool_metrics()
             return DatabaseHealth(
                 status="unhealthy",
                 response_time_ms=round((time.time() - started_at) * 1000, 2),
@@ -325,6 +358,7 @@ class SystemStore:
         async with self.session_factory.begin() as session:
             result = await session.execute(stmt)
         deleted_count = int(result.rowcount or 0)
+        self._update_pool_metrics()
         return deleted_count
 
     async def _run_periodic_retention_cleanup(self) -> None:
@@ -382,6 +416,7 @@ class SystemStore:
             stmt = stmt.on_conflict_do_nothing(index_elements=[InteractionEvent.event_id])
         async with self.session_factory.begin() as session:
             await session.execute(stmt)
+        self._update_pool_metrics()
 
     async def get_training_interactions(self, limit: int = 50000) -> List[Dict[str, Any]]:
         if not self.enabled:
@@ -394,6 +429,7 @@ class SystemStore:
                 .limit(limit)
             )
             rows = result.scalars().all()
+        self._update_pool_metrics()
 
         interactions: List[Dict[str, Any]] = []
         for row in rows:
@@ -446,6 +482,7 @@ class SystemStore:
             )
 
         action_counts = Counter({action: count for action, count in action_rows.all()})
+        self._update_pool_metrics()
         clicks = action_counts.get("click", 0)
         purchases = action_counts.get("purchase", 0)
         views = action_counts.get("view", 0)
@@ -504,6 +541,7 @@ class SystemStore:
         )
         async with self.session_factory.begin() as session:
             await session.execute(stmt)
+        self._update_pool_metrics()
 
     async def update_content_job_status(
         self,
@@ -541,6 +579,7 @@ class SystemStore:
             if payload is not None:
                 current.payload = payload
             current.updated_at = _utc_now()
+        self._update_pool_metrics()
 
     async def get_content_job(self, content_id: str) -> Optional[Dict[str, Any]]:
         if not self.enabled:
@@ -548,6 +587,7 @@ class SystemStore:
 
         async with self.session_factory() as session:
             row = await session.get(ContentJob, content_id)
+        self._update_pool_metrics()
         if row is None:
             return None
         return {
@@ -588,6 +628,7 @@ class SystemStore:
         )
         async with self.session_factory.begin() as session:
             await session.execute(stmt)
+        self._update_pool_metrics()
 
     async def record_model_checkpoint(
         self,
@@ -608,6 +649,7 @@ class SystemStore:
                     payload=payload or {},
                 )
             )
+        self._update_pool_metrics()
 
     async def get_latest_model_checkpoint(self, model_name: str) -> Optional[Dict[str, Any]]:
         if not self.enabled:
@@ -621,6 +663,7 @@ class SystemStore:
                 .limit(1)
             )
             row = result.scalar_one_or_none()
+        self._update_pool_metrics()
 
         if row is None:
             return None
@@ -633,3 +676,9 @@ class SystemStore:
             "payload": row.payload or {},
             "created_at": row.created_at.timestamp() if row.created_at else None,
         }
+
+
+def _sql_operation(statement: Optional[str]) -> str:
+    if not statement:
+        return "unknown"
+    return statement.strip().split(None, 1)[0].lower() or "unknown"

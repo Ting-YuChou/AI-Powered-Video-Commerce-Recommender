@@ -41,6 +41,9 @@ The default public edge URL is `http://localhost`. Set `CADDY_SITE_ADDRESS=your.
 - API docs: `http://localhost/docs`
 - Grafana: `http://127.0.0.1:3000`
 - Prometheus: `http://127.0.0.1:9090`
+- Jaeger traces: `http://127.0.0.1:16686`
+
+Observability validation steps live in `docs/operations/observability-validation.md`.
 
 ## Production Defaults
 
@@ -70,6 +73,9 @@ DATA_MAX_FILE_SIZE=104857600
 CADDY_SITE_ADDRESS=your.domain.com
 GRAFANA_ADMIN_USER=grafana
 GRAFANA_ADMIN_PASSWORD=replace-with-strong-password
+MONITORING_ENABLE_TRACING=true
+MONITORING_TRACING_SAMPLE_RATE=1.0
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
 OBJECT_STORAGE_BACKEND=s3
 OBJECT_STORAGE_ENDPOINT_URL=http://minio:9000
 OBJECT_STORAGE_BUCKET=video-commerce-assets

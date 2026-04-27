@@ -41,12 +41,17 @@ x-common-service: &common-service
     MODEL_CACHE_DIR: /app/models
     VECTOR_INDEX_PATH: /app/models/vector_index.faiss
     RECOMMENDATION_CF_INDEX_PATH: /app/models/cf_vector_index.faiss
+    RECOMMENDATION_USER_EMBEDDING_CACHE_SIZE: ${RECOMMENDATION_USER_EMBEDDING_CACHE_SIZE:-20000}
+    RECOMMENDATION_USER_EMBEDDING_CACHE_TIME_BUCKET_SECONDS: ${RECOMMENDATION_USER_EMBEDDING_CACHE_TIME_BUCKET_SECONDS:-1}
     DATA_UPLOAD_DIR: /app/uploads
     DATA_LOAD_SAMPLE_DATA: "false"
     DATA_MAX_FILE_SIZE: ${DATA_MAX_FILE_SIZE:-104857600}
     MODEL_LAZY_LOAD: "true"
     MODEL_TORCH_NUM_THREADS: ${MODEL_TORCH_NUM_THREADS:-0}
     MODEL_TORCH_NUM_INTEROP_THREADS: ${MODEL_TORCH_NUM_INTEROP_THREADS:-1}
+    RANKING_BATCH_RUNNER_COUNT: ${RANKING_BATCH_RUNNER_COUNT:-1}
+    RANKING_INFERENCE_EXECUTOR_WORKERS: ${RANKING_INFERENCE_EXECUTOR_WORKERS:-0}
+    RANKING_PRODUCT_FEATURE_CACHE_SIZE: ${RANKING_PRODUCT_FEATURE_CACHE_SIZE:-50000}
     MONITORING_LOG_LEVEL: INFO
     MONITORING_ENABLE_METRICS: "true"
     MONITORING_ENABLE_PROMETHEUS_METRICS: "true"
@@ -54,8 +59,19 @@ x-common-service: &common-service
     MONITORING_PROFILING_LOG_MIN_DURATION_MS: ${MONITORING_PROFILING_LOG_MIN_DURATION_MS:-250}
     MONITORING_WORKER_HEARTBEAT_INTERVAL_SECONDS: "15"
     MONITORING_WORKER_HEARTBEAT_TTL_SECONDS: "45"
+    MONITORING_ENABLE_TRACING: ${MONITORING_ENABLE_TRACING:-true}
+    MONITORING_TRACING_SAMPLE_RATE: ${MONITORING_TRACING_SAMPLE_RATE:-1.0}
+    MONITORING_WORKER_METRICS_HOST: 0.0.0.0
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+    OTEL_EXPORTER_OTLP_INSECURE: "true"
+    OTEL_TRACES_SAMPLER: parentbased_traceidratio
+    OTEL_TRACES_SAMPLER_ARG: ${MONITORING_TRACING_SAMPLE_RATE:-1.0}
     SERVICE_RECOMMENDATION_SERVICE_URL: http://recommendation-service:8001
     SERVICE_INTERACTION_INGEST_SERVICE_URL: http://interaction-ingest-service:8002
+    SERVICE_PROXY_POOL_TIMEOUT_SECONDS: ${SERVICE_PROXY_POOL_TIMEOUT_SECONDS:-5}
+    SERVICE_PROXY_MAX_CONNECTIONS: ${SERVICE_PROXY_MAX_CONNECTIONS:-500}
+    SERVICE_PROXY_MAX_KEEPALIVE_CONNECTIONS: ${SERVICE_PROXY_MAX_KEEPALIVE_CONNECTIONS:-250}
+    SERVICE_PROXY_KEEPALIVE_EXPIRY_SECONDS: ${SERVICE_PROXY_KEEPALIVE_EXPIRY_SECONDS:-30}
     SECURITY_AUTH_MODE: ${SECURITY_AUTH_MODE:-api_key}
     SECURITY_INTERNAL_SERVICE_KEY: ${SECURITY_INTERNAL_SERVICE_KEY:-}
     SECURITY_INTERNAL_SERVICE_KEY_FILE: ${SECURITY_INTERNAL_SERVICE_KEY_FILE:-}
@@ -232,6 +248,9 @@ services:
       <<: *common-env
       MODEL_LAZY_LOAD: "false"
       WORKER_TYPE: content_processor
+      MONITORING_WORKER_METRICS_PORT: 9101
+    expose:
+      - "9101"
     depends_on:
       kafka:
         condition: service_healthy
@@ -257,6 +276,9 @@ services:
     environment:
       <<: *common-env
       WORKER_TYPE: feature_updater
+      MONITORING_WORKER_METRICS_PORT: 9102
+    expose:
+      - "9102"
     depends_on:
       kafka:
         condition: service_healthy
@@ -283,6 +305,9 @@ services:
       <<: *common-env
       RANKING_ENABLE_PERIODIC_TRAINING: "true"
       SERVICE_TRAINER_INTERVAL_SECONDS: ${SERVICE_TRAINER_INTERVAL_SECONDS:-3600}
+      MONITORING_WORKER_METRICS_PORT: 9103
+    expose:
+      - "9103"
     depends_on:
       redis:
         condition: service_healthy
@@ -474,6 +499,88 @@ services:
       - video-commerce-network
     restart: unless-stopped
 
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-video_commerce}:${POSTGRES_PASSWORD:-video_commerce}@postgres:5432/${POSTGRES_DB:-video_commerce}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "9187"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    command:
+      - --redis.addr=redis://redis:6379
+      - --redis.password=${REDIS_PASSWORD:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    expose:
+      - "9121"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  redis-cache-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    command:
+      - --redis.addr=redis://redis-cache:6379
+      - --redis.password=${REDIS_CACHE_PASSWORD:-${REDIS_PASSWORD:-}}
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+    expose:
+      - "9121"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    command:
+      - --kafka.server=kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    expose:
+      - "9308"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    command: ["--config=/etc/otel-collector.yaml"]
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    volumes:
+      - ./monitoring/otel-collector.yaml:/etc/otel-collector.yaml:ro
+    depends_on:
+      - jaeger
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"
+    expose:
+      - "4317"
+      - "4318"
+      - "14250"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
   alertmanager:
     image: prom/alertmanager:latest
     command:
@@ -499,6 +606,9 @@ services:
       GF_SECURITY_COOKIE_SECURE: "true"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     networks:
       - video-commerce-network
     depends_on:

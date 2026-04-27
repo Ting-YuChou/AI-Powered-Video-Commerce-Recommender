@@ -52,6 +52,7 @@ class VectorSearchEngine:
         self.index_lock = threading.RLock()
         self.is_loaded = False
         self.last_updated = 0
+        self.catalog_version = 0
         
         # Performance tracking
         self.search_stats = {
@@ -103,6 +104,12 @@ class VectorSearchEngine:
                 self.product_index_map = {int(k): v for k, v in metadata['index_map'].items()}
                 self.product_metadata = metadata['product_metadata']
                 self.last_updated = metadata.get('last_updated', 0)
+                self.catalog_version = int(
+                    metadata.get(
+                        "catalog_version",
+                        int((self.last_updated or time.time()) * 1000),
+                    )
+                )
             
             # Reconstruct embeddings dictionary
             for faiss_idx, product_id in self.product_index_map.items():
@@ -215,6 +222,7 @@ class VectorSearchEngine:
                     self.index.add(embeddings_matrix)
             
             self.last_updated = time.time()
+            self.catalog_version = time.time_ns()
             logger.info(f"Added {len(embeddings_to_add)} products to index")
             
         except Exception as e:
@@ -349,6 +357,7 @@ class VectorSearchEngine:
                     self.product_metadata[product_id] = metadata
             
             self.last_updated = time.time()
+            self.catalog_version = time.time_ns()
             logger.debug(f"Added product {product_id} to index at position {current_idx}")
             
         except Exception as e:
@@ -371,12 +380,33 @@ class VectorSearchEngine:
     async def get_product_metadata(self, product_id: str) -> Optional[Dict[str, Any]]:
         """Get product metadata by ID."""
         return self.product_metadata.get(product_id)
+
+    async def get_product_metadata_batch(
+        self,
+        product_ids: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Get product metadata for many product IDs from the local catalog."""
+        unique_product_ids = list(dict.fromkeys(product_ids))
+        return {
+            product_id: metadata
+            for product_id in unique_product_ids
+            if (metadata := self.product_metadata.get(product_id)) is not None
+        }
+
+    def get_catalog_version_context(self) -> Dict[str, Any]:
+        """Return the local serving catalog token used by recommendation cache keys."""
+        return {
+            "catalog_version": int(self.catalog_version or self.last_updated or 0),
+            "last_updated": int(self.last_updated or 0),
+            "product_count": len(self.product_metadata),
+        }
     
     async def update_product_metadata(self, product_id: str, metadata: Dict[str, Any]):
         """Update product metadata."""
         if product_id in self.product_metadata:
             self.product_metadata[product_id].update(metadata)
             self.last_updated = time.time()
+            self.catalog_version = time.time_ns()
     
     async def remove_product(self, product_id: str):
         """Remove product from search (mark as inactive rather than rebuild index)."""
@@ -392,6 +422,8 @@ class VectorSearchEngine:
                 # Mark as inactive rather than rebuilding entire index
                 self.product_metadata[product_id] = self.product_metadata.get(product_id, {})
                 self.product_metadata[product_id]['active'] = False
+                self.last_updated = time.time()
+                self.catalog_version = time.time_ns()
                 
                 logger.debug(f"Marked product {product_id} as inactive")
             
@@ -419,6 +451,7 @@ class VectorSearchEngine:
                 'index_map': {str(k): v for k, v in self.product_index_map.items()},
                 'product_metadata': self.product_metadata,
                 'last_updated': self.last_updated,
+                'catalog_version': self.catalog_version,
                 'embedding_dim': self.embedding_dim,
                 'index_type': self.config.index_type,
                 'total_products': len(self.product_embeddings)

@@ -34,6 +34,7 @@ from service_common import (
     create_service_app,
 )
 from system_store import SystemStore
+from telemetry import inject_http_headers
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,10 @@ async def startup_event():
     await feature_store.initialize()
 
     if runtime.config.database_config.enable:
-        system_store = SystemStore(runtime.config.database_config)
+        system_store = SystemStore(
+            runtime.config.database_config,
+            observability=runtime.observability,
+        )
         await system_store.initialize()
 
     object_storage = ObjectStorage(runtime.config.object_storage_config)
@@ -165,7 +169,10 @@ async def startup_event():
 
     if runtime.config.kafka_config.enable:
         try:
-            kafka_manager = await init_kafka(runtime.config.kafka_config)
+            kafka_manager = await init_kafka(
+                runtime.config.kafka_config,
+                observability=runtime.observability,
+            )
         except Exception as exc:
             logger.warning(f"Gateway Kafka init failed: {exc}")
             kafka_manager = None
@@ -347,6 +354,7 @@ async def upload_content(
         request_id=request.state.request_id,
     )
     if not success:
+        runtime.observability.record_content_upload(priority, "enqueue_failed")
         if object_storage:
             await object_storage.delete_uploaded_object(storage_path)
         await feature_store.update_content_status(content_id, "failed")
@@ -358,6 +366,7 @@ async def upload_content(
                 storage_path=storage_path,
             )
         raise HTTPException(status_code=503, detail="Failed to enqueue video processing task")
+    runtime.observability.record_content_upload(priority, "queued")
 
     return {
         "content_id": content_id,
@@ -488,6 +497,7 @@ async def metrics():
         app.state.runtime,
         feature_store=feature_store,
         kafka_manager=kafka_manager,
+        system_store=system_store,
         worker_statuses=worker_statuses,
     )
 
@@ -556,6 +566,7 @@ async def _proxy_json_request(url: str, payload: dict, request: Request) -> Resp
     internal_key = app.state.runtime.config.security_config.internal_service_key
     if internal_key:
         headers[internal_header] = internal_key
+    inject_http_headers(headers)
 
     try:
         upstream = await proxy_client.post(url, json=payload, headers=headers)
@@ -590,6 +601,7 @@ async def _probe_health(url: str) -> dict:
     internal_key = app.state.runtime.config.security_config.internal_service_key
     if internal_key:
         headers[internal_header] = internal_key
+    inject_http_headers(headers)
 
     started_at = time.time()
     try:

@@ -30,6 +30,8 @@ from feature_store import FeatureStore
 from object_storage import ObjectStorage
 from system_store import SystemStore
 from vector_search import VectorSearchEngine
+from observability import ObservabilityManager, configure_logging, start_worker_metrics_server
+from telemetry import configure_tracing
 
 # Configure logging
 logging.basicConfig(
@@ -60,6 +62,7 @@ class VideoProcessorWorker:
         self.system_store: Optional[SystemStore] = None
         self.object_storage: Optional[ObjectStorage] = None
         self.consumer: Optional[KafkaConsumerClient] = None
+        self.observability = ObservabilityManager()
         
         self.is_running = False
         self._shutdown_event = asyncio.Event()
@@ -71,13 +74,25 @@ class VideoProcessorWorker:
     async def initialize(self):
         """Initialize all components."""
         logger.info("Initializing video processor components...")
+        configure_logging(self.config.monitoring_config)
+        configure_tracing("content-worker", self.config.monitoring_config)
+        metrics_port = start_worker_metrics_server(
+            self.observability,
+            self.config.monitoring_config,
+            default_port=9101,
+        )
+        if metrics_port:
+            logger.info("content_worker_metrics_server_started", extra={"port": metrics_port})
         
         # Initialize feature store (Redis)
         self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
         await self.feature_store.initialize()
 
         if self.config.database_config.enable:
-            self.system_store = SystemStore(self.config.database_config)
+            self.system_store = SystemStore(
+                self.config.database_config,
+                observability=self.observability,
+            )
             await self.system_store.initialize()
 
         self.object_storage = ObjectStorage(self.config.object_storage_config)
@@ -94,7 +109,8 @@ class VideoProcessorWorker:
         # Initialize Kafka consumer
         self.consumer = KafkaConsumerClient(
             self.kafka_config, 
-            group_id=f"{self.kafka_config.consumer_group_id}-video-processor"
+            group_id=f"{self.kafka_config.consumer_group_id}-video-processor",
+            observability=self.observability,
         )
         self.consumer.register_handler(
             self.kafka_config.video_processing_topic,
@@ -127,6 +143,8 @@ class VideoProcessorWorker:
         user_id = value.get('user_id')
         priority = value.get('priority', 'normal')
         request_id = value.get('request_id')
+        started_at = time.perf_counter()
+        status = "success"
         
         logger.info(
             "Processing video task",
@@ -207,7 +225,7 @@ class VideoProcessorWorker:
             logger.info(f"Video processing completed: {content_id}")
             
             # Send feature update event via Kafka
-            kafka_manager = get_kafka_manager()
+            kafka_manager = get_kafka_manager(observability=self.observability)
             if kafka_manager:
                 await kafka_manager.send_feature_update(
                     entity_type='content',
@@ -222,6 +240,7 @@ class VideoProcessorWorker:
                 )
             
         except Exception as e:
+            status = "error"
             logger.error(f"Error processing video {content_id}: {e}")
             await self.feature_store.update_content_status(content_id, "failed")
             if self.system_store:
@@ -237,6 +256,12 @@ class VideoProcessorWorker:
                 )
         
         finally:
+            self.observability.record_worker_message(
+                "content-worker",
+                topic,
+                status,
+                time.perf_counter() - started_at,
+            )
             # Cleanup temporary file
             try:
                 if cleanup_processing_path and processing_path and os.path.exists(processing_path):
@@ -265,6 +290,7 @@ class VideoProcessorWorker:
                     ttl,
                     {"pid": os.getpid()},
                 )
+                self.observability.update_worker_heartbeat("content-worker", self.instance_id)
             except Exception as exc:
                 logger.warning(f"Failed to publish content worker heartbeat: {exc}")
             await asyncio.sleep(interval)
