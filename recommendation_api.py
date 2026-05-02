@@ -140,6 +140,8 @@ def _build_cache_freshness_context(
 def _serving_version_context(runtime) -> Dict[str, Any]:
     ranking_path = runtime.config.model_config.ranking_model_path
     vector_path = runtime.config.vector_config.index_path
+    sasrec_checkpoint_path = runtime.config.recommendation_config.sasrec_checkpoint_path
+    sasrec_vocab_path = runtime.config.recommendation_config.sasrec_vocab_path
     return {
         "ranking_model": ranking_model.model_version if ranking_model else None,
         "ranking_checkpoint_mtime": _safe_file_mtime(ranking_path),
@@ -153,6 +155,13 @@ def _serving_version_context(runtime) -> Dict[str, Any]:
             if recommendation_engine
             else None
         ),
+        "sasrec_model": (
+            recommendation_engine.loaded_sasrec_version
+            if recommendation_engine
+            else None
+        ),
+        "sasrec_checkpoint_mtime": _safe_file_mtime(sasrec_checkpoint_path),
+        "sasrec_vocab_mtime": _safe_file_mtime(sasrec_vocab_path),
         "vector_index_mtime": _safe_file_mtime(vector_path),
         "catalog": _catalog_serving_version_context(),
     }

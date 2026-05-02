@@ -30,6 +30,7 @@ from model_artifacts import ModelArtifactManager
 from vector_search import VectorSearchEngine
 from config import RecommendationConfig
 from two_tower import TwoTowerTrainer
+from sasrec import SASRecCandidateEngine
 
 logger = logging.getLogger(__name__)
 
@@ -506,14 +507,16 @@ class RecommendationEngine:
 
         # Recommendation engines
         self.cf_engine = TwoTowerRetrievalEngine(config, vector_search)
+        self.sasrec_engine = SASRecCandidateEngine(config)
         self.trending_engine = TrendingEngine(config)
 
         # Model state
         self.is_initialized = False
         self.last_model_update = 0
         self.loaded_two_tower_version: Optional[str] = None
+        self.loaded_sasrec_version: Optional[str] = None
 
-        logger.info("Recommendation engine initialized (Two-Tower retrieval)")
+        logger.info("Recommendation engine initialized (Two-Tower + SASRec retrieval)")
 
     async def load_models(self):
         """Load and initialize all recommendation models."""
@@ -543,10 +546,13 @@ class RecommendationEngine:
         try:
             logger.info("Loading recommendation serving state")
             await self._try_load_cf_index()
+            await self._try_load_sasrec_artifacts()
             await self.refresh_serving_pools()
             self.is_initialized = True
             if not self.cf_engine.is_trained:
                 logger.warning("Two-Tower index not available; serving will fall back to non-CF sources")
+            if self.config.enable_sasrec and not self.sasrec_engine.is_trained:
+                logger.warning("SASRec artifacts not available; serving will skip sequential candidates")
             logger.info("Recommendation serving state ready")
         except Exception as e:
             logger.error(f"Error loading recommendation serving state: {e}")
@@ -588,6 +594,32 @@ class RecommendationEngine:
         except Exception as e:
             logger.warning(f"Could not load pre-existing CF index: {e}")
 
+    async def _try_load_sasrec_artifacts(self) -> bool:
+        """Load SASRec serving artifacts if the sequential source is enabled."""
+        if not self.config.enable_sasrec:
+            return False
+        try:
+            checkpoint_record = None
+            if self.artifact_manager:
+                checkpoint_record = await self.artifact_manager.sync_latest_sasrec_artifacts()
+
+            checkpoint_path, vocab_path, metadata_path = self._sasrec_artifact_paths()
+            loaded = await asyncio.to_thread(
+                self.sasrec_engine.load_artifacts,
+                checkpoint_path,
+                vocab_path,
+                metadata_path,
+            )
+            if loaded:
+                if checkpoint_record:
+                    self.sasrec_engine.model_version = checkpoint_record.model_version
+                self.loaded_sasrec_version = self.sasrec_engine.model_version
+                logger.info("Loaded SASRec serving artifacts")
+                return True
+        except Exception as e:
+            logger.warning(f"Could not load SASRec artifacts: {e}")
+        return False
+
     async def _update_models_from_interactions(self):
         """Update models using recent interaction data."""
         try:
@@ -623,6 +655,8 @@ class RecommendationEngine:
                     )
                     self.loaded_two_tower_version = artifact_record.model_version if artifact_record else model_version
 
+                await self._update_sasrec_from_sequences()
+
                 # Update trending scores (use last 1K for recency)
                 await self.trending_engine.update_trending_scores(interactions[:1000])
                 await self.refresh_serving_pools()
@@ -636,21 +670,89 @@ class RecommendationEngine:
         except Exception as e:
             logger.error(f"Error updating models from interactions: {e}")
 
+    async def _update_sasrec_from_sequences(self) -> None:
+        if not self.config.enable_sasrec:
+            return
+        if not self.artifact_manager or not self.artifact_manager.system_store:
+            logger.warning("Skipping SASRec training because Postgres system store is unavailable")
+            return
+
+        max_events = max(
+            int(self.config.sasrec_min_sequence_length),
+            int(self.config.sasrec_max_sequence_length) + 1,
+        )
+        sequences = await self.artifact_manager.system_store.get_user_training_sequences(
+            max_events_per_user=max_events,
+            min_sequence_length=self.config.sasrec_min_sequence_length,
+        )
+        if not sequences:
+            logger.info("Skipping SASRec training because no positive user sequences are available")
+            return
+
+        trained = await self.sasrec_engine.train_model(
+            sequences,
+            catalog_product_ids=self.vector_search.product_metadata.keys(),
+        )
+        if not trained or not self.sasrec_engine.is_trained:
+            return
+
+        checkpoint_path, vocab_path, metadata_path = self._sasrec_artifact_paths()
+        await asyncio.to_thread(
+            self.sasrec_engine.save_artifacts,
+            checkpoint_path,
+            vocab_path,
+            metadata_path,
+        )
+        model_version = self.sasrec_engine.model_version or f"sasrec-{int(time.time())}"
+        artifact_record = await self.artifact_manager.persist_sasrec_artifacts(
+            checkpoint_path=checkpoint_path,
+            vocab_path=vocab_path,
+            metadata_path=metadata_path,
+            model_version=model_version,
+            payload={
+                "sequence_count": len(sequences),
+                "training_sample_count": self.sasrec_engine.training_sample_count,
+                "last_training_time": self.sasrec_engine.last_training_time,
+            },
+        )
+        self.loaded_sasrec_version = artifact_record.model_version if artifact_record else model_version
+
+    def _sasrec_artifact_paths(self) -> Tuple[str, str, str]:
+        if self.artifact_manager:
+            return (
+                self.artifact_manager.sasrec_local_checkpoint_path,
+                self.artifact_manager.sasrec_local_vocab_path,
+                self.artifact_manager.sasrec_local_metadata_path,
+            )
+        base_dir = Path(self.config.cf_index_path).parent
+        return (
+            self.config.sasrec_checkpoint_path or str(base_dir / "sasrec_model.pt"),
+            self.config.sasrec_vocab_path or str(base_dir / "sasrec_vocab.json"),
+            self.config.sasrec_metadata_path or str(base_dir / "sasrec_metadata.json"),
+        )
+
     async def sync_serving_artifacts_if_updated(self) -> bool:
-        """Reload Two-Tower serving artifacts when a newer checkpoint is available."""
+        """Reload retrieval serving artifacts when newer checkpoints are available."""
         if not self.artifact_manager:
             return False
 
-        latest_record = await self.artifact_manager.get_latest_model_checkpoint(
+        updated = False
+        latest_two_tower = await self.artifact_manager.get_latest_model_checkpoint(
             ModelArtifactManager.TWO_TOWER_MODEL_NAME
         )
-        if not latest_record:
-            return False
-        if latest_record.model_version == self.loaded_two_tower_version:
-            return False
+        if latest_two_tower and latest_two_tower.model_version != self.loaded_two_tower_version:
+            await self._try_load_cf_index()
+            updated = updated or self.loaded_two_tower_version == latest_two_tower.model_version
 
-        await self._try_load_cf_index()
-        return self.loaded_two_tower_version == latest_record.model_version
+        if self.config.enable_sasrec:
+            latest_sasrec = await self.artifact_manager.get_latest_model_checkpoint(
+                ModelArtifactManager.SASREC_MODEL_NAME
+            )
+            if latest_sasrec and latest_sasrec.model_version != self.loaded_sasrec_version:
+                await self._try_load_sasrec_artifacts()
+                updated = updated or self.loaded_sasrec_version == latest_sasrec.model_version
+
+        return updated
 
     def _compute_serving_pool_score(
         self,
@@ -801,6 +903,7 @@ class RecommendationEngine:
                 "user_interactions_ms": 0.0,
                 "user_features_ms": 0.0,
                 "cf_candidates_ms": 0.0,
+                "sasrec_candidates_ms": 0.0,
                 "content_candidates_ms": 0.0,
                 "trending_candidates_ms": 0.0,
                 "category_pool_ms": 0.0,
@@ -879,6 +982,16 @@ class RecommendationEngine:
                     user_features=user_features_dict,
                 )
 
+            async def fetch_sasrec_candidates() -> List[CandidateProduct]:
+                if not self.config.enable_sasrec or not self.sasrec_engine.is_trained:
+                    return []
+                return await self.sasrec_engine.get_candidates(
+                    user_interactions,
+                    k=min(target_candidates, self.config.max_live_sasrec_candidates),
+                    exclude_items=exclude_items,
+                    catalog_product_ids=self.vector_search.product_metadata.keys(),
+                )
+
             async def fetch_content_candidates() -> List[CandidateProduct]:
                 if not content_features or not content_features.visual_embedding:
                     return []
@@ -927,6 +1040,10 @@ class RecommendationEngine:
                 timed_stage("cf_candidates_ms", fetch_cf_candidates(), [], source_timeout_ms),
                 name="candidate-source-cf",
             )
+            sasrec_task = asyncio.create_task(
+                timed_stage("sasrec_candidates_ms", fetch_sasrec_candidates(), [], source_timeout_ms),
+                name="candidate-source-sasrec",
+            )
             content_task = asyncio.create_task(
                 timed_stage("content_candidates_ms", fetch_content_candidates(), [], source_timeout_ms),
                 name="candidate-source-content",
@@ -940,13 +1057,17 @@ class RecommendationEngine:
                 name="candidate-source-category",
             )
 
-            cf_candidates, content_candidates, trending_candidates, category_candidates = (
-                await asyncio.gather(cf_task, content_task, trending_task, category_task)
+            cf_candidates, sasrec_candidates, content_candidates, trending_candidates, category_candidates = (
+                await asyncio.gather(cf_task, sasrec_task, content_task, trending_task, category_task)
             )
 
             for candidate in cf_candidates:
                 self._merge_candidate(all_candidates, candidate)
             profile["source_counts"]["cf"] = len(cf_candidates)
+
+            for candidate in sasrec_candidates:
+                self._merge_candidate(all_candidates, candidate)
+            profile["source_counts"]["sasrec"] = len(sasrec_candidates)
 
             for candidate in content_candidates:
                 self._merge_candidate(all_candidates, candidate)
@@ -1032,6 +1153,7 @@ class RecommendationEngine:
                     "user_interactions_ms": 0.0,
                     "user_features_ms": 0.0,
                     "cf_candidates_ms": 0.0,
+                    "sasrec_candidates_ms": 0.0,
                     "content_candidates_ms": 0.0,
                     "trending_candidates_ms": 0.0,
                     "category_pool_ms": 0.0,
@@ -1147,6 +1269,9 @@ class RecommendationEngine:
             model_params = sum(
                 p.numel() for p in self.cf_engine.trainer.model.parameters()
             )
+        sasrec_params = 0
+        if self.sasrec_engine.model is not None:
+            sasrec_params = sum(p.numel() for p in self.sasrec_engine.model.parameters())
 
         return {
             "is_initialized": self.is_initialized,
@@ -1158,6 +1283,11 @@ class RecommendationEngine:
             "cf_embedding_dim": self.config.tt_embedding_dim,
             "cf_index_size": self.cf_engine.cf_index.ntotal if self.cf_engine.cf_index else 0,
             "cf_model_parameters": model_params,
+            "sasrec_enabled": self.config.enable_sasrec,
+            "sasrec_trained": self.sasrec_engine.is_trained,
+            "sasrec_model_version": self.sasrec_engine.model_version,
+            "sasrec_items": len(self.sasrec_engine.product_to_id),
+            "sasrec_model_parameters": sasrec_params,
             "trending_products": len(self.trending_engine.trending_scores),
             "config": {
                 "tt_embedding_dim": self.config.tt_embedding_dim,

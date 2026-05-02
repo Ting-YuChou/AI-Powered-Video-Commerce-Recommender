@@ -21,6 +21,7 @@ from recommendation_api import (
     _filter_recommendable_candidates,
     _join_or_create_recommendation_singleflight,
     _resolve_recommendation_singleflight,
+    _serving_version_context,
     _user_feature_cache_token,
 )
 from recommender import TwoTowerRetrievalEngine
@@ -290,6 +291,56 @@ def test_catalog_version_context_uses_vector_search_catalog_token(monkeypatch):
         "last_updated": 100,
         "product_count": 2,
     }
+
+
+def test_serving_version_context_includes_sasrec_versions(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "sasrec.pt"
+    vocab = tmp_path / "sasrec_vocab.json"
+    checkpoint.write_bytes(b"checkpoint")
+    vocab.write_text("{}", encoding="utf-8")
+
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            model_config=SimpleNamespace(ranking_model_path=str(tmp_path / "ranking.pt")),
+            vector_config=SimpleNamespace(index_path=str(tmp_path / "vector.faiss")),
+            recommendation_config=SimpleNamespace(
+                sasrec_checkpoint_path=str(checkpoint),
+                sasrec_vocab_path=str(vocab),
+            ),
+        )
+    )
+
+    monkeypatch.setattr(
+        recommendation_api_module,
+        "recommendation_engine",
+        SimpleNamespace(
+            loaded_two_tower_version="two-tower-1",
+            loaded_sasrec_version="sasrec-1",
+            cf_engine=SimpleNamespace(model_version="two-tower-1"),
+        ),
+    )
+    monkeypatch.setattr(
+        recommendation_api_module,
+        "ranking_model",
+        SimpleNamespace(model_version="ranking-1"),
+    )
+    monkeypatch.setattr(
+        recommendation_api_module,
+        "vector_search",
+        SimpleNamespace(
+            get_catalog_version_context=lambda: {
+                "catalog_version": 1,
+                "last_updated": 1,
+                "product_count": 1,
+            }
+        ),
+    )
+
+    context = _serving_version_context(runtime)
+
+    assert context["sasrec_model"] == "sasrec-1"
+    assert context["sasrec_checkpoint_mtime"] is not None
+    assert context["sasrec_vocab_mtime"] is not None
 
 
 @pytest.mark.asyncio

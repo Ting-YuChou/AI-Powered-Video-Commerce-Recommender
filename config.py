@@ -161,6 +161,10 @@ class RecommendationConfig(BaseSettings):
         40,
         description="Maximum collaborative candidates to fetch live per request",
     )
+    max_live_sasrec_candidates: int = Field(
+        40,
+        description="Maximum SASRec sequential candidates to fetch live per request",
+    )
     max_live_content_candidates: int = Field(
         20,
         description="Maximum content-similar candidates to fetch live per request",
@@ -233,6 +237,22 @@ class RecommendationConfig(BaseSettings):
     
     # CF FAISS index path
     cf_index_path: str = Field("/tmp/cf_vector_index.faiss", description="CF FAISS index file path")
+
+    # SASRec sequential retrieval
+    enable_sasrec: bool = Field(False, description="Enable SASRec sequential candidate source")
+    sasrec_max_sequence_length: int = Field(50, description="Maximum positive user events for SASRec input")
+    sasrec_embedding_dim: int = Field(64, description="SASRec item embedding dimension")
+    sasrec_num_heads: int = Field(2, description="SASRec transformer attention heads")
+    sasrec_num_layers: int = Field(2, description="SASRec transformer encoder layers")
+    sasrec_dropout: float = Field(0.2, description="SASRec transformer dropout")
+    sasrec_batch_size: int = Field(256, description="SASRec training batch size")
+    sasrec_epochs: int = Field(10, description="SASRec training epochs")
+    sasrec_learning_rate: float = Field(0.001, description="SASRec training learning rate")
+    sasrec_min_sequence_length: int = Field(2, description="Minimum positive events required for SASRec training")
+    sasrec_score_weight: float = Field(1.0, description="SASRec score multiplier before candidate merge")
+    sasrec_checkpoint_path: Optional[str] = Field(None, description="SASRec checkpoint local path")
+    sasrec_vocab_path: Optional[str] = Field(None, description="SASRec vocabulary local path")
+    sasrec_metadata_path: Optional[str] = Field(None, description="SASRec metadata local path")
     
     class Config:
         env_prefix = "RECOMMENDATION_"
@@ -812,6 +832,18 @@ class Config:
         ):
             self.recommendation_config.cf_index_path = str(
                 Path(self.model_config.cache_dir) / "cf_vector_index.faiss"
+            )
+        if not self.recommendation_config.sasrec_checkpoint_path:
+            self.recommendation_config.sasrec_checkpoint_path = str(
+                Path(self.model_config.cache_dir) / "sasrec_model.pt"
+            )
+        if not self.recommendation_config.sasrec_vocab_path:
+            self.recommendation_config.sasrec_vocab_path = str(
+                Path(self.model_config.cache_dir) / "sasrec_vocab.json"
+            )
+        if not self.recommendation_config.sasrec_metadata_path:
+            self.recommendation_config.sasrec_metadata_path = str(
+                Path(self.model_config.cache_dir) / "sasrec_metadata.json"
             )
         
         # Set embedding dimension consistency

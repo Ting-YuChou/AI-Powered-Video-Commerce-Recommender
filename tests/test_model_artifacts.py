@@ -151,3 +151,125 @@ def test_sync_latest_two_tower_artifacts_rejects_checksum_mismatch(tmp_path):
 
     assert not (tmp_path / "cache" / "cf_index.pt").exists()
     assert not local_index.exists()
+
+
+def test_persist_sasrec_artifacts_records_manifest(tmp_path):
+    fake_store = FakeSystemStore()
+    checkpoint = tmp_path / "models" / "sasrec.pt"
+    vocab = tmp_path / "models" / "sasrec_vocab.json"
+    metadata = tmp_path / "models" / "sasrec_metadata.json"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"checkpoint")
+    vocab.write_text('{"product_to_id": {}}', encoding="utf-8")
+    metadata.write_text('{"model_version": "sasrec-123"}', encoding="utf-8")
+
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(),
+    )
+
+    record = asyncio.run(
+        manager.persist_sasrec_artifacts(
+            checkpoint_path=str(checkpoint),
+            vocab_path=str(vocab),
+            metadata_path=str(metadata),
+            model_version="sasrec-123",
+            payload={"trigger": "test"},
+        )
+    )
+
+    assert record is not None
+    assert fake_store.recorded[-1]["model_name"] == ModelArtifactManager.SASREC_MODEL_NAME
+    manifest = fake_store.recorded[-1]["payload"]["artifact_manifest"]
+    assert manifest["checkpoint"]["sha256"] == hashlib.sha256(b"checkpoint").hexdigest()
+    assert manifest["vocab"]["local_cache_path"].endswith("sasrec_vocab.json")
+    assert manifest["metadata"]["local_cache_path"].endswith("sasrec_metadata.json")
+
+
+def test_sync_latest_sasrec_artifacts_copies_to_local_cache(tmp_path):
+    fake_store = FakeSystemStore()
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    checkpoint = remote_dir / "sasrec.pt"
+    vocab = remote_dir / "sasrec_vocab.json"
+    metadata = remote_dir / "sasrec_metadata.json"
+    checkpoint.write_bytes(b"checkpoint")
+    vocab.write_text("{}", encoding="utf-8")
+    metadata.write_text("{}", encoding="utf-8")
+
+    fake_store.latest[ModelArtifactManager.SASREC_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.SASREC_MODEL_NAME,
+        "model_version": "sasrec-123",
+        "checkpoint_path": str(checkpoint),
+        "payload": {
+            "vocab_path": str(vocab),
+            "metadata_path": str(metadata),
+        },
+        "created_at": 1.0,
+    }
+
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(),
+    )
+
+    record = asyncio.run(manager.sync_latest_sasrec_artifacts())
+
+    assert record is not None
+    assert (tmp_path / "cache" / "sasrec_model.pt").read_bytes() == b"checkpoint"
+    assert (tmp_path / "cache" / "sasrec_vocab.json").read_text(encoding="utf-8") == "{}"
+    assert (tmp_path / "cache" / "sasrec_metadata.json").read_text(encoding="utf-8") == "{}"
+
+
+def test_sync_latest_sasrec_artifacts_rejects_checksum_mismatch(tmp_path):
+    fake_store = FakeSystemStore()
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    checkpoint = remote_dir / "sasrec.pt"
+    vocab = remote_dir / "sasrec_vocab.json"
+    metadata = remote_dir / "sasrec_metadata.json"
+    checkpoint.write_bytes(b"checkpoint")
+    vocab.write_text("{}", encoding="utf-8")
+    metadata.write_text("{}", encoding="utf-8")
+
+    fake_store.latest[ModelArtifactManager.SASREC_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.SASREC_MODEL_NAME,
+        "model_version": "sasrec-123",
+        "checkpoint_path": str(checkpoint),
+        "payload": {
+            "vocab_path": str(vocab),
+            "metadata_path": str(metadata),
+            "artifact_manifest": {
+                "checkpoint": {"sha256": "bad"},
+                "vocab": {"sha256": hashlib.sha256(b"{}").hexdigest()},
+                "metadata": {"sha256": hashlib.sha256(b"{}").hexdigest()},
+            },
+        },
+        "created_at": 1.0,
+    }
+
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(),
+    )
+
+    try:
+        asyncio.run(manager.sync_latest_sasrec_artifacts())
+    except ValueError as exc:
+        assert "checksum mismatch" in str(exc)
+    else:
+        raise AssertionError("expected checksum mismatch")
+
+    assert not (tmp_path / "cache" / "sasrec_model.pt").exists()
