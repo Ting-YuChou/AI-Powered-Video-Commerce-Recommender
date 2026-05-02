@@ -35,6 +35,8 @@ CREATE INDEX ix_interaction_events_user_id
     ON interaction_events (user_id);
 CREATE INDEX ix_interaction_events_product_id
     ON interaction_events (product_id);
+CREATE INDEX ix_interaction_events_user_sequence
+    ON interaction_events (user_id, occurred_at, event_id);
 
 DO $$
 DECLARE

@@ -115,6 +115,28 @@ def _user_feature_cache_token(user_features: UserFeatures) -> Dict[str, Any]:
     }
 
 
+def _default_user_sequence_token() -> Dict[str, Any]:
+    return {
+        "length": 0,
+        "latest_event_id": None,
+        "latest_occurred_at": 0,
+        "latest_product_id": None,
+        "latest_action": None,
+    }
+
+
+def _build_cache_freshness_context(
+    serving_versions: Dict[str, Any],
+    user_feature_token: Dict[str, Any],
+    user_sequence_token: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "serving_versions": serving_versions,
+        "user_feature_token": user_feature_token,
+        "user_sequence_token": user_sequence_token or _default_user_sequence_token(),
+    }
+
+
 def _serving_version_context(runtime) -> Dict[str, Any]:
     ranking_path = runtime.config.model_config.ranking_model_path
     vector_path = runtime.config.vector_config.index_path
@@ -433,6 +455,7 @@ async def get_recommendations(
         "candidate_cache_lookup_ms": 0.0,
         "content_features_ms": 0.0,
         "user_features_ms": 0.0,
+        "user_sequence_token_ms": 0.0,
         "candidate_generation_ms": 0.0,
         "candidate_cache_write_ms": 0.0,
         "metadata_lookup_ms": 0.0,
@@ -467,16 +490,29 @@ async def get_recommendations(
         if user_features is None:
             user_features = _default_user_features(payload.user_id)
 
+        stage_started = time.perf_counter()
+        user_sequence_token = await _bounded_hot_path_read(
+            runtime,
+            "user_sequence_token",
+            feature_store.get_user_sequence_token(payload.user_id),
+            _default_user_sequence_token(),
+        )
+        profile["user_sequence_token_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+
         serving_versions = _serving_version_context(runtime)
         user_feature_token = _user_feature_cache_token(user_features)
+        freshness_context = _build_cache_freshness_context(
+            serving_versions,
+            user_feature_token,
+            user_sequence_token,
+        )
         cache_key = feature_store.generate_context_hash(
             {
                 **_build_recommendation_cache_context(
                     payload,
                     current_time=start_time,
                 ),
-                "serving_versions": serving_versions,
-                "user_feature_token": user_feature_token,
+                **freshness_context,
             }
         )
         stage_started = time.perf_counter()
@@ -502,7 +538,7 @@ async def get_recommendations(
                     "response_time_ms": int((time.time() - start_time) * 1000),
                     "model_version": "v1.0.0",
                     "cache_hit": True,
-                    "cache_freshness": "model_user_and_catalog_versioned",
+                    "cache_freshness": "model_user_sequence_and_catalog_versioned",
                     "content_processed": payload.content_id is not None,
                     **(
                         {"profile": profile}
@@ -538,7 +574,7 @@ async def get_recommendations(
                     "response_time_ms": int((time.time() - start_time) * 1000),
                     "model_version": "v1.0.0",
                     "cache_hit": False,
-                    "cache_freshness": "model_user_and_catalog_versioned",
+                    "cache_freshness": "model_user_sequence_and_catalog_versioned",
                     "singleflight_joined": True,
                     "content_processed": shared_result.get(
                         "content_processed",
@@ -566,8 +602,7 @@ async def get_recommendations(
         candidate_cache_key = feature_store.generate_context_hash(
             {
                 **_build_candidate_cache_context(payload, k_per_source),
-                "serving_versions": serving_versions,
-                "user_feature_token": user_feature_token,
+                **freshness_context,
             }
         )
         candidate_cache_task = asyncio.create_task(
@@ -799,7 +834,7 @@ async def get_recommendations(
                 "total_candidates": len(candidates),
                 "response_time_ms": int(response_time * 1000),
                 "model_version": "v1.0.0",
-                "cache_freshness": "model_user_and_catalog_versioned",
+                "cache_freshness": "model_user_sequence_and_catalog_versioned",
                 "cache_hit": False,
                 "content_processed": payload.content_id is not None,
                 **(

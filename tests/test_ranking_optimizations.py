@@ -1,3 +1,8 @@
+import asyncio
+import hashlib
+import json
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -7,14 +12,22 @@ import recommendation_api as recommendation_api_module
 from ranking import RankingModel
 import ranking as ranking_module
 from recommendation_api import (
+    _bounded_hot_path_read,
+    _build_cache_freshness_context,
+    _build_candidate_cache_context,
     _build_recommendation_cache_context,
     _catalog_serving_version_context,
+    _default_user_sequence_token,
     _filter_recommendable_candidates,
     _join_or_create_recommendation_singleflight,
     _resolve_recommendation_singleflight,
     _user_feature_cache_token,
 )
 from recommender import TwoTowerRetrievalEngine
+
+
+def _hash_context(context):
+    return hashlib.md5(json.dumps(context, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def test_build_recommendations_constructs_only_top_k_in_score_order():
@@ -136,6 +149,109 @@ def test_recommendation_cache_context_ignores_tracing_fields_but_keeps_model_inp
     assert _build_recommendation_cache_context(base, current_time=3600) != (
         _build_recommendation_cache_context(changed_model_input, current_time=3600)
     )
+
+
+def test_cache_keys_change_when_user_sequence_token_changes():
+    payload = RecommendationRequest(
+        user_id="u1",
+        k=10,
+        context={"device": "mobile", "page": "home"},
+    )
+    serving_versions = {"ranking_model": "ranking-1", "catalog": {"catalog_version": 1}}
+    user_feature_token = {"total_interactions": 2}
+    first_sequence_token = {
+        "length": 1,
+        "latest_event_id": "e1",
+        "latest_occurred_at": 1.0,
+        "latest_product_id": "p1",
+        "latest_action": "view",
+    }
+    second_sequence_token = {
+        **first_sequence_token,
+        "length": 2,
+        "latest_event_id": "e2",
+        "latest_occurred_at": 2.0,
+        "latest_product_id": "p2",
+        "latest_action": "click",
+    }
+
+    recommendation_context = _build_recommendation_cache_context(payload, current_time=3600)
+    first_recommendation_key = _hash_context(
+        {
+            **recommendation_context,
+            **_build_cache_freshness_context(
+                serving_versions,
+                user_feature_token,
+                first_sequence_token,
+            ),
+        }
+    )
+    second_recommendation_key = _hash_context(
+        {
+            **recommendation_context,
+            **_build_cache_freshness_context(
+                serving_versions,
+                user_feature_token,
+                second_sequence_token,
+            ),
+        }
+    )
+    assert first_recommendation_key != second_recommendation_key
+
+    candidate_context = _build_candidate_cache_context(payload, k_per_source=100)
+    first_candidate_key = _hash_context(
+        {
+            **candidate_context,
+            **_build_cache_freshness_context(
+                serving_versions,
+                user_feature_token,
+                first_sequence_token,
+            ),
+        }
+    )
+    second_candidate_key = _hash_context(
+        {
+            **candidate_context,
+            **_build_cache_freshness_context(
+                serving_versions,
+                user_feature_token,
+                second_sequence_token,
+            ),
+        }
+    )
+    assert first_candidate_key != second_candidate_key
+
+
+def test_cache_freshness_context_uses_stable_cold_sequence_token():
+    context = _build_cache_freshness_context(
+        {"ranking_model": "ranking-1"},
+        {"total_interactions": 0},
+        None,
+    )
+
+    assert context["user_sequence_token"] == _default_user_sequence_token()
+
+
+@pytest.mark.asyncio
+async def test_user_sequence_token_timeout_falls_back_without_failing_request():
+    async def slow_read():
+        await asyncio.sleep(0.05)
+        return {"length": 1}
+
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            cache_config=SimpleNamespace(hot_path_read_timeout_ms=1)
+        )
+    )
+
+    result = await _bounded_hot_path_read(
+        runtime,
+        "user_sequence_token",
+        slow_read(),
+        _default_user_sequence_token(),
+    )
+
+    assert result == _default_user_sequence_token()
 
 
 def test_filter_recommendable_candidates_drops_unavailable_inventory():

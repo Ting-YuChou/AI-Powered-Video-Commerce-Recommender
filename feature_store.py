@@ -14,7 +14,7 @@ import asyncio
 import logging
 from typing import Dict, List, Any, Optional, Union, Iterable
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 
 # Local imports
@@ -35,6 +35,14 @@ from cache_codec import (
 from config import RedisConfig, CacheConfig
 
 logger = logging.getLogger(__name__)
+
+POSITIVE_SEQUENCE_ACTIONS = {
+    InteractionType.VIEW.value,
+    InteractionType.CLICK.value,
+    InteractionType.ADD_TO_CART.value,
+    InteractionType.PURCHASE.value,
+}
+
 
 class FeatureStore:
     """
@@ -462,15 +470,25 @@ class FeatureStore:
         user_id: str, 
         product_id: str, 
         action: str, 
-        context: Dict[str, Any] = None
+        context: Dict[str, Any] = None,
+        *,
+        event_id: Optional[str] = None,
+        schema_version: int = 1,
+        occurred_at: Optional[Union[float, datetime]] = None,
+        timestamp: Optional[Union[float, datetime]] = None,
     ):
         """Log recent user interaction for online serving state only."""
         try:
+            event_timestamp = self._coerce_event_timestamp(timestamp, default=time.time())
+            event_occurred_at = self._coerce_event_timestamp(occurred_at, default=event_timestamp)
             interaction_data = {
                 'user_id': user_id,
                 'product_id': product_id,
                 'action': action,
-                'timestamp': time.time(),
+                'timestamp': event_timestamp,
+                'occurred_at': event_occurred_at,
+                'event_id': event_id,
+                'schema_version': schema_version,
                 'context': context or {}
             }
             
@@ -496,18 +514,30 @@ class FeatureStore:
             if not interactions:
                 return
 
-            serialized = [
-                json.dumps(
-                    {
-                        "user_id": user_id,
-                        "product_id": interaction["product_id"],
-                        "action": interaction["action"],
-                        "timestamp": interaction.get("timestamp", time.time()),
-                        "context": interaction.get("context", {}),
-                    }
+            serialized = []
+            for interaction in interactions:
+                event_timestamp = self._coerce_event_timestamp(
+                    interaction.get("timestamp"),
+                    default=time.time(),
                 )
-                for interaction in interactions
-            ]
+                event_occurred_at = self._coerce_event_timestamp(
+                    interaction.get("occurred_at"),
+                    default=event_timestamp,
+                )
+                serialized.append(
+                    json.dumps(
+                        {
+                            "user_id": user_id,
+                            "product_id": interaction["product_id"],
+                            "action": interaction["action"],
+                            "timestamp": event_timestamp,
+                            "occurred_at": event_occurred_at,
+                            "event_id": interaction.get("event_id"),
+                            "schema_version": interaction.get("schema_version", 1),
+                            "context": interaction.get("context", {}),
+                        }
+                    )
+                )
 
             user_key = f"{self.prefixes['user_interactions']}{user_id}"
             pipeline = self._client_for_key_type("user_interactions").pipeline(transaction=False)
@@ -527,9 +557,9 @@ class FeatureStore:
             interactions = []
             for data in interactions_data:
                 try:
-                    interaction = json.loads(data.decode())
+                    interaction = self._loads_redis_json(data)
                     interactions.append(interaction)
-                except:
+                except Exception:
                     continue
             
             return interactions
@@ -537,6 +567,122 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error getting user interactions for {user_id}: {e}")
             return []
+
+    async def get_user_sequence(self, user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Get a positive interaction sequence in oldest-to-newest order."""
+        try:
+            if limit <= 0:
+                return []
+
+            key = f"{self.prefixes['user_interactions']}{user_id}"
+            interactions_data = await self._client_for_key_type("user_interactions").lrange(
+                key,
+                0,
+                limit - 1,
+            )
+
+            sequence: List[Dict[str, Any]] = []
+            for data in interactions_data:
+                try:
+                    interaction = self._loads_redis_json(data)
+                    normalized = self._normalize_sequence_interaction(user_id, interaction)
+                    if normalized is not None:
+                        sequence.append(normalized)
+                except Exception:
+                    continue
+
+            sequence.reverse()
+            return sequence
+        except Exception as e:
+            logger.error(f"Error getting user sequence for {user_id}: {e}")
+            return []
+
+    async def get_user_sequence_token(self, user_id: str, limit: int = 200) -> Dict[str, Any]:
+        """Return a compact freshness token for the user's positive sequence."""
+        try:
+            sequence = await self.get_user_sequence(user_id, limit=limit)
+            if not sequence:
+                return self._empty_user_sequence_token()
+
+            latest = sequence[-1]
+            return {
+                "length": len(sequence),
+                "latest_event_id": latest.get("event_id"),
+                "latest_occurred_at": round(float(latest.get("occurred_at") or 0.0), 6),
+                "latest_product_id": latest.get("product_id"),
+                "latest_action": latest.get("action"),
+            }
+        except Exception as e:
+            logger.error(f"Error getting user sequence token for {user_id}: {e}")
+            return self._empty_user_sequence_token()
+
+    @staticmethod
+    def _empty_user_sequence_token() -> Dict[str, Any]:
+        return {
+            "length": 0,
+            "latest_event_id": None,
+            "latest_occurred_at": 0,
+            "latest_product_id": None,
+            "latest_action": None,
+        }
+
+    @staticmethod
+    def _coerce_event_timestamp(
+        value: Optional[Union[float, int, datetime]],
+        *,
+        default: float,
+    ) -> float:
+        if isinstance(value, datetime):
+            return value.timestamp()
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return parsed.timestamp()
+                except ValueError:
+                    pass
+        return float(default)
+
+    @staticmethod
+    def _loads_redis_json(data: Any) -> Dict[str, Any]:
+        if isinstance(data, bytes):
+            data = data.decode()
+        return json.loads(data)
+
+    def _normalize_sequence_interaction(
+        self,
+        user_id: str,
+        interaction: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        product_id = interaction.get("product_id")
+        action = interaction.get("action")
+        if not product_id or action not in POSITIVE_SEQUENCE_ACTIONS:
+            return None
+
+        timestamp = self._coerce_event_timestamp(
+            interaction.get("timestamp"),
+            default=time.time(),
+        )
+        occurred_at = self._coerce_event_timestamp(
+            interaction.get("occurred_at"),
+            default=timestamp,
+        )
+        return {
+            "user_id": interaction.get("user_id") or user_id,
+            "product_id": product_id,
+            "action": action,
+            "timestamp": timestamp,
+            "occurred_at": occurred_at,
+            "event_id": interaction.get("event_id"),
+            "schema_version": interaction.get("schema_version", 1),
+            "context": interaction.get("context") or {},
+        }
 
     async def apply_user_interaction_batch(
         self,
