@@ -154,20 +154,30 @@ class FakeVectorSearch:
 
 
 class FakeSASRec:
-    is_trained = True
-    model_version = "sasrec-test"
-    product_to_id = {"seq": 1}
-    model = None
-
-    async def get_candidates(self, sequence, *, k, exclude_items, catalog_product_ids):
-        return [
+    def __init__(self, candidates=None):
+        self.is_trained = True
+        self.model_version = "sasrec-test"
+        self.product_to_id = {"seq": 1}
+        self.model = None
+        self.calls = []
+        self.candidates = candidates or [
             CandidateProduct(
                 product_id="seq",
                 collaborative_score=0.9,
                 combined_score=0.9,
                 source="sasrec",
             )
-        ][:k]
+        ]
+
+    async def get_candidates(self, sequence, *, k, exclude_items, catalog_product_ids):
+        self.calls.append(
+            {
+                "sequence": list(sequence),
+                "exclude_items": set(exclude_items),
+                "catalog_product_ids": set(catalog_product_ids),
+            }
+        )
+        return self.candidates[:k]
 
 
 class FailingSASRec(FakeSASRec):
@@ -202,6 +212,70 @@ async def test_generate_candidates_merges_sasrec_source_when_enabled():
 
     assert "sasrec" in {candidate.source for candidate in candidates}
     assert profile["source_counts"]["sasrec"] == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_passes_chronological_positive_sequence_to_sasrec():
+    interactions = [
+        _event("p3", action="purchase", timestamp=3.0),
+        _event("noisy", action="remove_from_cart", timestamp=2.5),
+        _event("p2", action="click", timestamp=2.0),
+        _event("p1", action="view", timestamp=1.0),
+    ]
+    sasrec = FakeSASRec()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=interactions),
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_sasrec=True,
+            candidates_per_source=2,
+            max_total_candidates=10,
+            sasrec_max_sequence_length=10,
+        ),
+    )
+    engine.sasrec_engine = sasrec
+
+    _, profile = await engine.generate_candidates("u1", include_profile=True)
+
+    assert [event["product_id"] for event in sasrec.calls[0]["sequence"]] == ["p1", "p2", "p3"]
+    assert "noisy" not in [event["product_id"] for event in sasrec.calls[0]["sequence"]]
+    assert "noisy" in sasrec.calls[0]["exclude_items"]
+    assert profile["sasrec_sequence_length"] == 3
+
+
+class FakeCFEngine:
+    is_trained = True
+
+    async def get_user_recommendations(self, user_id, k, exclude_items, user_features=None):
+        return [
+            CandidateProduct(
+                product_id="seq",
+                collaborative_score=0.2,
+                combined_score=0.2,
+                source="cf",
+            )
+        ][:k]
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_profiles_sasrec_overlap_after_merge():
+    sasrec = FakeSASRec()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[_event("seen")]),
+        FakeVectorSearch(),
+        RecommendationConfig(enable_sasrec=True, candidates_per_source=2, max_total_candidates=10),
+    )
+    engine.cf_engine = FakeCFEngine()
+    engine.sasrec_engine = sasrec
+
+    candidates, profile = await engine.generate_candidates("u1", include_profile=True)
+
+    seq_candidate = next(candidate for candidate in candidates if candidate.product_id == "seq")
+    assert seq_candidate.source == "cf+sasrec"
+    assert profile["source_counts"]["sasrec"] == 1
+    assert profile["source_overlap_counts"]["sasrec"] == 1
+    assert profile["merged_source_counts"]["cf"] == 1
+    assert profile["merged_source_counts"]["sasrec"] == 1
 
 
 @pytest.mark.asyncio

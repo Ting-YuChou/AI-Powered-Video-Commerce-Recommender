@@ -34,6 +34,13 @@ from sasrec import SASRecCandidateEngine
 
 logger = logging.getLogger(__name__)
 
+POSITIVE_SEQUENCE_ACTIONS = {
+    InteractionType.VIEW.value,
+    InteractionType.CLICK.value,
+    InteractionType.ADD_TO_CART.value,
+    InteractionType.PURCHASE.value,
+}
+
 
 class TwoTowerRetrievalEngine:
     """Two-Tower neural retrieval engine for collaborative filtering.
@@ -827,12 +834,12 @@ class RecommendationEngine:
         self,
         all_candidates: Dict[str, CandidateProduct],
         candidate: CandidateProduct,
-    ):
+    ) -> bool:
         """Merge candidate scores without expanding the candidate set excessively."""
         existing = all_candidates.get(candidate.product_id)
         if existing is None:
             all_candidates[candidate.product_id] = candidate
-            return
+            return False
 
         if candidate.collaborative_score is not None:
             existing.collaborative_score = max(
@@ -851,6 +858,41 @@ class RecommendationEngine:
             )
         if candidate.source not in existing.source.split("+"):
             existing.source = f"{existing.source}+{candidate.source}"
+        return True
+
+    def _build_sasrec_sequence_from_interactions(
+        self,
+        user_interactions: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Normalize Redis newest-first interactions into SASRec chronological positives."""
+        sequence: List[Dict[str, Any]] = []
+        for interaction in reversed(user_interactions):
+            product_id = interaction.get("product_id")
+            action = interaction.get("action")
+            if not product_id or action not in POSITIVE_SEQUENCE_ACTIONS:
+                continue
+            sequence.append(
+                {
+                    "user_id": interaction.get("user_id"),
+                    "product_id": product_id,
+                    "action": action,
+                    "timestamp": interaction.get("timestamp"),
+                    "occurred_at": interaction.get("occurred_at", interaction.get("timestamp")),
+                    "event_id": interaction.get("event_id"),
+                    "schema_version": interaction.get("schema_version", 1),
+                    "context": interaction.get("context") or {},
+                }
+            )
+        return sequence[-self.config.sasrec_max_sequence_length :]
+
+    @staticmethod
+    def _count_source_tokens(candidates: List[CandidateProduct]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for candidate in candidates:
+            for source in str(candidate.source or "unknown").split("+"):
+                source = source or "unknown"
+                counts[source] = counts.get(source, 0) + 1
+        return counts
 
     def _resolve_preferred_categories(
         self,
@@ -913,6 +955,9 @@ class RecommendationEngine:
                 "candidate_count": 0,
                 "preferred_categories": [],
                 "source_counts": {},
+                "source_overlap_counts": {},
+                "merged_source_counts": {},
+                "sasrec_sequence_length": 0,
             }
 
             async def timed_stage(
@@ -964,6 +1009,8 @@ class RecommendationEngine:
                 for interaction in user_interactions
                 if interaction.get("product_id")
             }
+            sasrec_sequence = self._build_sasrec_sequence_from_interactions(user_interactions)
+            profile["sasrec_sequence_length"] = len(sasrec_sequence)
             user_features_dict = user_features_obj.dict() if user_features_obj else {}
             preferred_categories = self._resolve_preferred_categories(user_features_obj, context)
             profile["preferred_categories"] = preferred_categories
@@ -986,7 +1033,7 @@ class RecommendationEngine:
                 if not self.config.enable_sasrec or not self.sasrec_engine.is_trained:
                     return []
                 return await self.sasrec_engine.get_candidates(
-                    user_interactions,
+                    sasrec_sequence,
                     k=min(target_candidates, self.config.max_live_sasrec_candidates),
                     exclude_items=exclude_items,
                     catalog_product_ids=self.vector_search.product_metadata.keys(),
@@ -1061,25 +1108,19 @@ class RecommendationEngine:
                 await asyncio.gather(cf_task, sasrec_task, content_task, trending_task, category_task)
             )
 
-            for candidate in cf_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["cf"] = len(cf_candidates)
+            def merge_source(source_name: str, candidates: List[CandidateProduct]) -> None:
+                overlaps = 0
+                for candidate in candidates:
+                    if self._merge_candidate(all_candidates, candidate):
+                        overlaps += 1
+                profile["source_counts"][source_name] = len(candidates)
+                profile["source_overlap_counts"][source_name] = overlaps
 
-            for candidate in sasrec_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["sasrec"] = len(sasrec_candidates)
-
-            for candidate in content_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["content"] = len(content_candidates)
-
-            for candidate in trending_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["trending_pool"] = len(trending_candidates)
-
-            for candidate in category_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["category_pool"] = len(category_candidates)
+            merge_source("cf", cf_candidates)
+            merge_source("sasrec", sasrec_candidates)
+            merge_source("content", content_candidates)
+            merge_source("trending_pool", trending_candidates)
+            merge_source("category_pool", category_candidates)
 
             # 5. Small random fallback only if stronger sources are still thin
             stage_started = time.perf_counter()
@@ -1107,7 +1148,12 @@ class RecommendationEngine:
                         and candidate.product_id not in all_candidates
                     ):
                         all_candidates[candidate.product_id] = candidate
+                    elif candidate.product_id in all_candidates:
+                        profile["source_overlap_counts"]["random"] = (
+                            profile["source_overlap_counts"].get("random", 0) + 1
+                        )
                 profile["source_counts"]["random"] = len(random_candidates)
+                profile["source_overlap_counts"].setdefault("random", 0)
             elif profile["random_candidates_ms"] == 0.0:
                 profile["random_candidates_ms"] = round(
                     (time.perf_counter() - stage_started) * 1000,
@@ -1116,6 +1162,7 @@ class RecommendationEngine:
 
             # Combine scores for final ranking
             stage_started = time.perf_counter()
+            profile["merged_source_counts"] = self._count_source_tokens(list(all_candidates.values()))
             final_candidates: List[CandidateProduct] = []
             for candidate in all_candidates.values():
                 cf_score = candidate.collaborative_score or 0.0
@@ -1163,6 +1210,9 @@ class RecommendationEngine:
                     "candidate_count": 0,
                     "preferred_categories": [],
                     "source_counts": {},
+                    "source_overlap_counts": {},
+                    "merged_source_counts": {},
+                    "sasrec_sequence_length": 0,
                     "error": str(e),
                 }
             return []

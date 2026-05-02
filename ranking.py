@@ -32,6 +32,9 @@ from config import RankingConfig
 
 logger = logging.getLogger(__name__)
 
+RANKING_FEATURE_SCHEMA_VERSION = "ranking_v1_28"
+RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
+
 try:
     if hasattr(torch.backends, "mkldnn"):
         torch.backends.mkldnn.enabled = False
@@ -312,6 +315,8 @@ class RankingModel:
         self.is_trained = False
         self.model_version = "1.0.0"
         self.last_training_time = 0
+        self.feature_schema_version = RANKING_FEATURE_SCHEMA_VERSION
+        self.training_data_source = RANKING_TRAINING_DATA_SOURCE
         
         # Performance tracking
         self.training_history = []
@@ -846,12 +851,20 @@ class RankingModel:
         
         return f"Based on your preferences - {explanations[0]}"
     
-    async def train_model(self, training_data: List[Dict[str, Any]]):
+    async def train_model(
+        self,
+        training_data: List[Dict[str, Any]],
+        *,
+        user_features_map: Optional[Dict[str, Any]] = None,
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         """Train the ranking model on user interaction data."""
         try:
             saved_model_path = await asyncio.to_thread(
                 self._train_model_sync,
                 training_data,
+                user_features_map or {},
+                product_metadata_map or {},
             )
             if saved_model_path:
                 await self.save_model(saved_model_path)
@@ -859,7 +872,12 @@ class RankingModel:
         except Exception as e:
             logger.error(f"Error training model: {e}")
 
-    def _train_model_sync(self, training_data: List[Dict[str, Any]]) -> Optional[str]:
+    def _train_model_sync(
+        self,
+        training_data: List[Dict[str, Any]],
+        user_features_map: Optional[Dict[str, Any]] = None,
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Optional[str]:
         if not self.model or len(training_data) < self.config.training_min_samples:
             logger.warning("Insufficient data or model not loaded for training")
             return None
@@ -867,7 +885,11 @@ class RankingModel:
         logger.info(f"Training ranking model on {len(training_data)} samples")
 
         # Prepare training data
-        features, labels = self._prepare_training_data(training_data)
+        features, labels = self._prepare_training_data(
+            training_data,
+            user_features_map=user_features_map,
+            product_metadata_map=product_metadata_map,
+        )
 
         if features.size(0) == 0:
             logger.warning("No valid training samples prepared")
@@ -913,17 +935,47 @@ class RankingModel:
         logger.info("Model training completed")
         return self.loaded_model_path
     
-    def _prepare_training_data(self, training_data: List[Dict[str, Any]]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def _prepare_training_data(
+        self,
+        training_data: List[Dict[str, Any]],
+        *,
+        user_features_map: Optional[Dict[str, Any]] = None,
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Prepare training data from interaction logs."""
         try:
+            user_features_map = user_features_map or {}
+            product_metadata_map = product_metadata_map or {}
             features = []
             ctr_labels = []
             cvr_labels = []
             gmv_labels = []
             
             for sample in training_data:
-                # Extract features (simplified - would use actual user/product data)
-                feature_vector = np.random.normal(0, 1, self.feature_extractor.total_feature_dim)
+                product_id = sample.get("product_id")
+                if not product_id:
+                    continue
+
+                user_features = self._training_user_features(sample, user_features_map)
+                product_metadata = self._training_product_metadata(sample, product_metadata_map)
+                context = dict(sample.get("context") or {})
+                candidate = self._training_candidate(sample)
+                feature_vector = self.feature_extractor.create_ranking_features(
+                    user_features,
+                    product_metadata,
+                    context,
+                    candidate,
+                )
+                feature_vector = np.asarray(feature_vector, dtype=np.float32)
+                if feature_vector.shape != (self.feature_extractor.total_feature_dim,):
+                    logger.warning(
+                        "Skipping ranking training sample with invalid feature shape",
+                        extra={
+                            "product_id": product_id,
+                            "shape": feature_vector.shape,
+                        },
+                    )
+                    continue
                 features.append(feature_vector)
                 
                 # Create labels based on interaction type
@@ -938,7 +990,7 @@ class RankingModel:
                 cvr_labels.append(cvr_label)
                 
                 # GMV label (purchase value)
-                gmv_value = sample.get('value', 0.0) if action == 'purchase' else 0.0
+                gmv_value = self._training_gmv_label(sample, product_metadata, action)
                 gmv_labels.append(gmv_value)
             
             if not features:
@@ -956,6 +1008,141 @@ class RankingModel:
         except Exception as e:
             logger.error(f"Error preparing training data: {e}")
             return torch.empty(0), {}
+
+    def _training_user_features(
+        self,
+        sample: Dict[str, Any],
+        user_features_map: Dict[str, Any],
+    ) -> UserFeatures:
+        user_id = str(sample.get("user_id") or "unknown")
+        raw_features = user_features_map.get(user_id)
+        if isinstance(raw_features, UserFeatures):
+            return raw_features
+        if isinstance(raw_features, dict):
+            payload = dict(raw_features)
+            payload.setdefault("user_id", user_id)
+            try:
+                return UserFeatures(**payload)
+            except Exception as exc:
+                logger.warning("Invalid user features for ranking training: %s", exc)
+        return UserFeatures(user_id=user_id)
+
+    def _training_product_metadata(
+        self,
+        sample: Dict[str, Any],
+        product_metadata_map: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        product_id = str(sample.get("product_id") or "")
+        context = sample.get("context") or {}
+        metadata = dict(product_metadata_map.get(product_id) or {})
+        embedded_metadata = sample.get("product_metadata") or context.get("product_metadata")
+        if isinstance(embedded_metadata, dict):
+            metadata.update(embedded_metadata)
+
+        if "category" not in metadata:
+            metadata["category"] = (
+                context.get("product_category")
+                or context.get("category")
+                or "General"
+            )
+        if "price" not in metadata:
+            metadata["price"] = self._first_float(
+                sample.get("price"),
+                context.get("price"),
+                default=1.0,
+            )
+        metadata.setdefault("rating", 3.0)
+        metadata.setdefault("num_reviews", 1)
+        metadata.setdefault("in_stock", True)
+        metadata.setdefault("created_at", sample.get("occurred_at") or sample.get("timestamp") or time.time())
+        metadata.setdefault("tags", [])
+        metadata.setdefault("brand", context.get("brand", "Unknown"))
+        return metadata
+
+    def _training_candidate(self, sample: Dict[str, Any]) -> CandidateProduct:
+        product_id = str(sample.get("product_id") or "")
+        context = sample.get("context") or {}
+        candidate_payload = sample.get("candidate") or sample.get("candidate_product")
+        if isinstance(candidate_payload, CandidateProduct):
+            return candidate_payload
+        if isinstance(candidate_payload, dict):
+            payload = dict(candidate_payload)
+            payload.setdefault("product_id", product_id)
+            payload.setdefault("source", "training_interaction")
+            try:
+                return CandidateProduct(**payload)
+            except Exception as exc:
+                logger.warning("Invalid candidate payload for ranking training: %s", exc)
+
+        candidate_scores = sample.get("candidate_scores") or context.get("candidate_scores") or {}
+        if not isinstance(candidate_scores, dict):
+            candidate_scores = {}
+        collaborative_score = self._optional_float(
+            sample.get("collaborative_score"),
+            candidate_scores.get("collaborative_score"),
+            candidate_scores.get("cf_score"),
+        )
+        content_score = self._optional_float(
+            sample.get("content_similarity_score"),
+            candidate_scores.get("content_similarity_score"),
+            candidate_scores.get("content_score"),
+        )
+        popularity_score = self._optional_float(
+            sample.get("popularity_score"),
+            candidate_scores.get("popularity_score"),
+        )
+        combined_score = self._first_float(
+            sample.get("combined_score"),
+            candidate_scores.get("combined_score"),
+            default=0.0,
+        )
+        return CandidateProduct(
+            product_id=product_id,
+            collaborative_score=collaborative_score,
+            content_similarity_score=content_score,
+            popularity_score=popularity_score,
+            combined_score=combined_score,
+            source=str(sample.get("source") or context.get("candidate_source") or "training_interaction"),
+        )
+
+    def _training_gmv_label(
+        self,
+        sample: Dict[str, Any],
+        product_metadata: Dict[str, Any],
+        action: str,
+    ) -> float:
+        if action != "purchase":
+            return 0.0
+        context = sample.get("context") or {}
+        return max(
+            0.0,
+            self._first_float(
+                sample.get("value"),
+                sample.get("gmv"),
+                sample.get("purchase_value"),
+                context.get("value"),
+                context.get("gmv"),
+                context.get("purchase_value"),
+                product_metadata.get("price"),
+                default=0.0,
+            ),
+        )
+
+    @staticmethod
+    def _optional_float(*values: Any) -> Optional[float]:
+        for value in values:
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def _first_float(cls, *values: Any, default: float) -> float:
+        value = cls._optional_float(*values)
+        return float(default if value is None else value)
     
     def _compute_loss(self, predictions: Dict[str, torch.Tensor], labels: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Compute multi-objective loss."""

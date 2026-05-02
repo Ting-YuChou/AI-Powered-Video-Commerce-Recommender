@@ -7,9 +7,14 @@ import numpy as np
 import pytest
 
 from config import RankingConfig, RecommendationConfig
-from models import CandidateProduct, RecommendationRequest, UserFeatures
+from models import CandidateProduct, ProductRecommendation, RecommendationRequest, UserFeatures
+from model_trainer import ModelTrainerService
 import recommendation_api as recommendation_api_module
-from ranking import RankingModel
+from ranking import (
+    RANKING_FEATURE_SCHEMA_VERSION,
+    RANKING_TRAINING_DATA_SOURCE,
+    RankingModel,
+)
 import ranking as ranking_module
 from recommendation_api import (
     _bounded_hot_path_read,
@@ -17,6 +22,8 @@ from recommendation_api import (
     _build_candidate_cache_context,
     _build_recommendation_cache_context,
     _catalog_serving_version_context,
+    _count_candidate_source_tokens,
+    _count_ranked_source_tokens,
     _default_user_sequence_token,
     _filter_recommendable_candidates,
     _join_or_create_recommendation_singleflight,
@@ -109,6 +116,237 @@ def test_prepare_request_matrix_reuses_static_product_features_without_changing_
     assert len(ranking._product_feature_cache) == 1
     np.testing.assert_allclose(matrix[0], expected)
     np.testing.assert_allclose(matrix[1], expected)
+
+
+def test_sasrec_candidate_keeps_existing_ranking_feature_dimension():
+    ranking = RankingModel(RankingConfig())
+    candidate = CandidateProduct(
+        product_id="seq",
+        collaborative_score=0.8,
+        combined_score=0.32,
+        source="sasrec",
+    )
+
+    candidate_features = ranking.feature_extractor.extract_candidate_features(candidate)
+
+    assert ranking.feature_extractor.candidate_feature_dim == 4
+    assert ranking.feature_extractor.total_feature_dim == 28
+    assert candidate_features.shape == (4,)
+    assert candidate_features.tolist() == [0.8, 0.0, 0.0, 0.32]
+
+
+def test_candidate_cache_schema_round_trips_merged_sasrec_source():
+    candidate = CandidateProduct(
+        product_id="seq",
+        collaborative_score=0.9,
+        combined_score=0.36,
+        source="cf+sasrec",
+    )
+
+    restored = CandidateProduct(**candidate.dict())
+
+    assert restored.source == "cf+sasrec"
+    assert restored.collaborative_score == 0.9
+
+
+def test_source_count_helpers_track_ranked_sasrec_coverage():
+    candidates = [
+        CandidateProduct(product_id="seq", source="cf+sasrec", collaborative_score=0.9),
+        CandidateProduct(product_id="trend", source="trending_pool", popularity_score=0.5),
+    ]
+    ranked = [
+        ProductRecommendation(
+            product_id="seq",
+            title="Sequential product",
+            price=10.0,
+            confidence_score=0.8,
+            ranking_score=0.7,
+        )
+    ]
+
+    assert _count_candidate_source_tokens(candidates) == {
+        "cf": 1,
+        "sasrec": 1,
+        "trending_pool": 1,
+    }
+    assert _count_ranked_source_tokens(
+        ranked,
+        {candidate.product_id: candidate.source for candidate in candidates},
+    ) == {"cf": 1, "sasrec": 1}
+
+
+def test_prepare_training_data_uses_online_equivalent_feature_extractor(monkeypatch):
+    fixed_now = 1_700_000_000.0
+    monkeypatch.setattr(ranking_module.time, "time", lambda: fixed_now)
+    ranking = RankingModel(RankingConfig())
+    user_features = UserFeatures(
+        user_id="u1",
+        total_interactions=12,
+        avg_session_length=180.0,
+        preferred_categories=["cat"],
+        last_active=fixed_now - 30,
+    )
+    product_metadata = {
+        "price": 42.0,
+        "rating": 4.5,
+        "num_reviews": 15,
+        "in_stock": True,
+        "created_at": fixed_now - 86400,
+        "tags": ["video"],
+        "brand": "brand",
+        "category": "cat",
+    }
+    sample = {
+        "user_id": "u1",
+        "product_id": "p1",
+        "action": "click",
+        "context": {"device": "mobile", "session_position": 2, "time_on_page": 30},
+        "collaborative_score": 0.2,
+        "content_similarity_score": 0.3,
+        "popularity_score": 0.4,
+        "combined_score": 0.5,
+        "source": "cf",
+    }
+
+    features, labels = ranking._prepare_training_data(
+        [sample],
+        user_features_map={"u1": user_features.dict()},
+        product_metadata_map={"p1": product_metadata},
+    )
+    expected = ranking.feature_extractor.create_ranking_features(
+        user_features,
+        product_metadata,
+        sample["context"],
+        CandidateProduct(
+            product_id="p1",
+            collaborative_score=0.2,
+            content_similarity_score=0.3,
+            popularity_score=0.4,
+            combined_score=0.5,
+            source="cf",
+        ),
+    )
+
+    np.testing.assert_allclose(features.cpu().numpy()[0], expected)
+    assert labels["ctr"].item() == 1.0
+    assert labels["cvr"].item() == 0.0
+
+
+def test_prepare_training_data_does_not_use_random_vectors(monkeypatch):
+    def fail_random(*args, **kwargs):
+        raise AssertionError("random feature generation should not be used")
+
+    monkeypatch.setattr(ranking_module.np.random, "normal", fail_random)
+    ranking = RankingModel(RankingConfig())
+
+    features, labels = ranking._prepare_training_data(
+        [
+            {
+                "user_id": "u1",
+                "product_id": "p1",
+                "action": "view",
+                "context": {},
+            }
+        ],
+        user_features_map={},
+        product_metadata_map={"p1": {"price": 10.0}},
+    )
+
+    assert features.shape == (1, ranking.feature_extractor.total_feature_dim)
+    assert labels["ctr"].item() == 0.0
+
+
+def test_prepare_training_data_labels_actions_and_gmv_sources():
+    ranking = RankingModel(RankingConfig())
+    samples = [
+        {"user_id": "u1", "product_id": "p1", "action": "view", "context": {}},
+        {"user_id": "u1", "product_id": "p2", "action": "click", "context": {}},
+        {"user_id": "u1", "product_id": "p3", "action": "add_to_cart", "context": {}},
+        {
+            "user_id": "u1",
+            "product_id": "p4",
+            "action": "purchase",
+            "context": {"purchase_value": 99.0},
+        },
+        {"user_id": "u1", "product_id": "p5", "action": "purchase", "context": {}},
+    ]
+
+    _, labels = ranking._prepare_training_data(
+        samples,
+        product_metadata_map={"p5": {"price": 25.0}},
+    )
+
+    assert labels["ctr"].squeeze(1).tolist() == [0.0, 1.0, 1.0, 1.0, 1.0]
+    assert labels["cvr"].squeeze(1).tolist() == [0.0, 0.0, 0.0, 1.0, 1.0]
+    assert labels["gmv"].squeeze(1).tolist() == [0.0, 0.0, 0.0, 99.0, 25.0]
+
+
+class FakeTrainerFeatureStore:
+    async def get_all_user_features_map(self):
+        return {"u1": {"user_id": "u1", "total_interactions": 7}}
+
+
+class FakeTrainerSystemStore:
+    async def get_training_interactions(self, limit=50000):
+        return [{"user_id": "u1", "product_id": "p1", "action": "click", "context": {}}]
+
+
+class FakeTrainerRankingModel:
+    def __init__(self):
+        self.is_trained = True
+        self.loaded_model_path = "/tmp/ranking.pt"
+        self.model_version = "ranking-test"
+        self.last_training_time = 123.0
+        self.feature_schema_version = RANKING_FEATURE_SCHEMA_VERSION
+        self.training_data_source = RANKING_TRAINING_DATA_SOURCE
+        self.received = None
+
+    async def train_model(self, training_data, *, user_features_map=None, product_metadata_map=None):
+        self.received = {
+            "training_data": training_data,
+            "user_features_map": user_features_map,
+            "product_metadata_map": product_metadata_map,
+        }
+
+
+class FakeTrainerArtifactManager:
+    def __init__(self):
+        self.payload = None
+
+    async def persist_ranking_checkpoint(self, *, local_path, model_version, payload=None):
+        self.payload = payload
+        return SimpleNamespace(model_version=model_version)
+
+
+class FakeTrainerObservability:
+    def __init__(self):
+        self.runs = []
+
+    def record_training_run(self, trigger, status, duration):
+        self.runs.append((trigger, status, duration))
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_passes_real_feature_context_and_checkpoint_metadata():
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(enable_periodic_training=True, training_min_samples=1),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = FakeTrainerFeatureStore()
+    service.system_store = FakeTrainerSystemStore()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.vector_search = SimpleNamespace(product_metadata={"p1": {"price": 12.0}})
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="test")
+
+    assert service.ranking_model.received["user_features_map"]["u1"]["total_interactions"] == 7
+    assert service.ranking_model.received["product_metadata_map"]["p1"]["price"] == 12.0
+    assert service.artifact_manager.payload["feature_schema_version"] == RANKING_FEATURE_SCHEMA_VERSION
+    assert service.artifact_manager.payload["training_data_source"] == RANKING_TRAINING_DATA_SOURCE
+    assert service.observability.runs[-1][1] == "success"
 
 
 def test_user_feature_cache_token_changes_when_personalization_changes():

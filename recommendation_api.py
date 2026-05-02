@@ -268,6 +268,29 @@ def _filter_recommendable_candidates(
     ]
 
 
+def _count_candidate_source_tokens(candidates: List[Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for candidate in candidates:
+        for source in str(getattr(candidate, "source", None) or "unknown").split("+"):
+            source = source or "unknown"
+            counts[source] = counts.get(source, 0) + 1
+    return counts
+
+
+def _count_ranked_source_tokens(
+    recommendations: List[Any],
+    candidate_source_by_product: Dict[str, str],
+) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for recommendation in recommendations:
+        product_id = getattr(recommendation, "product_id", None)
+        source_value = candidate_source_by_product.get(product_id, "unknown")
+        for source in str(source_value or "unknown").split("+"):
+            source = source or "unknown"
+            counts[source] = counts.get(source, 0) + 1
+    return counts
+
+
 @app.on_event("startup")
 async def startup_event():
     global feature_store, vector_search, recommendation_engine, ranking_model, ranking_batcher, kafka_manager
@@ -475,6 +498,10 @@ async def get_recommendations(
         "total_ms": 0.0,
         "candidate_count": 0,
         "ranked_count": 0,
+        "candidate_source_counts": {},
+        "candidate_source_counts_before_filter": {},
+        "ranked_source_counts": {},
+        "ranked_sasrec_count": 0,
         "cache_hit": False,
         "candidate_cache_hit": False,
         "metadata_cache_miss_count": 0,
@@ -730,7 +757,13 @@ async def get_recommendations(
             profile["metadata_cache_miss_count"] = len(missing_product_ids) - len(fetched_metadata)
         profile["metadata_lookup_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
         ranked_candidate_count = len(candidates)
+        profile["candidate_source_counts_before_filter"] = _count_candidate_source_tokens(candidates)
         candidates = _filter_recommendable_candidates(candidates, product_metadata_map)
+        candidate_source_by_product = {
+            candidate.product_id: candidate.source
+            for candidate in candidates
+        }
+        profile["candidate_source_counts"] = _count_candidate_source_tokens(candidates)
         profile["candidate_count_before_eligibility_filter"] = ranked_candidate_count
         profile["candidate_count"] = len(candidates)
         profile["filtered_unavailable_candidates"] = ranked_candidate_count - len(candidates)
@@ -778,6 +811,12 @@ async def get_recommendations(
         profile["ranking_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
         profile["ranked_count"] = len(ranked_recommendations)
         profile["ranking_profile"] = ranking_profile
+        ranked_source_counts = _count_ranked_source_tokens(
+            ranked_recommendations,
+            candidate_source_by_product,
+        )
+        profile["ranked_source_counts"] = ranked_source_counts
+        profile["ranked_sasrec_count"] = ranked_source_counts.get("sasrec", 0)
         response_time = time.time() - start_time
 
         stage_started = time.perf_counter()
@@ -817,6 +856,8 @@ async def get_recommendations(
                     metadata={
                         "content_id": payload.content_id,
                         "candidate_count": len(candidates),
+                        "candidate_source_counts": profile.get("candidate_source_counts", {}),
+                        "ranked_source_counts": profile.get("ranked_source_counts", {}),
                     },
                 ),
                 timeout_seconds=runtime.config.cache_config.background_write_timeout_ms / 1000.0,
