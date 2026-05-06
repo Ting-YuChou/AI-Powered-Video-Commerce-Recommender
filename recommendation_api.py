@@ -35,6 +35,7 @@ from service_common import (
     create_service_app,
     require_internal_service_auth,
 )
+from slate_diversity import select_mmr_recommendations
 from system_store import SystemStore
 from vector_search import VectorSearchEngine
 
@@ -82,6 +83,7 @@ def _build_recommendation_cache_context(
     payload: RecommendationRequest,
     *,
     current_time: Optional[float] = None,
+    recommendation_config: Optional[Any] = None,
 ) -> dict:
     """Build an exact-enough cache context from fields used by serving logic."""
     context = payload.context or {}
@@ -93,7 +95,44 @@ def _build_recommendation_cache_context(
         "session_position": context.get("session_position", 1),
         "time_on_page": context.get("time_on_page", 0),
         "ranking_time_hour": int(current_time // 3600),
+        "slate_diversity": _build_slate_diversity_cache_context(recommendation_config),
     }
+
+
+def _build_slate_diversity_cache_context(recommendation_config: Optional[Any]) -> Dict[str, Any]:
+    if not _is_mmr_slate_diversity_enabled(recommendation_config):
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "method": "mmr",
+        "lambda": round(float(getattr(recommendation_config, "mmr_lambda", 0.8)), 6),
+        "pool_multiplier": int(getattr(recommendation_config, "mmr_rerank_pool_multiplier", 5)),
+        "min_pool_size": int(getattr(recommendation_config, "mmr_min_rerank_pool_size", 50)),
+        "max_pool_size": int(getattr(recommendation_config, "mmr_max_rerank_pool_size", 100)),
+    }
+
+
+def _is_mmr_slate_diversity_enabled(recommendation_config: Optional[Any]) -> bool:
+    if recommendation_config is None:
+        return False
+    method = str(getattr(recommendation_config, "slate_diversity_method", "mmr") or "").lower()
+    return bool(getattr(recommendation_config, "enable_slate_diversity", False)) and method == "mmr"
+
+
+def _calculate_mmr_rerank_pool_size(
+    *,
+    requested_k: int,
+    candidate_count: int,
+    recommendation_config: Any,
+) -> int:
+    multiplier = max(1, int(getattr(recommendation_config, "mmr_rerank_pool_multiplier", 5)))
+    min_pool_size = max(1, int(getattr(recommendation_config, "mmr_min_rerank_pool_size", 50)))
+    max_pool_size = max(
+        min_pool_size,
+        int(getattr(recommendation_config, "mmr_max_rerank_pool_size", 100)),
+    )
+    desired_pool_size = max(requested_k * multiplier, min_pool_size)
+    return min(desired_pool_size, max_pool_size, candidate_count)
 
 
 def _user_feature_cache_token(user_features: UserFeatures) -> Dict[str, Any]:
@@ -492,6 +531,17 @@ async def get_recommendations(
         "candidate_cache_write_ms": 0.0,
         "metadata_lookup_ms": 0.0,
         "ranking_ms": 0.0,
+        "slate_diversity_enabled": _is_mmr_slate_diversity_enabled(
+            runtime.config.recommendation_config
+        ),
+        "slate_diversity_method": getattr(
+            runtime.config.recommendation_config,
+            "slate_diversity_method",
+            "mmr",
+        ),
+        "slate_diversity_ms": 0.0,
+        "slate_diversity_pool_size": 0,
+        "slate_diversity_selected_count": 0,
         "cache_write_ms": 0.0,
         "analytics_log_ms": 0.0,
         "kafka_schedule_ms": 0.0,
@@ -547,6 +597,7 @@ async def get_recommendations(
                 **_build_recommendation_cache_context(
                     payload,
                     current_time=start_time,
+                    recommendation_config=runtime.config.recommendation_config,
                 ),
                 **freshness_context,
             }
@@ -799,18 +850,44 @@ async def get_recommendations(
                 },
             )
 
+        slate_diversity_enabled = _is_mmr_slate_diversity_enabled(
+            runtime.config.recommendation_config
+        )
+        ranker_k = payload.k
+        if slate_diversity_enabled:
+            ranker_k = _calculate_mmr_rerank_pool_size(
+                requested_k=payload.k,
+                candidate_count=len(candidates),
+                recommendation_config=runtime.config.recommendation_config,
+            )
+
         stage_started = time.perf_counter()
         ranked_recommendations, ranking_profile = await ranking_batcher.rank_candidates(
             candidates=candidates,
             user_features=user_features,
             context=payload.context,
             product_metadata_map=product_metadata_map,
-            k=payload.k,
+            k=ranker_k,
             include_profile=True,
         )
         profile["ranking_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-        profile["ranked_count"] = len(ranked_recommendations)
         profile["ranking_profile"] = ranking_profile
+        profile["slate_diversity_pool_size"] = len(ranked_recommendations)
+
+        if slate_diversity_enabled:
+            stage_started = time.perf_counter()
+            ranked_recommendations = select_mmr_recommendations(
+                ranked_recommendations,
+                k=payload.k,
+                embedding_lookup=vector_search.get_product_embedding,
+                lambda_weight=runtime.config.recommendation_config.mmr_lambda,
+            )
+            profile["slate_diversity_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000,
+                2,
+            )
+        profile["ranked_count"] = len(ranked_recommendations)
+        profile["slate_diversity_selected_count"] = len(ranked_recommendations)
         ranked_source_counts = _count_ranked_source_tokens(
             ranked_recommendations,
             candidate_source_by_product,

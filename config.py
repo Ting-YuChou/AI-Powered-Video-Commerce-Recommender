@@ -219,6 +219,30 @@ class RecommendationConfig(BaseSettings):
     enable_diversity: bool = Field(True, description="Enable recommendation diversity")
     diversity_factor: float = Field(0.1, description="Diversity vs relevance trade-off")
     max_items_per_category: int = Field(3, description="Max recommendations per category")
+    enable_slate_diversity: bool = Field(
+        False,
+        description="Enable post-ranker slate diversity reranking",
+    )
+    slate_diversity_method: str = Field(
+        "mmr",
+        description="Post-ranker slate diversity method",
+    )
+    mmr_lambda: float = Field(
+        0.8,
+        description="MMR relevance weight; lower values increase diversity pressure",
+    )
+    mmr_rerank_pool_multiplier: int = Field(
+        5,
+        description="Ranker pool multiplier used before MMR selection",
+    )
+    mmr_min_rerank_pool_size: int = Field(
+        50,
+        description="Minimum ranker pool size before MMR selection",
+    )
+    mmr_max_rerank_pool_size: int = Field(
+        100,
+        description="Maximum ranker pool size before MMR selection",
+    )
     
     # Two-Tower model settings
     tt_embedding_dim: int = Field(128, description="Two-Tower output embedding dimension")
@@ -270,6 +294,31 @@ class RecommendationConfig(BaseSettings):
     def validate_tt_cross_layers(cls, value: int) -> int:
         if value < 0:
             raise ValueError("tt_cross_layers must be >= 0")
+        return value
+
+    @validator("slate_diversity_method")
+    def validate_slate_diversity_method(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized != "mmr":
+            raise ValueError("slate_diversity_method must be: mmr")
+        return normalized
+
+    @validator("mmr_lambda")
+    def validate_mmr_lambda(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("mmr_lambda must be between 0 and 1")
+        return value
+
+    @validator("mmr_rerank_pool_multiplier")
+    def validate_mmr_rerank_pool_multiplier(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("mmr_rerank_pool_multiplier must be >= 1")
+        return value
+
+    @validator("mmr_min_rerank_pool_size", "mmr_max_rerank_pool_size")
+    def validate_mmr_rerank_pool_size(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("MMR rerank pool sizes must be >= 1")
         return value
     
     class Config:
