@@ -35,6 +35,7 @@ from service_common import (
     create_service_app,
     require_internal_service_auth,
 )
+from slate_diversity import select_mmr_recommendations
 from system_store import SystemStore
 from vector_search import VectorSearchEngine
 
@@ -82,6 +83,7 @@ def _build_recommendation_cache_context(
     payload: RecommendationRequest,
     *,
     current_time: Optional[float] = None,
+    recommendation_config: Optional[Any] = None,
 ) -> dict:
     """Build an exact-enough cache context from fields used by serving logic."""
     context = payload.context or {}
@@ -93,7 +95,44 @@ def _build_recommendation_cache_context(
         "session_position": context.get("session_position", 1),
         "time_on_page": context.get("time_on_page", 0),
         "ranking_time_hour": int(current_time // 3600),
+        "slate_diversity": _build_slate_diversity_cache_context(recommendation_config),
     }
+
+
+def _build_slate_diversity_cache_context(recommendation_config: Optional[Any]) -> Dict[str, Any]:
+    if not _is_mmr_slate_diversity_enabled(recommendation_config):
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "method": "mmr",
+        "lambda": round(float(getattr(recommendation_config, "mmr_lambda", 0.8)), 6),
+        "pool_multiplier": int(getattr(recommendation_config, "mmr_rerank_pool_multiplier", 5)),
+        "min_pool_size": int(getattr(recommendation_config, "mmr_min_rerank_pool_size", 50)),
+        "max_pool_size": int(getattr(recommendation_config, "mmr_max_rerank_pool_size", 100)),
+    }
+
+
+def _is_mmr_slate_diversity_enabled(recommendation_config: Optional[Any]) -> bool:
+    if recommendation_config is None:
+        return False
+    method = str(getattr(recommendation_config, "slate_diversity_method", "mmr") or "").lower()
+    return bool(getattr(recommendation_config, "enable_slate_diversity", False)) and method == "mmr"
+
+
+def _calculate_mmr_rerank_pool_size(
+    *,
+    requested_k: int,
+    candidate_count: int,
+    recommendation_config: Any,
+) -> int:
+    multiplier = max(1, int(getattr(recommendation_config, "mmr_rerank_pool_multiplier", 5)))
+    min_pool_size = max(1, int(getattr(recommendation_config, "mmr_min_rerank_pool_size", 50)))
+    max_pool_size = max(
+        min_pool_size,
+        int(getattr(recommendation_config, "mmr_max_rerank_pool_size", 100)),
+    )
+    desired_pool_size = max(requested_k * multiplier, min_pool_size)
+    return min(desired_pool_size, max_pool_size, candidate_count)
 
 
 def _user_feature_cache_token(user_features: UserFeatures) -> Dict[str, Any]:
@@ -115,9 +154,33 @@ def _user_feature_cache_token(user_features: UserFeatures) -> Dict[str, Any]:
     }
 
 
+def _default_user_sequence_token() -> Dict[str, Any]:
+    return {
+        "length": 0,
+        "latest_event_id": None,
+        "latest_occurred_at": 0,
+        "latest_product_id": None,
+        "latest_action": None,
+    }
+
+
+def _build_cache_freshness_context(
+    serving_versions: Dict[str, Any],
+    user_feature_token: Dict[str, Any],
+    user_sequence_token: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "serving_versions": serving_versions,
+        "user_feature_token": user_feature_token,
+        "user_sequence_token": user_sequence_token or _default_user_sequence_token(),
+    }
+
+
 def _serving_version_context(runtime) -> Dict[str, Any]:
     ranking_path = runtime.config.model_config.ranking_model_path
     vector_path = runtime.config.vector_config.index_path
+    sasrec_checkpoint_path = runtime.config.recommendation_config.sasrec_checkpoint_path
+    sasrec_vocab_path = runtime.config.recommendation_config.sasrec_vocab_path
     return {
         "ranking_model": ranking_model.model_version if ranking_model else None,
         "ranking_checkpoint_mtime": _safe_file_mtime(ranking_path),
@@ -131,6 +194,13 @@ def _serving_version_context(runtime) -> Dict[str, Any]:
             if recommendation_engine
             else None
         ),
+        "sasrec_model": (
+            recommendation_engine.loaded_sasrec_version
+            if recommendation_engine
+            else None
+        ),
+        "sasrec_checkpoint_mtime": _safe_file_mtime(sasrec_checkpoint_path),
+        "sasrec_vocab_mtime": _safe_file_mtime(sasrec_vocab_path),
         "vector_index_mtime": _safe_file_mtime(vector_path),
         "catalog": _catalog_serving_version_context(),
     }
@@ -235,6 +305,29 @@ def _filter_recommendable_candidates(
         for candidate in candidates
         if _is_recommendable_product(metadata_map.get(candidate.product_id))
     ]
+
+
+def _count_candidate_source_tokens(candidates: List[Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for candidate in candidates:
+        for source in str(getattr(candidate, "source", None) or "unknown").split("+"):
+            source = source or "unknown"
+            counts[source] = counts.get(source, 0) + 1
+    return counts
+
+
+def _count_ranked_source_tokens(
+    recommendations: List[Any],
+    candidate_source_by_product: Dict[str, str],
+) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for recommendation in recommendations:
+        product_id = getattr(recommendation, "product_id", None)
+        source_value = candidate_source_by_product.get(product_id, "unknown")
+        for source in str(source_value or "unknown").split("+"):
+            source = source or "unknown"
+            counts[source] = counts.get(source, 0) + 1
+    return counts
 
 
 @app.on_event("startup")
@@ -433,16 +526,32 @@ async def get_recommendations(
         "candidate_cache_lookup_ms": 0.0,
         "content_features_ms": 0.0,
         "user_features_ms": 0.0,
+        "user_sequence_token_ms": 0.0,
         "candidate_generation_ms": 0.0,
         "candidate_cache_write_ms": 0.0,
         "metadata_lookup_ms": 0.0,
         "ranking_ms": 0.0,
+        "slate_diversity_enabled": _is_mmr_slate_diversity_enabled(
+            runtime.config.recommendation_config
+        ),
+        "slate_diversity_method": getattr(
+            runtime.config.recommendation_config,
+            "slate_diversity_method",
+            "mmr",
+        ),
+        "slate_diversity_ms": 0.0,
+        "slate_diversity_pool_size": 0,
+        "slate_diversity_selected_count": 0,
         "cache_write_ms": 0.0,
         "analytics_log_ms": 0.0,
         "kafka_schedule_ms": 0.0,
         "total_ms": 0.0,
         "candidate_count": 0,
         "ranked_count": 0,
+        "candidate_source_counts": {},
+        "candidate_source_counts_before_filter": {},
+        "ranked_source_counts": {},
+        "ranked_sasrec_count": 0,
         "cache_hit": False,
         "candidate_cache_hit": False,
         "metadata_cache_miss_count": 0,
@@ -467,16 +576,30 @@ async def get_recommendations(
         if user_features is None:
             user_features = _default_user_features(payload.user_id)
 
+        stage_started = time.perf_counter()
+        user_sequence_token = await _bounded_hot_path_read(
+            runtime,
+            "user_sequence_token",
+            feature_store.get_user_sequence_token(payload.user_id),
+            _default_user_sequence_token(),
+        )
+        profile["user_sequence_token_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+
         serving_versions = _serving_version_context(runtime)
         user_feature_token = _user_feature_cache_token(user_features)
+        freshness_context = _build_cache_freshness_context(
+            serving_versions,
+            user_feature_token,
+            user_sequence_token,
+        )
         cache_key = feature_store.generate_context_hash(
             {
                 **_build_recommendation_cache_context(
                     payload,
                     current_time=start_time,
+                    recommendation_config=runtime.config.recommendation_config,
                 ),
-                "serving_versions": serving_versions,
-                "user_feature_token": user_feature_token,
+                **freshness_context,
             }
         )
         stage_started = time.perf_counter()
@@ -502,7 +625,7 @@ async def get_recommendations(
                     "response_time_ms": int((time.time() - start_time) * 1000),
                     "model_version": "v1.0.0",
                     "cache_hit": True,
-                    "cache_freshness": "model_user_and_catalog_versioned",
+                    "cache_freshness": "model_user_sequence_and_catalog_versioned",
                     "content_processed": payload.content_id is not None,
                     **(
                         {"profile": profile}
@@ -538,7 +661,7 @@ async def get_recommendations(
                     "response_time_ms": int((time.time() - start_time) * 1000),
                     "model_version": "v1.0.0",
                     "cache_hit": False,
-                    "cache_freshness": "model_user_and_catalog_versioned",
+                    "cache_freshness": "model_user_sequence_and_catalog_versioned",
                     "singleflight_joined": True,
                     "content_processed": shared_result.get(
                         "content_processed",
@@ -566,8 +689,7 @@ async def get_recommendations(
         candidate_cache_key = feature_store.generate_context_hash(
             {
                 **_build_candidate_cache_context(payload, k_per_source),
-                "serving_versions": serving_versions,
-                "user_feature_token": user_feature_token,
+                **freshness_context,
             }
         )
         candidate_cache_task = asyncio.create_task(
@@ -686,7 +808,13 @@ async def get_recommendations(
             profile["metadata_cache_miss_count"] = len(missing_product_ids) - len(fetched_metadata)
         profile["metadata_lookup_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
         ranked_candidate_count = len(candidates)
+        profile["candidate_source_counts_before_filter"] = _count_candidate_source_tokens(candidates)
         candidates = _filter_recommendable_candidates(candidates, product_metadata_map)
+        candidate_source_by_product = {
+            candidate.product_id: candidate.source
+            for candidate in candidates
+        }
+        profile["candidate_source_counts"] = _count_candidate_source_tokens(candidates)
         profile["candidate_count_before_eligibility_filter"] = ranked_candidate_count
         profile["candidate_count"] = len(candidates)
         profile["filtered_unavailable_candidates"] = ranked_candidate_count - len(candidates)
@@ -722,18 +850,50 @@ async def get_recommendations(
                 },
             )
 
+        slate_diversity_enabled = _is_mmr_slate_diversity_enabled(
+            runtime.config.recommendation_config
+        )
+        ranker_k = payload.k
+        if slate_diversity_enabled:
+            ranker_k = _calculate_mmr_rerank_pool_size(
+                requested_k=payload.k,
+                candidate_count=len(candidates),
+                recommendation_config=runtime.config.recommendation_config,
+            )
+
         stage_started = time.perf_counter()
         ranked_recommendations, ranking_profile = await ranking_batcher.rank_candidates(
             candidates=candidates,
             user_features=user_features,
             context=payload.context,
             product_metadata_map=product_metadata_map,
-            k=payload.k,
+            k=ranker_k,
             include_profile=True,
         )
         profile["ranking_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
-        profile["ranked_count"] = len(ranked_recommendations)
         profile["ranking_profile"] = ranking_profile
+        profile["slate_diversity_pool_size"] = len(ranked_recommendations)
+
+        if slate_diversity_enabled:
+            stage_started = time.perf_counter()
+            ranked_recommendations = select_mmr_recommendations(
+                ranked_recommendations,
+                k=payload.k,
+                embedding_lookup=vector_search.get_product_embedding,
+                lambda_weight=runtime.config.recommendation_config.mmr_lambda,
+            )
+            profile["slate_diversity_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000,
+                2,
+            )
+        profile["ranked_count"] = len(ranked_recommendations)
+        profile["slate_diversity_selected_count"] = len(ranked_recommendations)
+        ranked_source_counts = _count_ranked_source_tokens(
+            ranked_recommendations,
+            candidate_source_by_product,
+        )
+        profile["ranked_source_counts"] = ranked_source_counts
+        profile["ranked_sasrec_count"] = ranked_source_counts.get("sasrec", 0)
         response_time = time.time() - start_time
 
         stage_started = time.perf_counter()
@@ -773,6 +933,8 @@ async def get_recommendations(
                     metadata={
                         "content_id": payload.content_id,
                         "candidate_count": len(candidates),
+                        "candidate_source_counts": profile.get("candidate_source_counts", {}),
+                        "ranked_source_counts": profile.get("ranked_source_counts", {}),
                     },
                 ),
                 timeout_seconds=runtime.config.cache_config.background_write_timeout_ms / 1000.0,
@@ -799,7 +961,7 @@ async def get_recommendations(
                 "total_candidates": len(candidates),
                 "response_time_ms": int(response_time * 1000),
                 "model_version": "v1.0.0",
-                "cache_freshness": "model_user_and_catalog_versioned",
+                "cache_freshness": "model_user_sequence_and_catalog_versioned",
                 "cache_hit": False,
                 "content_processed": payload.content_id is not None,
                 **(

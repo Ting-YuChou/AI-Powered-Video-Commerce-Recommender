@@ -29,8 +29,17 @@ from models import (
     RankingFeatures
 )
 from config import RankingConfig
+from dcn import (
+    DeepAndCrossNetwork,
+    LowRankDeepAndCrossNetwork,
+    RANKING_ARCHITECTURES,
+    normalize_architecture,
+)
 
 logger = logging.getLogger(__name__)
+
+RANKING_FEATURE_SCHEMA_VERSION = "ranking_v1_28"
+RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
 
 try:
     if hasattr(torch.backends, "mkldnn"):
@@ -47,26 +56,79 @@ class MultiObjectiveRankingModel(nn.Module):
     - Overall ranking score
     """
     
-    def __init__(self, input_dim: int, config: RankingConfig):
+    def __init__(
+        self,
+        input_dim: int,
+        config: RankingConfig,
+        *,
+        architecture: Optional[str] = None,
+        hidden_dims: Optional[List[int]] = None,
+        cross_layers: Optional[int] = None,
+        low_rank_dim: Optional[int] = None,
+    ):
         super().__init__()
         self.config = config
         self.input_dim = input_dim
+        self.architecture = normalize_architecture(
+            architecture or getattr(config, "architecture", "dcn"),
+            supported=RANKING_ARCHITECTURES,
+        )
+        self.cross_layers = max(
+            0,
+            int(
+                cross_layers
+                if cross_layers is not None
+                else getattr(config, "cross_layers", 3)
+            ),
+        )
+        self.low_rank_dim = max(
+            1,
+            int(
+                low_rank_dim
+                if low_rank_dim is not None
+                else getattr(config, "low_rank_dim", 8)
+            ),
+        )
         
         # Shared bottom layers
-        hidden_dims = config.hidden_dims
-        layers = []
-        prev_dim = input_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(config.dropout_rate)
-            ])
-            prev_dim = hidden_dim
-        
-        self.shared_layers = nn.Sequential(*layers)
+        hidden_dims = list(config.hidden_dims if hidden_dims is None else hidden_dims)
+        if not hidden_dims:
+            hidden_dims = [64]
+        self.hidden_dims = hidden_dims
+
+        if self.architecture == "mlp":
+            layers = []
+            prev_dim = input_dim
+
+            for hidden_dim in hidden_dims:
+                layers.extend([
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(config.dropout_rate)
+                ])
+                prev_dim = hidden_dim
+
+            self.shared_layers = nn.Sequential(*layers)
+        elif self.architecture == "dcn":
+            self.shared_layers = DeepAndCrossNetwork(
+                input_dim,
+                hidden_dims,
+                hidden_dims[-1],
+                cross_layers=self.cross_layers,
+                dropout=config.dropout_rate,
+                use_batch_norm=False,
+            )
+        else:
+            self.shared_layers = LowRankDeepAndCrossNetwork(
+                input_dim,
+                hidden_dims,
+                hidden_dims[-1],
+                cross_layers=self.cross_layers,
+                low_rank_dim=self.low_rank_dim,
+                dropout=config.dropout_rate,
+                use_batch_norm=False,
+            )
         
         # Task-specific towers
         tower_input_dim = hidden_dims[-1]
@@ -256,7 +318,7 @@ class FeatureExtractor:
             candidate.content_similarity_score or 0.0,
             candidate.popularity_score or 0.0,
             candidate.combined_score or 0.0,
-        ], dtype=np.float32)
+        ], dtype=float)
         
         return features
     
@@ -312,6 +374,8 @@ class RankingModel:
         self.is_trained = False
         self.model_version = "1.0.0"
         self.last_training_time = 0
+        self.feature_schema_version = RANKING_FEATURE_SCHEMA_VERSION
+        self.training_data_source = RANKING_TRAINING_DATA_SOURCE
         
         # Performance tracking
         self.training_history = []
@@ -338,39 +402,108 @@ class RankingModel:
         self._product_feature_cache_lock = threading.RLock()
         
         logger.info(f"RankingModel initialized on device: {self.device}")
+
+    def _initialize_model(
+        self,
+        *,
+        architecture: Optional[str] = None,
+        hidden_dims: Optional[List[int]] = None,
+        cross_layers: Optional[int] = None,
+        low_rank_dim: Optional[int] = None,
+    ) -> None:
+        input_dim = self.feature_extractor.total_feature_dim
+        self.model = MultiObjectiveRankingModel(
+            input_dim,
+            self.config,
+            architecture=architecture,
+            hidden_dims=hidden_dims,
+            cross_layers=cross_layers,
+            low_rank_dim=low_rank_dim,
+        ).to(self.device)
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=1e-5,
+        )
+
+    def _load_shape_compatible_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+    ) -> int:
+        if self.model is None:
+            return 0
+
+        current_state = self.model.state_dict()
+        compatible: Dict[str, torch.Tensor] = {}
+        skipped = []
+        for key, value in state_dict.items():
+            current_value = current_state.get(key)
+            if current_value is not None and tuple(current_value.shape) == tuple(value.shape):
+                compatible[key] = value
+            else:
+                skipped.append(key)
+
+        if not compatible:
+            logger.warning("No shape-compatible ranking checkpoint tensors found")
+            return 0
+
+        load_result = self.model.load_state_dict(compatible, strict=False)
+        if skipped or load_result.missing_keys or load_result.unexpected_keys:
+            logger.warning(
+                "Ranking checkpoint partially loaded: "
+                f"loaded={len(compatible)}, skipped={len(skipped)}, "
+                f"missing={len(load_result.missing_keys)}, "
+                f"unexpected={len(load_result.unexpected_keys)}"
+            )
+        return len(compatible)
+
+    @staticmethod
+    def _checkpoint_state_and_config(
+        checkpoint: Any,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any], bool]:
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            return (
+                checkpoint["model_state_dict"],
+                dict(checkpoint.get("config") or {}),
+                False,
+            )
+        return checkpoint, {"architecture": "mlp"}, True
     
     async def load_model(self, model_path: str = None):
         """Load or initialize the ranking model."""
         try:
             resolved_model_path = model_path or self.loaded_model_path
-
-            # Initialize model
-            input_dim = self.feature_extractor.total_feature_dim
-            self.model = MultiObjectiveRankingModel(input_dim, self.config).to(self.device)
             
             # Load pre-trained weights if available
             if resolved_model_path and Path(resolved_model_path).exists():
                 logger.info(f"Loading model from {resolved_model_path}")
-                state_dict = torch.load(resolved_model_path, map_location=self.device)
-                load_result = self.model.load_state_dict(state_dict, strict=False)
-                if load_result.missing_keys or load_result.unexpected_keys:
-                    logger.warning(
-                        "Ranking checkpoint partially loaded due to head-shape mismatch: "
-                        f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
+                checkpoint = torch.load(resolved_model_path, map_location=self.device)
+                state_dict, checkpoint_config, is_legacy_raw = (
+                    self._checkpoint_state_and_config(checkpoint)
+                )
+                architecture = normalize_architecture(
+                    checkpoint_config.get("architecture"),
+                    default="mlp" if is_legacy_raw else getattr(self.config, "architecture", "dcn"),
+                    supported=RANKING_ARCHITECTURES,
+                )
+                self._initialize_model(
+                    architecture=architecture,
+                    hidden_dims=checkpoint_config.get("hidden_dims"),
+                    cross_layers=checkpoint_config.get("cross_layers"),
+                    low_rank_dim=checkpoint_config.get("low_rank_dim"),
+                )
+                loaded_tensors = self._load_shape_compatible_state_dict(state_dict)
+                if loaded_tensors == 0:
+                    raise RuntimeError(
+                        f"No compatible tensors found in ranking checkpoint {resolved_model_path}"
                     )
                 self.is_trained = True
                 self.loaded_checkpoint_mtime = Path(resolved_model_path).stat().st_mtime
             else:
                 logger.info("Initializing new model")
+                self._initialize_model(architecture=getattr(self.config, "architecture", "dcn"))
                 self.is_trained = False
                 self.loaded_checkpoint_mtime = 0.0
-            
-            # Initialize optimizer
-            self.optimizer = optim.Adam(
-                self.model.parameters(),
-                lr=self.config.learning_rate,
-                weight_decay=1e-5
-            )
             
             # Set to evaluation mode initially
             self.model.eval()
@@ -846,12 +979,20 @@ class RankingModel:
         
         return f"Based on your preferences - {explanations[0]}"
     
-    async def train_model(self, training_data: List[Dict[str, Any]]):
+    async def train_model(
+        self,
+        training_data: List[Dict[str, Any]],
+        *,
+        user_features_map: Optional[Dict[str, Any]] = None,
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         """Train the ranking model on user interaction data."""
         try:
             saved_model_path = await asyncio.to_thread(
                 self._train_model_sync,
                 training_data,
+                user_features_map or {},
+                product_metadata_map or {},
             )
             if saved_model_path:
                 await self.save_model(saved_model_path)
@@ -859,15 +1000,44 @@ class RankingModel:
         except Exception as e:
             logger.error(f"Error training model: {e}")
 
-    def _train_model_sync(self, training_data: List[Dict[str, Any]]) -> Optional[str]:
-        if not self.model or len(training_data) < self.config.training_min_samples:
-            logger.warning("Insufficient data or model not loaded for training")
+    def _train_model_sync(
+        self,
+        training_data: List[Dict[str, Any]],
+        user_features_map: Optional[Dict[str, Any]] = None,
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        if len(training_data) < self.config.training_min_samples:
+            logger.warning("Insufficient data for ranking model training")
             return None
+
+        target_architecture = normalize_architecture(
+            getattr(self.config, "architecture", "dcn"),
+            supported=RANKING_ARCHITECTURES,
+        )
+        if self.model is None:
+            self._initialize_model(architecture=target_architecture)
+        elif getattr(self.model, "architecture", "mlp") != target_architecture:
+            previous_state = self.model.state_dict()
+            self._initialize_model(architecture=target_architecture)
+            self._load_shape_compatible_state_dict(previous_state)
+        elif self.optimizer is None:
+            previous_state = self.model.state_dict()
+            self._initialize_model(
+                architecture=target_architecture,
+                hidden_dims=getattr(self.model, "hidden_dims", None),
+                cross_layers=getattr(self.model, "cross_layers", None),
+                low_rank_dim=getattr(self.model, "low_rank_dim", None),
+            )
+            self._load_shape_compatible_state_dict(previous_state)
 
         logger.info(f"Training ranking model on {len(training_data)} samples")
 
         # Prepare training data
-        features, labels = self._prepare_training_data(training_data)
+        features, labels = self._prepare_training_data(
+            training_data,
+            user_features_map=user_features_map,
+            product_metadata_map=product_metadata_map,
+        )
 
         if features.size(0) == 0:
             logger.warning("No valid training samples prepared")
@@ -913,17 +1083,47 @@ class RankingModel:
         logger.info("Model training completed")
         return self.loaded_model_path
     
-    def _prepare_training_data(self, training_data: List[Dict[str, Any]]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def _prepare_training_data(
+        self,
+        training_data: List[Dict[str, Any]],
+        *,
+        user_features_map: Optional[Dict[str, Any]] = None,
+        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Prepare training data from interaction logs."""
         try:
+            user_features_map = user_features_map or {}
+            product_metadata_map = product_metadata_map or {}
             features = []
             ctr_labels = []
             cvr_labels = []
             gmv_labels = []
             
             for sample in training_data:
-                # Extract features (simplified - would use actual user/product data)
-                feature_vector = np.random.normal(0, 1, self.feature_extractor.total_feature_dim)
+                product_id = sample.get("product_id")
+                if not product_id:
+                    continue
+
+                user_features = self._training_user_features(sample, user_features_map)
+                product_metadata = self._training_product_metadata(sample, product_metadata_map)
+                context = dict(sample.get("context") or {})
+                candidate = self._training_candidate(sample)
+                feature_vector = self.feature_extractor.create_ranking_features(
+                    user_features,
+                    product_metadata,
+                    context,
+                    candidate,
+                )
+                feature_vector = np.asarray(feature_vector, dtype=np.float32)
+                if feature_vector.shape != (self.feature_extractor.total_feature_dim,):
+                    logger.warning(
+                        "Skipping ranking training sample with invalid feature shape",
+                        extra={
+                            "product_id": product_id,
+                            "shape": feature_vector.shape,
+                        },
+                    )
+                    continue
                 features.append(feature_vector)
                 
                 # Create labels based on interaction type
@@ -938,7 +1138,7 @@ class RankingModel:
                 cvr_labels.append(cvr_label)
                 
                 # GMV label (purchase value)
-                gmv_value = sample.get('value', 0.0) if action == 'purchase' else 0.0
+                gmv_value = self._training_gmv_label(sample, product_metadata, action)
                 gmv_labels.append(gmv_value)
             
             if not features:
@@ -956,6 +1156,141 @@ class RankingModel:
         except Exception as e:
             logger.error(f"Error preparing training data: {e}")
             return torch.empty(0), {}
+
+    def _training_user_features(
+        self,
+        sample: Dict[str, Any],
+        user_features_map: Dict[str, Any],
+    ) -> UserFeatures:
+        user_id = str(sample.get("user_id") or "unknown")
+        raw_features = user_features_map.get(user_id)
+        if isinstance(raw_features, UserFeatures):
+            return raw_features
+        if isinstance(raw_features, dict):
+            payload = dict(raw_features)
+            payload.setdefault("user_id", user_id)
+            try:
+                return UserFeatures(**payload)
+            except Exception as exc:
+                logger.warning("Invalid user features for ranking training: %s", exc)
+        return UserFeatures(user_id=user_id)
+
+    def _training_product_metadata(
+        self,
+        sample: Dict[str, Any],
+        product_metadata_map: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        product_id = str(sample.get("product_id") or "")
+        context = sample.get("context") or {}
+        metadata = dict(product_metadata_map.get(product_id) or {})
+        embedded_metadata = sample.get("product_metadata") or context.get("product_metadata")
+        if isinstance(embedded_metadata, dict):
+            metadata.update(embedded_metadata)
+
+        if "category" not in metadata:
+            metadata["category"] = (
+                context.get("product_category")
+                or context.get("category")
+                or "General"
+            )
+        if "price" not in metadata:
+            metadata["price"] = self._first_float(
+                sample.get("price"),
+                context.get("price"),
+                default=1.0,
+            )
+        metadata.setdefault("rating", 3.0)
+        metadata.setdefault("num_reviews", 1)
+        metadata.setdefault("in_stock", True)
+        metadata.setdefault("created_at", sample.get("occurred_at") or sample.get("timestamp") or time.time())
+        metadata.setdefault("tags", [])
+        metadata.setdefault("brand", context.get("brand", "Unknown"))
+        return metadata
+
+    def _training_candidate(self, sample: Dict[str, Any]) -> CandidateProduct:
+        product_id = str(sample.get("product_id") or "")
+        context = sample.get("context") or {}
+        candidate_payload = sample.get("candidate") or sample.get("candidate_product")
+        if isinstance(candidate_payload, CandidateProduct):
+            return candidate_payload
+        if isinstance(candidate_payload, dict):
+            payload = dict(candidate_payload)
+            payload.setdefault("product_id", product_id)
+            payload.setdefault("source", "training_interaction")
+            try:
+                return CandidateProduct(**payload)
+            except Exception as exc:
+                logger.warning("Invalid candidate payload for ranking training: %s", exc)
+
+        candidate_scores = sample.get("candidate_scores") or context.get("candidate_scores") or {}
+        if not isinstance(candidate_scores, dict):
+            candidate_scores = {}
+        collaborative_score = self._optional_float(
+            sample.get("collaborative_score"),
+            candidate_scores.get("collaborative_score"),
+            candidate_scores.get("cf_score"),
+        )
+        content_score = self._optional_float(
+            sample.get("content_similarity_score"),
+            candidate_scores.get("content_similarity_score"),
+            candidate_scores.get("content_score"),
+        )
+        popularity_score = self._optional_float(
+            sample.get("popularity_score"),
+            candidate_scores.get("popularity_score"),
+        )
+        combined_score = self._first_float(
+            sample.get("combined_score"),
+            candidate_scores.get("combined_score"),
+            default=0.0,
+        )
+        return CandidateProduct(
+            product_id=product_id,
+            collaborative_score=collaborative_score,
+            content_similarity_score=content_score,
+            popularity_score=popularity_score,
+            combined_score=combined_score,
+            source=str(sample.get("source") or context.get("candidate_source") or "training_interaction"),
+        )
+
+    def _training_gmv_label(
+        self,
+        sample: Dict[str, Any],
+        product_metadata: Dict[str, Any],
+        action: str,
+    ) -> float:
+        if action != "purchase":
+            return 0.0
+        context = sample.get("context") or {}
+        return max(
+            0.0,
+            self._first_float(
+                sample.get("value"),
+                sample.get("gmv"),
+                sample.get("purchase_value"),
+                context.get("value"),
+                context.get("gmv"),
+                context.get("purchase_value"),
+                product_metadata.get("price"),
+                default=0.0,
+            ),
+        )
+
+    @staticmethod
+    def _optional_float(*values: Any) -> Optional[float]:
+        for value in values:
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def _first_float(cls, *values: Any, default: float) -> float:
+        value = cls._optional_float(*values)
+        return float(default if value is None else value)
     
     def _compute_loss(self, predictions: Dict[str, torch.Tensor], labels: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Compute multi-objective loss."""
@@ -987,7 +1322,18 @@ class RankingModel:
         try:
             if self.model and self.is_trained:
                 Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-                torch.save(self.model.state_dict(), model_path)
+                checkpoint = {
+                    "model_state_dict": self.model.state_dict(),
+                    "config": {
+                        "architecture": self.model.architecture,
+                        "cross_layers": self.model.cross_layers,
+                        "low_rank_dim": self.model.low_rank_dim,
+                        "hidden_dims": self.model.hidden_dims,
+                        "input_dim": self.feature_extractor.total_feature_dim,
+                        "feature_schema_version": self.feature_schema_version,
+                    },
+                }
+                torch.save(checkpoint, model_path)
                 self.loaded_model_path = model_path
                 self.loaded_checkpoint_mtime = Path(model_path).stat().st_mtime
                 logger.info(f"Model saved to {model_path}")
@@ -1007,7 +1353,9 @@ class RankingModel:
             'device': str(self.device),
             'inference_stats': self.inference_stats.copy(),
             'model_parameters': sum(p.numel() for p in self.model.parameters()) if self.model else 0,
-            'feature_dim': self.feature_extractor.total_feature_dim
+            'feature_dim': self.feature_extractor.total_feature_dim,
+            'architecture': getattr(self.model, "architecture", None) if self.model else None,
+            'low_rank_dim': getattr(self.model, "low_rank_dim", None) if self.model else None,
         }
     
     def health_check(self) -> Dict[str, Any]:
@@ -1022,6 +1370,8 @@ class RankingModel:
                 'checkpoint_reload_count': self.checkpoint_reload_count,
                 'device': str(self.device),
                 'feature_dim': self.feature_extractor.total_feature_dim,
+                'architecture': getattr(self.model, "architecture", None) if self.model else None,
+                'low_rank_dim': getattr(self.model, "low_rank_dim", None) if self.model else None,
                 'torch_inference_available': self.torch_inference_available,
             }
             

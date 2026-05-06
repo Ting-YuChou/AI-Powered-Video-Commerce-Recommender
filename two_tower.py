@@ -29,6 +29,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+from dcn import DeepAndCrossNetwork, normalize_architecture
+
 logger = logging.getLogger(__name__)
 
 NUM_CATEGORY_BUCKETS = 64
@@ -125,26 +127,41 @@ class UserTower(nn.Module):
         hidden_dims: Optional[List[int]] = None,
         output_dim: int = 128,
         dropout: float = 0.1,
+        architecture: str = "dcn",
+        cross_layers: int = 3,
     ):
         super().__init__()
         hidden_dims = hidden_dims or [256, 128]
+        self.architecture = normalize_architecture(architecture)
+        self.cross_layers = max(0, int(cross_layers))
 
         self.user_embedding = nn.Embedding(num_users + 1, id_embed_dim, padding_idx=0)
 
-        layers: List[nn.Module] = []
-        prev_dim = id_embed_dim + user_feat_dim
-        for h_dim in hidden_dims:
-            layers.extend(
-                [
-                    nn.Linear(prev_dim, h_dim),
-                    nn.BatchNorm1d(h_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                ]
+        input_dim = id_embed_dim + user_feat_dim
+        if self.architecture == "mlp":
+            layers: List[nn.Module] = []
+            prev_dim = input_dim
+            for h_dim in hidden_dims:
+                layers.extend(
+                    [
+                        nn.Linear(prev_dim, h_dim),
+                        nn.BatchNorm1d(h_dim),
+                        nn.ReLU(),
+                        nn.Dropout(dropout),
+                    ]
+                )
+                prev_dim = h_dim
+            layers.append(nn.Linear(prev_dim, output_dim))
+            self.mlp = nn.Sequential(*layers)
+        else:
+            self.dcn = DeepAndCrossNetwork(
+                input_dim,
+                hidden_dims,
+                output_dim,
+                cross_layers=self.cross_layers,
+                dropout=dropout,
+                use_batch_norm=False,
             )
-            prev_dim = h_dim
-        layers.append(nn.Linear(prev_dim, output_dim))
-        self.mlp = nn.Sequential(*layers)
 
         self._init_weights()
 
@@ -160,7 +177,10 @@ class UserTower(nn.Module):
     def forward(self, user_ids: torch.Tensor, user_features: torch.Tensor) -> torch.Tensor:
         id_emb = self.user_embedding(user_ids)
         x = torch.cat([id_emb, user_features], dim=-1)
-        x = self.mlp(x)
+        if self.architecture == "mlp":
+            x = self.mlp(x)
+        else:
+            x = self.dcn(x)
         return F.normalize(x, p=2, dim=-1)
 
 
@@ -177,27 +197,42 @@ class ItemTower(nn.Module):
         hidden_dims: Optional[List[int]] = None,
         output_dim: int = 128,
         dropout: float = 0.1,
+        architecture: str = "dcn",
+        cross_layers: int = 3,
     ):
         super().__init__()
         hidden_dims = hidden_dims or [256, 128]
+        self.architecture = normalize_architecture(architecture)
+        self.cross_layers = max(0, int(cross_layers))
 
         self.item_embedding = nn.Embedding(num_items + 1, id_embed_dim, padding_idx=0)
         self.clip_projection = nn.Linear(clip_dim, clip_proj_dim)
 
-        layers: List[nn.Module] = []
-        prev_dim = id_embed_dim + clip_proj_dim + item_feat_dim
-        for h_dim in hidden_dims:
-            layers.extend(
-                [
-                    nn.Linear(prev_dim, h_dim),
-                    nn.BatchNorm1d(h_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                ]
+        input_dim = id_embed_dim + clip_proj_dim + item_feat_dim
+        if self.architecture == "mlp":
+            layers: List[nn.Module] = []
+            prev_dim = input_dim
+            for h_dim in hidden_dims:
+                layers.extend(
+                    [
+                        nn.Linear(prev_dim, h_dim),
+                        nn.BatchNorm1d(h_dim),
+                        nn.ReLU(),
+                        nn.Dropout(dropout),
+                    ]
+                )
+                prev_dim = h_dim
+            layers.append(nn.Linear(prev_dim, output_dim))
+            self.mlp = nn.Sequential(*layers)
+        else:
+            self.dcn = DeepAndCrossNetwork(
+                input_dim,
+                hidden_dims,
+                output_dim,
+                cross_layers=self.cross_layers,
+                dropout=dropout,
+                use_batch_norm=False,
             )
-            prev_dim = h_dim
-        layers.append(nn.Linear(prev_dim, output_dim))
-        self.mlp = nn.Sequential(*layers)
 
         self._init_weights()
 
@@ -219,7 +254,10 @@ class ItemTower(nn.Module):
         id_emb = self.item_embedding(item_ids)
         clip_feat = self.clip_projection(clip_embeddings)
         x = torch.cat([id_emb, clip_feat, item_features], dim=-1)
-        x = self.mlp(x)
+        if self.architecture == "mlp":
+            x = self.mlp(x)
+        else:
+            x = self.dcn(x)
         return F.normalize(x, p=2, dim=-1)
 
 
@@ -235,21 +273,29 @@ class TwoTowerModel(nn.Module):
         temperature: float = 0.07,
         user_hidden_dims: Optional[List[int]] = None,
         item_hidden_dims: Optional[List[int]] = None,
+        architecture: str = "dcn",
+        cross_layers: int = 3,
     ):
         super().__init__()
         self.temperature = temperature
         self.output_dim = output_dim
+        self.architecture = normalize_architecture(architecture)
+        self.cross_layers = max(0, int(cross_layers))
 
         self.user_tower = UserTower(
             num_users=num_users,
             output_dim=output_dim,
             hidden_dims=user_hidden_dims,
+            architecture=self.architecture,
+            cross_layers=self.cross_layers,
         )
         self.item_tower = ItemTower(
             num_items=num_items,
             clip_dim=clip_dim,
             output_dim=output_dim,
             hidden_dims=item_hidden_dims,
+            architecture=self.architecture,
+            cross_layers=self.cross_layers,
         )
 
     def encode_users(self, user_ids: torch.Tensor, user_features: torch.Tensor) -> torch.Tensor:
@@ -401,6 +447,8 @@ class TwoTowerTrainer:
         hard_ratio_end: float = 0.5,
         user_hidden_dims: Optional[List[int]] = None,
         item_hidden_dims: Optional[List[int]] = None,
+        architecture: str = "dcn",
+        cross_layers: int = 3,
         device: Optional[torch.device] = None,
     ):
         self.clip_dim = clip_dim
@@ -411,6 +459,8 @@ class TwoTowerTrainer:
         self.epochs = epochs
         self.user_hidden_dims = user_hidden_dims
         self.item_hidden_dims = item_hidden_dims
+        self.architecture = normalize_architecture(architecture)
+        self.cross_layers = max(0, int(cross_layers))
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model: Optional[TwoTowerModel] = None
@@ -501,6 +551,8 @@ class TwoTowerTrainer:
             temperature=self.temperature,
             user_hidden_dims=self.user_hidden_dims,
             item_hidden_dims=self.item_hidden_dims,
+            architecture=self.architecture,
+            cross_layers=self.cross_layers,
         ).to(self.device)
 
         self.negative_sampler = NegativeSampler(
@@ -693,10 +745,84 @@ class TwoTowerTrainer:
                 "temperature": self.temperature,
                 "num_users": len(self.user_mapping),
                 "num_items": len(self.item_mapping),
+                "architecture": self.model.architecture,
+                "cross_layers": self.model.cross_layers,
+                "user_hidden_dims": self.user_hidden_dims,
+                "item_hidden_dims": self.item_hidden_dims,
             },
         }
         torch.save(checkpoint, path)
         logger.info(f"Saved Two-Tower checkpoint to {path}")
+
+    def _load_shape_compatible_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        *,
+        skip_prefixes: Tuple[str, ...] = (),
+    ) -> int:
+        if self.model is None:
+            return 0
+
+        current_state = self.model.state_dict()
+        compatible: Dict[str, torch.Tensor] = {}
+        skipped: List[str] = []
+
+        for key, value in state_dict.items():
+            if skip_prefixes and key.startswith(skip_prefixes):
+                skipped.append(key)
+                continue
+            current_value = current_state.get(key)
+            if current_value is not None and tuple(current_value.shape) == tuple(value.shape):
+                compatible[key] = value
+            else:
+                skipped.append(key)
+
+        if not compatible:
+            logger.warning("No shape-compatible Two-Tower checkpoint tensors found")
+            return 0
+
+        load_result = self.model.load_state_dict(compatible, strict=False)
+        if skipped or load_result.missing_keys or load_result.unexpected_keys:
+            logger.info(
+                "Two-Tower checkpoint warm-start loaded partially: "
+                f"loaded={len(compatible)}, skipped={len(skipped)}, "
+                f"missing={len(load_result.missing_keys)}, "
+                f"unexpected={len(load_result.unexpected_keys)}"
+            )
+        return len(compatible)
+
+    def warm_start_from_checkpoint(self, path: str) -> bool:
+        """Load shape-compatible tensors into the already-prepared model."""
+        checkpoint_path = Path(path)
+        if self.model is None or not checkpoint_path.exists():
+            return False
+
+        try:
+            checkpoint = torch.load(path, map_location=self.device)
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            skip_prefixes: List[str] = []
+            if checkpoint.get("user_mapping") != self.user_mapping:
+                skip_prefixes.append("user_tower.user_embedding.")
+            if checkpoint.get("item_mapping") != self.item_mapping:
+                skip_prefixes.append("item_tower.item_embedding.")
+
+            loaded = self._load_shape_compatible_state_dict(
+                state_dict,
+                skip_prefixes=tuple(skip_prefixes),
+            )
+            if loaded:
+                logger.info(
+                    "Warm-started Two-Tower training checkpoint",
+                    extra={
+                        "path": str(checkpoint_path),
+                        "loaded_tensors": loaded,
+                        "target_architecture": self.model.architecture,
+                    },
+                )
+            return loaded > 0
+        except Exception as exc:
+            logger.warning(f"Failed to warm-start Two-Tower checkpoint: {exc}")
+            return False
 
     def load_checkpoint(self, path: str) -> bool:
         checkpoint_path = Path(path)
@@ -711,6 +837,8 @@ class TwoTowerTrainer:
             self.user_mapping = checkpoint["user_mapping"]
             self.item_mapping = checkpoint["item_mapping"]
             self.reverse_item_mapping = checkpoint["reverse_item_mapping"]
+            architecture = normalize_architecture(cfg.get("architecture"), default="mlp")
+            cross_layers = int(cfg.get("cross_layers", self.cross_layers))
 
             self.model = TwoTowerModel(
                 num_users=cfg["num_users"],
@@ -718,8 +846,10 @@ class TwoTowerTrainer:
                 clip_dim=cfg.get("clip_dim", self.clip_dim),
                 output_dim=cfg.get("output_dim", self.output_dim),
                 temperature=cfg.get("temperature", self.temperature),
-                user_hidden_dims=self.user_hidden_dims,
-                item_hidden_dims=self.item_hidden_dims,
+                user_hidden_dims=cfg.get("user_hidden_dims", self.user_hidden_dims),
+                item_hidden_dims=cfg.get("item_hidden_dims", self.item_hidden_dims),
+                architecture=architecture,
+                cross_layers=cross_layers,
             ).to(self.device)
 
             self.model.load_state_dict(checkpoint["model_state_dict"])

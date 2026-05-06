@@ -161,6 +161,10 @@ class RecommendationConfig(BaseSettings):
         40,
         description="Maximum collaborative candidates to fetch live per request",
     )
+    max_live_sasrec_candidates: int = Field(
+        40,
+        description="Maximum SASRec sequential candidates to fetch live per request",
+    )
     max_live_content_candidates: int = Field(
         20,
         description="Maximum content-similar candidates to fetch live per request",
@@ -215,9 +219,38 @@ class RecommendationConfig(BaseSettings):
     enable_diversity: bool = Field(True, description="Enable recommendation diversity")
     diversity_factor: float = Field(0.1, description="Diversity vs relevance trade-off")
     max_items_per_category: int = Field(3, description="Max recommendations per category")
+    enable_slate_diversity: bool = Field(
+        False,
+        description="Enable post-ranker slate diversity reranking",
+    )
+    slate_diversity_method: str = Field(
+        "mmr",
+        description="Post-ranker slate diversity method",
+    )
+    mmr_lambda: float = Field(
+        0.8,
+        description="MMR relevance weight; lower values increase diversity pressure",
+    )
+    mmr_rerank_pool_multiplier: int = Field(
+        5,
+        description="Ranker pool multiplier used before MMR selection",
+    )
+    mmr_min_rerank_pool_size: int = Field(
+        50,
+        description="Minimum ranker pool size before MMR selection",
+    )
+    mmr_max_rerank_pool_size: int = Field(
+        100,
+        description="Maximum ranker pool size before MMR selection",
+    )
     
     # Two-Tower model settings
     tt_embedding_dim: int = Field(128, description="Two-Tower output embedding dimension")
+    tt_architecture: str = Field(
+        "dcn",
+        description="Two-Tower tower architecture: dcn or mlp",
+    )
+    tt_cross_layers: int = Field(3, description="Two-Tower DCN cross layer count")
     tt_user_hidden_dims: List[int] = Field([256, 128], description="User tower hidden dimensions")
     tt_item_hidden_dims: List[int] = Field([256, 128], description="Item tower hidden dimensions")
     tt_learning_rate: float = Field(0.001, description="Two-Tower learning rate")
@@ -233,6 +266,60 @@ class RecommendationConfig(BaseSettings):
     
     # CF FAISS index path
     cf_index_path: str = Field("/tmp/cf_vector_index.faiss", description="CF FAISS index file path")
+
+    # SASRec sequential retrieval
+    enable_sasrec: bool = Field(False, description="Enable SASRec sequential candidate source")
+    sasrec_max_sequence_length: int = Field(50, description="Maximum positive user events for SASRec input")
+    sasrec_embedding_dim: int = Field(64, description="SASRec item embedding dimension")
+    sasrec_num_heads: int = Field(2, description="SASRec transformer attention heads")
+    sasrec_num_layers: int = Field(2, description="SASRec transformer encoder layers")
+    sasrec_dropout: float = Field(0.2, description="SASRec transformer dropout")
+    sasrec_batch_size: int = Field(256, description="SASRec training batch size")
+    sasrec_epochs: int = Field(10, description="SASRec training epochs")
+    sasrec_learning_rate: float = Field(0.001, description="SASRec training learning rate")
+    sasrec_min_sequence_length: int = Field(2, description="Minimum positive events required for SASRec training")
+    sasrec_score_weight: float = Field(1.0, description="SASRec score multiplier before candidate merge")
+    sasrec_checkpoint_path: Optional[str] = Field(None, description="SASRec checkpoint local path")
+    sasrec_vocab_path: Optional[str] = Field(None, description="SASRec vocabulary local path")
+    sasrec_metadata_path: Optional[str] = Field(None, description="SASRec metadata local path")
+
+    @validator("tt_architecture")
+    def validate_tt_architecture(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"dcn", "mlp"}:
+            raise ValueError("tt_architecture must be one of: dcn, mlp")
+        return normalized
+
+    @validator("tt_cross_layers")
+    def validate_tt_cross_layers(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("tt_cross_layers must be >= 0")
+        return value
+
+    @validator("slate_diversity_method")
+    def validate_slate_diversity_method(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized != "mmr":
+            raise ValueError("slate_diversity_method must be: mmr")
+        return normalized
+
+    @validator("mmr_lambda")
+    def validate_mmr_lambda(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("mmr_lambda must be between 0 and 1")
+        return value
+
+    @validator("mmr_rerank_pool_multiplier")
+    def validate_mmr_rerank_pool_multiplier(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("mmr_rerank_pool_multiplier must be >= 1")
+        return value
+
+    @validator("mmr_min_rerank_pool_size", "mmr_max_rerank_pool_size")
+    def validate_mmr_rerank_pool_size(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("MMR rerank pool sizes must be >= 1")
+        return value
     
     class Config:
         env_prefix = "RECOMMENDATION_"
@@ -240,6 +327,12 @@ class RecommendationConfig(BaseSettings):
 class RankingConfig(BaseSettings):
     """Ranking model configuration."""
     model_type: str = Field("neural", description="Ranking model type")
+    architecture: str = Field(
+        "dcn",
+        description="Ranking model architecture: mlp, dcn, or dcn_v2_low_rank",
+    )
+    cross_layers: int = Field(3, description="Ranking DCN cross layer count")
+    low_rank_dim: int = Field(8, description="Ranking DCN-v2 low-rank dimension")
     hidden_dims: List[int] = Field([256, 128, 64], description="Neural network hidden dimensions")
     dropout_rate: float = Field(0.2, description="Dropout rate")
     learning_rate: float = Field(0.001, description="Learning rate")
@@ -298,6 +391,25 @@ class RankingConfig(BaseSettings):
         60,
         description="How often recommendation workers check for a newer ranking checkpoint",
     )
+
+    @validator("architecture")
+    def validate_architecture(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"dcn", "dcn_v2_low_rank", "mlp"}:
+            raise ValueError("architecture must be one of: dcn, dcn_v2_low_rank, mlp")
+        return normalized
+
+    @validator("cross_layers")
+    def validate_cross_layers(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("cross_layers must be >= 0")
+        return value
+
+    @validator("low_rank_dim")
+    def validate_low_rank_dim(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("low_rank_dim must be >= 1")
+        return value
     
     class Config:
         env_prefix = "RANKING_"
@@ -812,6 +924,18 @@ class Config:
         ):
             self.recommendation_config.cf_index_path = str(
                 Path(self.model_config.cache_dir) / "cf_vector_index.faiss"
+            )
+        if not self.recommendation_config.sasrec_checkpoint_path:
+            self.recommendation_config.sasrec_checkpoint_path = str(
+                Path(self.model_config.cache_dir) / "sasrec_model.pt"
+            )
+        if not self.recommendation_config.sasrec_vocab_path:
+            self.recommendation_config.sasrec_vocab_path = str(
+                Path(self.model_config.cache_dir) / "sasrec_vocab.json"
+            )
+        if not self.recommendation_config.sasrec_metadata_path:
+            self.recommendation_config.sasrec_metadata_path = str(
+                Path(self.model_config.cache_dir) / "sasrec_metadata.json"
             )
         
         # Set embedding dimension consistency

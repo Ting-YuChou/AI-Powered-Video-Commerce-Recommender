@@ -31,6 +31,7 @@ class ModelArtifactManager:
 
     RANKING_MODEL_NAME = "ranking_model"
     TWO_TOWER_MODEL_NAME = "two_tower_retrieval"
+    SASREC_MODEL_NAME = "sasrec_retrieval"
 
     def __init__(
         self,
@@ -60,6 +61,24 @@ class ModelArtifactManager:
     @property
     def two_tower_local_metadata_path(self) -> str:
         return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_meta.json"))
+
+    @property
+    def sasrec_local_checkpoint_path(self) -> str:
+        return self.recommendation_config.sasrec_checkpoint_path or str(
+            Path(self.model_config.cache_dir) / "sasrec_model.pt"
+        )
+
+    @property
+    def sasrec_local_vocab_path(self) -> str:
+        return self.recommendation_config.sasrec_vocab_path or str(
+            Path(self.model_config.cache_dir) / "sasrec_vocab.json"
+        )
+
+    @property
+    def sasrec_local_metadata_path(self) -> str:
+        return self.recommendation_config.sasrec_metadata_path or str(
+            Path(self.model_config.cache_dir) / "sasrec_metadata.json"
+        )
 
     async def get_latest_model_checkpoint(
         self,
@@ -143,6 +162,46 @@ class ModelArtifactManager:
                     ),
                 )
             )
+        await self._sync_paths_to_local_atomically(artifact_specs)
+        return record
+
+    async def sync_latest_sasrec_artifacts(self) -> Optional[ModelArtifactRecord]:
+        record = await self.get_latest_model_checkpoint(self.SASREC_MODEL_NAME)
+        if not record:
+            return None
+
+        payload = record.payload
+        vocab_path = payload.get("vocab_path")
+        metadata_path = payload.get("metadata_path")
+        if not vocab_path or not metadata_path:
+            logger.warning(
+                "SASRec artifact record is incomplete; skipping sync",
+                extra={
+                    "model_version": record.model_version,
+                    "has_checkpoint": bool(record.checkpoint_path),
+                    "has_vocab": bool(vocab_path),
+                    "has_metadata": bool(metadata_path),
+                },
+            )
+            return None
+
+        artifact_specs: List[Tuple[str, str, Optional[str]]] = [
+            (
+                record.checkpoint_path,
+                self.sasrec_local_checkpoint_path,
+                self._extract_artifact_sha256(payload, "checkpoint"),
+            ),
+            (
+                vocab_path,
+                self.sasrec_local_vocab_path,
+                self._extract_artifact_sha256(payload, "vocab", legacy_key="vocab_sha256"),
+            ),
+            (
+                metadata_path,
+                self.sasrec_local_metadata_path,
+                self._extract_artifact_sha256(payload, "metadata", legacy_key="metadata_sha256"),
+            ),
+        ]
         await self._sync_paths_to_local_atomically(artifact_specs)
         return record
 
@@ -259,6 +318,82 @@ class ModelArtifactManager:
         )
         return ModelArtifactRecord(
             model_name=self.TWO_TOWER_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_checkpoint,
+            payload=record_payload,
+        )
+
+    async def persist_sasrec_artifacts(
+        self,
+        *,
+        checkpoint_path: str,
+        vocab_path: str,
+        metadata_path: str,
+        model_version: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ModelArtifactRecord]:
+        if not self.system_store:
+            return None
+
+        checkpoint_sha256 = ObjectStorage.calculate_sha256(checkpoint_path)
+        vocab_sha256 = ObjectStorage.calculate_sha256(vocab_path)
+        metadata_sha256 = ObjectStorage.calculate_sha256(metadata_path)
+
+        persisted_checkpoint = await self._persist_artifact(
+            local_path=checkpoint_path,
+            model_name=self.SASREC_MODEL_NAME,
+            model_version=model_version,
+        )
+        persisted_vocab = await self._persist_artifact(
+            local_path=vocab_path,
+            model_name=self.SASREC_MODEL_NAME,
+            model_version=model_version,
+            content_type="application/json",
+        )
+        persisted_metadata = await self._persist_artifact(
+            local_path=metadata_path,
+            model_name=self.SASREC_MODEL_NAME,
+            model_version=model_version,
+            content_type="application/json",
+        )
+
+        record_payload = dict(payload or {})
+        record_payload.update(
+            {
+                "vocab_path": persisted_vocab,
+                "metadata_path": persisted_metadata,
+                "vocab_sha256": vocab_sha256,
+                "metadata_sha256": metadata_sha256,
+                "local_cache_checkpoint_path": self.sasrec_local_checkpoint_path,
+                "local_cache_vocab_path": self.sasrec_local_vocab_path,
+                "local_cache_metadata_path": self.sasrec_local_metadata_path,
+                "artifact_manifest": {
+                    "checkpoint": {
+                        "path": persisted_checkpoint,
+                        "sha256": checkpoint_sha256,
+                        "local_cache_path": self.sasrec_local_checkpoint_path,
+                    },
+                    "vocab": {
+                        "path": persisted_vocab,
+                        "sha256": vocab_sha256,
+                        "local_cache_path": self.sasrec_local_vocab_path,
+                    },
+                    "metadata": {
+                        "path": persisted_metadata,
+                        "sha256": metadata_sha256,
+                        "local_cache_path": self.sasrec_local_metadata_path,
+                    },
+                },
+            }
+        )
+        await self.system_store.record_model_checkpoint(
+            model_name=self.SASREC_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_checkpoint,
+            payload=record_payload,
+        )
+        return ModelArtifactRecord(
+            model_name=self.SASREC_MODEL_NAME,
             model_version=model_version,
             checkpoint_path=persisted_checkpoint,
             payload=record_payload,

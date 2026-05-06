@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import time
 from collections import Counter
+from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Optional
 
 from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, delete, desc, event, func, select, text
@@ -21,9 +22,85 @@ from config import DatabaseConfig
 
 logger = logging.getLogger(__name__)
 
+POSITIVE_SEQUENCE_ACTIONS = ("view", "click", "add_to_cart", "purchase")
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _coerce_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    if isinstance(value, str):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _event_value(event: Any, key: str, default: Any = None) -> Any:
+    if isinstance(event, Mapping):
+        return event.get(key, default)
+    return getattr(event, key, default)
+
+
+def _event_to_sequence_dict(event: Any) -> Dict[str, Any]:
+    occurred_at = _coerce_datetime(_event_value(event, "occurred_at")) or _utc_now()
+    return {
+        "event_id": _event_value(event, "event_id"),
+        "schema_version": int(_event_value(event, "schema_version", 1) or 1),
+        "request_id": _event_value(event, "request_id"),
+        "user_id": _event_value(event, "user_id"),
+        "product_id": _event_value(event, "product_id"),
+        "action": _event_value(event, "action"),
+        "context": _event_value(event, "context", {}) or {},
+        "timestamp": occurred_at.timestamp(),
+        "occurred_at": occurred_at.timestamp(),
+    }
+
+
+def build_chronological_user_sequences(
+    events: Iterable[Any],
+    *,
+    max_events_per_user: int,
+    min_sequence_length: int,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Build bounded positive product sequences keyed by user id."""
+    if max_events_per_user <= 0:
+        return {}
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for event in events:
+        user_id = _event_value(event, "user_id")
+        product_id = _event_value(event, "product_id")
+        action = _event_value(event, "action")
+        if not user_id or not product_id or action not in POSITIVE_SEQUENCE_ACTIONS:
+            continue
+        grouped.setdefault(user_id, []).append(_event_to_sequence_dict(event))
+
+    min_sequence_length = max(1, int(min_sequence_length))
+    bounded: Dict[str, List[Dict[str, Any]]] = {}
+    for user_id, sequence in grouped.items():
+        sequence.sort(
+            key=lambda item: (
+                float(item.get("occurred_at") or 0.0),
+                str(item.get("event_id") or ""),
+            )
+        )
+        sequence = sequence[-max_events_per_user:]
+        if len(sequence) >= min_sequence_length:
+            bounded[user_id] = sequence
+    return bounded
 
 
 class Base(DeclarativeBase):
@@ -107,6 +184,12 @@ Index(
     InteractionEvent.occurred_at.desc(),
 )
 Index(
+    "ix_interaction_events_user_sequence",
+    InteractionEvent.user_id,
+    InteractionEvent.occurred_at,
+    InteractionEvent.event_id,
+)
+Index(
     "ix_model_checkpoints_latest",
     ModelCheckpoint.model_name,
     ModelCheckpoint.created_at.desc(),
@@ -188,6 +271,12 @@ class SystemStore:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_interaction_events_action_occurred_at "
                 "ON interaction_events (action, occurred_at DESC)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_interaction_events_user_sequence "
+                "ON interaction_events (user_id, occurred_at, event_id)"
             )
         )
         await conn.execute(
@@ -447,6 +536,81 @@ class SystemStore:
                 }
             )
         return interactions
+
+    async def get_user_training_sequences(
+        self,
+        *,
+        max_users: int = 10000,
+        max_events_per_user: int = 200,
+        since: Optional[Any] = None,
+        min_sequence_length: int = 2,
+        actions: Optional[Iterable[str]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return bounded positive chronological interaction sequences per user."""
+        if not self.enabled or max_users <= 0 or max_events_per_user <= 0:
+            return {}
+
+        selected_actions = tuple(actions or POSITIVE_SEQUENCE_ACTIONS)
+        if not selected_actions:
+            return {}
+
+        conditions = [InteractionEvent.action.in_(selected_actions)]
+        since_dt = _coerce_datetime(since)
+        if since_dt is not None:
+            conditions.append(InteractionEvent.occurred_at >= since_dt)
+
+        min_sequence_length = max(1, int(min_sequence_length))
+        eligible_users = (
+            select(InteractionEvent.user_id)
+            .where(*conditions)
+            .group_by(InteractionEvent.user_id)
+            .having(func.count(InteractionEvent.event_id) >= min_sequence_length)
+            .order_by(func.max(InteractionEvent.occurred_at).desc(), InteractionEvent.user_id.asc())
+            .limit(max_users)
+            .subquery()
+        )
+        event_rank = func.row_number().over(
+            partition_by=InteractionEvent.user_id,
+            order_by=(InteractionEvent.occurred_at.desc(), InteractionEvent.event_id.desc()),
+        ).label("event_rank")
+        ranked_events = (
+            select(
+                InteractionEvent.event_id,
+                InteractionEvent.schema_version,
+                InteractionEvent.request_id,
+                InteractionEvent.user_id,
+                InteractionEvent.product_id,
+                InteractionEvent.action,
+                InteractionEvent.context,
+                InteractionEvent.occurred_at,
+                event_rank,
+            )
+            .where(
+                InteractionEvent.user_id.in_(select(eligible_users.c.user_id)),
+                *conditions,
+            )
+            .subquery()
+        )
+        stmt = (
+            select(ranked_events)
+            .where(ranked_events.c.event_rank <= max_events_per_user)
+            .order_by(
+                ranked_events.c.user_id.asc(),
+                ranked_events.c.occurred_at.asc(),
+                ranked_events.c.event_id.asc(),
+            )
+        )
+
+        async with self.session_factory() as session:
+            result = await session.execute(stmt)
+            rows = result.mappings().all()
+        self._update_pool_metrics()
+
+        return build_chronological_user_sequences(
+            rows,
+            max_events_per_user=max_events_per_user,
+            min_sequence_length=min_sequence_length,
+        )
 
     async def get_analytics_summary(self) -> Dict[str, Any]:
         if not self.enabled:

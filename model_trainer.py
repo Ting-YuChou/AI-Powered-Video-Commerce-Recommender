@@ -171,7 +171,17 @@ class ModelTrainerService:
         )
         status = "success"
         try:
-            await self.ranking_model.train_model(interactions)
+            user_features_map = await self.feature_store.get_all_user_features_map()
+            product_metadata_map = (
+                dict(self.vector_search.product_metadata)
+                if self.vector_search and self.vector_search.product_metadata
+                else {}
+            )
+            await self.ranking_model.train_model(
+                interactions,
+                user_features_map=user_features_map,
+                product_metadata_map=product_metadata_map,
+            )
             if self.ranking_model.is_trained and self.artifact_manager:
                 record = await self.artifact_manager.persist_ranking_checkpoint(
                     local_path=self.ranking_model.loaded_model_path or self.config.model_config.ranking_model_path,
@@ -180,6 +190,8 @@ class ModelTrainerService:
                         "trigger": trigger,
                         "sample_count": len(interactions),
                         "last_training_time": self.ranking_model.last_training_time,
+                        "feature_schema_version": self.ranking_model.feature_schema_version,
+                        "training_data_source": self.ranking_model.training_data_source,
                     },
                 )
                 if record:

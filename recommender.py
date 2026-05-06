@@ -30,8 +30,16 @@ from model_artifacts import ModelArtifactManager
 from vector_search import VectorSearchEngine
 from config import RecommendationConfig
 from two_tower import TwoTowerTrainer
+from sasrec import SASRecCandidateEngine
 
 logger = logging.getLogger(__name__)
+
+POSITIVE_SEQUENCE_ACTIONS = {
+    InteractionType.VIEW.value,
+    InteractionType.CLICK.value,
+    InteractionType.ADD_TO_CART.value,
+    InteractionType.PURCHASE.value,
+}
 
 
 class TwoTowerRetrievalEngine:
@@ -65,6 +73,8 @@ class TwoTowerRetrievalEngine:
             hard_ratio_end=config.tt_hard_negative_ratio_end,
             user_hidden_dims=config.tt_user_hidden_dims,
             item_hidden_dims=config.tt_item_hidden_dims,
+            architecture=config.tt_architecture,
+            cross_layers=config.tt_cross_layers,
         )
 
         # CF FAISS index (populated after training)
@@ -151,7 +161,7 @@ class TwoTowerRetrievalEngine:
             existing_index = self.cf_index
             checkpoint_path = self.config.cf_index_path.replace(".faiss", ".pt")
             if Path(checkpoint_path).exists():
-                await asyncio.to_thread(self.trainer.load_checkpoint, checkpoint_path)
+                await asyncio.to_thread(self.trainer.warm_start_from_checkpoint, checkpoint_path)
 
             # Run training
             start_time = time.time()
@@ -506,14 +516,16 @@ class RecommendationEngine:
 
         # Recommendation engines
         self.cf_engine = TwoTowerRetrievalEngine(config, vector_search)
+        self.sasrec_engine = SASRecCandidateEngine(config)
         self.trending_engine = TrendingEngine(config)
 
         # Model state
         self.is_initialized = False
         self.last_model_update = 0
         self.loaded_two_tower_version: Optional[str] = None
+        self.loaded_sasrec_version: Optional[str] = None
 
-        logger.info("Recommendation engine initialized (Two-Tower retrieval)")
+        logger.info("Recommendation engine initialized (Two-Tower + SASRec retrieval)")
 
     async def load_models(self):
         """Load and initialize all recommendation models."""
@@ -543,10 +555,13 @@ class RecommendationEngine:
         try:
             logger.info("Loading recommendation serving state")
             await self._try_load_cf_index()
+            await self._try_load_sasrec_artifacts()
             await self.refresh_serving_pools()
             self.is_initialized = True
             if not self.cf_engine.is_trained:
                 logger.warning("Two-Tower index not available; serving will fall back to non-CF sources")
+            if self.config.enable_sasrec and not self.sasrec_engine.is_trained:
+                logger.warning("SASRec artifacts not available; serving will skip sequential candidates")
             logger.info("Recommendation serving state ready")
         except Exception as e:
             logger.error(f"Error loading recommendation serving state: {e}")
@@ -588,6 +603,32 @@ class RecommendationEngine:
         except Exception as e:
             logger.warning(f"Could not load pre-existing CF index: {e}")
 
+    async def _try_load_sasrec_artifacts(self) -> bool:
+        """Load SASRec serving artifacts if the sequential source is enabled."""
+        if not self.config.enable_sasrec:
+            return False
+        try:
+            checkpoint_record = None
+            if self.artifact_manager:
+                checkpoint_record = await self.artifact_manager.sync_latest_sasrec_artifacts()
+
+            checkpoint_path, vocab_path, metadata_path = self._sasrec_artifact_paths()
+            loaded = await asyncio.to_thread(
+                self.sasrec_engine.load_artifacts,
+                checkpoint_path,
+                vocab_path,
+                metadata_path,
+            )
+            if loaded:
+                if checkpoint_record:
+                    self.sasrec_engine.model_version = checkpoint_record.model_version
+                self.loaded_sasrec_version = self.sasrec_engine.model_version
+                logger.info("Loaded SASRec serving artifacts")
+                return True
+        except Exception as e:
+            logger.warning(f"Could not load SASRec artifacts: {e}")
+        return False
+
     async def _update_models_from_interactions(self):
         """Update models using recent interaction data."""
         try:
@@ -623,6 +664,8 @@ class RecommendationEngine:
                     )
                     self.loaded_two_tower_version = artifact_record.model_version if artifact_record else model_version
 
+                await self._update_sasrec_from_sequences()
+
                 # Update trending scores (use last 1K for recency)
                 await self.trending_engine.update_trending_scores(interactions[:1000])
                 await self.refresh_serving_pools()
@@ -636,21 +679,89 @@ class RecommendationEngine:
         except Exception as e:
             logger.error(f"Error updating models from interactions: {e}")
 
+    async def _update_sasrec_from_sequences(self) -> None:
+        if not self.config.enable_sasrec:
+            return
+        if not self.artifact_manager or not self.artifact_manager.system_store:
+            logger.warning("Skipping SASRec training because Postgres system store is unavailable")
+            return
+
+        max_events = max(
+            int(self.config.sasrec_min_sequence_length),
+            int(self.config.sasrec_max_sequence_length) + 1,
+        )
+        sequences = await self.artifact_manager.system_store.get_user_training_sequences(
+            max_events_per_user=max_events,
+            min_sequence_length=self.config.sasrec_min_sequence_length,
+        )
+        if not sequences:
+            logger.info("Skipping SASRec training because no positive user sequences are available")
+            return
+
+        trained = await self.sasrec_engine.train_model(
+            sequences,
+            catalog_product_ids=self.vector_search.product_metadata.keys(),
+        )
+        if not trained or not self.sasrec_engine.is_trained:
+            return
+
+        checkpoint_path, vocab_path, metadata_path = self._sasrec_artifact_paths()
+        await asyncio.to_thread(
+            self.sasrec_engine.save_artifacts,
+            checkpoint_path,
+            vocab_path,
+            metadata_path,
+        )
+        model_version = self.sasrec_engine.model_version or f"sasrec-{int(time.time())}"
+        artifact_record = await self.artifact_manager.persist_sasrec_artifacts(
+            checkpoint_path=checkpoint_path,
+            vocab_path=vocab_path,
+            metadata_path=metadata_path,
+            model_version=model_version,
+            payload={
+                "sequence_count": len(sequences),
+                "training_sample_count": self.sasrec_engine.training_sample_count,
+                "last_training_time": self.sasrec_engine.last_training_time,
+            },
+        )
+        self.loaded_sasrec_version = artifact_record.model_version if artifact_record else model_version
+
+    def _sasrec_artifact_paths(self) -> Tuple[str, str, str]:
+        if self.artifact_manager:
+            return (
+                self.artifact_manager.sasrec_local_checkpoint_path,
+                self.artifact_manager.sasrec_local_vocab_path,
+                self.artifact_manager.sasrec_local_metadata_path,
+            )
+        base_dir = Path(self.config.cf_index_path).parent
+        return (
+            self.config.sasrec_checkpoint_path or str(base_dir / "sasrec_model.pt"),
+            self.config.sasrec_vocab_path or str(base_dir / "sasrec_vocab.json"),
+            self.config.sasrec_metadata_path or str(base_dir / "sasrec_metadata.json"),
+        )
+
     async def sync_serving_artifacts_if_updated(self) -> bool:
-        """Reload Two-Tower serving artifacts when a newer checkpoint is available."""
+        """Reload retrieval serving artifacts when newer checkpoints are available."""
         if not self.artifact_manager:
             return False
 
-        latest_record = await self.artifact_manager.get_latest_model_checkpoint(
+        updated = False
+        latest_two_tower = await self.artifact_manager.get_latest_model_checkpoint(
             ModelArtifactManager.TWO_TOWER_MODEL_NAME
         )
-        if not latest_record:
-            return False
-        if latest_record.model_version == self.loaded_two_tower_version:
-            return False
+        if latest_two_tower and latest_two_tower.model_version != self.loaded_two_tower_version:
+            await self._try_load_cf_index()
+            updated = updated or self.loaded_two_tower_version == latest_two_tower.model_version
 
-        await self._try_load_cf_index()
-        return self.loaded_two_tower_version == latest_record.model_version
+        if self.config.enable_sasrec:
+            latest_sasrec = await self.artifact_manager.get_latest_model_checkpoint(
+                ModelArtifactManager.SASREC_MODEL_NAME
+            )
+            if latest_sasrec and latest_sasrec.model_version != self.loaded_sasrec_version:
+                await self._try_load_sasrec_artifacts()
+                updated = updated or self.loaded_sasrec_version == latest_sasrec.model_version
+
+        return updated
 
     def _compute_serving_pool_score(
         self,
@@ -725,12 +836,12 @@ class RecommendationEngine:
         self,
         all_candidates: Dict[str, CandidateProduct],
         candidate: CandidateProduct,
-    ):
+    ) -> bool:
         """Merge candidate scores without expanding the candidate set excessively."""
         existing = all_candidates.get(candidate.product_id)
         if existing is None:
             all_candidates[candidate.product_id] = candidate
-            return
+            return False
 
         if candidate.collaborative_score is not None:
             existing.collaborative_score = max(
@@ -749,6 +860,41 @@ class RecommendationEngine:
             )
         if candidate.source not in existing.source.split("+"):
             existing.source = f"{existing.source}+{candidate.source}"
+        return True
+
+    def _build_sasrec_sequence_from_interactions(
+        self,
+        user_interactions: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Normalize Redis newest-first interactions into SASRec chronological positives."""
+        sequence: List[Dict[str, Any]] = []
+        for interaction in reversed(user_interactions):
+            product_id = interaction.get("product_id")
+            action = interaction.get("action")
+            if not product_id or action not in POSITIVE_SEQUENCE_ACTIONS:
+                continue
+            sequence.append(
+                {
+                    "user_id": interaction.get("user_id"),
+                    "product_id": product_id,
+                    "action": action,
+                    "timestamp": interaction.get("timestamp"),
+                    "occurred_at": interaction.get("occurred_at", interaction.get("timestamp")),
+                    "event_id": interaction.get("event_id"),
+                    "schema_version": interaction.get("schema_version", 1),
+                    "context": interaction.get("context") or {},
+                }
+            )
+        return sequence[-self.config.sasrec_max_sequence_length :]
+
+    @staticmethod
+    def _count_source_tokens(candidates: List[CandidateProduct]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for candidate in candidates:
+            for source in str(candidate.source or "unknown").split("+"):
+                source = source or "unknown"
+                counts[source] = counts.get(source, 0) + 1
+        return counts
 
     def _resolve_preferred_categories(
         self,
@@ -801,6 +947,7 @@ class RecommendationEngine:
                 "user_interactions_ms": 0.0,
                 "user_features_ms": 0.0,
                 "cf_candidates_ms": 0.0,
+                "sasrec_candidates_ms": 0.0,
                 "content_candidates_ms": 0.0,
                 "trending_candidates_ms": 0.0,
                 "category_pool_ms": 0.0,
@@ -810,6 +957,9 @@ class RecommendationEngine:
                 "candidate_count": 0,
                 "preferred_categories": [],
                 "source_counts": {},
+                "source_overlap_counts": {},
+                "merged_source_counts": {},
+                "sasrec_sequence_length": 0,
             }
 
             async def timed_stage(
@@ -861,6 +1011,8 @@ class RecommendationEngine:
                 for interaction in user_interactions
                 if interaction.get("product_id")
             }
+            sasrec_sequence = self._build_sasrec_sequence_from_interactions(user_interactions)
+            profile["sasrec_sequence_length"] = len(sasrec_sequence)
             user_features_dict = user_features_obj.dict() if user_features_obj else {}
             preferred_categories = self._resolve_preferred_categories(user_features_obj, context)
             profile["preferred_categories"] = preferred_categories
@@ -877,6 +1029,16 @@ class RecommendationEngine:
                     min(target_candidates, self.config.max_live_cf_candidates),
                     exclude_items,
                     user_features=user_features_dict,
+                )
+
+            async def fetch_sasrec_candidates() -> List[CandidateProduct]:
+                if not self.config.enable_sasrec or not self.sasrec_engine.is_trained:
+                    return []
+                return await self.sasrec_engine.get_candidates(
+                    sasrec_sequence,
+                    k=min(target_candidates, self.config.max_live_sasrec_candidates),
+                    exclude_items=exclude_items,
+                    catalog_product_ids=self.vector_search.product_metadata.keys(),
                 )
 
             async def fetch_content_candidates() -> List[CandidateProduct]:
@@ -927,6 +1089,10 @@ class RecommendationEngine:
                 timed_stage("cf_candidates_ms", fetch_cf_candidates(), [], source_timeout_ms),
                 name="candidate-source-cf",
             )
+            sasrec_task = asyncio.create_task(
+                timed_stage("sasrec_candidates_ms", fetch_sasrec_candidates(), [], source_timeout_ms),
+                name="candidate-source-sasrec",
+            )
             content_task = asyncio.create_task(
                 timed_stage("content_candidates_ms", fetch_content_candidates(), [], source_timeout_ms),
                 name="candidate-source-content",
@@ -940,25 +1106,23 @@ class RecommendationEngine:
                 name="candidate-source-category",
             )
 
-            cf_candidates, content_candidates, trending_candidates, category_candidates = (
-                await asyncio.gather(cf_task, content_task, trending_task, category_task)
+            cf_candidates, sasrec_candidates, content_candidates, trending_candidates, category_candidates = (
+                await asyncio.gather(cf_task, sasrec_task, content_task, trending_task, category_task)
             )
 
-            for candidate in cf_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["cf"] = len(cf_candidates)
+            def merge_source(source_name: str, candidates: List[CandidateProduct]) -> None:
+                overlaps = 0
+                for candidate in candidates:
+                    if self._merge_candidate(all_candidates, candidate):
+                        overlaps += 1
+                profile["source_counts"][source_name] = len(candidates)
+                profile["source_overlap_counts"][source_name] = overlaps
 
-            for candidate in content_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["content"] = len(content_candidates)
-
-            for candidate in trending_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["trending_pool"] = len(trending_candidates)
-
-            for candidate in category_candidates:
-                self._merge_candidate(all_candidates, candidate)
-            profile["source_counts"]["category_pool"] = len(category_candidates)
+            merge_source("cf", cf_candidates)
+            merge_source("sasrec", sasrec_candidates)
+            merge_source("content", content_candidates)
+            merge_source("trending_pool", trending_candidates)
+            merge_source("category_pool", category_candidates)
 
             # 5. Small random fallback only if stronger sources are still thin
             stage_started = time.perf_counter()
@@ -986,7 +1150,12 @@ class RecommendationEngine:
                         and candidate.product_id not in all_candidates
                     ):
                         all_candidates[candidate.product_id] = candidate
+                    elif candidate.product_id in all_candidates:
+                        profile["source_overlap_counts"]["random"] = (
+                            profile["source_overlap_counts"].get("random", 0) + 1
+                        )
                 profile["source_counts"]["random"] = len(random_candidates)
+                profile["source_overlap_counts"].setdefault("random", 0)
             elif profile["random_candidates_ms"] == 0.0:
                 profile["random_candidates_ms"] = round(
                     (time.perf_counter() - stage_started) * 1000,
@@ -995,6 +1164,7 @@ class RecommendationEngine:
 
             # Combine scores for final ranking
             stage_started = time.perf_counter()
+            profile["merged_source_counts"] = self._count_source_tokens(list(all_candidates.values()))
             final_candidates: List[CandidateProduct] = []
             for candidate in all_candidates.values():
                 cf_score = candidate.collaborative_score or 0.0
@@ -1032,6 +1202,7 @@ class RecommendationEngine:
                     "user_interactions_ms": 0.0,
                     "user_features_ms": 0.0,
                     "cf_candidates_ms": 0.0,
+                    "sasrec_candidates_ms": 0.0,
                     "content_candidates_ms": 0.0,
                     "trending_candidates_ms": 0.0,
                     "category_pool_ms": 0.0,
@@ -1041,6 +1212,9 @@ class RecommendationEngine:
                     "candidate_count": 0,
                     "preferred_categories": [],
                     "source_counts": {},
+                    "source_overlap_counts": {},
+                    "merged_source_counts": {},
+                    "sasrec_sequence_length": 0,
                     "error": str(e),
                 }
             return []
@@ -1147,6 +1321,9 @@ class RecommendationEngine:
             model_params = sum(
                 p.numel() for p in self.cf_engine.trainer.model.parameters()
             )
+        sasrec_params = 0
+        if self.sasrec_engine.model is not None:
+            sasrec_params = sum(p.numel() for p in self.sasrec_engine.model.parameters())
 
         return {
             "is_initialized": self.is_initialized,
@@ -1158,6 +1335,11 @@ class RecommendationEngine:
             "cf_embedding_dim": self.config.tt_embedding_dim,
             "cf_index_size": self.cf_engine.cf_index.ntotal if self.cf_engine.cf_index else 0,
             "cf_model_parameters": model_params,
+            "sasrec_enabled": self.config.enable_sasrec,
+            "sasrec_trained": self.sasrec_engine.is_trained,
+            "sasrec_model_version": self.sasrec_engine.model_version,
+            "sasrec_items": len(self.sasrec_engine.product_to_id),
+            "sasrec_model_parameters": sasrec_params,
             "trending_products": len(self.trending_engine.trending_scores),
             "config": {
                 "tt_embedding_dim": self.config.tt_embedding_dim,
