@@ -222,6 +222,11 @@ class RecommendationConfig(BaseSettings):
     
     # Two-Tower model settings
     tt_embedding_dim: int = Field(128, description="Two-Tower output embedding dimension")
+    tt_architecture: str = Field(
+        "dcn",
+        description="Two-Tower tower architecture: dcn or mlp",
+    )
+    tt_cross_layers: int = Field(3, description="Two-Tower DCN cross layer count")
     tt_user_hidden_dims: List[int] = Field([256, 128], description="User tower hidden dimensions")
     tt_item_hidden_dims: List[int] = Field([256, 128], description="Item tower hidden dimensions")
     tt_learning_rate: float = Field(0.001, description="Two-Tower learning rate")
@@ -253,6 +258,19 @@ class RecommendationConfig(BaseSettings):
     sasrec_checkpoint_path: Optional[str] = Field(None, description="SASRec checkpoint local path")
     sasrec_vocab_path: Optional[str] = Field(None, description="SASRec vocabulary local path")
     sasrec_metadata_path: Optional[str] = Field(None, description="SASRec metadata local path")
+
+    @validator("tt_architecture")
+    def validate_tt_architecture(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"dcn", "mlp"}:
+            raise ValueError("tt_architecture must be one of: dcn, mlp")
+        return normalized
+
+    @validator("tt_cross_layers")
+    def validate_tt_cross_layers(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("tt_cross_layers must be >= 0")
+        return value
     
     class Config:
         env_prefix = "RECOMMENDATION_"
@@ -260,6 +278,12 @@ class RecommendationConfig(BaseSettings):
 class RankingConfig(BaseSettings):
     """Ranking model configuration."""
     model_type: str = Field("neural", description="Ranking model type")
+    architecture: str = Field(
+        "dcn",
+        description="Ranking model architecture: mlp, dcn, or dcn_v2_low_rank",
+    )
+    cross_layers: int = Field(3, description="Ranking DCN cross layer count")
+    low_rank_dim: int = Field(8, description="Ranking DCN-v2 low-rank dimension")
     hidden_dims: List[int] = Field([256, 128, 64], description="Neural network hidden dimensions")
     dropout_rate: float = Field(0.2, description="Dropout rate")
     learning_rate: float = Field(0.001, description="Learning rate")
@@ -318,6 +342,25 @@ class RankingConfig(BaseSettings):
         60,
         description="How often recommendation workers check for a newer ranking checkpoint",
     )
+
+    @validator("architecture")
+    def validate_architecture(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"dcn", "dcn_v2_low_rank", "mlp"}:
+            raise ValueError("architecture must be one of: dcn, dcn_v2_low_rank, mlp")
+        return normalized
+
+    @validator("cross_layers")
+    def validate_cross_layers(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("cross_layers must be >= 0")
+        return value
+
+    @validator("low_rank_dim")
+    def validate_low_rank_dim(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("low_rank_dim must be >= 1")
+        return value
     
     class Config:
         env_prefix = "RANKING_"

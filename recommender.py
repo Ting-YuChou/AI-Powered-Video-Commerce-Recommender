@@ -73,6 +73,8 @@ class TwoTowerRetrievalEngine:
             hard_ratio_end=config.tt_hard_negative_ratio_end,
             user_hidden_dims=config.tt_user_hidden_dims,
             item_hidden_dims=config.tt_item_hidden_dims,
+            architecture=config.tt_architecture,
+            cross_layers=config.tt_cross_layers,
         )
 
         # CF FAISS index (populated after training)
@@ -159,7 +161,7 @@ class TwoTowerRetrievalEngine:
             existing_index = self.cf_index
             checkpoint_path = self.config.cf_index_path.replace(".faiss", ".pt")
             if Path(checkpoint_path).exists():
-                await asyncio.to_thread(self.trainer.load_checkpoint, checkpoint_path)
+                await asyncio.to_thread(self.trainer.warm_start_from_checkpoint, checkpoint_path)
 
             # Run training
             start_time = time.time()
