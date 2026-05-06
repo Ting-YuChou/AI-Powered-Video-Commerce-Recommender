@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
 import json
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from starlette.responses import Response
 
 from config import RankingConfig, RecommendationConfig
 from models import CandidateProduct, ProductRecommendation, RecommendationRequest, UserFeatures
@@ -32,10 +34,21 @@ from recommendation_api import (
     _user_feature_cache_token,
 )
 from recommender import TwoTowerRetrievalEngine
+from slate_diversity import select_mmr_recommendations
 
 
 def _hash_context(context):
     return hashlib.md5(json.dumps(context, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _recommendation(product_id: str, ranking_score: float) -> ProductRecommendation:
+    return ProductRecommendation(
+        product_id=product_id,
+        title=f"Product {product_id}",
+        price=10.0,
+        confidence_score=0.8,
+        ranking_score=ranking_score,
+    )
 
 
 def test_build_recommendations_constructs_only_top_k_in_score_order():
@@ -66,6 +79,68 @@ def test_build_recommendations_constructs_only_top_k_in_score_order():
     )
 
     assert [item.product_id for item in recommendations] == ["p1", "p3"]
+
+
+def test_mmr_diversifies_high_relevance_duplicate_cluster():
+    recommendations = [
+        _recommendation("p1", 1.0),
+        _recommendation("p2", 0.95),
+        _recommendation("p3", 0.9),
+    ]
+    embeddings = {
+        "p1": np.array([1.0, 0.0], dtype=np.float32),
+        "p2": np.array([1.0, 0.0], dtype=np.float32),
+        "p3": np.array([0.0, 1.0], dtype=np.float32),
+    }
+
+    selected = select_mmr_recommendations(
+        recommendations,
+        k=2,
+        embedding_lookup=embeddings.get,
+        lambda_weight=0.5,
+    )
+
+    assert [item.product_id for item in selected] == ["p1", "p3"]
+
+
+def test_mmr_lambda_one_preserves_relevance_order():
+    recommendations = [
+        _recommendation("p1", 1.0),
+        _recommendation("p2", 0.8),
+        _recommendation("p3", 0.7),
+    ]
+    embeddings = {
+        "p1": np.array([1.0, 0.0], dtype=np.float32),
+        "p2": np.array([1.0, 0.0], dtype=np.float32),
+        "p3": np.array([0.0, 1.0], dtype=np.float32),
+    }
+
+    selected = select_mmr_recommendations(
+        recommendations,
+        k=3,
+        embedding_lookup=embeddings.get,
+        lambda_weight=1.0,
+    )
+
+    assert [item.product_id for item in selected] == ["p1", "p2", "p3"]
+
+
+def test_mmr_missing_embeddings_do_not_remove_products():
+    recommendations = [
+        _recommendation("p1", 1.0),
+        _recommendation("p2", 0.9),
+        _recommendation("p3", 0.8),
+    ]
+    embeddings = {"p1": np.array([1.0, 0.0], dtype=np.float32)}
+
+    selected = select_mmr_recommendations(
+        recommendations,
+        k=3,
+        embedding_lookup=embeddings.get,
+        lambda_weight=0.5,
+    )
+
+    assert [item.product_id for item in selected] == ["p1", "p2", "p3"]
 
 
 def test_prepare_request_matrix_reuses_static_product_features_without_changing_values(monkeypatch):
@@ -469,6 +544,218 @@ def test_cache_freshness_context_uses_stable_cold_sequence_token():
     )
 
     assert context["user_sequence_token"] == _default_user_sequence_token()
+
+
+def test_recommendation_cache_context_changes_when_slate_diversity_is_enabled():
+    payload = RecommendationRequest(user_id="u1", k=10, context={"device": "mobile"})
+
+    disabled = _build_recommendation_cache_context(
+        payload,
+        current_time=3600,
+        recommendation_config=RecommendationConfig(enable_slate_diversity=False),
+    )
+    enabled = _build_recommendation_cache_context(
+        payload,
+        current_time=3600,
+        recommendation_config=RecommendationConfig(
+            enable_slate_diversity=True,
+            mmr_lambda=0.7,
+        ),
+    )
+
+    assert disabled != enabled
+    assert enabled["slate_diversity"]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_recommendation_path_expands_ranker_pool_and_caches_post_mmr(monkeypatch):
+    recommendation_api_module._recommendation_singleflight.clear()
+    scheduled_tasks = []
+
+    class FakeFeatureStore:
+        def __init__(self):
+            self.cached_recommendations = None
+
+        async def get_user_features(self, user_id, cache_default=False):
+            return UserFeatures(user_id=user_id, total_interactions=3)
+
+        async def get_user_sequence_token(self, user_id):
+            return _default_user_sequence_token()
+
+        async def get_cached_recommendations(self, user_id, cache_key):
+            return None
+
+        async def get_cached_candidate_products(self, user_id, cache_key):
+            return None
+
+        def generate_context_hash(self, context):
+            return hashlib.md5(json.dumps(context, sort_keys=True).encode()).hexdigest()
+
+        async def cache_candidate_products(self, user_id, cache_key, candidates, user_features=None):
+            return None
+
+        async def get_product_metadata_batch(self, product_ids):
+            return {
+                product_id: {
+                    "title": f"Product {product_id}",
+                    "price": 10.0,
+                    "active": True,
+                    "in_stock": True,
+                }
+                for product_id in product_ids
+            }
+
+        def prime_product_metadata_memory_cache(self, metadata):
+            return None
+
+        async def store_product_metadata_batch(self, metadata):
+            return None
+
+        async def cache_recommendations(self, user_id, cache_key, recommendations, user_features=None):
+            self.cached_recommendations = recommendations
+
+        async def log_recommendation_request(self, user_id, count, response_time):
+            return None
+
+    class FakeRecommendationEngine:
+        loaded_two_tower_version = "two-tower-test"
+        loaded_sasrec_version = None
+        cf_engine = SimpleNamespace(model_version="two-tower-test")
+
+        async def generate_candidates(
+            self,
+            user_id,
+            content_features=None,
+            context=None,
+            k_per_source=100,
+            include_profile=False,
+            user_features=None,
+        ):
+            candidates = [
+                CandidateProduct(product_id=f"p{i}", combined_score=1.0 - i * 0.1, source="test")
+                for i in range(1, 6)
+            ]
+            return candidates, {"path": "fake", "candidate_count": len(candidates)}
+
+        async def get_trending_recommendations(self, k):
+            return []
+
+    class FakeVectorSearch:
+        def __init__(self):
+            self.embeddings = {
+                "p1": np.array([1.0, 0.0], dtype=np.float32),
+                "p2": np.array([1.0, 0.0], dtype=np.float32),
+                "p3": np.array([0.0, 1.0], dtype=np.float32),
+                "p4": np.array([0.0, 1.0], dtype=np.float32),
+            }
+
+        def get_catalog_version_context(self):
+            return {"catalog_version": 1, "last_updated": 1, "product_count": 5}
+
+        async def get_product_metadata_batch(self, product_ids):
+            return {}
+
+        def get_product_embedding(self, product_id):
+            return self.embeddings.get(product_id)
+
+    class FakeRankingBatcher:
+        def __init__(self):
+            self.received_k = None
+
+        async def rank_candidates(
+            self,
+            candidates,
+            user_features,
+            context,
+            k,
+            product_metadata_map=None,
+            include_profile=False,
+        ):
+            self.received_k = k
+            recommendations = [
+                _recommendation(candidate.product_id, 1.0 - index * 0.05)
+                for index, candidate in enumerate(candidates[:k])
+            ]
+            return recommendations, {"path": "fake", "ranked_count": len(recommendations)}
+
+    class FakeObservability:
+        def record_recommendation(self, **kwargs):
+            return None
+
+    def schedule_task(task_name, awaitable, timeout_seconds=0.25):
+        scheduled_tasks.append(asyncio.create_task(awaitable))
+
+    feature_store = FakeFeatureStore()
+    ranking_batcher = FakeRankingBatcher()
+    runtime = SimpleNamespace(
+        service_name="recommendation-service",
+        active_requests=0,
+        handled_requests=0,
+        max_active_requests=0,
+        observability=FakeObservability(),
+        config=SimpleNamespace(
+            recommendation_config=RecommendationConfig(
+                enable_slate_diversity=True,
+                mmr_lambda=0.5,
+                mmr_rerank_pool_multiplier=2,
+                mmr_min_rerank_pool_size=1,
+                mmr_max_rerank_pool_size=10,
+            ),
+            cache_config=SimpleNamespace(
+                hot_path_read_timeout_ms=1000,
+                background_write_timeout_ms=1000,
+            ),
+            monitoring_config=SimpleNamespace(
+                enable_profiling_logs=True,
+                profiling_log_min_duration_ms=999999,
+            ),
+            model_config=SimpleNamespace(ranking_model_path=None),
+            vector_config=SimpleNamespace(index_path=None),
+        ),
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            worker_process_id=123,
+            worker_active_requests_at_entry=1,
+            worker_handled_requests=7,
+            request_started_at=time.perf_counter(),
+        )
+    )
+
+    monkeypatch.setattr(recommendation_api_module.app.state, "runtime", runtime, raising=False)
+    monkeypatch.setattr(recommendation_api_module, "feature_store", feature_store)
+    monkeypatch.setattr(recommendation_api_module, "recommendation_engine", FakeRecommendationEngine())
+    monkeypatch.setattr(recommendation_api_module, "vector_search", FakeVectorSearch())
+    monkeypatch.setattr(recommendation_api_module, "ranking_batcher", ranking_batcher)
+    monkeypatch.setattr(
+        recommendation_api_module,
+        "ranking_model",
+        SimpleNamespace(model_version="ranking-test"),
+    )
+    monkeypatch.setattr(recommendation_api_module, "kafka_manager", None)
+    monkeypatch.setattr(recommendation_api_module, "_schedule_best_effort_task", schedule_task)
+
+    result = await recommendation_api_module.get_recommendations(
+        request,
+        Response(),
+        RecommendationRequest(user_id="u1", k=2, context={"device": "mobile"}),
+    )
+    if scheduled_tasks:
+        await asyncio.gather(*scheduled_tasks)
+
+    assert ranking_batcher.received_k == 4
+    assert [item.product_id for item in result.recommendations] == ["p1", "p3"]
+    assert len(result.recommendations) == 2
+    assert [
+        item["product_id"]
+        for item in feature_store.cached_recommendations
+    ] == ["p1", "p3"]
+    profile = result.metadata["profile"]
+    assert profile["slate_diversity_enabled"] is True
+    assert profile["slate_diversity_method"] == "mmr"
+    assert profile["slate_diversity_pool_size"] == 4
+    assert profile["slate_diversity_selected_count"] == 2
+    assert profile["slate_diversity_ms"] >= 0.0
 
 
 @pytest.mark.asyncio
