@@ -16,6 +16,7 @@ Architecture:
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -39,7 +40,8 @@ NUM_BRAND_BUCKETS = 128
 
 def _hash_bucket(value: str, num_buckets: int) -> int:
     """Hash a string into a fixed bucket index."""
-    return abs(hash(value)) % num_buckets
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) % num_buckets
 
 
 class UserFeatureEncoder:
@@ -478,6 +480,7 @@ class TwoTowerTrainer:
 
         self._item_clip_embs: Optional[np.ndarray] = None
         self._item_side_feats: Optional[np.ndarray] = None
+        self._last_item_embeddings: Optional[np.ndarray] = None
         self._user_side_feats: Dict[int, np.ndarray] = {}
         self._train_samples: List[Tuple[int, int, float]] = []
 
@@ -568,9 +571,18 @@ class TwoTowerTrainer:
             logger.warning("Model or training data not prepared; skipping training")
             return {"status": "skipped"}
 
-        if existing_cf_index is not None and existing_cf_index.ntotal > 0:
+        if (
+            existing_cf_index is not None
+            and existing_cf_index.ntotal > 0
+            and existing_cf_index.ntotal == len(self.item_mapping)
+        ):
             idx_map = {i: i + 1 for i in range(existing_cf_index.ntotal)}
             self.negative_sampler.set_index(existing_cf_index, idx_map)
+        elif existing_cf_index is not None and existing_cf_index.ntotal > 0:
+            logger.info(
+                "Skipping warm hard-negative index because item count changed: "
+                f"index_items={existing_cf_index.ntotal}, current_items={len(self.item_mapping)}"
+            )
 
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
         self.model.train()
@@ -612,8 +624,35 @@ class TwoTowerTrainer:
                     pos_clip_np[i] = self._item_clip_embs[p_idx]
                     pos_feat_np[i] = self._item_side_feats[p_idx]
 
+                user_embeddings_np: Optional[np.ndarray] = None
+                hard_count = int(
+                    total_neg * self.negative_sampler.get_hard_ratio(epoch, self.epochs)
+                )
+                if (
+                    hard_count > 0
+                    and self.negative_sampler.item_index is not None
+                    and self.negative_sampler.item_index.ntotal > 0
+                ):
+                    was_training = self.model.training
+                    self.model.eval()
+                    with torch.no_grad():
+                        user_ids_t = torch.tensor(user_ids_np, dtype=torch.long, device=self.device)
+                        user_feats_t = torch.tensor(user_feats_np, device=self.device)
+                        user_embeddings_np = self.model.encode_users(
+                            user_ids_t,
+                            user_feats_t,
+                        ).cpu().numpy()
+                    if was_training:
+                        self.model.train()
+
+                for i, sample_idx in enumerate(batch_indices):
+                    u_idx, _, _ = self._train_samples[sample_idx]
                     neg_indices = self.negative_sampler.sample(
-                        user_embedding=None,
+                        user_embedding=(
+                            user_embeddings_np[i]
+                            if user_embeddings_np is not None
+                            else None
+                        ),
                         positive_items=self.user_positives.get(u_idx, set()),
                         epoch=epoch,
                         total_epochs=self.epochs,
@@ -706,10 +745,45 @@ class TwoTowerTrainer:
         index.hnsw.efConstruction = 200
         index.hnsw.efSearch = 50
         index.add(all_embeddings)
+        self._last_item_embeddings = all_embeddings
 
         idx_map = {i: i + 1 for i in range(num_items)}
         logger.info(f"Built CF FAISS index with {index.ntotal} item embeddings")
         return index, idx_map
+
+    def get_item_embedding_map(self) -> Dict[str, np.ndarray]:
+        """Return product_id -> latest trained item embedding."""
+        if self._last_item_embeddings is None:
+            return {}
+        embeddings: Dict[str, np.ndarray] = {}
+        for product_id, item_idx in self.item_mapping.items():
+            if 1 <= item_idx <= len(self._last_item_embeddings):
+                embeddings[product_id] = np.asarray(
+                    self._last_item_embeddings[item_idx - 1],
+                    dtype=np.float32,
+                )
+        return embeddings
+
+    def get_item_side_feature_map(self) -> Dict[str, np.ndarray]:
+        if self._item_side_feats is None:
+            return {}
+        features: Dict[str, np.ndarray] = {}
+        for product_id, item_idx in self.item_mapping.items():
+            if 0 <= item_idx < len(self._item_side_feats):
+                features[product_id] = np.asarray(
+                    self._item_side_feats[item_idx],
+                    dtype=np.float32,
+                )
+        return features
+
+    def get_item_clip_available_map(self) -> Dict[str, bool]:
+        if self._item_clip_embs is None:
+            return {}
+        available: Dict[str, bool] = {}
+        for product_id, item_idx in self.item_mapping.items():
+            if 0 <= item_idx < len(self._item_clip_embs):
+                available[product_id] = bool(np.linalg.norm(self._item_clip_embs[item_idx]) > 0.0)
+        return available
 
     @torch.no_grad()
     def encode_user(

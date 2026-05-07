@@ -194,6 +194,16 @@ def _serving_version_context(runtime) -> Dict[str, Any]:
             if recommendation_engine
             else None
         ),
+        "cf_cold_start_overlay": (
+            getattr(recommendation_engine.cf_engine, "cold_start_overlay_version", None)
+            if recommendation_engine
+            else None
+        ),
+        "cf_new_item_pool": (
+            getattr(recommendation_engine.cf_engine, "new_item_pool_version", None)
+            if recommendation_engine
+            else None
+        ),
         "sasrec_model": (
             recommendation_engine.loaded_sasrec_version
             if recommendation_engine

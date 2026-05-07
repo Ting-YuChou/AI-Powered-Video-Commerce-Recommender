@@ -31,6 +31,15 @@ from vector_search import VectorSearchEngine
 from config import RecommendationConfig
 from two_tower import TwoTowerTrainer
 from sasrec import SASRecCandidateEngine
+from cf_cold_start import (
+    ContentToCFAdapter,
+    build_content_feature,
+    build_hybrid_synthetic_embedding,
+    is_cold_start_eligible,
+    load_item_embedding_sidecar,
+    normalize_vector,
+    save_item_embedding_sidecar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +89,8 @@ class TwoTowerRetrievalEngine:
         # CF FAISS index (populated after training)
         self.cf_index: Optional[faiss.Index] = None
         self.cf_index_map: Dict[int, str] = {}  # faiss_idx -> product_id
+        self._base_cf_index: Optional[faiss.Index] = None
+        self._base_cf_index_map: Dict[int, str] = {}
 
         # Backward-compatible attributes consumed by RecommendationEngine.get_stats()
         self.user_mapping: Dict[str, int] = {}
@@ -89,6 +100,17 @@ class TwoTowerRetrievalEngine:
         self.last_training_time: float = 0
         self.model_version: Optional[str] = None
         self._item_popularity: Dict[str, float] = {}
+        self.trained_item_embeddings: Dict[str, np.ndarray] = {}
+        self.trained_item_clip_available: Dict[str, bool] = {}
+        self.trained_item_features: Dict[str, np.ndarray] = {}
+        self.content_to_cf_adapter: Optional[ContentToCFAdapter] = None
+        self.synthetic_item_embeddings: Dict[str, np.ndarray] = {}
+        self.synthetic_item_metadata: Dict[str, Dict[str, Any]] = {}
+        self.cold_start_overlay_version: Optional[str] = None
+        self._new_item_candidates: List[CandidateProduct] = []
+        self.new_item_pool_version: Optional[str] = None
+        self.new_item_pool_refreshed_at: float = 0.0
+        self._new_item_pool_catalog_token: Optional[str] = None
         self._user_embedding_cache_max_size = max(
             0,
             int(getattr(config, "user_embedding_cache_size", 20000)),
@@ -158,7 +180,7 @@ class TwoTowerRetrievalEngine:
             )
 
             # Try to load existing checkpoint for warm-start
-            existing_index = self.cf_index
+            existing_index = self._base_cf_index or self.cf_index
             checkpoint_path = self.config.cf_index_path.replace(".faiss", ".pt")
             if Path(checkpoint_path).exists():
                 await asyncio.to_thread(self.trainer.warm_start_from_checkpoint, checkpoint_path)
@@ -180,13 +202,26 @@ class TwoTowerRetrievalEngine:
                 product_id = self.trainer.reverse_item_mapping.get(item_idx)
                 if product_id:
                     self.cf_index_map[faiss_idx] = product_id
+            self._base_cf_index = self.cf_index
+            self._base_cf_index_map = dict(self.cf_index_map)
 
             # Sync backward-compat attributes
             self.user_mapping = dict(self.trainer.user_mapping)
             self.item_mapping = dict(self.trainer.item_mapping)
+            self.trained_item_embeddings = self.trainer.get_item_embedding_map()
+            self.trained_item_clip_available = self.trainer.get_item_clip_available_map()
+            self.trained_item_features = self.trainer.get_item_side_feature_map()
 
             # Save checkpoint and index
             await asyncio.to_thread(self.trainer.save_checkpoint, checkpoint_path)
+            model_version = f"two-tower-{int(time.time())}"
+            self.model_version = model_version
+            await asyncio.to_thread(
+                self._save_cold_start_sidecars,
+                model_version,
+                product_clip_embeddings,
+                product_metadata,
+            )
             await asyncio.to_thread(
                 VectorSearchEngine.save_cf_index,
                 self.cf_index,
@@ -195,12 +230,15 @@ class TwoTowerRetrievalEngine:
                     "num_items": len(self.item_mapping),
                     "embedding_dim": self.config.tt_embedding_dim,
                     "index_map": {str(k): v for k, v in self.cf_index_map.items()},
+                    "cf_embedding_sidecar_path": self._embedding_sidecar_path(),
+                    "cf_adapter_path": self._adapter_path(),
                 },
             )
 
             self.is_trained = True
             self.last_training_time = time.time()
-            self.model_version = f"two-tower-{int(self.last_training_time)}"
+            await self.refresh_cold_start_overlay()
+            await asyncio.to_thread(self.refresh_new_item_candidates)
             self.clear_user_embedding_cache()
 
             logger.info(
@@ -212,6 +250,508 @@ class TwoTowerRetrievalEngine:
         except Exception as e:
             logger.error(f"Error training Two-Tower model: {e}")
             self.is_trained = False
+
+    def _embedding_sidecar_path(self) -> str:
+        return str(Path(self.config.cf_index_path).with_suffix(".cf_embeddings.npz"))
+
+    def _adapter_path(self) -> str:
+        return str(Path(self.config.cf_index_path).with_suffix(".cf_adapter.npz"))
+
+    def _save_cold_start_sidecars(
+        self,
+        model_version: str,
+        product_clip_embeddings: Dict[str, np.ndarray],
+        product_metadata: Dict[str, Dict[str, Any]],
+    ) -> None:
+        self.content_to_cf_adapter = None
+        self._remove_cold_start_artifact(self._adapter_path())
+        if not self.trained_item_embeddings:
+            self._remove_cold_start_artifact(self._embedding_sidecar_path())
+            return
+
+        save_item_embedding_sidecar(
+            self._embedding_sidecar_path(),
+            embedding_map=self.trained_item_embeddings,
+            clip_available=self.trained_item_clip_available,
+            item_features=self.trained_item_features,
+            model_version=model_version,
+        )
+        adapter = self._fit_content_to_cf_adapter(product_clip_embeddings, product_metadata)
+        if adapter is not None:
+            adapter.save(
+                self._adapter_path(),
+                metadata={
+                    "two_tower_model_version": model_version,
+                    "trained_item_count": len(self.trained_item_embeddings),
+                },
+            )
+            self.content_to_cf_adapter = adapter
+
+    @staticmethod
+    def _remove_cold_start_artifact(path: str) -> None:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to remove stale CF cold-start artifact %s: %s", path, exc)
+
+    def _fit_content_to_cf_adapter(
+        self,
+        product_clip_embeddings: Dict[str, np.ndarray],
+        product_metadata: Dict[str, Dict[str, Any]],
+    ) -> Optional[ContentToCFAdapter]:
+        features: List[np.ndarray] = []
+        targets: List[np.ndarray] = []
+        for product_id, embedding in self.trained_item_embeddings.items():
+            clip_embedding = product_clip_embeddings.get(product_id)
+            if clip_embedding is None:
+                continue
+            try:
+                features.append(
+                    build_content_feature(
+                        clip_embedding,
+                        product_metadata.get(product_id, {}),
+                        clip_dim=self.vector_search.embedding_dim,
+                    )
+                )
+                targets.append(normalize_vector(embedding))
+            except ValueError:
+                continue
+
+        if len(features) < 2:
+            logger.warning("Skipping content-to-CF adapter fit; not enough CLIP-backed items")
+            return None
+        try:
+            return ContentToCFAdapter.fit(np.vstack(features), np.vstack(targets))
+        except Exception as exc:
+            logger.warning("Skipping content-to-CF adapter fit: %s", exc)
+            return None
+
+    def _clear_loaded_cold_start_sidecars(self) -> None:
+        self.trained_item_embeddings = {}
+        self.trained_item_clip_available = {}
+        self.trained_item_features = {}
+        self.content_to_cf_adapter = None
+        self.synthetic_item_embeddings = {}
+        self.synthetic_item_metadata = {}
+        self.cold_start_overlay_version = None
+        if self._base_cf_index is not None:
+            self.cf_index = self._base_cf_index
+            self.cf_index_map = dict(self._base_cf_index_map)
+
+    def _load_cold_start_sidecars(self) -> None:
+        embeddings, clip_available, item_features, sidecar_version = load_item_embedding_sidecar(
+            self._embedding_sidecar_path()
+        )
+        expected_model_version = self.model_version
+        if not embeddings:
+            self._clear_loaded_cold_start_sidecars()
+            return
+        if expected_model_version and sidecar_version != expected_model_version:
+            logger.warning(
+                "Skipping CF cold-start sidecars because embedding sidecar version %s "
+                "does not match checkpoint version %s",
+                sidecar_version,
+                expected_model_version,
+            )
+            self._clear_loaded_cold_start_sidecars()
+            return
+        if sidecar_version and not self.model_version:
+            self.model_version = sidecar_version
+
+        adapter = ContentToCFAdapter.load(self._adapter_path())
+        adapter_model_version = (
+            adapter.metadata.get("two_tower_model_version")
+            if adapter is not None
+            else None
+        )
+        expected_model_version = self.model_version
+        if adapter is None or adapter_model_version != expected_model_version:
+            logger.warning(
+                "Skipping CF cold-start sidecars because adapter version %s "
+                "does not match checkpoint version %s",
+                adapter_model_version,
+                expected_model_version,
+            )
+            self._clear_loaded_cold_start_sidecars()
+            return
+
+        self.trained_item_embeddings = embeddings
+        self.trained_item_clip_available = clip_available
+        self.trained_item_features = item_features
+        self.content_to_cf_adapter = adapter
+
+    async def refresh_cold_start_overlay(self) -> None:
+        if not self.config.enable_cf_cold_start_bootstrap:
+            self.synthetic_item_embeddings = {}
+            self.synthetic_item_metadata = {}
+            self.cold_start_overlay_version = None
+            if self._base_cf_index is not None:
+                self.cf_index = self._base_cf_index
+                self.cf_index_map = dict(self._base_cf_index_map)
+            return
+
+        if not self.trained_item_embeddings or self.content_to_cf_adapter is None:
+            logger.info("Skipping CF cold-start overlay; trained embeddings or adapter unavailable")
+            self.synthetic_item_embeddings = {}
+            self.synthetic_item_metadata = {}
+            self.cold_start_overlay_version = None
+            if self._base_cf_index is not None:
+                self.cf_index = self._base_cf_index
+                self.cf_index_map = dict(self._base_cf_index_map)
+            return
+
+        (
+            synthetic_embeddings,
+            synthetic_metadata,
+            index,
+            index_map,
+            overlay_version,
+        ) = await asyncio.to_thread(self._build_cold_start_overlay_snapshot)
+        self.synthetic_item_embeddings = synthetic_embeddings
+        self.synthetic_item_metadata = synthetic_metadata
+        if index is not None:
+            self.cf_index = index
+            self.cf_index_map = index_map
+        self.cold_start_overlay_version = overlay_version
+
+    def _build_cold_start_overlay_snapshot(
+        self,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, Any]], Optional[faiss.Index], Dict[int, str], str]:
+        synthetic_embeddings, synthetic_metadata = self._build_synthetic_item_embeddings()
+        index, index_map = self._build_serving_cf_index_snapshot(synthetic_embeddings)
+        overlay_version = self._build_cold_start_overlay_version(synthetic_embeddings)
+        return synthetic_embeddings, synthetic_metadata, index, index_map, overlay_version
+
+    def _build_synthetic_item_embeddings(
+        self,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, Any]]]:
+        current_time = time.time()
+        trained_item_ids = set(self.item_mapping.keys())
+        synthetic_embeddings: Dict[str, np.ndarray] = {}
+        synthetic_metadata: Dict[str, Dict[str, Any]] = {}
+        eligible_product_ids = self._eligible_cold_start_product_ids(current_time)
+
+        for product_id in eligible_product_ids:
+            if len(synthetic_embeddings) >= self.config.cf_cold_start_max_items:
+                break
+            metadata = self.vector_search.product_metadata.get(product_id, {})
+            clip_embedding = self._get_product_clip_embedding(product_id)
+            if not is_cold_start_eligible(
+                product_id=product_id,
+                metadata=metadata,
+                clip_embedding=clip_embedding,
+                trained_item_ids=trained_item_ids,
+                current_time=current_time,
+                max_age_days=self.config.cf_cold_start_max_age_days,
+                max_interactions=self.config.cf_cold_start_max_interactions,
+            ):
+                continue
+
+            synthetic = self._build_one_synthetic_embedding(
+                product_id,
+                clip_embedding,
+                metadata,
+            )
+            if synthetic is None:
+                continue
+            embedding, metadata_payload = synthetic
+            synthetic_embeddings[product_id] = embedding
+            synthetic_metadata[product_id] = metadata_payload
+
+        return synthetic_embeddings, synthetic_metadata
+
+    def _eligible_cold_start_product_ids(self, current_time: float) -> List[str]:
+        if not hasattr(self.vector_search, "get_product_embedding"):
+            return []
+        trained_item_ids = set(self.item_mapping.keys())
+        candidates: List[Tuple[str, float]] = []
+        for product_id, metadata in self.vector_search.product_metadata.items():
+            clip_embedding = self._get_product_clip_embedding(product_id)
+            if not is_cold_start_eligible(
+                product_id=product_id,
+                metadata=metadata,
+                clip_embedding=clip_embedding,
+                trained_item_ids=trained_item_ids,
+                current_time=current_time,
+                max_age_days=self.config.cf_cold_start_max_age_days,
+                max_interactions=self.config.cf_cold_start_max_interactions,
+            ):
+                continue
+            created_at = float(metadata.get("created_at", current_time))
+            candidates.append((product_id, created_at))
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        return [product_id for product_id, _ in candidates[: self.config.cf_cold_start_max_items]]
+
+    def _get_product_clip_embedding(self, product_id: str) -> Optional[np.ndarray]:
+        if not hasattr(self.vector_search, "get_product_embedding"):
+            return None
+        return self.vector_search.get_product_embedding(product_id)
+
+    def _build_one_synthetic_embedding(
+        self,
+        product_id: str,
+        clip_embedding: np.ndarray,
+        metadata: Dict[str, Any],
+    ) -> Optional[Tuple[np.ndarray, Dict[str, Any]]]:
+        assert self.content_to_cf_adapter is not None
+        neighbors = self._get_clip_neighbors(
+            product_id,
+            clip_embedding,
+            max(self.config.cf_cold_start_neighbors * 2, self.config.cf_cold_start_neighbors),
+        )
+        neighbor_embeddings: List[np.ndarray] = []
+        neighbor_similarities: List[float] = []
+        neighbor_metadatas: List[Dict[str, Any]] = []
+        neighbor_ids: List[str] = []
+
+        for neighbor in neighbors:
+            if neighbor.product_id == product_id:
+                continue
+            trained_embedding = self.trained_item_embeddings.get(neighbor.product_id)
+            if trained_embedding is None:
+                continue
+            similarity = float(neighbor.content_similarity_score or 0.0)
+            if similarity < self.config.cf_cold_start_min_clip_similarity:
+                continue
+            neighbor_embeddings.append(trained_embedding)
+            neighbor_similarities.append(similarity)
+            neighbor_metadatas.append(self.vector_search.product_metadata.get(neighbor.product_id, {}))
+            neighbor_ids.append(neighbor.product_id)
+            if len(neighbor_embeddings) >= self.config.cf_cold_start_neighbors:
+                break
+
+        if len(neighbor_embeddings) < self.config.cf_cold_start_min_valid_neighbors:
+            return None
+        if float(np.mean(neighbor_similarities)) < self.config.cf_cold_start_min_clip_similarity:
+            return None
+
+        try:
+            content_feature = build_content_feature(
+                clip_embedding,
+                metadata,
+                clip_dim=self.vector_search.embedding_dim,
+            )
+            adapter_embedding = self.content_to_cf_adapter.predict(content_feature)[0]
+            synthetic_embedding, confidence, neighbor_weights = build_hybrid_synthetic_embedding(
+                neighbor_embeddings=neighbor_embeddings,
+                neighbor_similarities=neighbor_similarities,
+                adapter_embedding=adapter_embedding,
+                query_metadata=metadata,
+                neighbor_metadatas=neighbor_metadatas,
+                neighbor_weight=self.config.cf_cold_start_neighbor_weight,
+                softmax_temperature=self.config.cf_cold_start_softmax_temperature,
+                configured_neighbor_count=self.config.cf_cold_start_neighbors,
+            )
+        except Exception as exc:
+            logger.warning("synthetic_cf_embedding_failed: %s", exc)
+            return None
+
+        metadata_payload = {
+            "source": "synthetic_clip_neighbor_adapter",
+            "confidence": confidence,
+            "neighbor_product_ids": neighbor_ids,
+            "neighbor_similarities": neighbor_similarities,
+            "neighbor_weights": neighbor_weights,
+            "adapter_version": self.content_to_cf_adapter.version,
+            "base_two_tower_version": self.model_version,
+            "created_at": time.time(),
+        }
+        return synthetic_embedding, metadata_payload
+
+    def _get_clip_neighbors(
+        self,
+        product_id: str,
+        clip_embedding: np.ndarray,
+        k: int,
+    ) -> List[CandidateProduct]:
+        if k <= 0 or not hasattr(self.vector_search, "get_all_product_embeddings"):
+            return []
+        query = normalize_vector(clip_embedding)
+        if not np.any(query):
+            return []
+        scored: List[Tuple[str, float]] = []
+        for neighbor_id, embedding in self.vector_search.get_all_product_embeddings().items():
+            if neighbor_id == product_id:
+                continue
+            score = float(np.dot(query, normalize_vector(embedding)))
+            if np.isfinite(score):
+                scored.append((neighbor_id, score))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return [
+            CandidateProduct(
+                product_id=neighbor_id,
+                content_similarity_score=score,
+                combined_score=score,
+                source="content_similarity",
+            )
+            for neighbor_id, score in scored[:k]
+        ]
+
+    def _rebuild_serving_cf_index(self) -> None:
+        index, index_map = self._build_serving_cf_index_snapshot(self.synthetic_item_embeddings)
+        if index is None:
+            return
+        self.cf_index = index
+        self.cf_index_map = index_map
+
+    def _build_serving_cf_index_snapshot(
+        self,
+        synthetic_item_embeddings: Dict[str, np.ndarray],
+    ) -> Tuple[Optional[faiss.Index], Dict[int, str]]:
+        if not self.trained_item_embeddings:
+            return None, {}
+        product_ids = list(self.trained_item_embeddings.keys()) + [
+            product_id
+            for product_id in synthetic_item_embeddings.keys()
+            if product_id not in self.item_mapping
+        ]
+        if not product_ids:
+            return None, {}
+        embeddings = []
+        for product_id in product_ids:
+            embedding = (
+                self.trained_item_embeddings.get(product_id)
+                if product_id in self.trained_item_embeddings
+                else synthetic_item_embeddings[product_id]
+            )
+            embeddings.append(normalize_vector(embedding))
+        index = self.vector_search.create_cf_index(self.config.tt_embedding_dim)
+        index.add(np.vstack(embeddings).astype(np.float32))
+        return index, {idx: product_id for idx, product_id in enumerate(product_ids)}
+
+    def _build_cold_start_overlay_version(
+        self,
+        synthetic_item_embeddings: Optional[Dict[str, np.ndarray]] = None,
+    ) -> str:
+        synthetic_item_embeddings = (
+            self.synthetic_item_embeddings
+            if synthetic_item_embeddings is None
+            else synthetic_item_embeddings
+        )
+        payload = {
+            "base_model": self.model_version,
+            "synthetic_count": len(synthetic_item_embeddings),
+            "synthetic_ids": sorted(synthetic_item_embeddings.keys()),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def refresh_new_item_candidates(self) -> None:
+        refreshed_at = time.time()
+        candidates = self._build_new_item_candidates_snapshot(refreshed_at)
+        self._new_item_candidates = candidates
+        self.new_item_pool_refreshed_at = refreshed_at
+        self._new_item_pool_catalog_token = self._new_item_catalog_token()
+        self.new_item_pool_version = self._build_new_item_pool_version(candidates)
+
+    def should_refresh_new_item_candidates(self, current_time: Optional[float] = None) -> bool:
+        if self.config.max_new_item_candidates <= 0:
+            return bool(self._new_item_candidates)
+        if self.new_item_pool_refreshed_at <= 0.0:
+            return True
+        current_time = current_time or time.time()
+        interval_seconds = float(
+            getattr(self.config, "new_item_pool_refresh_interval_seconds", 300.0)
+        )
+        if interval_seconds > 0 and current_time - self.new_item_pool_refreshed_at >= interval_seconds:
+            return True
+        return self._new_item_catalog_token() != self._new_item_pool_catalog_token
+
+    def _new_item_catalog_token(self) -> str:
+        if hasattr(self.vector_search, "get_catalog_version_context"):
+            context = self.vector_search.get_catalog_version_context()
+        else:
+            context = {
+                "last_updated": getattr(self.vector_search, "last_updated", None),
+                "product_count": len(getattr(self.vector_search, "product_metadata", {}) or {}),
+            }
+        return hashlib.sha256(
+            json.dumps(context, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _build_new_item_candidates_snapshot(self, current_time: float) -> List[CandidateProduct]:
+        if self.config.max_new_item_candidates <= 0:
+            return []
+        candidates: List[CandidateProduct] = []
+        for product_id in self._eligible_cold_start_product_ids(current_time):
+            metadata = self.vector_search.product_metadata.get(product_id, {})
+            age_days = max((current_time - float(metadata.get("created_at", current_time))) / 86400.0, 0.0)
+            freshness_score = 1.0 / (1.0 + age_days / 30.0)
+            bootstrap_confidence = float(
+                self.synthetic_item_metadata.get(product_id, {}).get("confidence", 0.5)
+            )
+            score = float(min(1.0, max(0.0, 0.5 * freshness_score + 0.5 * bootstrap_confidence)))
+            candidates.append(
+                CandidateProduct(
+                    product_id=product_id,
+                    popularity_score=score,
+                    combined_score=score,
+                    source="new_item",
+                )
+            )
+        return candidates
+
+    @staticmethod
+    def _build_new_item_pool_version(candidates: List[CandidateProduct]) -> str:
+        payload = [
+            {
+                "product_id": candidate.product_id,
+                "score": round(float(candidate.popularity_score or candidate.combined_score or 0.0), 6),
+            }
+            for candidate in candidates
+        ]
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def get_new_item_candidates(
+        self,
+        k: int,
+        exclude_items: Optional[Set[str]] = None,
+    ) -> List[CandidateProduct]:
+        exclude_items = exclude_items or set()
+        if k <= 0:
+            return []
+        current_time = time.time()
+        candidates: List[CandidateProduct] = []
+        for candidate in self._new_item_candidates:
+            if len(candidates) >= k:
+                break
+            if candidate.product_id in exclude_items:
+                continue
+            if not self._new_item_metadata_still_eligible(candidate.product_id, current_time):
+                continue
+            candidates.append(CandidateProduct(**candidate.dict()))
+        return candidates
+
+    def _new_item_metadata_still_eligible(self, product_id: str, current_time: float) -> bool:
+        metadata = self.vector_search.product_metadata.get(product_id)
+        if not metadata or product_id in self.item_mapping:
+            return False
+        if metadata.get("active") is False or metadata.get("in_stock") is False:
+            return False
+        if metadata.get("deleted") is True or metadata.get("is_deleted") is True:
+            return False
+        try:
+            created_at = float(metadata.get("created_at", current_time))
+        except (TypeError, ValueError):
+            created_at = current_time
+        age_days = max((current_time - created_at) / 86400.0, 0.0)
+        if age_days > float(self.config.cf_cold_start_max_age_days):
+            return False
+        interaction_count = self._metadata_interaction_count(metadata)
+        return interaction_count <= float(self.config.cf_cold_start_max_interactions)
+
+    @staticmethod
+    def _metadata_interaction_count(metadata: Dict[str, Any]) -> float:
+        for key in ("interaction_count", "num_interactions", "views", "view_count"):
+            if key in metadata:
+                try:
+                    return max(0.0, float(metadata.get(key) or 0.0))
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
 
     # ------------------------------------------------------------------
     # Recommendation serving
@@ -276,13 +816,20 @@ class TwoTowerRetrievalEngine:
                     continue
                 product_id = self.cf_index_map.get(int(idx))
                 if product_id and product_id not in exclude_items:
-                    norm_score = float(max(min((score + 1.0) / 2.0, 1.0), 0.0))
+                    norm_score = self._cf_search_score_to_similarity(self.cf_index, score)
+                    source = "collaborative_filtering"
+                    if product_id in self.synthetic_item_metadata and product_id not in self.item_mapping:
+                        confidence = float(
+                            self.synthetic_item_metadata[product_id].get("confidence", 0.0)
+                        )
+                        norm_score *= max(0.0, min(confidence, 1.0))
+                        source = "cf_cold_start"
                     candidates.append(
                         CandidateProduct(
                             product_id=product_id,
                             collaborative_score=norm_score,
                             combined_score=norm_score,
-                            source="collaborative_filtering",
+                            source=source,
                         )
                     )
 
@@ -292,6 +839,19 @@ class TwoTowerRetrievalEngine:
         except Exception as e:
             logger.error(f"Error getting Two-Tower recommendations for {user_id}: {e}")
             return []
+
+    @staticmethod
+    def _cf_search_score_to_similarity(index: faiss.Index, score: float) -> float:
+        raw_score = float(score)
+        if not np.isfinite(raw_score):
+            return 0.0
+        metric_type = getattr(index, "metric_type", faiss.METRIC_L2)
+        if metric_type == faiss.METRIC_INNER_PRODUCT:
+            return float(max(min((raw_score + 1.0) / 2.0, 1.0), 0.0))
+        # FAISS L2 indexes return squared distance. For normalized vectors,
+        # squared L2 is in [0, 4], and 1 - distance / 4 maps nearest to 1.
+        distance = max(raw_score, 0.0)
+        return float(max(min(1.0 - distance / 4.0, 1.0), 0.0))
 
     def clear_user_embedding_cache(self) -> None:
         with self._user_embedding_cache_lock:
@@ -580,28 +1140,43 @@ class RecommendationEngine:
             )
             if result is not None:
                 index, metadata = result
-                # Restore index map
                 index_map_raw = metadata.get("index_map", {})
-                self.cf_engine.cf_index = index
-                self.cf_engine.cf_index_map = {int(k): v for k, v in index_map_raw.items()}
+                index_map = {int(k): v for k, v in index_map_raw.items()}
 
-                # Load trainer checkpoint
                 checkpoint_path = (
                     self.artifact_manager.two_tower_local_checkpoint_path
                     if self.artifact_manager
                     else self.config.cf_index_path.replace(".faiss", ".pt")
                 )
-                if await asyncio.to_thread(self.cf_engine.trainer.load_checkpoint, checkpoint_path):
-                    self.cf_engine.user_mapping = dict(self.cf_engine.trainer.user_mapping)
-                    self.cf_engine.item_mapping = dict(self.cf_engine.trainer.item_mapping)
-                    self.cf_engine.is_trained = True
-                    if checkpoint_record:
-                        self.cf_engine.model_version = checkpoint_record.model_version
-                        self.loaded_two_tower_version = checkpoint_record.model_version
-                    self.cf_engine.clear_user_embedding_cache()
-                    logger.info("Loaded pre-existing Two-Tower model and CF index")
+                loaded_engine = TwoTowerRetrievalEngine(self.config, self.vector_search)
+                loaded_engine.cf_index = index
+                loaded_engine.cf_index_map = index_map
+                loaded_engine._base_cf_index = index
+                loaded_engine._base_cf_index_map = dict(index_map)
+
+                if not await asyncio.to_thread(loaded_engine.trainer.load_checkpoint, checkpoint_path):
+                    return False
+
+                loaded_engine.user_mapping = dict(loaded_engine.trainer.user_mapping)
+                loaded_engine.item_mapping = dict(loaded_engine.trainer.item_mapping)
+                loaded_engine.is_trained = True
+                if checkpoint_record:
+                    loaded_engine.model_version = checkpoint_record.model_version
+                loaded_engine._load_cold_start_sidecars()
+                await loaded_engine.refresh_cold_start_overlay()
+                await asyncio.to_thread(loaded_engine.refresh_new_item_candidates)
+                loaded_engine.clear_user_embedding_cache()
+
+                self.cf_engine = loaded_engine
+                if checkpoint_record:
+                    self.loaded_two_tower_version = checkpoint_record.model_version
+                elif loaded_engine.model_version:
+                    self.loaded_two_tower_version = loaded_engine.model_version
+                logger.info("Loaded pre-existing Two-Tower model and CF index")
+                return True
         except Exception as e:
             logger.warning(f"Could not load pre-existing CF index: {e}")
+        return False
 
     async def _try_load_sasrec_artifacts(self) -> bool:
         """Load SASRec serving artifacts if the sequential source is enabled."""
@@ -657,6 +1232,8 @@ class RecommendationEngine:
                         index_path=index_path,
                         metadata_path=metadata_path,
                         model_version=model_version,
+                        embedding_sidecar_path=self.artifact_manager.two_tower_local_embedding_sidecar_path,
+                        adapter_path=self.artifact_manager.two_tower_local_adapter_path,
                         payload={
                             "sample_count": len(interactions),
                             "last_training_time": self.cf_engine.last_training_time,
@@ -761,6 +1338,10 @@ class RecommendationEngine:
                 await self._try_load_sasrec_artifacts()
                 updated = updated or self.loaded_sasrec_version == latest_sasrec.model_version
 
+        if self.cf_engine.should_refresh_new_item_candidates():
+            await asyncio.to_thread(self.cf_engine.refresh_new_item_candidates)
+            updated = True
+
         return updated
 
     def _compute_serving_pool_score(
@@ -782,6 +1363,7 @@ class RecommendationEngine:
         """Precompute global trending and per-category serving pools."""
         try:
             if not self.vector_search.product_metadata:
+                await asyncio.to_thread(self.cf_engine.refresh_new_item_candidates)
                 return
 
             current_time = time.time()
@@ -824,6 +1406,7 @@ class RecommendationEngine:
                 ]
 
             await self.feature_store.store_category_pools(category_pools)
+            await asyncio.to_thread(self.cf_engine.refresh_new_item_candidates)
             logger.info(
                 "Refreshed serving pools: %s global products, %s categories",
                 len(trending_pool),
@@ -951,6 +1534,7 @@ class RecommendationEngine:
                 "content_candidates_ms": 0.0,
                 "trending_candidates_ms": 0.0,
                 "category_pool_ms": 0.0,
+                "new_item_candidates_ms": 0.0,
                 "random_candidates_ms": 0.0,
                 "score_merge_ms": 0.0,
                 "total_ms": 0.0,
@@ -1084,6 +1668,14 @@ class RecommendationEngine:
                     category_candidates.extend(result)
                 return category_candidates
 
+            async def fetch_new_item_candidates() -> List[CandidateProduct]:
+                if not hasattr(self.cf_engine, "get_new_item_candidates"):
+                    return []
+                return self.cf_engine.get_new_item_candidates(
+                    min(target_candidates, self.config.max_new_item_candidates),
+                    exclude_items,
+                )
+
             source_timeout_ms = self.config.candidate_source_timeout_ms
             cf_task = asyncio.create_task(
                 timed_stage("cf_candidates_ms", fetch_cf_candidates(), [], source_timeout_ms),
@@ -1105,9 +1697,27 @@ class RecommendationEngine:
                 timed_stage("category_pool_ms", fetch_category_candidates(), [], source_timeout_ms),
                 name="candidate-source-category",
             )
+            new_item_task = asyncio.create_task(
+                timed_stage("new_item_candidates_ms", fetch_new_item_candidates(), [], source_timeout_ms),
+                name="candidate-source-new-item",
+            )
 
-            cf_candidates, sasrec_candidates, content_candidates, trending_candidates, category_candidates = (
-                await asyncio.gather(cf_task, sasrec_task, content_task, trending_task, category_task)
+            (
+                cf_candidates,
+                sasrec_candidates,
+                content_candidates,
+                trending_candidates,
+                category_candidates,
+                new_item_candidates,
+            ) = (
+                await asyncio.gather(
+                    cf_task,
+                    sasrec_task,
+                    content_task,
+                    trending_task,
+                    category_task,
+                    new_item_task,
+                )
             )
 
             def merge_source(source_name: str, candidates: List[CandidateProduct]) -> None:
@@ -1123,6 +1733,7 @@ class RecommendationEngine:
             merge_source("content", content_candidates)
             merge_source("trending_pool", trending_candidates)
             merge_source("category_pool", category_candidates)
+            merge_source("new_item", new_item_candidates)
 
             # 5. Small random fallback only if stronger sources are still thin
             stage_started = time.perf_counter()
@@ -1206,6 +1817,7 @@ class RecommendationEngine:
                     "content_candidates_ms": 0.0,
                     "trending_candidates_ms": 0.0,
                     "category_pool_ms": 0.0,
+                    "new_item_candidates_ms": 0.0,
                     "random_candidates_ms": 0.0,
                     "score_merge_ms": 0.0,
                     "total_ms": 0.0,
@@ -1334,6 +1946,9 @@ class RecommendationEngine:
             "cf_items": len(self.cf_engine.item_mapping),
             "cf_embedding_dim": self.config.tt_embedding_dim,
             "cf_index_size": self.cf_engine.cf_index.ntotal if self.cf_engine.cf_index else 0,
+            "cf_cold_start_enabled": self.config.enable_cf_cold_start_bootstrap,
+            "cf_cold_start_synthetic_items": len(self.cf_engine.synthetic_item_embeddings),
+            "cf_cold_start_overlay_version": self.cf_engine.cold_start_overlay_version,
             "cf_model_parameters": model_params,
             "sasrec_enabled": self.config.enable_sasrec,
             "sasrec_trained": self.sasrec_engine.is_trained,

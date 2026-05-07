@@ -63,6 +63,14 @@ class ModelArtifactManager:
         return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_meta.json"))
 
     @property
+    def two_tower_local_embedding_sidecar_path(self) -> str:
+        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_embeddings.npz"))
+
+    @property
+    def two_tower_local_adapter_path(self) -> str:
+        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_adapter.npz"))
+
+    @property
     def sasrec_local_checkpoint_path(self) -> str:
         return self.recommendation_config.sasrec_checkpoint_path or str(
             Path(self.model_config.cache_dir) / "sasrec_model.pt"
@@ -162,7 +170,31 @@ class ModelArtifactManager:
                     ),
                 )
             )
+        embedding_sidecar_path = payload.get("cf_embedding_sidecar_path")
+        stale_optional_local_paths: List[str] = []
+        if embedding_sidecar_path:
+            artifact_specs.append(
+                (
+                    embedding_sidecar_path,
+                    self.two_tower_local_embedding_sidecar_path,
+                    self._extract_artifact_sha256(payload, "cf_embedding_sidecar"),
+                )
+            )
+        else:
+            stale_optional_local_paths.append(self.two_tower_local_embedding_sidecar_path)
+        adapter_path = payload.get("cf_adapter_path")
+        if adapter_path:
+            artifact_specs.append(
+                (
+                    adapter_path,
+                    self.two_tower_local_adapter_path,
+                    self._extract_artifact_sha256(payload, "cf_adapter"),
+                )
+            )
+        else:
+            stale_optional_local_paths.append(self.two_tower_local_adapter_path)
         await self._sync_paths_to_local_atomically(artifact_specs)
+        self._remove_local_artifacts(stale_optional_local_paths)
         return record
 
     async def sync_latest_sasrec_artifacts(self) -> Optional[ModelArtifactRecord]:
@@ -255,6 +287,8 @@ class ModelArtifactManager:
         index_path: str,
         metadata_path: str,
         model_version: str,
+        embedding_sidecar_path: Optional[str] = None,
+        adapter_path: Optional[str] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> Optional[ModelArtifactRecord]:
         if not self.system_store:
@@ -263,6 +297,16 @@ class ModelArtifactManager:
         checkpoint_sha256 = ObjectStorage.calculate_sha256(checkpoint_path)
         index_sha256 = ObjectStorage.calculate_sha256(index_path)
         metadata_sha256 = ObjectStorage.calculate_sha256(metadata_path)
+        embedding_sidecar_sha256 = (
+            ObjectStorage.calculate_sha256(embedding_sidecar_path)
+            if embedding_sidecar_path and Path(embedding_sidecar_path).exists()
+            else None
+        )
+        adapter_sha256 = (
+            ObjectStorage.calculate_sha256(adapter_path)
+            if adapter_path and Path(adapter_path).exists()
+            else None
+        )
 
         persisted_checkpoint = await self._persist_artifact(
             local_path=checkpoint_path,
@@ -280,8 +324,66 @@ class ModelArtifactManager:
             model_version=model_version,
             content_type="application/json",
         )
+        persisted_embedding_sidecar = None
+        if embedding_sidecar_path and embedding_sidecar_sha256:
+            persisted_embedding_sidecar = await self._persist_artifact(
+                local_path=embedding_sidecar_path,
+                model_name=self.TWO_TOWER_MODEL_NAME,
+                model_version=model_version,
+            )
+        persisted_adapter = None
+        if adapter_path and adapter_sha256:
+            persisted_adapter = await self._persist_artifact(
+                local_path=adapter_path,
+                model_name=self.TWO_TOWER_MODEL_NAME,
+                model_version=model_version,
+            )
 
         record_payload = dict(payload or {})
+        artifact_manifest = {
+            "checkpoint": {
+                "path": persisted_checkpoint,
+                "sha256": checkpoint_sha256,
+                "local_cache_path": self.two_tower_local_checkpoint_path,
+            },
+            "cf_index": {
+                "path": persisted_index,
+                "sha256": index_sha256,
+                "local_cache_path": self.two_tower_local_index_path,
+            },
+            "cf_index_metadata": {
+                "path": persisted_metadata,
+                "sha256": metadata_sha256,
+                "local_cache_path": self.two_tower_local_metadata_path,
+            },
+        }
+        optional_payload: Dict[str, Any] = {}
+        if persisted_embedding_sidecar and embedding_sidecar_sha256:
+            optional_payload.update(
+                {
+                    "cf_embedding_sidecar_path": persisted_embedding_sidecar,
+                    "cf_embedding_sidecar_sha256": embedding_sidecar_sha256,
+                    "local_cache_embedding_sidecar_path": self.two_tower_local_embedding_sidecar_path,
+                }
+            )
+            artifact_manifest["cf_embedding_sidecar"] = {
+                "path": persisted_embedding_sidecar,
+                "sha256": embedding_sidecar_sha256,
+                "local_cache_path": self.two_tower_local_embedding_sidecar_path,
+            }
+        if persisted_adapter and adapter_sha256:
+            optional_payload.update(
+                {
+                    "cf_adapter_path": persisted_adapter,
+                    "cf_adapter_sha256": adapter_sha256,
+                    "local_cache_adapter_path": self.two_tower_local_adapter_path,
+                }
+            )
+            artifact_manifest["cf_adapter"] = {
+                "path": persisted_adapter,
+                "sha256": adapter_sha256,
+                "local_cache_path": self.two_tower_local_adapter_path,
+            }
         record_payload.update(
             {
                 "cf_index_path": persisted_index,
@@ -291,23 +393,8 @@ class ModelArtifactManager:
                 "local_cache_checkpoint_path": self.two_tower_local_checkpoint_path,
                 "local_cache_index_path": self.two_tower_local_index_path,
                 "local_cache_metadata_path": self.two_tower_local_metadata_path,
-                "artifact_manifest": {
-                    "checkpoint": {
-                        "path": persisted_checkpoint,
-                        "sha256": checkpoint_sha256,
-                        "local_cache_path": self.two_tower_local_checkpoint_path,
-                    },
-                    "cf_index": {
-                        "path": persisted_index,
-                        "sha256": index_sha256,
-                        "local_cache_path": self.two_tower_local_index_path,
-                    },
-                    "cf_index_metadata": {
-                        "path": persisted_metadata,
-                        "sha256": metadata_sha256,
-                        "local_cache_path": self.two_tower_local_metadata_path,
-                    },
-                },
+                "artifact_manifest": artifact_manifest,
+                **optional_payload,
             }
         )
         await self.system_store.record_model_checkpoint(
@@ -503,3 +590,11 @@ class ModelArtifactManager:
         if legacy_key and payload.get(legacy_key):
             return str(payload[legacy_key])
         return None
+
+    @staticmethod
+    def _remove_local_artifacts(paths: List[str]) -> None:
+        for path in paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Failed to remove stale local artifact %s: %s", path, exc)

@@ -110,13 +110,25 @@ class VectorSearchEngine:
                         int((self.last_updated or time.time()) * 1000),
                     )
                 )
-            
-            # Reconstruct embeddings dictionary
+
+            sidecar_path = self._resolve_embedding_sidecar_path(index_path, metadata)
+            self.product_embeddings = self._load_product_embedding_sidecar(sidecar_path)
+
+            missing_embeddings = 0
             for faiss_idx, product_id in self.product_index_map.items():
+                if product_id in self.product_embeddings:
+                    continue
                 if faiss_idx < self.index.ntotal:
-                    # Get embedding from index (approximation)
-                    embedding = np.zeros(self.embedding_dim, dtype=np.float32)
+                    embedding = self._reconstruct_product_embedding(faiss_idx)
+                    if embedding is None:
+                        missing_embeddings += 1
+                        continue
                     self.product_embeddings[product_id] = embedding
+            if missing_embeddings:
+                logger.warning(
+                    "Vector index loaded without %s reconstructable product embeddings",
+                    missing_embeddings,
+                )
             
             logger.info(f"Loaded index with {self.index.ntotal} vectors")
             
@@ -445,6 +457,8 @@ class VectorSearchEngine:
             # Save FAISS index
             with self.index_lock:
                 faiss.write_index(self.index, str(index_path))
+
+            embedding_sidecar_path = self._save_product_embedding_sidecar(index_path)
             
             # Save metadata
             metadata = {
@@ -456,6 +470,9 @@ class VectorSearchEngine:
                 'index_type': self.config.index_type,
                 'total_products': len(self.product_embeddings)
             }
+            if embedding_sidecar_path is not None:
+                metadata["embedding_sidecar_path"] = embedding_sidecar_path.name
+                metadata["embedding_sidecar_format"] = "npz_product_embeddings_v1"
             
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
@@ -464,6 +481,97 @@ class VectorSearchEngine:
             
         except Exception as e:
             logger.error(f"Error saving index: {e}")
+
+    @staticmethod
+    def _product_embedding_sidecar_path(index_path: Path) -> Path:
+        return index_path.with_suffix(".embeddings.npz")
+
+    def _resolve_embedding_sidecar_path(self, index_path: Path, metadata: Dict[str, Any]) -> Path:
+        configured_path = metadata.get("embedding_sidecar_path")
+        if configured_path:
+            candidate = Path(configured_path)
+            if candidate.is_absolute():
+                return candidate
+            return index_path.parent / candidate
+        return self._product_embedding_sidecar_path(index_path)
+
+    def _save_product_embedding_sidecar(self, index_path: Path) -> Optional[Path]:
+        sidecar_path = self._product_embedding_sidecar_path(index_path)
+        product_ids: List[str] = []
+        embeddings: List[np.ndarray] = []
+        normalized_embeddings: Dict[str, np.ndarray] = {}
+
+        for product_id in sorted(self.product_embeddings.keys()):
+            embedding = self._normalize_product_embedding(self.product_embeddings[product_id])
+            if embedding is None:
+                continue
+            product_ids.append(product_id)
+            embeddings.append(embedding)
+            normalized_embeddings[product_id] = embedding
+
+        if not embeddings:
+            try:
+                sidecar_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Failed to remove stale product embedding sidecar %s: %s", sidecar_path, exc)
+            return None
+
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            sidecar_path,
+            product_ids=np.asarray(product_ids),
+            embeddings=np.vstack(embeddings).astype(np.float32),
+            embedding_dim=np.asarray([self.embedding_dim], dtype=np.int32),
+            created_at=np.asarray([time.time()], dtype=np.float64),
+        )
+        self.product_embeddings.update(normalized_embeddings)
+        return sidecar_path
+
+    def _load_product_embedding_sidecar(self, sidecar_path: Path) -> Dict[str, np.ndarray]:
+        if not sidecar_path.exists():
+            return {}
+        try:
+            with np.load(sidecar_path, allow_pickle=False) as data:
+                product_ids = [str(product_id) for product_id in data["product_ids"]]
+                embeddings = np.asarray(data["embeddings"], dtype=np.float32)
+            loaded: Dict[str, np.ndarray] = {}
+            for index, product_id in enumerate(product_ids):
+                if index >= len(embeddings):
+                    continue
+                embedding = self._normalize_product_embedding(embeddings[index])
+                if embedding is not None:
+                    loaded[product_id] = embedding
+            return loaded
+        except Exception as exc:
+            logger.warning("Failed to load product embedding sidecar %s: %s", sidecar_path, exc)
+            return {}
+
+    def _reconstruct_product_embedding(self, faiss_idx: int) -> Optional[np.ndarray]:
+        if self.index is None:
+            return None
+        try:
+            reconstructed = self.index.reconstruct(int(faiss_idx))
+        except TypeError:
+            reconstructed = np.zeros(self.embedding_dim, dtype=np.float32)
+            try:
+                self.index.reconstruct(int(faiss_idx), reconstructed)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        return self._normalize_product_embedding(reconstructed)
+
+    def _normalize_product_embedding(self, embedding: Any) -> Optional[np.ndarray]:
+        try:
+            values = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if values.shape[0] != self.embedding_dim:
+            return None
+        norm = float(np.linalg.norm(values))
+        if norm <= 0.0 or not np.isfinite(norm):
+            return None
+        return (values / norm).astype(np.float32)
     
     async def rebuild_index(self, products: List[Dict[str, Any]] = None):
         """Rebuild the entire index (expensive operation)."""
