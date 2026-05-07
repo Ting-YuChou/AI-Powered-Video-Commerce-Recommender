@@ -210,6 +210,29 @@ def test_sasrec_candidate_keeps_existing_ranking_feature_dimension():
     assert candidate_features.tolist() == [0.8, 0.0, 0.0, 0.32]
 
 
+def test_ranking_brand_feature_uses_stable_hash_bucket():
+    ranking = RankingModel(RankingConfig())
+    metadata = {
+        "price": 25.0,
+        "rating": 4.0,
+        "num_reviews": 8,
+        "in_stock": True,
+        "created_at": time.time(),
+        "tags": ["a"],
+        "brand": "Acme",
+    }
+    expected_bucket = (
+        int.from_bytes(hashlib.sha256(b"Acme").digest()[:8], byteorder="big", signed=False)
+        % 100
+    ) / 100
+
+    dynamic_features = ranking.feature_extractor.extract_product_features(metadata)
+    static_features, _ = ranking.feature_extractor.extract_static_product_features(metadata)
+
+    np.testing.assert_allclose(dynamic_features[7], expected_bucket, rtol=1e-6)
+    np.testing.assert_allclose(static_features[7], expected_bucket, rtol=1e-6)
+
+
 def test_candidate_cache_schema_round_trips_merged_sasrec_source():
     candidate = CandidateProduct(
         product_id="seq",

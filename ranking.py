@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import asyncio
+import hashlib
 import logging
 from collections import OrderedDict
 from typing import Dict, List, Any, Optional, Tuple
@@ -38,8 +39,14 @@ from dcn import (
 
 logger = logging.getLogger(__name__)
 
-RANKING_FEATURE_SCHEMA_VERSION = "ranking_v1_28"
+RANKING_FEATURE_SCHEMA_VERSION = "ranking_v1_29"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
+
+
+def _stable_hash_bucket(value: Any, buckets: int = 100) -> int:
+    normalized = str(value or "").encode("utf-8")
+    digest = hashlib.sha256(normalized).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) % buckets
 
 try:
     if hasattr(torch.backends, "mkldnn"):
@@ -268,7 +275,7 @@ class FeatureExtractor:
             (current_time - product_metadata.get('created_at', current_time)) / 86400,  # Age in days
             len(product_metadata.get('tags', [])) / 10,  # Tag count normalized
             1.0 if product_metadata.get('price', 0) > 100 else 0.0,  # Premium product
-            hash(product_metadata.get('brand', '')) % 100 / 100,  # Brand embedding (simple)
+            _stable_hash_bucket(product_metadata.get('brand', '')) / 100,
         ], dtype=np.float32)
         
         return features
@@ -287,7 +294,7 @@ class FeatureExtractor:
             0.0,  # Filled with age-in-days at request time.
             len(product_metadata.get("tags", [])) / 10,
             1.0 if product_metadata.get("price", 0) > 100 else 0.0,
-            hash(product_metadata.get("brand", "")) % 100 / 100,
+            _stable_hash_bucket(product_metadata.get("brand", "")) / 100,
         ], dtype=np.float32)
         return features, created_at
     

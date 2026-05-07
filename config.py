@@ -181,6 +181,54 @@ class RecommendationConfig(BaseSettings):
         10,
         description="Maximum random fallback candidates to merge per request",
     )
+    enable_cf_cold_start_bootstrap: bool = Field(
+        False,
+        description="Enable serving-only synthetic Two-Tower embeddings for new items",
+    )
+    cf_cold_start_method: str = Field(
+        "hybrid_adapter_neighbors",
+        description="Synthetic CF cold-start embedding method",
+    )
+    cf_cold_start_neighbors: int = Field(
+        20,
+        description="CLIP neighbors considered for synthetic CF embeddings",
+    )
+    cf_cold_start_min_valid_neighbors: int = Field(
+        5,
+        description="Minimum trained neighbors required for synthetic CF embeddings",
+    )
+    cf_cold_start_min_clip_similarity: float = Field(
+        0.35,
+        description="Minimum average CLIP similarity for synthetic CF embeddings",
+    )
+    cf_cold_start_softmax_temperature: float = Field(
+        0.07,
+        description="Softmax temperature for CLIP neighbor weights",
+    )
+    cf_cold_start_neighbor_weight: float = Field(
+        0.65,
+        description="Blend weight for neighbor CF prior over adapter prior",
+    )
+    cf_cold_start_max_items: int = Field(
+        500,
+        description="Maximum synthetic CF cold-start items in the serving overlay",
+    )
+    cf_cold_start_max_age_days: float = Field(
+        30.0,
+        description="Maximum product age for new-item synthetic CF eligibility",
+    )
+    cf_cold_start_max_interactions: int = Field(
+        5,
+        description="Maximum product interactions for synthetic CF eligibility",
+    )
+    max_new_item_candidates: int = Field(
+        10,
+        description="Maximum explicit new-item candidates to merge per request",
+    )
+    new_item_pool_refresh_interval_seconds: float = Field(
+        300.0,
+        description="How often serving workers refresh the precomputed new-item pool",
+    )
     user_embedding_cache_size: int = Field(
         20000,
         description="Per-process LRU cache entries for Two-Tower user embeddings",
@@ -319,6 +367,48 @@ class RecommendationConfig(BaseSettings):
     def validate_mmr_rerank_pool_size(cls, value: int) -> int:
         if value < 1:
             raise ValueError("MMR rerank pool sizes must be >= 1")
+        return value
+
+    @validator("cf_cold_start_method")
+    def validate_cf_cold_start_method(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized != "hybrid_adapter_neighbors":
+            raise ValueError("cf_cold_start_method must be: hybrid_adapter_neighbors")
+        return normalized
+
+    @validator(
+        "cf_cold_start_neighbors",
+        "cf_cold_start_min_valid_neighbors",
+        "cf_cold_start_max_items",
+        "cf_cold_start_max_interactions",
+    )
+    def validate_cf_cold_start_positive_ints(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("CF cold-start integer settings must be >= 0")
+        return value
+
+    @validator("max_new_item_candidates")
+    def validate_max_new_item_candidates(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_new_item_candidates must be >= 0")
+        return value
+
+    @validator("new_item_pool_refresh_interval_seconds")
+    def validate_new_item_pool_refresh_interval_seconds(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("new_item_pool_refresh_interval_seconds must be >= 0")
+        return value
+
+    @validator("cf_cold_start_softmax_temperature", "cf_cold_start_max_age_days")
+    def validate_cf_cold_start_positive_floats(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("CF cold-start positive float settings must be > 0")
+        return value
+
+    @validator("cf_cold_start_min_clip_similarity", "cf_cold_start_neighbor_weight")
+    def validate_cf_cold_start_unit_interval(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("CF cold-start ratio settings must be between 0 and 1")
         return value
     
     class Config:

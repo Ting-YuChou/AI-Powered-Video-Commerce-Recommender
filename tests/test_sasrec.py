@@ -1,3 +1,6 @@
+import time
+
+import numpy as np
 import pytest
 
 from config import CacheConfig, RecommendationConfig
@@ -153,6 +156,43 @@ class FakeVectorSearch:
         return []
 
 
+class FakeNewItemVectorSearch:
+    embedding_dim = 8
+
+    def __init__(self):
+        self.embedding_lookup_count = 0
+        self.catalog_version = 1
+        self.last_updated = 1
+        self.product_metadata = {
+            "fresh": {
+                "category": "cat",
+                "active": True,
+                "in_stock": True,
+                "created_at": time.time(),
+            }
+        }
+        self.product_embeddings = {
+            "fresh": np.ones(8, dtype=np.float32),
+        }
+
+    def get_product_embedding(self, product_id):
+        self.embedding_lookup_count += 1
+        return self.product_embeddings.get(product_id)
+
+    def get_catalog_version_context(self):
+        return {
+            "catalog_version": self.catalog_version,
+            "last_updated": self.last_updated,
+            "product_count": len(self.product_metadata),
+        }
+
+    async def search_similar_products(self, embedding, k=10):
+        return []
+
+    async def get_random_products(self, k=10):
+        return []
+
+
 class FakeSASRec:
     def __init__(self, candidates=None):
         self.is_trained = True
@@ -291,3 +331,96 @@ async def test_generate_candidates_falls_back_when_sasrec_errors():
 
     assert [candidate.source for candidate in candidates] == ["trending_pool"]
     assert profile["source_counts"]["sasrec"] == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_includes_explicit_new_item_source():
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[]),
+        FakeNewItemVectorSearch(),
+        RecommendationConfig(
+            candidates_per_source=2,
+            max_total_candidates=10,
+            max_new_item_candidates=1,
+        ),
+    )
+    engine.cf_engine.refresh_new_item_candidates()
+
+    candidates, profile = await engine.generate_candidates("u1", include_profile=True)
+
+    assert "new_item" in {candidate.source for candidate in candidates}
+    assert profile["source_counts"]["new_item"] == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_uses_precomputed_new_item_pool_without_catalog_scan():
+    vector_search = FakeNewItemVectorSearch()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[]),
+        vector_search,
+        RecommendationConfig(
+            candidates_per_source=2,
+            max_total_candidates=10,
+            max_new_item_candidates=1,
+        ),
+    )
+    engine.cf_engine.refresh_new_item_candidates()
+    assert vector_search.embedding_lookup_count == 1
+    vector_search.embedding_lookup_count = 0
+
+    candidates, profile = await engine.generate_candidates("u1", include_profile=True)
+
+    assert "new_item" in {candidate.source for candidate in candidates}
+    assert profile["source_counts"]["new_item"] == 1
+    assert vector_search.embedding_lookup_count == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_filters_expired_new_item_snapshot_without_catalog_scan():
+    vector_search = FakeNewItemVectorSearch()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[]),
+        vector_search,
+        RecommendationConfig(
+            candidates_per_source=2,
+            max_total_candidates=10,
+            max_new_item_candidates=1,
+            cf_cold_start_max_age_days=30,
+        ),
+    )
+    engine.cf_engine.refresh_new_item_candidates()
+    vector_search.product_metadata["fresh"]["created_at"] = time.time() - 60 * 86400
+    vector_search.embedding_lookup_count = 0
+
+    candidates, profile = await engine.generate_candidates("u1", include_profile=True)
+
+    assert "new_item" not in {candidate.source for candidate in candidates}
+    assert profile["source_counts"]["new_item"] == 0
+    assert vector_search.embedding_lookup_count == 0
+
+
+def test_new_item_pool_refreshes_on_ttl_or_catalog_change():
+    vector_search = FakeNewItemVectorSearch()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[]),
+        vector_search,
+        RecommendationConfig(
+            max_new_item_candidates=1,
+            new_item_pool_refresh_interval_seconds=10,
+        ),
+    )
+    engine.cf_engine.refresh_new_item_candidates()
+
+    assert not engine.cf_engine.should_refresh_new_item_candidates(
+        engine.cf_engine.new_item_pool_refreshed_at + 1
+    )
+
+    vector_search.catalog_version += 1
+    assert engine.cf_engine.should_refresh_new_item_candidates(
+        engine.cf_engine.new_item_pool_refreshed_at + 1
+    )
+
+    engine.cf_engine.refresh_new_item_candidates()
+    assert engine.cf_engine.should_refresh_new_item_candidates(
+        engine.cf_engine.new_item_pool_refreshed_at + 11
+    )

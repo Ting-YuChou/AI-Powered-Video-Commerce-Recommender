@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 
+import faiss
 import numpy as np
 import pytest
 import torch
@@ -9,7 +11,7 @@ from dcn import DeepAndCrossNetwork, LowRankCrossLayer
 from models import CandidateProduct, UserFeatures
 from ranking import MultiObjectiveRankingModel, RankingModel
 from ranking_batcher import RankingBatcher
-from two_tower import TwoTowerModel, TwoTowerTrainer
+from two_tower import ItemFeatureEncoder, TwoTowerModel, TwoTowerTrainer
 
 
 def test_deep_and_cross_network_outputs_finite_expected_shape():
@@ -156,6 +158,90 @@ def test_two_tower_dcn_checkpoint_round_trips_architecture(tmp_path):
     assert loaded.model is not None
     assert loaded.model.architecture == "dcn"
     assert loaded.model.cross_layers == 2
+
+
+def test_two_tower_item_side_features_use_stable_hash_buckets():
+    features = ItemFeatureEncoder.encode(
+        {
+            "price": 10.0,
+            "rating": 4.0,
+            "num_reviews": 2,
+            "in_stock": True,
+            "created_at": 1_700_000_000.0,
+            "tags": [],
+            "category": "shoes",
+            "brand": "Acme",
+        }
+    )
+    expected_category = (
+        int.from_bytes(hashlib.sha256(b"shoes").digest()[:8], byteorder="big", signed=False)
+        % 64
+    ) / 64
+    expected_brand = (
+        int.from_bytes(hashlib.sha256(b"Acme").digest()[:8], byteorder="big", signed=False)
+        % 128
+    ) / 128
+
+    np.testing.assert_allclose(features[6], expected_category, rtol=1e-6)
+    np.testing.assert_allclose(features[7], expected_brand, rtol=1e-6)
+
+
+def test_two_tower_training_passes_user_embedding_to_hard_negative_sampler():
+    trainer = TwoTowerTrainer(
+        clip_dim=2,
+        output_dim=2,
+        batch_size=2,
+        epochs=1,
+        num_hard_negatives=1,
+        num_random_negatives=0,
+        hard_ratio_start=1.0,
+        hard_ratio_end=1.0,
+        user_hidden_dims=[8],
+        item_hidden_dims=[8],
+        architecture="dcn",
+    )
+    trainer.prepare(
+        interactions=[
+            {"user_id": "u1", "product_id": "p1", "action": "view"},
+            {"user_id": "u2", "product_id": "p2", "action": "view"},
+        ],
+        product_metadata={
+            "p1": {"brand": "a", "category": "cat"},
+            "p2": {"brand": "b", "category": "cat"},
+            "p3": {"brand": "c", "category": "cat"},
+        },
+        product_clip_embeddings={
+            "p1": np.array([1.0, 0.0], dtype=np.float32),
+            "p2": np.array([0.0, 1.0], dtype=np.float32),
+            "p3": np.array([1.0, 1.0], dtype=np.float32),
+        },
+        user_features_map={"u1": {}, "u2": {}},
+    )
+    index = faiss.IndexFlatIP(2)
+    index.add(
+        np.array(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.707, 0.707],
+            ],
+            dtype=np.float32,
+        )
+    )
+    saw_user_embedding = []
+
+    def sample_with_probe(user_embedding, positive_items, epoch=0, total_epochs=1):
+        saw_user_embedding.append(user_embedding is not None)
+        for item_idx in range(1, len(trainer.item_mapping) + 1):
+            if item_idx not in positive_items:
+                return [item_idx]
+        return [0]
+
+    trainer.negative_sampler.sample = sample_with_probe
+
+    trainer.train(existing_cf_index=index)
+
+    assert any(saw_user_embedding)
 
 
 def test_two_tower_warm_start_keeps_configured_dcn_architecture(tmp_path):
