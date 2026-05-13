@@ -174,11 +174,15 @@ def test_two_tower_item_side_features_use_stable_hash_buckets():
         }
     )
     expected_category = (
-        int.from_bytes(hashlib.sha256(b"shoes").digest()[:8], byteorder="big", signed=False)
+        int.from_bytes(
+            hashlib.sha256(b"shoes").digest()[:8], byteorder="big", signed=False
+        )
         % 64
     ) / 64
     expected_brand = (
-        int.from_bytes(hashlib.sha256(b"Acme").digest()[:8], byteorder="big", signed=False)
+        int.from_bytes(
+            hashlib.sha256(b"Acme").digest()[:8], byteorder="big", signed=False
+        )
         % 128
     ) / 128
 
@@ -362,11 +366,14 @@ async def test_ranking_dcn_direct_and_microbatch_inference_outputs_shapes():
         enable_async_batching=True,
         batch_max_requests=2,
         batch_wait_ms=25.0,
+        batch_runner_count=1,
         offload_inference_to_thread=False,
     )
     ranking = RankingModel(config)
     await ranking.load_model()
-    feature_matrix = np.zeros((4, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
+    feature_matrix = np.zeros(
+        (4, ranking.feature_extractor.total_feature_dim), dtype=np.float32
+    )
 
     predictions, _ = ranking.run_inference_batch(feature_matrix)
 
@@ -375,8 +382,18 @@ async def test_ranking_dcn_direct_and_microbatch_inference_outputs_shapes():
 
     user_features = UserFeatures(user_id="u1")
     product_metadata = {
-        "p1": {"title": "Product 1", "price": 10.0, "category": "cat", "brand": "brand"},
-        "p2": {"title": "Product 2", "price": 12.0, "category": "cat", "brand": "brand"},
+        "p1": {
+            "title": "Product 1",
+            "price": 10.0,
+            "category": "cat",
+            "brand": "brand",
+        },
+        "p2": {
+            "title": "Product 2",
+            "price": 12.0,
+            "category": "cat",
+            "brand": "brand",
+        },
     }
     first_candidates = [
         CandidateProduct(product_id="p1", combined_score=0.4, source="test")
@@ -432,6 +449,7 @@ async def test_ranking_dcn_v2_low_rank_trains_and_infers_with_batch_size_one():
         enable_async_batching=True,
         batch_max_requests=2,
         batch_wait_ms=25.0,
+        batch_runner_count=1,
         offload_inference_to_thread=False,
     )
     ranking = RankingModel(config)
@@ -488,7 +506,9 @@ async def test_ranking_dcn_v2_low_rank_trains_and_infers_with_batch_size_one():
         user_features_map=user_features_map,
         product_metadata_map=product_metadata_map,
     )
-    feature_matrix = np.zeros((4, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
+    feature_matrix = np.zeros(
+        (4, ranking.feature_extractor.total_feature_dim), dtype=np.float32
+    )
     predictions, _ = ranking.run_inference_batch(feature_matrix)
 
     assert ranking.is_trained

@@ -258,6 +258,15 @@ class VectorSearchEngine:
         Returns:
             List of candidate products with similarity scores
         """
+        return self.search_similar_products_sync(query_embedding, k, filter_categories)
+
+    def search_similar_products_sync(
+        self,
+        query_embedding: np.ndarray,
+        k: int = None,
+        filter_categories: List[str] = None,
+    ) -> List[CandidateProduct]:
+        """Synchronous FAISS content search for bounded executor use."""
         if not self.is_loaded or self.index is None:
             logger.warning("Index not loaded, returning empty results")
             return []
@@ -608,6 +617,10 @@ class VectorSearchEngine:
     
     async def get_random_products(self, k: int = 10) -> List[CandidateProduct]:
         """Get random products for diversity or cold start scenarios."""
+        return self.get_random_products_sync(k=k)
+
+    def get_random_products_sync(self, k: int = 10) -> List[CandidateProduct]:
+        """Synchronous random fallback selection for bounded executor use."""
         try:
             if not self.product_index_map:
                 return []

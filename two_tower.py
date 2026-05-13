@@ -798,7 +798,11 @@ class TwoTowerTrainer:
         u_idx = self.user_mapping.get(user_id, 0)
         u_feat = UserFeatureEncoder.encode(user_features, current_time=current_time)
         ids_t = torch.tensor([u_idx], dtype=torch.long, device=self.device)
-        feat_t = torch.tensor([u_feat], device=self.device)
+        feat_t = torch.as_tensor(
+            np.expand_dims(u_feat, axis=0),
+            dtype=torch.float32,
+            device=self.device,
+        )
         return self.model.encode_users(ids_t, feat_t).cpu().numpy()[0]
 
     def save_checkpoint(self, path: str):

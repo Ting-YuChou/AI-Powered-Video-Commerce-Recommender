@@ -28,11 +28,22 @@ class RequestResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Recommendation API load baseline")
-    parser.add_argument("--base-url", required=True, help="Base URL, e.g. http://127.0.0.1:8000")
-    parser.add_argument("--requests", type=int, default=1000, help="Total request count")
+    parser.add_argument(
+        "--base-url", required=True, help="Base URL, e.g. http://127.0.0.1:8000"
+    )
+    parser.add_argument(
+        "--requests", type=int, default=1000, help="Total request count"
+    )
     parser.add_argument("--concurrency", type=int, default=50, help="Concurrency level")
-    parser.add_argument("--mode", choices=["hot", "unique"], default="hot", help="Request distribution mode")
-    parser.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout seconds")
+    parser.add_argument(
+        "--mode",
+        choices=["hot", "unique"],
+        default="hot",
+        help="Request distribution mode",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=10.0, help="Per-request timeout seconds"
+    )
     parser.add_argument(
         "--output",
         help="Optional output JSON path. Defaults to loadtest/results/httpx-baseline-<mode>.json",
@@ -83,7 +94,7 @@ async def run_request(
         )
 
 
-async def run_load(args: argparse.Namespace) -> List[RequestResult]:
+async def run_load(args: argparse.Namespace) -> tuple[List[RequestResult], float]:
     headers = {}
     api_key = args.api_key or os.environ.get("API_API_KEY")
     if api_key:
@@ -100,18 +111,35 @@ async def run_load(args: argparse.Namespace) -> List[RequestResult]:
     )
 
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+
         async def guarded(index: int) -> RequestResult:
             async with semaphore:
-                return await run_request(client, args.base_url, index, args.mode, headers)
+                return await run_request(
+                    client, args.base_url, index, args.mode, headers
+                )
 
-        return await asyncio.gather(*(guarded(index) for index in range(args.requests)))
+        started_at = time.perf_counter()
+        results = await asyncio.gather(
+            *(guarded(index) for index in range(args.requests))
+        )
+        return results, time.perf_counter() - started_at
 
 
-def summarize(results: List[RequestResult], args: argparse.Namespace) -> Dict[str, object]:
+def summarize(
+    results: List[RequestResult],
+    args: argparse.Namespace,
+    elapsed_seconds: float,
+) -> Dict[str, object]:
     durations = [result.duration_ms for result in results]
     status_counts = Counter(str(result.status_code) for result in results)
     ok_results = [result for result in results if result.ok]
+    server_error_count = sum(
+        1
+        for result in results
+        if result.status_code == 0 or 500 <= result.status_code <= 599
+    )
     success_rate = len(ok_results) / len(results) if results else 0.0
+    elapsed_seconds = max(elapsed_seconds, 0.000001)
 
     def percentile(p: float) -> float:
         if not durations:
@@ -126,7 +154,11 @@ def summarize(results: List[RequestResult], args: argparse.Namespace) -> Dict[st
         "requests": args.requests,
         "concurrency": args.concurrency,
         "timeout_seconds": args.timeout,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "qps_total": round(len(results) / elapsed_seconds, 2),
+        "qps_2xx": round(len(ok_results) / elapsed_seconds, 2),
         "success_rate": round(success_rate, 4),
+        "server_error_count": server_error_count,
         "average_ms": round(statistics.fmean(durations), 2) if durations else 0.0,
         "p50_ms": round(percentile(0.50), 2),
         "p95_ms": round(percentile(0.95), 2),
@@ -138,15 +170,16 @@ def summarize(results: List[RequestResult], args: argparse.Namespace) -> Dict[st
 
 def main() -> None:
     args = parse_args()
-    results = asyncio.run(run_load(args))
-    summary = summarize(results, args)
+    results, elapsed_seconds = asyncio.run(run_load(args))
+    summary = summarize(results, args, elapsed_seconds)
 
     output_path = Path(
-        args.output
-        or f"loadtest/results/httpx-baseline-{args.mode}.json"
+        args.output or f"loadtest/results/httpx-baseline-{args.mode}.json"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+    )
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

@@ -31,6 +31,9 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
         "REDIS_CACHE_MAX_CONNECTIONS",
         "REDIS_CACHE_SOCKET_TIMEOUT",
         "REDIS_CACHE_SOCKET_CONNECT_TIMEOUT",
+        "SERVICE_RANKING_COORDINATOR_HOST",
+        "SERVICE_RANKING_COORDINATOR_PORT",
+        "SERVICE_RANKING_COORDINATOR_CLIENT_POOL_SIZE",
     ):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("MODEL_CACHE_DIR", str(tmp_path / "models"))
@@ -38,11 +41,27 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     reset_config()
     config = Config()
 
-    assert config.vector_config.index_path == str(tmp_path / "models" / "vector_index.faiss")
+    assert config.vector_config.index_path == str(
+        tmp_path / "models" / "vector_index.faiss"
+    )
     assert config.recommendation_config.cf_index_path == str(
         tmp_path / "models" / "cf_vector_index.faiss"
     )
     assert config.cache_config.hot_path_read_timeout_ms == 150.0
+    assert config.cache_config.candidate_cache_race_timeout_ms == 5.0
+    assert config.cache_config.recommendation_cache_race_timeout_ms == 5.0
+    assert config.cache_config.background_task_queue_size == 8192
+    assert config.recommendation_config.known_user_snapshot_enabled is True
+    assert config.recommendation_config.content_features_snapshot_enabled is True
+    assert config.service_topology_config.ranking_single_coordinator_enabled is True
+    assert config.service_topology_config.ranking_coordinator_host == ""
+    assert config.service_topology_config.ranking_coordinator_port == 8013
+    assert config.service_topology_config.ranking_coordinator_client_pool_size == 128
+    assert config.service_topology_config.ranking_runner_endpoint_missing_refreshes == 3
+    assert (
+        config.service_topology_config.ranking_runner_endpoint_missing_grace_seconds
+        == 30.0
+    )
     assert config.recommendation_config.preload_product_metadata_on_startup is False
     assert config.recommendation_config.publish_catalog_snapshot_on_startup is False
     assert config.redis_config.cache_host is None
@@ -62,6 +81,18 @@ def test_config_reads_separate_cache_redis_env(monkeypatch):
     assert config.redis_config.cache_host == "redis-cache"
     assert config.redis_config.cache_db == 2
     assert config.redis_config.cache_socket_timeout == 0.25
+
+    reset_config()
+
+
+def test_explicit_monitoring_log_level_wins_over_development_env(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("MONITORING_LOG_LEVEL", "INFO")
+
+    reset_config()
+    config = Config()
+
+    assert config.monitoring_config.log_level == "INFO"
 
     reset_config()
 

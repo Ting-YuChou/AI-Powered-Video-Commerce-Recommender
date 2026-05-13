@@ -2,8 +2,14 @@
     encode zstd gzip
 
     route {
-        @gateway path /api/* /health /livez /readyz /docs /redoc /openapi.json
-        reverse_proxy @gateway gateway-api:8000
+        @gateway path /api/* /health /livez /readyz /readyz/full /docs /redoc /openapi.json
+        reverse_proxy @gateway gateway-api:8000 {
+            transport http {
+                keepalive 30s
+                keepalive_idle_conns 1024
+                keepalive_idle_conns_per_host 1024
+            }
+        }
 
         root * /srv
         try_files {path} /index.html
