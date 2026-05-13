@@ -9,11 +9,13 @@ candidate products.
 """
 
 import asyncio
+import functools
 import numpy as np
 import faiss
 import logging
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional, Set, Tuple
 import time
 from collections import OrderedDict, defaultdict
@@ -21,10 +23,7 @@ from pathlib import Path
 import threading
 
 # Local imports
-from models import (
-    UserFeatures, ContentFeatures, CandidateProduct,
-    InteractionType
-)
+from models import UserFeatures, ContentFeatures, CandidateProduct, InteractionType
 from feature_store import FeatureStore
 from model_artifacts import ModelArtifactManager
 from vector_search import VectorSearchEngine
@@ -123,9 +122,49 @@ class TwoTowerRetrievalEngine:
             Tuple[Any, ...],
             np.ndarray,
         ] = OrderedDict()
+        self._unknown_user_candidate_cache: OrderedDict[
+            Tuple[Any, ...],
+            List[CandidateProduct],
+        ] = OrderedDict()
         self._user_embedding_cache_lock = threading.RLock()
+        retrieval_workers = max(
+            1,
+            int(getattr(config, "retrieval_executor_workers", 1) or 1),
+        )
+        self._retrieval_executor = ThreadPoolExecutor(
+            max_workers=retrieval_workers,
+            thread_name_prefix="two-tower-retrieval",
+        )
 
         logger.info("Two-Tower retrieval engine initialized")
+
+    async def run_in_retrieval_executor(self, func, *args, **kwargs):
+        """Run synchronous retrieval CPU work on the bounded retrieval executor."""
+        loop = asyncio.get_running_loop()
+        if kwargs:
+            return await loop.run_in_executor(
+                self._retrieval_executor,
+                functools.partial(func, *args, **kwargs),
+            )
+        return await loop.run_in_executor(self._retrieval_executor, func, *args)
+
+    def prime_default_unknown_candidates(self, k: int) -> None:
+        """Warm the shared cold-user CF candidate cache for common live requests."""
+        if k <= 0 or not self.is_trained:
+            return
+        self._get_user_recommendations_sync(
+            "__default_unknown_user__",
+            k,
+            set(),
+            {
+                "total_interactions": 0,
+                "avg_session_length": 0.0,
+                "preferred_categories": [],
+                "price_sensitivity": 0.5,
+                "click_through_rate": 0.0,
+                "conversion_rate": 0.0,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Training
@@ -183,7 +222,9 @@ class TwoTowerRetrievalEngine:
             existing_index = self._base_cf_index or self.cf_index
             checkpoint_path = self.config.cf_index_path.replace(".faiss", ".pt")
             if Path(checkpoint_path).exists():
-                await asyncio.to_thread(self.trainer.warm_start_from_checkpoint, checkpoint_path)
+                await asyncio.to_thread(
+                    self.trainer.warm_start_from_checkpoint, checkpoint_path
+                )
 
             # Run training
             start_time = time.time()
@@ -194,7 +235,9 @@ class TwoTowerRetrievalEngine:
             training_time = time.time() - start_time
 
             # Build FAISS index from trained item embeddings
-            self.cf_index, idx_map = await asyncio.to_thread(self.trainer.build_item_index)
+            self.cf_index, idx_map = await asyncio.to_thread(
+                self.trainer.build_item_index
+            )
 
             # Build reverse mapping: faiss_idx -> product_id
             self.cf_index_map = {}
@@ -209,7 +252,9 @@ class TwoTowerRetrievalEngine:
             self.user_mapping = dict(self.trainer.user_mapping)
             self.item_mapping = dict(self.trainer.item_mapping)
             self.trained_item_embeddings = self.trainer.get_item_embedding_map()
-            self.trained_item_clip_available = self.trainer.get_item_clip_available_map()
+            self.trained_item_clip_available = (
+                self.trainer.get_item_clip_available_map()
+            )
             self.trained_item_features = self.trainer.get_item_side_feature_map()
 
             # Save checkpoint and index
@@ -276,7 +321,9 @@ class TwoTowerRetrievalEngine:
             item_features=self.trained_item_features,
             model_version=model_version,
         )
-        adapter = self._fit_content_to_cf_adapter(product_clip_embeddings, product_metadata)
+        adapter = self._fit_content_to_cf_adapter(
+            product_clip_embeddings, product_metadata
+        )
         if adapter is not None:
             adapter.save(
                 self._adapter_path(),
@@ -292,7 +339,9 @@ class TwoTowerRetrievalEngine:
         try:
             Path(path).unlink(missing_ok=True)
         except OSError as exc:
-            logger.warning("Failed to remove stale CF cold-start artifact %s: %s", path, exc)
+            logger.warning(
+                "Failed to remove stale CF cold-start artifact %s: %s", path, exc
+            )
 
     def _fit_content_to_cf_adapter(
         self,
@@ -318,7 +367,9 @@ class TwoTowerRetrievalEngine:
                 continue
 
         if len(features) < 2:
-            logger.warning("Skipping content-to-CF adapter fit; not enough CLIP-backed items")
+            logger.warning(
+                "Skipping content-to-CF adapter fit; not enough CLIP-backed items"
+            )
             return None
         try:
             return ContentToCFAdapter.fit(np.vstack(features), np.vstack(targets))
@@ -339,9 +390,12 @@ class TwoTowerRetrievalEngine:
             self.cf_index_map = dict(self._base_cf_index_map)
 
     def _load_cold_start_sidecars(self) -> None:
-        embeddings, clip_available, item_features, sidecar_version = load_item_embedding_sidecar(
-            self._embedding_sidecar_path()
-        )
+        (
+            embeddings,
+            clip_available,
+            item_features,
+            sidecar_version,
+        ) = load_item_embedding_sidecar(self._embedding_sidecar_path())
         expected_model_version = self.model_version
         if not embeddings:
             self._clear_loaded_cold_start_sidecars()
@@ -391,7 +445,9 @@ class TwoTowerRetrievalEngine:
             return
 
         if not self.trained_item_embeddings or self.content_to_cf_adapter is None:
-            logger.info("Skipping CF cold-start overlay; trained embeddings or adapter unavailable")
+            logger.info(
+                "Skipping CF cold-start overlay; trained embeddings or adapter unavailable"
+            )
             self.synthetic_item_embeddings = {}
             self.synthetic_item_metadata = {}
             self.cold_start_overlay_version = None
@@ -416,11 +472,26 @@ class TwoTowerRetrievalEngine:
 
     def _build_cold_start_overlay_snapshot(
         self,
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, Any]], Optional[faiss.Index], Dict[int, str], str]:
-        synthetic_embeddings, synthetic_metadata = self._build_synthetic_item_embeddings()
+    ) -> Tuple[
+        Dict[str, np.ndarray],
+        Dict[str, Dict[str, Any]],
+        Optional[faiss.Index],
+        Dict[int, str],
+        str,
+    ]:
+        (
+            synthetic_embeddings,
+            synthetic_metadata,
+        ) = self._build_synthetic_item_embeddings()
         index, index_map = self._build_serving_cf_index_snapshot(synthetic_embeddings)
         overlay_version = self._build_cold_start_overlay_version(synthetic_embeddings)
-        return synthetic_embeddings, synthetic_metadata, index, index_map, overlay_version
+        return (
+            synthetic_embeddings,
+            synthetic_metadata,
+            index,
+            index_map,
+            overlay_version,
+        )
 
     def _build_synthetic_item_embeddings(
         self,
@@ -480,7 +551,10 @@ class TwoTowerRetrievalEngine:
             created_at = float(metadata.get("created_at", current_time))
             candidates.append((product_id, created_at))
         candidates.sort(key=lambda item: item[1], reverse=True)
-        return [product_id for product_id, _ in candidates[: self.config.cf_cold_start_max_items]]
+        return [
+            product_id
+            for product_id, _ in candidates[: self.config.cf_cold_start_max_items]
+        ]
 
     def _get_product_clip_embedding(self, product_id: str) -> Optional[np.ndarray]:
         if not hasattr(self.vector_search, "get_product_embedding"):
@@ -497,7 +571,10 @@ class TwoTowerRetrievalEngine:
         neighbors = self._get_clip_neighbors(
             product_id,
             clip_embedding,
-            max(self.config.cf_cold_start_neighbors * 2, self.config.cf_cold_start_neighbors),
+            max(
+                self.config.cf_cold_start_neighbors * 2,
+                self.config.cf_cold_start_neighbors,
+            ),
         )
         neighbor_embeddings: List[np.ndarray] = []
         neighbor_similarities: List[float] = []
@@ -515,14 +592,19 @@ class TwoTowerRetrievalEngine:
                 continue
             neighbor_embeddings.append(trained_embedding)
             neighbor_similarities.append(similarity)
-            neighbor_metadatas.append(self.vector_search.product_metadata.get(neighbor.product_id, {}))
+            neighbor_metadatas.append(
+                self.vector_search.product_metadata.get(neighbor.product_id, {})
+            )
             neighbor_ids.append(neighbor.product_id)
             if len(neighbor_embeddings) >= self.config.cf_cold_start_neighbors:
                 break
 
         if len(neighbor_embeddings) < self.config.cf_cold_start_min_valid_neighbors:
             return None
-        if float(np.mean(neighbor_similarities)) < self.config.cf_cold_start_min_clip_similarity:
+        if (
+            float(np.mean(neighbor_similarities))
+            < self.config.cf_cold_start_min_clip_similarity
+        ):
             return None
 
         try:
@@ -532,7 +614,11 @@ class TwoTowerRetrievalEngine:
                 clip_dim=self.vector_search.embedding_dim,
             )
             adapter_embedding = self.content_to_cf_adapter.predict(content_feature)[0]
-            synthetic_embedding, confidence, neighbor_weights = build_hybrid_synthetic_embedding(
+            (
+                synthetic_embedding,
+                confidence,
+                neighbor_weights,
+            ) = build_hybrid_synthetic_embedding(
                 neighbor_embeddings=neighbor_embeddings,
                 neighbor_similarities=neighbor_similarities,
                 adapter_embedding=adapter_embedding,
@@ -570,7 +656,10 @@ class TwoTowerRetrievalEngine:
         if not np.any(query):
             return []
         scored: List[Tuple[str, float]] = []
-        for neighbor_id, embedding in self.vector_search.get_all_product_embeddings().items():
+        for (
+            neighbor_id,
+            embedding,
+        ) in self.vector_search.get_all_product_embeddings().items():
             if neighbor_id == product_id:
                 continue
             score = float(np.dot(query, normalize_vector(embedding)))
@@ -588,7 +677,9 @@ class TwoTowerRetrievalEngine:
         ]
 
     def _rebuild_serving_cf_index(self) -> None:
-        index, index_map = self._build_serving_cf_index_snapshot(self.synthetic_item_embeddings)
+        index, index_map = self._build_serving_cf_index_snapshot(
+            self.synthetic_item_embeddings
+        )
         if index is None:
             return
         self.cf_index = index
@@ -645,7 +736,9 @@ class TwoTowerRetrievalEngine:
         self._new_item_pool_catalog_token = self._new_item_catalog_token()
         self.new_item_pool_version = self._build_new_item_pool_version(candidates)
 
-    def should_refresh_new_item_candidates(self, current_time: Optional[float] = None) -> bool:
+    def should_refresh_new_item_candidates(
+        self, current_time: Optional[float] = None
+    ) -> bool:
         if self.config.max_new_item_candidates <= 0:
             return bool(self._new_item_candidates)
         if self.new_item_pool_refreshed_at <= 0.0:
@@ -654,7 +747,10 @@ class TwoTowerRetrievalEngine:
         interval_seconds = float(
             getattr(self.config, "new_item_pool_refresh_interval_seconds", 300.0)
         )
-        if interval_seconds > 0 and current_time - self.new_item_pool_refreshed_at >= interval_seconds:
+        if (
+            interval_seconds > 0
+            and current_time - self.new_item_pool_refreshed_at >= interval_seconds
+        ):
             return True
         return self._new_item_catalog_token() != self._new_item_pool_catalog_token
 
@@ -664,24 +760,36 @@ class TwoTowerRetrievalEngine:
         else:
             context = {
                 "last_updated": getattr(self.vector_search, "last_updated", None),
-                "product_count": len(getattr(self.vector_search, "product_metadata", {}) or {}),
+                "product_count": len(
+                    getattr(self.vector_search, "product_metadata", {}) or {}
+                ),
             }
         return hashlib.sha256(
-            json.dumps(context, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            json.dumps(
+                context, sort_keys=True, separators=(",", ":"), default=str
+            ).encode("utf-8")
         ).hexdigest()[:16]
 
-    def _build_new_item_candidates_snapshot(self, current_time: float) -> List[CandidateProduct]:
+    def _build_new_item_candidates_snapshot(
+        self, current_time: float
+    ) -> List[CandidateProduct]:
         if self.config.max_new_item_candidates <= 0:
             return []
         candidates: List[CandidateProduct] = []
         for product_id in self._eligible_cold_start_product_ids(current_time):
             metadata = self.vector_search.product_metadata.get(product_id, {})
-            age_days = max((current_time - float(metadata.get("created_at", current_time))) / 86400.0, 0.0)
+            age_days = max(
+                (current_time - float(metadata.get("created_at", current_time)))
+                / 86400.0,
+                0.0,
+            )
             freshness_score = 1.0 / (1.0 + age_days / 30.0)
             bootstrap_confidence = float(
                 self.synthetic_item_metadata.get(product_id, {}).get("confidence", 0.5)
             )
-            score = float(min(1.0, max(0.0, 0.5 * freshness_score + 0.5 * bootstrap_confidence)))
+            score = float(
+                min(1.0, max(0.0, 0.5 * freshness_score + 0.5 * bootstrap_confidence))
+            )
             candidates.append(
                 CandidateProduct(
                     product_id=product_id,
@@ -697,7 +805,12 @@ class TwoTowerRetrievalEngine:
         payload = [
             {
                 "product_id": candidate.product_id,
-                "score": round(float(candidate.popularity_score or candidate.combined_score or 0.0), 6),
+                "score": round(
+                    float(
+                        candidate.popularity_score or candidate.combined_score or 0.0
+                    ),
+                    6,
+                ),
             }
             for candidate in candidates
         ]
@@ -720,12 +833,16 @@ class TwoTowerRetrievalEngine:
                 break
             if candidate.product_id in exclude_items:
                 continue
-            if not self._new_item_metadata_still_eligible(candidate.product_id, current_time):
+            if not self._new_item_metadata_still_eligible(
+                candidate.product_id, current_time
+            ):
                 continue
             candidates.append(CandidateProduct(**candidate.dict()))
         return candidates
 
-    def _new_item_metadata_still_eligible(self, product_id: str, current_time: float) -> bool:
+    def _new_item_metadata_still_eligible(
+        self, product_id: str, current_time: float
+    ) -> bool:
         metadata = self.vector_search.product_metadata.get(product_id)
         if not metadata or product_id in self.item_mapping:
             return False
@@ -772,13 +889,18 @@ class TwoTowerRetrievalEngine:
             exclude_items: product_ids to exclude
             user_features: optional user features dict (avoids redundant lookups)
         """
-        return await asyncio.to_thread(
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._retrieval_executor,
             self._get_user_recommendations_sync,
             user_id,
             k,
             exclude_items,
             user_features,
         )
+
+    def close(self) -> None:
+        self._retrieval_executor.shutdown(wait=False, cancel_futures=True)
 
     def _get_user_recommendations_sync(
         self,
@@ -788,13 +910,33 @@ class TwoTowerRetrievalEngine:
         user_features: Optional[Dict[str, Any]] = None,
     ) -> List[CandidateProduct]:
         try:
-            if not self.is_trained or self.cf_index is None or self.cf_index.ntotal == 0:
-                logger.warning("Two-Tower model not trained, returning empty recommendations")
+            if (
+                not self.is_trained
+                or self.cf_index is None
+                or self.cf_index.ntotal == 0
+            ):
+                logger.warning(
+                    "Two-Tower model not trained, returning empty recommendations"
+                )
                 return []
 
             exclude_items = exclude_items or set()
             user_features = user_features or {}
             current_time = time.time()
+            unknown_cache_key = self._unknown_user_candidate_cache_key(
+                user_id,
+                user_features,
+                current_time,
+                k,
+                exclude_items,
+            )
+            if unknown_cache_key is not None:
+                cached_candidates = self._get_unknown_user_candidate_cache(
+                    unknown_cache_key
+                )
+                if cached_candidates is not None:
+                    return cached_candidates
+
             user_embedding = self._get_user_embedding(
                 user_id,
                 user_features,
@@ -816,11 +958,18 @@ class TwoTowerRetrievalEngine:
                     continue
                 product_id = self.cf_index_map.get(int(idx))
                 if product_id and product_id not in exclude_items:
-                    norm_score = self._cf_search_score_to_similarity(self.cf_index, score)
+                    norm_score = self._cf_search_score_to_similarity(
+                        self.cf_index, score
+                    )
                     source = "collaborative_filtering"
-                    if product_id in self.synthetic_item_metadata and product_id not in self.item_mapping:
+                    if (
+                        product_id in self.synthetic_item_metadata
+                        and product_id not in self.item_mapping
+                    ):
                         confidence = float(
-                            self.synthetic_item_metadata[product_id].get("confidence", 0.0)
+                            self.synthetic_item_metadata[product_id].get(
+                                "confidence", 0.0
+                            )
                         )
                         norm_score *= max(0.0, min(confidence, 1.0))
                         source = "cf_cold_start"
@@ -833,12 +982,102 @@ class TwoTowerRetrievalEngine:
                         )
                     )
 
-            logger.debug(f"Generated {len(candidates)} Two-Tower recommendations for user {user_id}")
+            logger.debug(
+                f"Generated {len(candidates)} Two-Tower recommendations for user {user_id}"
+            )
+            if unknown_cache_key is not None:
+                self._set_unknown_user_candidate_cache(unknown_cache_key, candidates)
             return candidates
 
         except Exception as e:
             logger.error(f"Error getting Two-Tower recommendations for {user_id}: {e}")
             return []
+
+    def _unknown_user_candidate_cache_key(
+        self,
+        user_id: str,
+        user_features: Dict[str, Any],
+        current_time: float,
+        k: int,
+        exclude_items: Set[str],
+    ) -> Optional[Tuple[Any, ...]]:
+        if user_id in self.trainer.user_mapping or exclude_items:
+            return None
+        if self._is_default_unknown_user_features(user_features):
+            return (
+                self.model_version,
+                getattr(self.cf_index, "ntotal", 0),
+                k,
+                "default_unknown",
+            )
+        time_bucket = int(current_time / self._user_embedding_cache_time_bucket_seconds)
+        last_active = float(user_features.get("last_active", current_time))
+        hours_since_active = max((current_time - last_active) / 3600.0, 0.0)
+        normalized_features = {
+            "total_interactions": int(user_features.get("total_interactions", 0)),
+            "avg_session_length": round(
+                float(user_features.get("avg_session_length", 0.0)), 3
+            ),
+            "preferred_categories": list(user_features.get("preferred_categories", [])),
+            "price_sensitivity": round(
+                float(user_features.get("price_sensitivity", 0.5)), 6
+            ),
+            "click_through_rate": round(
+                float(user_features.get("click_through_rate", 0.0)), 6
+            ),
+            "conversion_rate": round(
+                float(user_features.get("conversion_rate", 0.0)), 6
+            ),
+            "hours_since_active": round(hours_since_active, 3),
+        }
+        feature_hash = hashlib.sha256(
+            json.dumps(
+                normalized_features, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return (
+            self.model_version,
+            getattr(self.cf_index, "ntotal", 0),
+            k,
+            time_bucket,
+            feature_hash,
+        )
+
+    @staticmethod
+    def _is_default_unknown_user_features(user_features: Dict[str, Any]) -> bool:
+        preferred_categories = user_features.get("preferred_categories", [])
+        return (
+            int(user_features.get("total_interactions", 0) or 0) == 0
+            and abs(float(user_features.get("avg_session_length", 0.0) or 0.0)) < 1e-9
+            and list(preferred_categories or []) == []
+            and abs(float(user_features.get("price_sensitivity", 0.5) or 0.5) - 0.5)
+            < 1e-9
+            and abs(float(user_features.get("click_through_rate", 0.0) or 0.0))
+            < 1e-9
+            and abs(float(user_features.get("conversion_rate", 0.0) or 0.0)) < 1e-9
+        )
+
+    def _get_unknown_user_candidate_cache(
+        self, cache_key: Tuple[Any, ...]
+    ) -> Optional[List[CandidateProduct]]:
+        with self._user_embedding_cache_lock:
+            cached = self._unknown_user_candidate_cache.get(cache_key)
+            if cached is None:
+                return None
+            self._unknown_user_candidate_cache.move_to_end(cache_key)
+            return [CandidateProduct(**candidate.dict()) for candidate in cached]
+
+    def _set_unknown_user_candidate_cache(
+        self, cache_key: Tuple[Any, ...], candidates: List[CandidateProduct]
+    ) -> None:
+        if self._user_embedding_cache_max_size <= 0:
+            return
+        with self._user_embedding_cache_lock:
+            self._unknown_user_candidate_cache[cache_key] = [
+                CandidateProduct(**candidate.dict()) for candidate in candidates
+            ]
+            if len(self._unknown_user_candidate_cache) > self._user_embedding_cache_max_size:
+                self._unknown_user_candidate_cache.popitem(last=False)
 
     @staticmethod
     def _cf_search_score_to_similarity(index: faiss.Index, score: float) -> float:
@@ -856,6 +1095,7 @@ class TwoTowerRetrievalEngine:
     def clear_user_embedding_cache(self) -> None:
         with self._user_embedding_cache_lock:
             self._user_embedding_cache.clear()
+            self._unknown_user_candidate_cache.clear()
 
     def _get_user_embedding(
         self,
@@ -890,20 +1130,30 @@ class TwoTowerRetrievalEngine:
         user_features: Dict[str, Any],
         current_time: float,
     ) -> Tuple[Any, ...]:
-        time_bucket = int(
-            current_time / self._user_embedding_cache_time_bucket_seconds
-        )
+        time_bucket = int(current_time / self._user_embedding_cache_time_bucket_seconds)
         normalized_features = {
             "total_interactions": int(user_features.get("total_interactions", 0)),
-            "avg_session_length": round(float(user_features.get("avg_session_length", 0.0)), 3),
+            "avg_session_length": round(
+                float(user_features.get("avg_session_length", 0.0)), 3
+            ),
             "preferred_categories": list(user_features.get("preferred_categories", [])),
-            "price_sensitivity": round(float(user_features.get("price_sensitivity", 0.5)), 6),
-            "click_through_rate": round(float(user_features.get("click_through_rate", 0.0)), 6),
-            "conversion_rate": round(float(user_features.get("conversion_rate", 0.0)), 6),
-            "last_active": round(float(user_features.get("last_active", current_time)), 3),
+            "price_sensitivity": round(
+                float(user_features.get("price_sensitivity", 0.5)), 6
+            ),
+            "click_through_rate": round(
+                float(user_features.get("click_through_rate", 0.0)), 6
+            ),
+            "conversion_rate": round(
+                float(user_features.get("conversion_rate", 0.0)), 6
+            ),
+            "last_active": round(
+                float(user_features.get("last_active", current_time)), 3
+            ),
         }
         feature_hash = hashlib.sha256(
-            json.dumps(normalized_features, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            json.dumps(
+                normalized_features, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
         ).hexdigest()[:16]
         return (
             self.model_version,
@@ -927,8 +1177,12 @@ class TwoTowerRetrievalEngine:
             if not self._item_popularity:
                 return []
 
-            max_pop = max(self._item_popularity.values()) if self._item_popularity else 1.0
-            sorted_items = sorted(self._item_popularity.items(), key=lambda x: x[1], reverse=True)
+            max_pop = (
+                max(self._item_popularity.values()) if self._item_popularity else 1.0
+            )
+            sorted_items = sorted(
+                self._item_popularity.items(), key=lambda x: x[1], reverse=True
+            )
 
             candidates: List[CandidateProduct] = []
             for product_id, pop_score in sorted_items:
@@ -999,20 +1253,24 @@ class TrendingEngine:
                 total_score = 0.0
                 for timestamp, weight in recent:
                     hours_ago = (current_time - timestamp) / 3600
-                    decay_factor = self.config.trending_decay_factor ** hours_ago
+                    decay_factor = self.config.trending_decay_factor**hours_ago
                     total_score += weight * decay_factor
                 self.trending_scores[product_id] = total_score
 
             cutoff_time = current_time - (self.config.trending_window_hours * 2 * 3600)
             for product_id in list(self.interaction_counts.keys()):
                 self.interaction_counts[product_id] = [
-                    (ts, w) for ts, w in self.interaction_counts[product_id] if ts >= cutoff_time
+                    (ts, w)
+                    for ts, w in self.interaction_counts[product_id]
+                    if ts >= cutoff_time
                 ]
                 if not self.interaction_counts[product_id]:
                     del self.interaction_counts[product_id]
 
             self.last_updated = current_time
-            logger.debug(f"Updated trending scores for {len(self.trending_scores)} products")
+            logger.debug(
+                f"Updated trending scores for {len(self.trending_scores)} products"
+            )
 
         except Exception as e:
             logger.error(f"Error updating trending scores: {e}")
@@ -1030,8 +1288,12 @@ class TrendingEngine:
                 logger.warning("No trending scores available")
                 return []
 
-            sorted_products = sorted(self.trending_scores.items(), key=lambda x: x[1], reverse=True)
-            max_score = max(self.trending_scores.values()) if self.trending_scores else 1.0
+            sorted_products = sorted(
+                self.trending_scores.items(), key=lambda x: x[1], reverse=True
+            )
+            max_score = (
+                max(self.trending_scores.values()) if self.trending_scores else 1.0
+            )
 
             candidates: List[CandidateProduct] = []
             for product_id, score in sorted_products:
@@ -1087,6 +1349,9 @@ class RecommendationEngine:
 
         logger.info("Recommendation engine initialized (Two-Tower + SASRec retrieval)")
 
+    def close(self) -> None:
+        self.cf_engine.close()
+
     async def load_models(self):
         """Load and initialize all recommendation models."""
         try:
@@ -1117,22 +1382,42 @@ class RecommendationEngine:
             await self._try_load_cf_index()
             await self._try_load_sasrec_artifacts()
             await self.refresh_serving_pools()
+            await self._prime_hot_serving_caches()
             self.is_initialized = True
             if not self.cf_engine.is_trained:
-                logger.warning("Two-Tower index not available; serving will fall back to non-CF sources")
+                logger.warning(
+                    "Two-Tower index not available; serving will fall back to non-CF sources"
+                )
             if self.config.enable_sasrec and not self.sasrec_engine.is_trained:
-                logger.warning("SASRec artifacts not available; serving will skip sequential candidates")
+                logger.warning(
+                    "SASRec artifacts not available; serving will skip sequential candidates"
+                )
             logger.info("Recommendation serving state ready")
         except Exception as e:
             logger.error(f"Error loading recommendation serving state: {e}")
             raise
+
+    async def _prime_hot_serving_caches(self) -> None:
+        if not self.cf_engine.is_trained:
+            return
+        default_k = min(
+            max(200, self.config.candidates_per_source),
+            self.config.max_total_candidates,
+            self.config.max_live_cf_candidates,
+        )
+        await asyncio.to_thread(
+            self.cf_engine.prime_default_unknown_candidates,
+            default_k,
+        )
 
     async def _try_load_cf_index(self):
         """Attempt to load a previously saved CF FAISS index for fast cold start."""
         try:
             checkpoint_record = None
             if self.artifact_manager:
-                checkpoint_record = await self.artifact_manager.sync_latest_two_tower_artifacts()
+                checkpoint_record = (
+                    await self.artifact_manager.sync_latest_two_tower_artifacts()
+                )
 
             result = await asyncio.to_thread(
                 VectorSearchEngine.load_cf_index,
@@ -1154,7 +1439,10 @@ class RecommendationEngine:
                 loaded_engine._base_cf_index = index
                 loaded_engine._base_cf_index_map = dict(index_map)
 
-                if not await asyncio.to_thread(loaded_engine.trainer.load_checkpoint, checkpoint_path):
+                if not await asyncio.to_thread(
+                    loaded_engine.trainer.load_checkpoint, checkpoint_path
+                ):
+                    loaded_engine.close()
                     return False
 
                 loaded_engine.user_mapping = dict(loaded_engine.trainer.user_mapping)
@@ -1167,6 +1455,7 @@ class RecommendationEngine:
                 await asyncio.to_thread(loaded_engine.refresh_new_item_candidates)
                 loaded_engine.clear_user_embedding_cache()
 
+                self.cf_engine.close()
                 self.cf_engine = loaded_engine
                 if checkpoint_record:
                     self.loaded_two_tower_version = checkpoint_record.model_version
@@ -1185,7 +1474,9 @@ class RecommendationEngine:
         try:
             checkpoint_record = None
             if self.artifact_manager:
-                checkpoint_record = await self.artifact_manager.sync_latest_sasrec_artifacts()
+                checkpoint_record = (
+                    await self.artifact_manager.sync_latest_sasrec_artifacts()
+                )
 
             checkpoint_path, vocab_path, metadata_path = self._sasrec_artifact_paths()
             loaded = await asyncio.to_thread(
@@ -1209,10 +1500,16 @@ class RecommendationEngine:
         try:
             if not self.artifact_manager or not self.artifact_manager.system_store:
                 await self.refresh_serving_pools()
-                logger.warning("Skipping Two-Tower retraining because Postgres system store is unavailable")
+                logger.warning(
+                    "Skipping Two-Tower retraining because Postgres system store is unavailable"
+                )
                 return
 
-            interactions = await self.artifact_manager.system_store.get_training_interactions(limit=50000)
+            interactions = (
+                await self.artifact_manager.system_store.get_training_interactions(
+                    limit=50000
+                )
+            )
 
             if interactions:
                 # Gather user features for the trainer
@@ -1223,10 +1520,14 @@ class RecommendationEngine:
                     interactions, user_features_map=user_features_map
                 )
                 if self.cf_engine.is_trained:
-                    checkpoint_path = self.artifact_manager.two_tower_local_checkpoint_path
+                    checkpoint_path = (
+                        self.artifact_manager.two_tower_local_checkpoint_path
+                    )
                     index_path = self.artifact_manager.two_tower_local_index_path
                     metadata_path = self.artifact_manager.two_tower_local_metadata_path
-                    model_version = self.cf_engine.model_version or f"two-tower-{int(time.time())}"
+                    model_version = (
+                        self.cf_engine.model_version or f"two-tower-{int(time.time())}"
+                    )
                     artifact_record = await self.artifact_manager.persist_two_tower_artifacts(
                         checkpoint_path=checkpoint_path,
                         index_path=index_path,
@@ -1239,7 +1540,11 @@ class RecommendationEngine:
                             "last_training_time": self.cf_engine.last_training_time,
                         },
                     )
-                    self.loaded_two_tower_version = artifact_record.model_version if artifact_record else model_version
+                    self.loaded_two_tower_version = (
+                        artifact_record.model_version
+                        if artifact_record
+                        else model_version
+                    )
 
                 await self._update_sasrec_from_sequences()
 
@@ -1260,19 +1565,25 @@ class RecommendationEngine:
         if not self.config.enable_sasrec:
             return
         if not self.artifact_manager or not self.artifact_manager.system_store:
-            logger.warning("Skipping SASRec training because Postgres system store is unavailable")
+            logger.warning(
+                "Skipping SASRec training because Postgres system store is unavailable"
+            )
             return
 
         max_events = max(
             int(self.config.sasrec_min_sequence_length),
             int(self.config.sasrec_max_sequence_length) + 1,
         )
-        sequences = await self.artifact_manager.system_store.get_user_training_sequences(
-            max_events_per_user=max_events,
-            min_sequence_length=self.config.sasrec_min_sequence_length,
+        sequences = (
+            await self.artifact_manager.system_store.get_user_training_sequences(
+                max_events_per_user=max_events,
+                min_sequence_length=self.config.sasrec_min_sequence_length,
+            )
         )
         if not sequences:
-            logger.info("Skipping SASRec training because no positive user sequences are available")
+            logger.info(
+                "Skipping SASRec training because no positive user sequences are available"
+            )
             return
 
         trained = await self.sasrec_engine.train_model(
@@ -1301,7 +1612,9 @@ class RecommendationEngine:
                 "last_training_time": self.sasrec_engine.last_training_time,
             },
         )
-        self.loaded_sasrec_version = artifact_record.model_version if artifact_record else model_version
+        self.loaded_sasrec_version = (
+            artifact_record.model_version if artifact_record else model_version
+        )
 
     def _sasrec_artifact_paths(self) -> Tuple[str, str, str]:
         if self.artifact_manager:
@@ -1326,17 +1639,28 @@ class RecommendationEngine:
         latest_two_tower = await self.artifact_manager.get_latest_model_checkpoint(
             ModelArtifactManager.TWO_TOWER_MODEL_NAME
         )
-        if latest_two_tower and latest_two_tower.model_version != self.loaded_two_tower_version:
+        if (
+            latest_two_tower
+            and latest_two_tower.model_version != self.loaded_two_tower_version
+        ):
             await self._try_load_cf_index()
-            updated = updated or self.loaded_two_tower_version == latest_two_tower.model_version
+            updated = (
+                updated
+                or self.loaded_two_tower_version == latest_two_tower.model_version
+            )
 
         if self.config.enable_sasrec:
             latest_sasrec = await self.artifact_manager.get_latest_model_checkpoint(
                 ModelArtifactManager.SASREC_MODEL_NAME
             )
-            if latest_sasrec and latest_sasrec.model_version != self.loaded_sasrec_version:
+            if (
+                latest_sasrec
+                and latest_sasrec.model_version != self.loaded_sasrec_version
+            ):
                 await self._try_load_sasrec_artifacts()
-                updated = updated or self.loaded_sasrec_version == latest_sasrec.model_version
+                updated = (
+                    updated or self.loaded_sasrec_version == latest_sasrec.model_version
+                )
 
         if self.cf_engine.should_refresh_new_item_candidates():
             await asyncio.to_thread(self.cf_engine.refresh_new_item_candidates)
@@ -1352,12 +1676,22 @@ class RecommendationEngine:
     ) -> float:
         """Compute a stable heuristic score for serving pools."""
         current_time = current_time or time.time()
-        trending_score = float(self.trending_engine.trending_scores.get(product_id, 0.0))
+        trending_score = float(
+            self.trending_engine.trending_scores.get(product_id, 0.0)
+        )
         rating_score = float(metadata.get("rating", 0.0)) / 5.0
         review_score = np.log1p(float(metadata.get("num_reviews", 0.0))) / 5.0
-        age_days = max((current_time - float(metadata.get("created_at", current_time))) / 86400.0, 0.0)
+        age_days = max(
+            (current_time - float(metadata.get("created_at", current_time))) / 86400.0,
+            0.0,
+        )
         freshness_score = 1.0 / (1.0 + age_days / 30.0)
-        return trending_score + rating_score * 0.6 + review_score * 0.2 + freshness_score * 0.2
+        return (
+            trending_score
+            + rating_score * 0.6
+            + review_score * 0.2
+            + freshness_score * 0.2
+        )
 
     async def refresh_serving_pools(self):
         """Precompute global trending and per-category serving pools."""
@@ -1371,7 +1705,9 @@ class RecommendationEngine:
             category_scored: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
 
             for product_id, metadata in self.vector_search.product_metadata.items():
-                score = self._compute_serving_pool_score(product_id, metadata, current_time)
+                score = self._compute_serving_pool_score(
+                    product_id, metadata, current_time
+                )
                 global_scored.append((product_id, score))
                 category = metadata.get("category", "unknown")
                 category_scored[category].append((product_id, score))
@@ -1394,7 +1730,9 @@ class RecommendationEngine:
             for category, scored_items in category_scored.items():
                 scored_items.sort(key=lambda item: item[1], reverse=True)
                 category_top = scored_items[: self.config.serving_category_pool_size]
-                category_max = max((score for _, score in category_top), default=1.0) or 1.0
+                category_max = (
+                    max((score for _, score in category_top), default=1.0) or 1.0
+                )
                 category_pools[category] = [
                     CandidateProduct(
                         product_id=product_id,
@@ -1462,7 +1800,9 @@ class RecommendationEngine:
                     "product_id": product_id,
                     "action": action,
                     "timestamp": interaction.get("timestamp"),
-                    "occurred_at": interaction.get("occurred_at", interaction.get("timestamp")),
+                    "occurred_at": interaction.get(
+                        "occurred_at", interaction.get("timestamp")
+                    ),
                     "event_id": interaction.get("event_id"),
                     "schema_version": interaction.get("schema_version", 1),
                     "context": interaction.get("context") or {},
@@ -1508,6 +1848,7 @@ class RecommendationEngine:
         k_per_source: int = 100,
         include_profile: bool = False,
         user_features: Optional[UserFeatures] = None,
+        user_interactions: Optional[List[Dict[str, Any]]] = None,
     ) -> List[CandidateProduct]:
         """
         Generate candidate products from multiple recommendation sources.
@@ -1555,7 +1896,9 @@ class RecommendationEngine:
                 stage_started = time.perf_counter()
                 try:
                     if timeout_ms and timeout_ms > 0:
-                        return await asyncio.wait_for(awaitable, timeout=timeout_ms / 1000.0)
+                        return await asyncio.wait_for(
+                            awaitable, timeout=timeout_ms / 1000.0
+                        )
                     return await awaitable
                 except asyncio.TimeoutError:
                     logger.warning("%s_timed_out", metric_name)
@@ -1566,17 +1909,42 @@ class RecommendationEngine:
                     logger.warning("%s_failed: %s", metric_name, exc)
                     return fallback
                 finally:
-                    profile[metric_name] = round((time.perf_counter() - stage_started) * 1000, 2)
+                    profile[metric_name] = round(
+                        (time.perf_counter() - stage_started) * 1000, 2
+                    )
 
-            interaction_task = asyncio.create_task(
-                timed_stage(
-                    "user_interactions_ms",
-                    self.feature_store.get_user_interactions(user_id, limit=200),
-                    [],
-                    self.config.interaction_history_timeout_ms,
-                ),
-                name="candidate-user-interactions",
+            interaction_task = None
+            sasrec_needs_interactions = (
+                bool(self.config.enable_sasrec)
+                and bool(getattr(self.sasrec_engine, "is_trained", False))
             )
+            serving_recent_limit = int(
+                getattr(self.config, "serving_recent_interaction_limit", 0) or 0
+            )
+            interaction_limit = 0
+            if user_interactions is None:
+                if sasrec_needs_interactions:
+                    interaction_limit = max(
+                        serving_recent_limit,
+                        int(getattr(self.config, "sasrec_max_sequence_length", 0) or 0),
+                    )
+                elif serving_recent_limit > 0:
+                    interaction_limit = serving_recent_limit
+            if user_interactions is None and interaction_limit > 0:
+                interaction_task = asyncio.create_task(
+                    timed_stage(
+                        "user_interactions_ms",
+                        self.feature_store.get_user_interactions(
+                            user_id,
+                            limit=interaction_limit,
+                        ),
+                        [],
+                        self.config.interaction_history_timeout_ms,
+                    ),
+                    name="candidate-user-interactions",
+                )
+            else:
+                profile["user_interactions_ms"] = 0.0
             if user_features is not None:
                 user_features_obj = user_features
             else:
@@ -1589,16 +1957,24 @@ class RecommendationEngine:
             if user_features is not None:
                 profile["user_features_ms"] = 0.0
 
-            user_interactions = await interaction_task
+            resolved_user_interactions = (
+                await interaction_task
+                if interaction_task is not None
+                else (user_interactions or [])
+            )
             exclude_items = {
                 interaction.get("product_id")
-                for interaction in user_interactions
+                for interaction in resolved_user_interactions
                 if interaction.get("product_id")
             }
-            sasrec_sequence = self._build_sasrec_sequence_from_interactions(user_interactions)
+            sasrec_sequence = self._build_sasrec_sequence_from_interactions(
+                resolved_user_interactions
+            )
             profile["sasrec_sequence_length"] = len(sasrec_sequence)
             user_features_dict = user_features_obj.dict() if user_features_obj else {}
-            preferred_categories = self._resolve_preferred_categories(user_features_obj, context)
+            preferred_categories = self._resolve_preferred_categories(
+                user_features_obj, context
+            )
             profile["preferred_categories"] = preferred_categories
             target_candidates = min(
                 max(k_per_source, self.config.candidates_per_source),
@@ -1628,10 +2004,27 @@ class RecommendationEngine:
             async def fetch_content_candidates() -> List[CandidateProduct]:
                 if not content_features or not content_features.visual_embedding:
                     return []
-                candidates = await self.vector_search.search_similar_products(
-                    np.array(content_features.visual_embedding),
-                    k=min(target_candidates, self.config.max_live_content_candidates),
+                query_embedding = np.array(content_features.visual_embedding)
+                content_k = min(
+                    target_candidates,
+                    self.config.max_live_content_candidates,
                 )
+                sync_search = getattr(
+                    self.vector_search,
+                    "search_similar_products_sync",
+                    None,
+                )
+                if callable(sync_search):
+                    candidates = await self.cf_engine.run_in_retrieval_executor(
+                        sync_search,
+                        query_embedding,
+                        content_k,
+                    )
+                else:
+                    candidates = await self.vector_search.search_similar_products(
+                        query_embedding,
+                        k=content_k,
+                    )
                 return [
                     candidate
                     for candidate in candidates
@@ -1649,7 +2042,8 @@ class RecommendationEngine:
                     return []
                 per_category_limit = max(
                     1,
-                    self.config.max_pool_category_candidates // max(len(preferred_categories), 1),
+                    self.config.max_pool_category_candidates
+                    // max(len(preferred_categories), 1),
                 )
                 category_tasks = [
                     self.feature_store.get_category_pool(
@@ -1659,7 +2053,9 @@ class RecommendationEngine:
                     )
                     for category in preferred_categories
                 ]
-                category_results = await asyncio.gather(*category_tasks, return_exceptions=True)
+                category_results = await asyncio.gather(
+                    *category_tasks, return_exceptions=True
+                )
                 category_candidates: List[CandidateProduct] = []
                 for result in category_results:
                     if isinstance(result, Exception):
@@ -1678,27 +2074,54 @@ class RecommendationEngine:
 
             source_timeout_ms = self.config.candidate_source_timeout_ms
             cf_task = asyncio.create_task(
-                timed_stage("cf_candidates_ms", fetch_cf_candidates(), [], source_timeout_ms),
+                timed_stage(
+                    "cf_candidates_ms", fetch_cf_candidates(), [], source_timeout_ms
+                ),
                 name="candidate-source-cf",
             )
             sasrec_task = asyncio.create_task(
-                timed_stage("sasrec_candidates_ms", fetch_sasrec_candidates(), [], source_timeout_ms),
+                timed_stage(
+                    "sasrec_candidates_ms",
+                    fetch_sasrec_candidates(),
+                    [],
+                    source_timeout_ms,
+                ),
                 name="candidate-source-sasrec",
             )
             content_task = asyncio.create_task(
-                timed_stage("content_candidates_ms", fetch_content_candidates(), [], source_timeout_ms),
+                timed_stage(
+                    "content_candidates_ms",
+                    fetch_content_candidates(),
+                    [],
+                    source_timeout_ms,
+                ),
                 name="candidate-source-content",
             )
             trending_task = asyncio.create_task(
-                timed_stage("trending_candidates_ms", fetch_trending_candidates(), [], source_timeout_ms),
+                timed_stage(
+                    "trending_candidates_ms",
+                    fetch_trending_candidates(),
+                    [],
+                    source_timeout_ms,
+                ),
                 name="candidate-source-trending",
             )
             category_task = asyncio.create_task(
-                timed_stage("category_pool_ms", fetch_category_candidates(), [], source_timeout_ms),
+                timed_stage(
+                    "category_pool_ms",
+                    fetch_category_candidates(),
+                    [],
+                    source_timeout_ms,
+                ),
                 name="candidate-source-category",
             )
             new_item_task = asyncio.create_task(
-                timed_stage("new_item_candidates_ms", fetch_new_item_candidates(), [], source_timeout_ms),
+                timed_stage(
+                    "new_item_candidates_ms",
+                    fetch_new_item_candidates(),
+                    [],
+                    source_timeout_ms,
+                ),
                 name="candidate-source-new-item",
             )
 
@@ -1709,18 +2132,18 @@ class RecommendationEngine:
                 trending_candidates,
                 category_candidates,
                 new_item_candidates,
-            ) = (
-                await asyncio.gather(
-                    cf_task,
-                    sasrec_task,
-                    content_task,
-                    trending_task,
-                    category_task,
-                    new_item_task,
-                )
+            ) = await asyncio.gather(
+                cf_task,
+                sasrec_task,
+                content_task,
+                trending_task,
+                category_task,
+                new_item_task,
             )
 
-            def merge_source(source_name: str, candidates: List[CandidateProduct]) -> None:
+            def merge_source(
+                source_name: str, candidates: List[CandidateProduct]
+            ) -> None:
                 overlaps = 0
                 for candidate in candidates:
                     if self._merge_candidate(all_candidates, candidate):
@@ -1749,9 +2172,22 @@ class RecommendationEngine:
                     )
                 random_candidates = []
                 if random_target > 0:
+                    sync_random = getattr(
+                        self.vector_search,
+                        "get_random_products_sync",
+                        None,
+                    )
+                    random_awaitable = (
+                        self.cf_engine.run_in_retrieval_executor(
+                            sync_random,
+                            random_target,
+                        )
+                        if callable(sync_random)
+                        else self.vector_search.get_random_products(k=random_target)
+                    )
                     random_candidates = await timed_stage(
                         "random_candidates_ms",
-                        self.vector_search.get_random_products(k=random_target),
+                        random_awaitable,
                         [],
                         source_timeout_ms,
                     )
@@ -1775,7 +2211,9 @@ class RecommendationEngine:
 
             # Combine scores for final ranking
             stage_started = time.perf_counter()
-            profile["merged_source_counts"] = self._count_source_tokens(list(all_candidates.values()))
+            profile["merged_source_counts"] = self._count_source_tokens(
+                list(all_candidates.values())
+            )
             final_candidates: List[CandidateProduct] = []
             for candidate in all_candidates.values():
                 cf_score = candidate.collaborative_score or 0.0
@@ -1792,16 +2230,22 @@ class RecommendationEngine:
 
             # Apply diversity if enabled
             if self.config.enable_diversity:
-                final_candidates = await self._apply_diversity_filter(final_candidates, context)
+                final_candidates = await self._apply_diversity_filter(
+                    final_candidates, context
+                )
 
             # Sort by combined score
             final_candidates.sort(key=lambda x: x.combined_score, reverse=True)
             final_candidates = final_candidates[: self.config.max_total_candidates]
-            profile["score_merge_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
+            profile["score_merge_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000, 2
+            )
             profile["candidate_count"] = len(final_candidates)
             profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
 
-            logger.debug(f"Generated {len(final_candidates)} candidates from multiple sources")
+            logger.debug(
+                f"Generated {len(final_candidates)} candidates from multiple sources"
+            )
             if include_profile:
                 return final_candidates, profile
             return final_candidates
@@ -1870,7 +2314,9 @@ class RecommendationEngine:
                             del category_groups[category]
 
                 if ungrouped_candidates and added_in_round < 3:
-                    diverse_candidates.extend(ungrouped_candidates[: 3 - added_in_round])
+                    diverse_candidates.extend(
+                        ungrouped_candidates[: 3 - added_in_round]
+                    )
                     ungrouped_candidates = ungrouped_candidates[3 - added_in_round :]
 
                 if added_in_round == 0:
@@ -1935,7 +2381,9 @@ class RecommendationEngine:
             )
         sasrec_params = 0
         if self.sasrec_engine.model is not None:
-            sasrec_params = sum(p.numel() for p in self.sasrec_engine.model.parameters())
+            sasrec_params = sum(
+                p.numel() for p in self.sasrec_engine.model.parameters()
+            )
 
         return {
             "is_initialized": self.is_initialized,
@@ -1945,9 +2393,13 @@ class RecommendationEngine:
             "cf_users": len(self.cf_engine.user_mapping),
             "cf_items": len(self.cf_engine.item_mapping),
             "cf_embedding_dim": self.config.tt_embedding_dim,
-            "cf_index_size": self.cf_engine.cf_index.ntotal if self.cf_engine.cf_index else 0,
+            "cf_index_size": self.cf_engine.cf_index.ntotal
+            if self.cf_engine.cf_index
+            else 0,
             "cf_cold_start_enabled": self.config.enable_cf_cold_start_bootstrap,
-            "cf_cold_start_synthetic_items": len(self.cf_engine.synthetic_item_embeddings),
+            "cf_cold_start_synthetic_items": len(
+                self.cf_engine.synthetic_item_embeddings
+            ),
             "cf_cold_start_overlay_version": self.cf_engine.cold_start_overlay_version,
             "cf_model_parameters": model_params,
             "sasrec_enabled": self.config.enable_sasrec,
@@ -1978,7 +2430,8 @@ class RecommendationEngine:
                 "cf_index_size": (
                     self.cf_engine.cf_index.ntotal if self.cf_engine.cf_index else 0
                 ),
-                "trending_data_available": len(self.trending_engine.trending_scores) > 0,
+                "trending_data_available": len(self.trending_engine.trending_scores)
+                > 0,
                 "last_model_update": self.last_model_update,
                 "stats": self.get_stats(),
             }

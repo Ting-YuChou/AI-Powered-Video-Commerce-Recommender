@@ -5,12 +5,14 @@ Shared helpers for multi-service API entrypoints.
 from __future__ import annotations
 
 import os
+import random
 import time
 import uuid
 import logging
 from http import HTTPStatus
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -21,7 +23,7 @@ from observability import (
     configure_logging,
     request_id_ctx_var,
 )
-from telemetry import configure_tracing, http_server_span
+from telemetry import configure_tracing
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,84 @@ class RedisRateLimiter:
         return int(current_count) <= self.limit
 
 
+class RoundRobinAsyncClientPool:
+    """Small async httpx client pool with per-upstream keepalive state."""
+
+    def __init__(
+        self,
+        base_urls: Iterable[str],
+        *,
+        timeout: httpx.Timeout,
+        limits: httpx.Limits,
+    ) -> None:
+        urls = [url.rstrip("/") for url in base_urls if str(url).strip()]
+        if not urls:
+            raise ValueError("At least one upstream URL is required")
+        self.base_urls = urls
+        self._clients = [
+            httpx.AsyncClient(base_url=base_url, timeout=timeout, limits=limits)
+            for base_url in self.base_urls
+        ]
+        self._next_index = 0
+        self._unhealthy_until = [0.0 for _ in self._clients]
+        self._failure_cooldown_seconds = 1.0
+
+    @staticmethod
+    def parse_urls(value: str | Iterable[str] | None, fallback: str | None = None) -> List[str]:
+        if value is None:
+            value = ""
+        if isinstance(value, str):
+            urls = [item.strip() for item in value.split(",") if item.strip()]
+        else:
+            urls = [str(item).strip() for item in value if str(item).strip()]
+        if not urls and fallback:
+            urls = [fallback.strip()]
+        return urls
+
+    def _choose_client(self) -> Tuple[int, httpx.AsyncClient]:
+        now = time.monotonic()
+        fallback_index = self._next_index % len(self._clients)
+        for _ in range(len(self._clients)):
+            index = self._next_index % len(self._clients)
+            self._next_index = (self._next_index + 1) % len(self._clients)
+            if self._unhealthy_until[index] <= now:
+                return index, self._clients[index]
+        self._next_index = (fallback_index + 1) % len(self._clients)
+        return fallback_index, self._clients[fallback_index]
+
+    def _mark_unhealthy(self, index: int) -> None:
+        self._unhealthy_until[index] = (
+            time.monotonic() + self._failure_cooldown_seconds
+        )
+
+    def _mark_healthy(self, index: int) -> None:
+        self._unhealthy_until[index] = 0.0
+
+    async def request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        index, client = self._choose_client()
+        try:
+            response = await client.request(method, path, **kwargs)
+        except httpx.HTTPError:
+            self._mark_unhealthy(index)
+            raise
+
+        if response.status_code >= 500:
+            self._mark_unhealthy(index)
+        else:
+            self._mark_healthy(index)
+        return response
+
+    async def get(self, path: str, **kwargs) -> httpx.Response:
+        return await self.request("GET", path, **kwargs)
+
+    async def post(self, path: str, **kwargs) -> httpx.Response:
+        return await self.request("POST", path, **kwargs)
+
+    async def aclose(self) -> None:
+        for client in self._clients:
+            await client.aclose()
+
+
 def build_error_response(
     status_code: int,
     code: str,
@@ -100,7 +180,16 @@ def require_internal_service_auth(
     if runtime.config is None:
         return
     path = request.url.path
-    if path in {"/", "/health", "/livez", "/readyz", "/metrics", "/docs", "/redoc", "/openapi.json"}:
+    if path in {
+        "/",
+        "/health",
+        "/livez",
+        "/readyz",
+        "/metrics",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+    }:
         return
     expected_key = runtime.config.security_config.internal_service_key
     if not expected_key:
@@ -187,7 +276,9 @@ def create_service_app(
         request.state.request_id = request_id
         request.state.request_started_at = time.perf_counter()
         runtime.active_requests += 1
-        runtime.max_active_requests = max(runtime.max_active_requests, runtime.active_requests)
+        runtime.max_active_requests = max(
+            runtime.max_active_requests, runtime.active_requests
+        )
         request.state.worker_process_id = runtime.process_id
         request.state.worker_active_requests_at_entry = runtime.active_requests
         request.state.worker_handled_requests = runtime.handled_requests
@@ -195,12 +286,7 @@ def create_service_app(
         runtime.observability.http_requests_in_progress.inc()
 
         try:
-            with http_server_span(
-                method=request.method,
-                path=request.url.path,
-                headers=request.headers.items(),
-            ):
-                response = await call_next(request)
+            response = await call_next(request)
         except Exception as exc:
             duration = time.perf_counter() - request.state.request_started_at
             path = _get_route_template(request)
@@ -231,7 +317,7 @@ def create_service_app(
                 response.status_code,
                 duration,
             )
-            if not (runtime.config and not runtime.config.monitoring_config.enable_request_logging):
+            if _should_log_request(runtime, response.status_code, duration):
                 logger.info(
                     "request_complete",
                     extra={
@@ -260,7 +346,11 @@ def create_service_app(
             if runtime.config
             else "X-Request-ID"
         )
-        detail = exc.detail if isinstance(exc.detail, str) else HTTPStatus(exc.status_code).phrase
+        detail = (
+            exc.detail
+            if isinstance(exc.detail, str)
+            else HTTPStatus(exc.status_code).phrase
+        )
         return build_error_response(
             status_code=exc.status_code,
             code=_error_code_for_status(exc.status_code),
@@ -287,6 +377,31 @@ def create_service_app(
         )
 
     return app
+
+
+def _should_log_request(
+    runtime: ServiceRuntime, status_code: int, duration_seconds: float
+) -> bool:
+    if not runtime.config:
+        return True
+
+    monitoring = runtime.config.monitoring_config
+    if not monitoring.enable_request_logging:
+        return False
+
+    sample_attr = (
+        "error_request_log_sample_rate"
+        if status_code >= 400
+        else "request_log_sample_rate"
+    )
+    sample_rate = min(
+        1.0, max(0.0, float(getattr(monitoring, sample_attr, 1.0)))
+    )
+    if sample_rate >= 1.0:
+        return True
+    if sample_rate <= 0.0:
+        return False
+    return random.random() < sample_rate
 
 
 def configure_service_logging(runtime: ServiceRuntime) -> None:
@@ -345,9 +460,13 @@ def build_health_response(
 ) -> HealthResponse:
     """Construct a health response with derived overall status."""
     overall = HealthStatus.HEALTHY
-    if any(component.status == HealthStatus.UNHEALTHY for component in components.values()):
+    if any(
+        component.status == HealthStatus.UNHEALTHY for component in components.values()
+    ):
         overall = HealthStatus.UNHEALTHY
-    elif any(component.status == HealthStatus.DEGRADED for component in components.values()):
+    elif any(
+        component.status == HealthStatus.DEGRADED for component in components.values()
+    ):
         overall = HealthStatus.DEGRADED
 
     return HealthResponse(

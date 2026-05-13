@@ -10,6 +10,7 @@ for development and production environments.
 import os
 import json
 from typing import Dict, Any, Optional, List
+
 try:
     from pydantic.v1 import BaseSettings, Field, validator
 except ImportError:
@@ -33,8 +34,10 @@ def _load_secret_file_env() -> None:
         with open(file_path, "r", encoding="utf-8") as secret_handle:
             os.environ[target_name] = secret_handle.read().strip()
 
+
 class RedisConfig(BaseSettings):
     """Redis database configuration."""
+
     host: str = Field("localhost", description="Redis host address")
     port: int = Field(6379, description="Redis port")
     db: int = Field(0, description="Redis database number")
@@ -48,9 +51,15 @@ class RedisConfig(BaseSettings):
         None,
         description="Optional separate Redis host for recommendation caches and serving pools",
     )
-    cache_port: Optional[int] = Field(None, description="Optional separate cache Redis port")
-    cache_db: Optional[int] = Field(None, description="Optional separate cache Redis DB")
-    cache_password: Optional[str] = Field(None, description="Optional separate cache Redis password")
+    cache_port: Optional[int] = Field(
+        None, description="Optional separate cache Redis port"
+    )
+    cache_db: Optional[int] = Field(
+        None, description="Optional separate cache Redis DB"
+    )
+    cache_password: Optional[str] = Field(
+        None, description="Optional separate cache Redis password"
+    )
     cache_max_connections: Optional[int] = Field(
         None,
         description="Optional separate cache Redis max connections",
@@ -67,36 +76,35 @@ class RedisConfig(BaseSettings):
         None,
         description="Optional separate cache Redis retry-on-timeout setting",
     )
-    
+
     class Config:
         env_prefix = "REDIS_"
 
+
 class ModelConfig(BaseSettings):
     """Machine learning model configuration."""
+
     # CLIP model settings
     clip_model: str = Field(
-        "openai/clip-vit-large-patch14", 
-        description="CLIP model identifier"
+        "openai/clip-vit-large-patch14", description="CLIP model identifier"
     )
     embedding_dim: int = Field(512, description="Embedding dimension")
-    
+
     # Model paths
     ranking_model_path: Optional[str] = Field(
-        None, 
-        description="Path to trained ranking model"
+        None, description="Path to trained ranking model"
     )
     cf_model_path: Optional[str] = Field(
-        None, 
-        description="Path to collaborative filtering model"
+        None, description="Path to collaborative filtering model"
     )
-    
+
     # Processing settings
     cache_dir: str = Field("/tmp/models", description="Model cache directory")
     device: str = Field("auto", description="Compute device (cpu/cuda/auto)")
     batch_size: int = Field(32, description="Processing batch size")
     max_video_length: int = Field(300, description="Maximum video length in seconds")
     num_keyframes: int = Field(8, description="Number of keyframes to extract")
-    
+
     # Performance settings
     enable_quantization: bool = Field(False, description="Enable model quantization")
     enable_gpu: bool = Field(True, description="Enable GPU acceleration if available")
@@ -109,37 +117,47 @@ class ModelConfig(BaseSettings):
         1,
         description="Torch inter-op CPU thread count; 0 auto-detects from cgroup quota",
     )
-    
+
     class Config:
         env_prefix = "MODEL_"
 
+
 class VectorConfig(BaseSettings):
     """Vector search configuration."""
-    index_path: str = Field("/tmp/vector_index.faiss", description="FAISS index file path")
+
+    index_path: str = Field(
+        "/tmp/vector_index.faiss", description="FAISS index file path"
+    )
     embedding_dim: int = Field(512, description="Vector embedding dimension")
     index_type: str = Field("HNSW", description="FAISS index type (HNSW/IVF)")
-    
+
     # HNSW parameters
     hnsw_m: int = Field(32, description="HNSW M parameter")
     hnsw_ef_construction: int = Field(200, description="HNSW efConstruction parameter")
     hnsw_ef_search: int = Field(50, description="HNSW efSearch parameter")
-    
+
     # Search parameters
     search_k: int = Field(100, description="Number of candidates to retrieve")
     similarity_threshold: float = Field(0.1, description="Minimum similarity threshold")
-    
+
     class Config:
         env_prefix = "VECTOR_"
 
+
 class RecommendationConfig(BaseSettings):
     """Recommendation engine configuration."""
+
     # Legacy collaborative filtering (kept for backward-compat env vars)
     cf_factors: int = Field(64, description="Collaborative filtering factors (legacy)")
-    cf_regularization: float = Field(0.1, description="CF regularization parameter (legacy)")
+    cf_regularization: float = Field(
+        0.1, description="CF regularization parameter (legacy)"
+    )
     cf_iterations: int = Field(50, description="CF training iterations (legacy)")
-    
+
     # Candidate generation
-    candidates_per_source: int = Field(100, description="Candidates per recommendation source")
+    candidates_per_source: int = Field(
+        100, description="Candidates per recommendation source"
+    )
     max_total_candidates: int = Field(500, description="Maximum total candidates")
     cold_start_random_candidate_cap: int = Field(
         50,
@@ -237,13 +255,48 @@ class RecommendationConfig(BaseSettings):
         1.0,
         description="Time bucket used in Two-Tower user embedding cache keys",
     )
+    retrieval_executor_workers: int = Field(
+        2,
+        description="Bounded per-process executor workers for hot-path retrieval CPU work",
+    )
     interaction_history_timeout_ms: float = Field(
         50.0,
         description="Maximum time to spend reading recent user interactions on the serving path",
     )
+    serving_recent_interaction_limit: int = Field(
+        0,
+        description=(
+            "Recent interactions to read during online candidate serving; 0 avoids "
+            "the hot-path read unless SASRec is enabled"
+        ),
+    )
     candidate_source_timeout_ms: float = Field(
         250.0,
         description="Maximum time to spend on one live candidate source on the serving path",
+    )
+    known_user_snapshot_enabled: bool = Field(
+        True,
+        description="Use an in-memory known-user snapshot to avoid Redis reads for definitely cold users",
+    )
+    known_user_snapshot_refresh_interval_seconds: float = Field(
+        60.0,
+        description="How often recommendation workers refresh the known-user snapshot from Redis",
+    )
+    known_user_snapshot_max_users: int = Field(
+        200000,
+        description="Maximum user ids to keep in the per-process known-user snapshot",
+    )
+    content_features_snapshot_enabled: bool = Field(
+        True,
+        description="Use an in-memory content-feature key snapshot to avoid Redis misses for unknown content IDs",
+    )
+    content_features_snapshot_refresh_interval_seconds: float = Field(
+        60.0,
+        description="How often recommendation workers refresh known content-feature keys from Redis",
+    )
+    content_features_snapshot_max_items: int = Field(
+        100000,
+        description="Maximum content feature entries to keep in the per-process snapshot",
     )
     preload_product_metadata_on_startup: bool = Field(
         False,
@@ -253,20 +306,24 @@ class RecommendationConfig(BaseSettings):
         False,
         description="Publish product catalog snapshots to Postgres during recommendation service startup",
     )
-    
+
     # Ranking weights
     cf_weight: float = Field(0.4, description="Collaborative filtering weight")
     content_weight: float = Field(0.3, description="Content similarity weight")
     popularity_weight: float = Field(0.3, description="Popularity weight")
-    
+
     # Trending algorithm
-    trending_decay_factor: float = Field(0.95, description="Time decay factor for trending")
+    trending_decay_factor: float = Field(
+        0.95, description="Time decay factor for trending"
+    )
     trending_window_hours: int = Field(24, description="Trending calculation window")
-    
+
     # Diversity settings
     enable_diversity: bool = Field(True, description="Enable recommendation diversity")
     diversity_factor: float = Field(0.1, description="Diversity vs relevance trade-off")
-    max_items_per_category: int = Field(3, description="Max recommendations per category")
+    max_items_per_category: int = Field(
+        3, description="Max recommendations per category"
+    )
     enable_slate_diversity: bool = Field(
         False,
         description="Enable post-ranker slate diversity reranking",
@@ -291,45 +348,77 @@ class RecommendationConfig(BaseSettings):
         100,
         description="Maximum ranker pool size before MMR selection",
     )
-    
+
     # Two-Tower model settings
-    tt_embedding_dim: int = Field(128, description="Two-Tower output embedding dimension")
+    tt_embedding_dim: int = Field(
+        128, description="Two-Tower output embedding dimension"
+    )
     tt_architecture: str = Field(
         "dcn",
         description="Two-Tower tower architecture: dcn or mlp",
     )
     tt_cross_layers: int = Field(3, description="Two-Tower DCN cross layer count")
-    tt_user_hidden_dims: List[int] = Field([256, 128], description="User tower hidden dimensions")
-    tt_item_hidden_dims: List[int] = Field([256, 128], description="Item tower hidden dimensions")
+    tt_user_hidden_dims: List[int] = Field(
+        [256, 128], description="User tower hidden dimensions"
+    )
+    tt_item_hidden_dims: List[int] = Field(
+        [256, 128], description="Item tower hidden dimensions"
+    )
     tt_learning_rate: float = Field(0.001, description="Two-Tower learning rate")
     tt_batch_size: int = Field(1024, description="Two-Tower training batch size")
     tt_epochs: int = Field(20, description="Two-Tower training epochs")
     tt_temperature: float = Field(0.07, description="InfoNCE temperature parameter")
-    
+
     # Negative sampling settings
-    tt_num_hard_negatives: int = Field(5, description="Hard negatives per positive sample")
-    tt_num_random_negatives: int = Field(10, description="Random negatives per positive sample")
-    tt_hard_negative_ratio_start: float = Field(0.1, description="Initial hard negative ratio (curriculum)")
-    tt_hard_negative_ratio_end: float = Field(0.5, description="Final hard negative ratio (curriculum)")
-    
+    tt_num_hard_negatives: int = Field(
+        5, description="Hard negatives per positive sample"
+    )
+    tt_num_random_negatives: int = Field(
+        10, description="Random negatives per positive sample"
+    )
+    tt_hard_negative_ratio_start: float = Field(
+        0.1, description="Initial hard negative ratio (curriculum)"
+    )
+    tt_hard_negative_ratio_end: float = Field(
+        0.5, description="Final hard negative ratio (curriculum)"
+    )
+
     # CF FAISS index path
-    cf_index_path: str = Field("/tmp/cf_vector_index.faiss", description="CF FAISS index file path")
+    cf_index_path: str = Field(
+        "/tmp/cf_vector_index.faiss", description="CF FAISS index file path"
+    )
 
     # SASRec sequential retrieval
-    enable_sasrec: bool = Field(False, description="Enable SASRec sequential candidate source")
-    sasrec_max_sequence_length: int = Field(50, description="Maximum positive user events for SASRec input")
+    enable_sasrec: bool = Field(
+        False, description="Enable SASRec sequential candidate source"
+    )
+    sasrec_max_sequence_length: int = Field(
+        50, description="Maximum positive user events for SASRec input"
+    )
     sasrec_embedding_dim: int = Field(64, description="SASRec item embedding dimension")
     sasrec_num_heads: int = Field(2, description="SASRec transformer attention heads")
     sasrec_num_layers: int = Field(2, description="SASRec transformer encoder layers")
     sasrec_dropout: float = Field(0.2, description="SASRec transformer dropout")
     sasrec_batch_size: int = Field(256, description="SASRec training batch size")
     sasrec_epochs: int = Field(10, description="SASRec training epochs")
-    sasrec_learning_rate: float = Field(0.001, description="SASRec training learning rate")
-    sasrec_min_sequence_length: int = Field(2, description="Minimum positive events required for SASRec training")
-    sasrec_score_weight: float = Field(1.0, description="SASRec score multiplier before candidate merge")
-    sasrec_checkpoint_path: Optional[str] = Field(None, description="SASRec checkpoint local path")
-    sasrec_vocab_path: Optional[str] = Field(None, description="SASRec vocabulary local path")
-    sasrec_metadata_path: Optional[str] = Field(None, description="SASRec metadata local path")
+    sasrec_learning_rate: float = Field(
+        0.001, description="SASRec training learning rate"
+    )
+    sasrec_min_sequence_length: int = Field(
+        2, description="Minimum positive events required for SASRec training"
+    )
+    sasrec_score_weight: float = Field(
+        1.0, description="SASRec score multiplier before candidate merge"
+    )
+    sasrec_checkpoint_path: Optional[str] = Field(
+        None, description="SASRec checkpoint local path"
+    )
+    sasrec_vocab_path: Optional[str] = Field(
+        None, description="SASRec vocabulary local path"
+    )
+    sasrec_metadata_path: Optional[str] = Field(
+        None, description="SASRec metadata local path"
+    )
 
     @validator("tt_architecture")
     def validate_tt_architecture(cls, value: str) -> str:
@@ -393,6 +482,12 @@ class RecommendationConfig(BaseSettings):
             raise ValueError("max_new_item_candidates must be >= 0")
         return value
 
+    @validator("serving_recent_interaction_limit")
+    def validate_serving_recent_interaction_limit(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("serving_recent_interaction_limit must be >= 0")
+        return value
+
     @validator("new_item_pool_refresh_interval_seconds")
     def validate_new_item_pool_refresh_interval_seconds(cls, value: float) -> float:
         if value < 0:
@@ -410,12 +505,14 @@ class RecommendationConfig(BaseSettings):
         if not 0.0 <= value <= 1.0:
             raise ValueError("CF cold-start ratio settings must be between 0 and 1")
         return value
-    
+
     class Config:
         env_prefix = "RECOMMENDATION_"
 
+
 class RankingConfig(BaseSettings):
     """Ranking model configuration."""
+
     model_type: str = Field("neural", description="Ranking model type")
     architecture: str = Field(
         "dcn",
@@ -423,7 +520,9 @@ class RankingConfig(BaseSettings):
     )
     cross_layers: int = Field(3, description="Ranking DCN cross layer count")
     low_rank_dim: int = Field(8, description="Ranking DCN-v2 low-rank dimension")
-    hidden_dims: List[int] = Field([256, 128, 64], description="Neural network hidden dimensions")
+    hidden_dims: List[int] = Field(
+        [256, 128, 64], description="Neural network hidden dimensions"
+    )
     dropout_rate: float = Field(0.2, description="Dropout rate")
     learning_rate: float = Field(0.001, description="Learning rate")
     enable_async_batching: bool = Field(
@@ -431,24 +530,44 @@ class RankingConfig(BaseSettings):
         description="Enable micro-batching queue for ranking inference",
     )
     batch_max_requests: int = Field(
-        8,
+        64,
         description="Maximum number of ranking requests to combine into one micro-batch",
     )
+    batch_target_requests: int = Field(
+        32,
+        description="Target number of ranking requests to accumulate before dispatching a micro-batch",
+    )
     batch_wait_ms: float = Field(
-        5.0,
+        48.0,
         description="Maximum time to wait for more ranking requests before dispatching a batch",
     )
     batch_queue_size: int = Field(
-        2048,
+        32768,
         description="Maximum queued ranking requests per worker",
     )
     batch_runner_count: int = Field(
-        1,
+        16,
         description="Number of concurrent micro-batch runners per recommendation worker",
     )
-    inference_executor_workers: int = Field(
+    coordinator_dispatch_concurrency: int = Field(
+        16,
+        description="Maximum concurrent remote ranking-runner batch dispatches from the coordinator",
+    )
+    runner_queue_size: int = Field(
         0,
+        description="Maximum queued micro-batches accepted by each ranking-runner process; 0 disables hidden runner queueing",
+    )
+    runner_batch_concurrency: int = Field(
+        1,
+        description="Maximum concurrent micro-batches executed inside each ranking-runner process",
+    )
+    inference_executor_workers: int = Field(
+        16,
         description="Dedicated per-process thread workers for ranking feature prep and inference; 0 uses asyncio's default executor",
+    )
+    inference_process_workers: int = Field(
+        0,
+        description="Dedicated model runner processes behind the single ranking coordinator queue; 0 uses in-process execution",
     )
     offload_inference_to_thread: bool = Field(
         True,
@@ -458,13 +577,27 @@ class RankingConfig(BaseSettings):
         50000,
         description="Per-process cache size for static product ranking feature components",
     )
+    max_queue_wait_ms: float = Field(
+        150.0,
+        description="Maximum time a ranking request may wait in the queue before failing fast",
+    )
+    runner_payload_v2_enabled: bool = Field(
+        True,
+        description="Use compact batch-level metadata payloads for ranking-runner batches",
+    )
+    runner_payload_max_bytes: int = Field(
+        32 * 1024 * 1024,
+        description="Maximum encoded ranking-runner batch payload size before failing fast",
+    )
 
     # Multi-objective settings
-    enable_multi_objective: bool = Field(True, description="Enable multi-objective optimization")
+    enable_multi_objective: bool = Field(
+        True, description="Enable multi-objective optimization"
+    )
     ctr_weight: float = Field(1.0, description="Click-through rate weight")
     cvr_weight: float = Field(2.0, description="Conversion rate weight")
     gmv_weight: float = Field(3.0, description="GMV optimization weight")
-    
+
     # Training settings
     epochs: int = Field(100, description="Training epochs")
     batch_size: int = Field(1024, description="Training batch size")
@@ -500,30 +633,43 @@ class RankingConfig(BaseSettings):
         if value < 1:
             raise ValueError("low_rank_dim must be >= 1")
         return value
-    
+
+    @validator("runner_payload_max_bytes")
+    def validate_runner_payload_max_bytes(cls, value: int) -> int:
+        if value < 1024:
+            raise ValueError("runner_payload_max_bytes must be >= 1024")
+        return value
+
     class Config:
         env_prefix = "RANKING_"
 
+
 class APIConfig(BaseSettings):
     """API server configuration."""
+
     host: str = Field("0.0.0.0", description="API server host")
     port: int = Field(8000, description="API server port")
     debug: bool = Field(False, description="Debug mode")
     reload: bool = Field(False, description="Auto-reload on code changes")
-    
+
     # Request limits
-    max_request_size: int = Field(100 * 1024 * 1024, description="Max request size (100MB)")
+    max_request_size: int = Field(
+        100 * 1024 * 1024, description="Max request size (100MB)"
+    )
     request_timeout: int = Field(30, description="Request timeout in seconds")
     max_concurrent_requests: int = Field(100, description="Max concurrent requests")
-    
+
     # CORS settings
     cors_origins: List[str] = Field(["*"], description="CORS allowed origins")
     cors_credentials: bool = Field(True, description="CORS allow credentials")
-    
+
     # Security
     api_key: Optional[str] = Field(None, description="API key for authentication")
-    rate_limit_requests: int = Field(1000, description="Rate limit per minute")
-    
+    rate_limit_requests: int = Field(
+        120000,
+        description="Rate limit per minute; default sized for 1000 QPS public-edge validation",
+    )
+
     class Config:
         env_prefix = "API_"
 
@@ -538,62 +684,102 @@ class APIConfig(BaseSettings):
                 return [item.strip() for item in value.split(",") if item.strip()]
             return super().parse_env_var(field_name, raw_val)
 
+
 class CacheConfig(BaseSettings):
     """Caching configuration."""
+
     enable_caching: bool = Field(True, description="Enable recommendation caching")
     default_ttl: int = Field(3600, description="Default cache TTL in seconds")
     user_features_ttl: int = Field(1800, description="User features cache TTL")
     content_features_ttl: int = Field(86400, description="Content features cache TTL")
     recommendations_ttl: int = Field(900, description="Recommendations cache TTL")
     candidate_ttl: int = Field(300, description="Candidate cache TTL in seconds")
-    product_metadata_ttl: int = Field(86400, description="Product metadata cache TTL in seconds")
+    product_metadata_ttl: int = Field(
+        86400, description="Product metadata cache TTL in seconds"
+    )
     serving_pool_ttl: int = Field(1800, description="Serving pool cache TTL in seconds")
     hot_path_read_timeout_ms: float = Field(
         150.0,
         description="Maximum time to spend on optional Redis reads in the recommendation request path",
     )
+    candidate_cache_race_timeout_ms: float = Field(
+        5.0,
+        description="Maximum time to wait for candidate cache before proceeding with live generation",
+    )
+    recommendation_cache_race_timeout_ms: float = Field(
+        5.0,
+        description="Maximum time to wait for recommendation cache before proceeding with live generation",
+    )
     background_write_timeout_ms: float = Field(
         250.0,
         description="Maximum time to spend on best-effort cache/analytics writes in the request path",
     )
-    
+    background_task_queue_size: int = Field(
+        8192,
+        description="Bounded best-effort background task queue size per recommendation worker",
+    )
+    background_task_worker_count: int = Field(
+        4,
+        description="Best-effort background task workers per recommendation worker",
+    )
+
     # Cache size limits
     max_cache_size: int = Field(10000, description="Maximum cache entries")
     cleanup_interval: int = Field(3600, description="Cache cleanup interval")
-    
+
     # Intelligent caching
-    adaptive_ttl: bool = Field(True, description="Enable adaptive TTL based on user activity")
+    adaptive_ttl: bool = Field(
+        True, description="Enable adaptive TTL based on user activity"
+    )
     high_activity_ttl: int = Field(300, description="TTL for high-activity users")
     low_activity_ttl: int = Field(7200, description="TTL for low-activity users")
-    
+
     class Config:
         env_prefix = "CACHE_"
 
+
 class MonitoringConfig(BaseSettings):
     """Monitoring and logging configuration."""
+
     log_level: str = Field("INFO", description="Logging level")
     log_format: str = Field(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        description="Log format string"
+        description="Log format string",
     )
     structured_logging: bool = Field(True, description="Emit logs as JSON")
     request_id_header: str = Field("X-Request-ID", description="Request ID header name")
-    
+
     # Metrics collection
     enable_metrics: bool = Field(True, description="Enable metrics collection")
-    enable_prometheus_metrics: bool = Field(True, description="Expose Prometheus metrics")
+    enable_prometheus_metrics: bool = Field(
+        True, description="Expose Prometheus metrics"
+    )
     metrics_interval: int = Field(60, description="Metrics collection interval")
-    worker_metrics_host: str = Field("0.0.0.0", description="Host for worker Prometheus endpoints")
+    worker_metrics_host: str = Field(
+        "0.0.0.0", description="Host for worker Prometheus endpoints"
+    )
     enable_tracing: bool = Field(False, description="Enable OpenTelemetry tracing")
-    tracing_sample_rate: float = Field(1.0, description="OpenTelemetry trace sampling rate")
-    
+    tracing_sample_rate: float = Field(
+        0.01, description="OpenTelemetry trace sampling rate"
+    )
+
     # Health checks
     health_check_interval: int = Field(30, description="Health check interval")
     component_timeout: int = Field(5, description="Component health check timeout")
-    
+
     # Performance monitoring
-    slow_request_threshold: float = Field(1.0, description="Slow request threshold in seconds")
+    slow_request_threshold: float = Field(
+        1.0, description="Slow request threshold in seconds"
+    )
     enable_request_logging: bool = Field(True, description="Enable request logging")
+    request_log_sample_rate: float = Field(
+        0.01,
+        description="Sample rate for successful request completion logs",
+    )
+    error_request_log_sample_rate: float = Field(
+        0.01,
+        description="Sample rate for HTTP error completion logs; exception logs and metrics remain complete",
+    )
     enable_profiling_logs: bool = Field(
         False,
         description="Emit detailed timing breakdown logs for critical request paths",
@@ -601,6 +787,10 @@ class MonitoringConfig(BaseSettings):
     profiling_log_min_duration_ms: float = Field(
         250.0,
         description="Minimum end-to-end request duration before detailed timing logs are emitted",
+    )
+    profiling_log_sample_rate: float = Field(
+        0.001,
+        description="Sample rate for successful detailed timing logs above the profiling threshold",
     )
     worker_heartbeat_interval_seconds: int = Field(
         15,
@@ -610,59 +800,98 @@ class MonitoringConfig(BaseSettings):
         45,
         description="Heartbeat TTL for worker readiness evaluation",
     )
-    
+
     # Alerting thresholds
     error_rate_threshold: float = Field(0.05, description="Error rate alert threshold")
-    response_time_threshold: float = Field(500, description="Response time threshold (ms)")
+    response_time_threshold: float = Field(
+        500, description="Response time threshold (ms)"
+    )
     memory_threshold: float = Field(0.8, description="Memory usage threshold")
-    
+
     class Config:
         env_prefix = "MONITORING_"
 
+
 class KafkaConfig(BaseSettings):
     """Kafka message streaming configuration."""
+
     # Connection settings
-    bootstrap_servers: str = Field("localhost:9092", description="Kafka bootstrap servers")
+    bootstrap_servers: str = Field(
+        "localhost:9092", description="Kafka bootstrap servers"
+    )
     enable: bool = Field(True, description="Enable Kafka integration")
-    
+
     # Topic names
-    user_interactions_topic: str = Field("user-interactions", description="User interactions topic")
-    video_processing_topic: str = Field("video-processing-tasks", description="Video processing tasks topic")
-    recommendation_events_topic: str = Field("recommendation-events", description="Recommendation events topic")
-    feature_updates_topic: str = Field("feature-updates", description="Feature updates topic")
-    
+    user_interactions_topic: str = Field(
+        "user-interactions", description="User interactions topic"
+    )
+    video_processing_topic: str = Field(
+        "video-processing-tasks", description="Video processing tasks topic"
+    )
+    recommendation_events_topic: str = Field(
+        "recommendation-events", description="Recommendation events topic"
+    )
+    feature_updates_topic: str = Field(
+        "feature-updates", description="Feature updates topic"
+    )
+
     # Producer settings
     producer_acks: str = Field("all", description="Producer acknowledgment level")
     producer_retries: int = Field(3, description="Number of producer retries")
     producer_batch_size: int = Field(16384, description="Producer batch size in bytes")
-    producer_linger_ms: int = Field(10, description="Producer linger time in milliseconds")
-    producer_compression_type: str = Field("gzip", description="Producer compression type")
-    
+    producer_linger_ms: int = Field(
+        10, description="Producer linger time in milliseconds"
+    )
+    producer_compression_type: str = Field(
+        "gzip", description="Producer compression type"
+    )
+
     # Consumer settings
-    consumer_group_id: str = Field("video-commerce-group", description="Consumer group ID")
-    consumer_auto_offset_reset: str = Field("earliest", description="Auto offset reset policy")
+    consumer_group_id: str = Field(
+        "video-commerce-group", description="Consumer group ID"
+    )
+    consumer_auto_offset_reset: str = Field(
+        "earliest", description="Auto offset reset policy"
+    )
     consumer_enable_auto_commit: bool = Field(False, description="Enable auto commit")
-    consumer_auto_commit_interval_ms: int = Field(5000, description="Auto commit interval")
+    consumer_auto_commit_interval_ms: int = Field(
+        5000, description="Auto commit interval"
+    )
     consumer_max_poll_records: int = Field(500, description="Max records per poll")
-    consumer_handler_retries: int = Field(3, description="Handler retry attempts before DLQ/fail")
-    consumer_handler_retry_backoff_ms: int = Field(250, description="Handler retry backoff in milliseconds")
-    dead_letter_enable: bool = Field(True, description="Publish poison messages to a dead-letter topic")
-    dead_letter_topic: str = Field("dead-letter-events", description="Kafka dead-letter topic")
-    
+    consumer_handler_retries: int = Field(
+        3, description="Handler retry attempts before DLQ/fail"
+    )
+    consumer_handler_retry_backoff_ms: int = Field(
+        250, description="Handler retry backoff in milliseconds"
+    )
+    dead_letter_enable: bool = Field(
+        True, description="Publish poison messages to a dead-letter topic"
+    )
+    dead_letter_topic: str = Field(
+        "dead-letter-events", description="Kafka dead-letter topic"
+    )
+
     # Timeout settings
-    request_timeout_ms: int = Field(30000, description="Request timeout in milliseconds")
-    session_timeout_ms: int = Field(10000, description="Session timeout in milliseconds")
-    
+    request_timeout_ms: int = Field(
+        30000, description="Request timeout in milliseconds"
+    )
+    session_timeout_ms: int = Field(
+        10000, description="Session timeout in milliseconds"
+    )
+
     # Retry settings
     retry_backoff_ms: int = Field(100, description="Retry backoff in milliseconds")
-    max_in_flight_requests: int = Field(5, description="Max in-flight requests per connection")
-    
+    max_in_flight_requests: int = Field(
+        5, description="Max in-flight requests per connection"
+    )
+
     class Config:
         env_prefix = "KAFKA_"
 
 
 class SecurityConfig(BaseSettings):
     """Internal service authentication configuration."""
+
     auth_mode: str = Field(
         "api_key",
         description="Client auth mode: disabled, api_key, bearer, or api_key_or_bearer",
@@ -721,15 +950,118 @@ class SecurityConfig(BaseSettings):
 
 class ServiceTopologyConfig(BaseSettings):
     """Inter-service routing and deployment configuration."""
+
     gateway_host: str = Field("0.0.0.0", description="Gateway bind host")
     gateway_port: int = Field(8000, description="Gateway bind port")
-    recommendation_host: str = Field("0.0.0.0", description="Recommendation service bind host")
-    recommendation_port: int = Field(8001, description="Recommendation service bind port")
-    interaction_host: str = Field("0.0.0.0", description="Interaction ingest service bind host")
-    interaction_port: int = Field(8002, description="Interaction ingest service bind port")
+    recommendation_host: str = Field(
+        "0.0.0.0", description="Recommendation service bind host"
+    )
+    recommendation_port: int = Field(
+        8001, description="Recommendation service bind port"
+    )
+    ranking_host: str = Field("0.0.0.0", description="Ranking service bind host")
+    ranking_port: int = Field(8003, description="Ranking service bind port")
+    ranking_coordinator_host: str = Field(
+        "",
+        description="Host of the single ranking coordinator; when set ranking-service workers proxy to it",
+    )
+    ranking_coordinator_bind_host: str = Field(
+        "0.0.0.0",
+        description="Bind host for the single ranking coordinator process",
+    )
+    ranking_coordinator_port: int = Field(
+        8013,
+        description="TCP port for the single ranking coordinator process",
+    )
+    ranking_coordinator_backlog: int = Field(
+        4096,
+        description="TCP listen backlog for ranking coordinator client connections",
+    )
+    ranking_coordinator_stream_limit: int = Field(
+        33554432,
+        description="Per-connection stream buffer limit for ranking coordinator frames",
+    )
+    ranking_coordinator_client_pool_size: int = Field(
+        128,
+        description="Persistent coordinator TCP connections per ranking-service HTTP worker",
+    )
+    ranking_coordinator_direct_enabled: bool = Field(
+        True,
+        description="Allow recommendation workers to call the single ranking coordinator over TCP instead of proxying through ranking-service HTTP",
+    )
+    ranking_coordinator_connect_timeout_seconds: float = Field(
+        1.0,
+        description="TCP connect timeout from ranking-service workers to the coordinator",
+    )
+    ranking_coordinator_request_timeout_seconds: float = Field(
+        2.0,
+        description="End-to-end timeout for ranking-service worker coordinator calls",
+    )
+    ranking_runner_urls: str = Field(
+        "",
+        description="Comma-separated ranking-runner TCP endpoints used by the coordinator",
+    )
+    ranking_runner_bind_host: str = Field(
+        "0.0.0.0",
+        description="Bind host for ranking-runner TCP servers",
+    )
+    ranking_runner_port: int = Field(
+        8014,
+        description="TCP port for ranking-runner model batch servers",
+    )
+    ranking_runner_backlog: int = Field(
+        4096,
+        description="TCP listen backlog for ranking-runner client connections",
+    )
+    ranking_runner_stream_limit: int = Field(
+        33554432,
+        description="Per-connection stream buffer limit for ranking-runner frames",
+    )
+    ranking_runner_connect_timeout_seconds: float = Field(
+        1.0,
+        description="TCP connect timeout from ranking coordinator to ranking runners",
+    )
+    ranking_runner_request_timeout_seconds: float = Field(
+        1.5,
+        description="End-to-end timeout for ranking coordinator batch dispatches to ranking runners",
+    )
+    ranking_runner_unhealthy_cooldown_seconds: float = Field(
+        0.2,
+        description="Cooldown before retrying a ranking runner after a failed batch dispatch",
+    )
+    ranking_runner_dns_refresh_seconds: float = Field(
+        5.0,
+        description="Interval for refreshing ranking-runner DNS endpoint resolution",
+    )
+    ranking_runner_endpoint_missing_refreshes: int = Field(
+        3,
+        description="Consecutive DNS refresh misses before a ranking-runner endpoint starts draining",
+    )
+    ranking_runner_endpoint_missing_grace_seconds: float = Field(
+        30.0,
+        description="Minimum seconds an endpoint must be absent from DNS before draining",
+    )
+    interaction_host: str = Field(
+        "0.0.0.0", description="Interaction ingest service bind host"
+    )
+    interaction_port: int = Field(
+        8002, description="Interaction ingest service bind port"
+    )
     recommendation_service_url: str = Field(
         "http://recommendation-service:8001",
         description="Internal URL for the recommendation service",
+    )
+    recommendation_service_urls: str = Field(
+        "",
+        description="Comma-separated internal URLs for recommendation service replicas",
+    )
+    ranking_service_url: str = Field(
+        "",
+        description="Internal URL for the ranking service",
+    )
+    ranking_service_urls: str = Field(
+        "",
+        description="Comma-separated internal URLs for ranking service replicas",
     )
     interaction_ingest_service_url: str = Field(
         "http://interaction-ingest-service:8002",
@@ -767,13 +1099,30 @@ class ServiceTopologyConfig(BaseSettings):
         30.0,
         description="Idle keepalive expiry for upstream HTTP connections in the gateway",
     )
+    max_inflight_recommendations: int = Field(
+        0,
+        description="Maximum in-flight recommendation requests per worker; 0 disables admission control",
+    )
+    ranking_service_fallback_enabled: bool = Field(
+        False,
+        description="Allow recommendation service to use the local same-model ranker when remote ranking is unavailable",
+    )
+    ranking_single_coordinator_enabled: bool = Field(
+        True,
+        description="Route ranking requests to one logical coordinator URL so batching is not split across queues",
+    )
     trainer_interval_seconds: int = Field(
         3600,
         description="Background model trainer interval in seconds",
     )
     gateway_workers: int = Field(2, description="Gateway worker process count")
-    recommendation_workers: int = Field(2, description="Recommendation worker process count")
-    interaction_workers: int = Field(2, description="Interaction ingest worker process count")
+    recommendation_workers: int = Field(
+        2, description="Recommendation worker process count"
+    )
+    ranking_workers: int = Field(1, description="Ranking worker process count")
+    interaction_workers: int = Field(
+        2, description="Interaction ingest worker process count"
+    )
 
     class Config:
         env_prefix = "SERVICE_"
@@ -781,26 +1130,43 @@ class ServiceTopologyConfig(BaseSettings):
 
 class DataConfig(BaseSettings):
     """Data management configuration."""
+
     # Sample data
     load_sample_data: bool = Field(True, description="Load sample data on startup")
-    use_csv_dataset: bool = Field(False, description="Load data from CSV files in Dataset folder")
-    dataset_dir: str = Field("Dataset", description="Directory containing CSV dataset files")
-    sample_data_path: str = Field("data/sample_products.json", description="Sample data file path")
+    use_csv_dataset: bool = Field(
+        False, description="Load data from CSV files in Dataset folder"
+    )
+    dataset_dir: str = Field(
+        "Dataset", description="Directory containing CSV dataset files"
+    )
+    sample_data_path: str = Field(
+        "data/sample_products.json", description="Sample data file path"
+    )
     sample_users: int = Field(1000, description="Number of sample users to generate")
     sample_interactions: int = Field(10000, description="Number of sample interactions")
-    
+
     # CSV dataset loading limits (None = load all)
-    csv_limit_users: Optional[int] = Field(None, description="Limit number of users to load from CSV")
-    csv_limit_products: Optional[int] = Field(None, description="Limit number of products to load from CSV")
-    csv_limit_interactions: Optional[int] = Field(None, description="Limit number of interactions to load from CSV")
-    csv_limit_content: Optional[int] = Field(None, description="Limit number of content items to load from CSV")
-    
+    csv_limit_users: Optional[int] = Field(
+        None, description="Limit number of users to load from CSV"
+    )
+    csv_limit_products: Optional[int] = Field(
+        None, description="Limit number of products to load from CSV"
+    )
+    csv_limit_interactions: Optional[int] = Field(
+        None, description="Limit number of interactions to load from CSV"
+    )
+    csv_limit_content: Optional[int] = Field(
+        None, description="Limit number of content items to load from CSV"
+    )
+
     # Data storage
     upload_dir: str = Field("/tmp/uploads", description="File upload directory")
-    max_file_size: int = Field(500 * 1024 * 1024, description="Max upload file size (500MB)")
+    max_file_size: int = Field(
+        500 * 1024 * 1024, description="Max upload file size (500MB)"
+    )
     allowed_extensions: List[str] = Field(
         [".mp4", ".avi", ".mov", ".mkv", ".webm"],
-        description="Allowed video file extensions"
+        description="Allowed video file extensions",
     )
     allowed_mime_types: List[str] = Field(
         [
@@ -816,17 +1182,18 @@ class DataConfig(BaseSettings):
         1024 * 1024,
         description="Chunk size for streaming uploads to disk",
     )
-    
+
     # Data processing
     cleanup_temp_files: bool = Field(True, description="Cleanup temporary files")
     temp_file_ttl: int = Field(3600, description="Temporary file TTL in seconds")
-    
+
     class Config:
         env_prefix = "DATA_"
 
 
 class ObjectStorageConfig(BaseSettings):
     """Remote object storage configuration for upload durability."""
+
     backend: str = Field(
         "local",
         description="Upload storage backend: local or s3",
@@ -891,6 +1258,7 @@ class ObjectStorageConfig(BaseSettings):
 
 class DatabaseConfig(BaseSettings):
     """Postgres system-of-record configuration."""
+
     enable: bool = Field(False, description="Enable Postgres persistence layer")
     url: str = Field(
         "postgresql+asyncpg://video_commerce:video_commerce@postgres:5432/video_commerce",
@@ -935,14 +1303,15 @@ class DatabaseConfig(BaseSettings):
     class Config:
         env_prefix = "DATABASE_"
 
+
 class Config:
     """Main configuration class that combines all configuration sections."""
-    
+
     def __init__(self, config_file: Optional[str] = None):
         """Initialize configuration from environment variables and optional config file."""
         self.config_file = config_file
         _load_secret_file_env()
-        
+
         # Load configuration sections
         self.redis_config = RedisConfig()
         self.model_config = ModelConfig()
@@ -958,25 +1327,25 @@ class Config:
         self.security_config = SecurityConfig()
         self.service_topology_config = ServiceTopologyConfig()
         self.database_config = DatabaseConfig()
-        
+
         # Load additional config from file if provided
         if config_file and os.path.exists(config_file):
             self._load_config_file(config_file)
-        
+
         # Set up derived configurations
         self._setup_derived_config()
-        
+
         # Validate configuration
         self._validate_config()
-        
+
         logger.info("Configuration loaded successfully")
-    
+
     def _load_config_file(self, config_file: str):
         """Load additional configuration from JSON file."""
         try:
-            with open(config_file, 'r') as f:
+            with open(config_file, "r") as f:
                 file_config = json.load(f)
-            
+
             # Override default values with file config
             for section, values in file_config.items():
                 if hasattr(self, f"{section}_config"):
@@ -984,12 +1353,12 @@ class Config:
                     for key, value in values.items():
                         if hasattr(config_obj, key):
                             setattr(config_obj, key, value)
-            
+
             logger.info(f"Loaded configuration from {config_file}")
-            
+
         except Exception as e:
             logger.warning(f"Failed to load config file {config_file}: {e}")
-    
+
     def _setup_derived_config(self):
         """Set up derived configuration values."""
         # Ensure cache directory exists
@@ -1027,43 +1396,50 @@ class Config:
             self.recommendation_config.sasrec_metadata_path = str(
                 Path(self.model_config.cache_dir) / "sasrec_metadata.json"
             )
-        
+
         # Set embedding dimension consistency
         if self.vector_config.embedding_dim != self.model_config.embedding_dim:
             logger.warning("Vector and model embedding dimensions don't match")
             self.vector_config.embedding_dim = self.model_config.embedding_dim
-        
-        # Environment-specific overrides
+
+        # Environment-specific overrides. Explicit env values should win over
+        # the broad ENVIRONMENT defaults so load-test profiles can suppress
+        # third-party debug log storms even when a local .env says development.
+        explicit_monitoring_log_level = "MONITORING_LOG_LEVEL" in os.environ
         if os.getenv("ENVIRONMENT") == "production":
             self.api_config.debug = False
             self.api_config.reload = False
-            self.monitoring_config.log_level = "WARNING"
+            if not explicit_monitoring_log_level:
+                self.monitoring_config.log_level = "WARNING"
         elif os.getenv("ENVIRONMENT") == "development":
             self.api_config.debug = True
             self.api_config.reload = True
-            self.monitoring_config.log_level = "DEBUG"
-    
+            if not explicit_monitoring_log_level:
+                self.monitoring_config.log_level = "DEBUG"
+
     def _validate_config(self):
         """Validate configuration values."""
         errors = []
-        
+
         # Validate weights sum to reasonable values
         total_weight = (
-            self.recommendation_config.cf_weight +
-            self.recommendation_config.content_weight +
-            self.recommendation_config.popularity_weight
+            self.recommendation_config.cf_weight
+            + self.recommendation_config.content_weight
+            + self.recommendation_config.popularity_weight
         )
         if abs(total_weight - 1.0) > 0.1:
-            errors.append(f"Recommendation weights should sum to ~1.0, got {total_weight}")
-        
+            errors.append(
+                f"Recommendation weights should sum to ~1.0, got {total_weight}"
+            )
+
         # Validate cache TTL values
         if self.cache_config.high_activity_ttl >= self.cache_config.low_activity_ttl:
             errors.append("High activity TTL should be less than low activity TTL")
-        
+
         # Validate batch sizes
         if self.model_config.batch_size <= 0:
             errors.append("Model batch size must be positive")
-        
+
         # Validate file paths
         if not os.path.exists(os.path.dirname(self.model_config.cache_dir)):
             try:
@@ -1077,134 +1453,184 @@ class Config:
             )
         if self.object_storage_config.backend == "s3":
             if not self.object_storage_config.bucket:
-                errors.append("Object storage bucket is required when OBJECT_STORAGE_BACKEND=s3")
+                errors.append(
+                    "Object storage bucket is required when OBJECT_STORAGE_BACKEND=s3"
+                )
             if self.object_storage_config.max_attempts <= 0:
                 errors.append("Object storage max attempts must be positive")
             if os.getenv("ENVIRONMENT", "").lower() == "production":
                 if not self.object_storage_config.access_key_id:
-                    errors.append("Object storage access key is required in production when S3 is enabled")
+                    errors.append(
+                        "Object storage access key is required in production when S3 is enabled"
+                    )
                 if not self.object_storage_config.secret_access_key:
-                    errors.append("Object storage secret key is required in production when S3 is enabled")
+                    errors.append(
+                        "Object storage secret key is required in production when S3 is enabled"
+                    )
                 if self.object_storage_config.access_key_id == "minioadmin":
-                    errors.append("Default MinIO access key is not allowed in production")
+                    errors.append(
+                        "Default MinIO access key is not allowed in production"
+                    )
                 if self.object_storage_config.secret_access_key == "minioadmin":
-                    errors.append("Default MinIO secret key is not allowed in production")
-        if self.security_config.auth_mode not in {"disabled", "api_key", "bearer", "api_key_or_bearer"}:
+                    errors.append(
+                        "Default MinIO secret key is not allowed in production"
+                    )
+        if self.security_config.auth_mode not in {
+            "disabled",
+            "api_key",
+            "bearer",
+            "api_key_or_bearer",
+        }:
             errors.append(
                 "Security auth mode must be disabled, api_key, bearer, or api_key_or_bearer"
             )
         if self.database_config.enable and not self.database_config.url:
-            errors.append("DATABASE_URL or DATABASE_URL_FILE is required when DATABASE_ENABLE=true")
+            errors.append(
+                "DATABASE_URL or DATABASE_URL_FILE is required when DATABASE_ENABLE=true"
+            )
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":
             if self.security_config.auth_mode == "disabled":
-                errors.append("SECURITY_AUTH_MODE=disabled is not allowed in production")
-            if self.security_config.auth_mode in {"api_key", "api_key_or_bearer"} and not self.api_config.api_key:
-                errors.append("API_API_KEY or API_API_KEY_FILE is required in production")
+                errors.append(
+                    "SECURITY_AUTH_MODE=disabled is not allowed in production"
+                )
+            if (
+                self.security_config.auth_mode in {"api_key", "api_key_or_bearer"}
+                and not self.api_config.api_key
+            ):
+                errors.append(
+                    "API_API_KEY or API_API_KEY_FILE is required in production"
+                )
             if not self.security_config.internal_service_key:
-                errors.append("SECURITY_INTERNAL_SERVICE_KEY or SECURITY_INTERNAL_SERVICE_KEY_FILE is required in production")
+                errors.append(
+                    "SECURITY_INTERNAL_SERVICE_KEY or SECURITY_INTERNAL_SERVICE_KEY_FILE is required in production"
+                )
             if self.security_config.internal_service_key == "change-me-in-production":
-                errors.append("Default internal service key is not allowed in production")
+                errors.append(
+                    "Default internal service key is not allowed in production"
+                )
             if not self.redis_config.password:
-                errors.append("REDIS_PASSWORD or REDIS_PASSWORD_FILE is required in production")
+                errors.append(
+                    "REDIS_PASSWORD or REDIS_PASSWORD_FILE is required in production"
+                )
             if self.redis_config.cache_host and not (
                 self.redis_config.cache_password or self.redis_config.password
             ):
-                errors.append("REDIS_CACHE_PASSWORD, REDIS_CACHE_PASSWORD_FILE, or REDIS_PASSWORD is required in production when cache Redis is separate")
+                errors.append(
+                    "REDIS_CACHE_PASSWORD, REDIS_CACHE_PASSWORD_FILE, or REDIS_PASSWORD is required in production when cache Redis is separate"
+                )
             if "video_commerce:video_commerce@" in self.database_config.url:
-                errors.append("Default Postgres credentials are not allowed in production")
-        
+                errors.append(
+                    "Default Postgres credentials are not allowed in production"
+                )
+
         if errors:
             logger.error("Configuration validation failed:")
             for error in errors:
                 logger.error(f"  - {error}")
             raise ValueError("Invalid configuration")
-    
+
     def get_redis_url(self) -> str:
         """Get Redis connection URL."""
         auth = f":{self.redis_config.password}@" if self.redis_config.password else ""
         return f"redis://{auth}{self.redis_config.host}:{self.redis_config.port}/{self.redis_config.db}"
-    
+
     def get_model_device(self) -> str:
         """Get the appropriate device for ML models."""
         if self.model_config.device == "auto":
             try:
                 import torch
-                return "cuda" if torch.cuda.is_available() and self.model_config.enable_gpu else "cpu"
+
+                return (
+                    "cuda"
+                    if torch.cuda.is_available() and self.model_config.enable_gpu
+                    else "cpu"
+                )
             except ImportError:
                 return "cpu"
         return self.model_config.device
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary (for logging/debugging)."""
         config_dict = {}
         for attr_name in dir(self):
-            if attr_name.endswith('_config') and not attr_name.startswith('_'):
+            if attr_name.endswith("_config") and not attr_name.startswith("_"):
                 config_obj = getattr(self, attr_name)
-                if hasattr(config_obj, '__dict__'):
+                if hasattr(config_obj, "__dict__"):
                     config_dict[attr_name] = config_obj.__dict__.copy()
                     # Remove sensitive information
-                    if 'password' in config_dict[attr_name]:
-                        config_dict[attr_name]['password'] = "***"
-                    if 'api_key' in config_dict[attr_name]:
-                        config_dict[attr_name]['api_key'] = "***"
-                    if 'internal_service_key' in config_dict[attr_name]:
-                        config_dict[attr_name]['internal_service_key'] = "***"
-                    if 'secret_access_key' in config_dict[attr_name]:
-                        config_dict[attr_name]['secret_access_key'] = "***"
-                    if 'access_key_id' in config_dict[attr_name]:
-                        config_dict[attr_name]['access_key_id'] = "***"
-                    if 'jwt_shared_secret' in config_dict[attr_name]:
-                        config_dict[attr_name]['jwt_shared_secret'] = "***"
-        
+                    if "password" in config_dict[attr_name]:
+                        config_dict[attr_name]["password"] = "***"
+                    if "api_key" in config_dict[attr_name]:
+                        config_dict[attr_name]["api_key"] = "***"
+                    if "internal_service_key" in config_dict[attr_name]:
+                        config_dict[attr_name]["internal_service_key"] = "***"
+                    if "secret_access_key" in config_dict[attr_name]:
+                        config_dict[attr_name]["secret_access_key"] = "***"
+                    if "access_key_id" in config_dict[attr_name]:
+                        config_dict[attr_name]["access_key_id"] = "***"
+                    if "jwt_shared_secret" in config_dict[attr_name]:
+                        config_dict[attr_name]["jwt_shared_secret"] = "***"
+
         return config_dict
-    
+
     @property
     def model_version(self) -> str:
         """Get model version string."""
         return "v1.0.0"
-    
+
     @property
     def load_sample_data(self) -> bool:
         """Whether to load sample data on startup."""
         return self.data_config.load_sample_data and not os.getenv("NO_SAMPLE_DATA")
 
+
 # Global configuration instance
 _config_instance: Optional[Config] = None
+
 
 def get_config(config_file: Optional[str] = None) -> Config:
     """Get the global configuration instance."""
     global _config_instance
-    
+
     if _config_instance is None:
         # Look for config file in standard locations
         if config_file is None:
-            for path in ["config.json", "config/config.json", "/etc/recommender/config.json"]:
+            for path in [
+                "config.json",
+                "config/config.json",
+                "/etc/recommender/config.json",
+            ]:
                 if os.path.exists(path):
                     config_file = path
                     break
-        
+
         _config_instance = Config(config_file)
-    
+
     return _config_instance
+
 
 def reset_config():
     """Reset the global configuration instance (useful for testing)."""
     global _config_instance
     _config_instance = None
 
+
 # Convenience function for getting specific config sections
 def get_redis_config() -> RedisConfig:
     """Get Redis configuration."""
     return get_config().redis_config
 
+
 def get_model_config() -> ModelConfig:
     """Get model configuration."""
     return get_config().model_config
 
+
 def get_api_config() -> APIConfig:
     """Get API configuration."""
     return get_config().api_config
+
 
 def get_kafka_config() -> KafkaConfig:
     """Get Kafka configuration."""
@@ -1215,14 +1641,17 @@ def get_database_config() -> DatabaseConfig:
     """Get database configuration."""
     return get_config().database_config
 
+
 # Environment detection
 def is_production() -> bool:
     """Check if running in production environment."""
     return os.getenv("ENVIRONMENT", "").lower() == "production"
 
+
 def is_development() -> bool:
     """Check if running in development environment."""
     return os.getenv("ENVIRONMENT", "").lower() in ("development", "dev", "")
+
 
 def is_testing() -> bool:
     """Check if running in test environment."""

@@ -1,7 +1,17 @@
 from fastapi import FastAPI
+import httpx
+import pytest
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
-from service_common import ServiceRuntime, build_error_response, build_readiness_response, create_service_app
+from service_common import (
+    RoundRobinAsyncClientPool,
+    ServiceRuntime,
+    _should_log_request,
+    build_error_response,
+    build_readiness_response,
+    create_service_app,
+)
 
 
 def test_build_error_response_uses_standard_envelope():
@@ -46,3 +56,54 @@ def test_create_service_app_sets_request_id_and_runtime_counters():
     assert "X-Request-ID" in response.headers
     assert app.state.runtime.handled_requests == 1
     assert app.state.runtime.active_requests == 0
+
+
+def test_request_logging_samples_completion_logs_by_status_class():
+    runtime = ServiceRuntime("test-service")
+    runtime.config = SimpleNamespace(
+        monitoring_config=SimpleNamespace(
+            enable_request_logging=True,
+            request_log_sample_rate=0.0,
+            error_request_log_sample_rate=1.0,
+            slow_request_threshold=1.0,
+        )
+    )
+
+    assert _should_log_request(runtime, 500, 0.01) is True
+    assert _should_log_request(runtime, 200, 0.01) is False
+    assert _should_log_request(runtime, 200, 1.5) is False
+
+    runtime.config.monitoring_config.error_request_log_sample_rate = 0.0
+    assert _should_log_request(runtime, 500, 0.01) is False
+
+    runtime.config.monitoring_config.request_log_sample_rate = 1.0
+    assert _should_log_request(runtime, 200, 0.01) is True
+    assert _should_log_request(runtime, 200, 1.5) is True
+
+
+def test_round_robin_pool_url_parsing_and_selection():
+    urls = RoundRobinAsyncClientPool.parse_urls(
+        "http://a:8000, http://b:8000",
+        fallback="http://fallback:8000",
+    )
+    assert urls == ["http://a:8000", "http://b:8000"]
+    assert RoundRobinAsyncClientPool.parse_urls("", fallback="http://fallback:8000") == [
+        "http://fallback:8000"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_round_robin_pool_skips_temporarily_unhealthy_upstream():
+    pool = RoundRobinAsyncClientPool(
+        ["http://a:8000", "http://b:8000"],
+        timeout=httpx.Timeout(1.0),
+        limits=httpx.Limits(max_connections=2),
+    )
+    try:
+        pool._mark_unhealthy(0)
+        index, client = pool._choose_client()
+
+        assert index == 1
+        assert str(client.base_url).rstrip("/") == "http://b:8000"
+    finally:
+        await pool.aclose()

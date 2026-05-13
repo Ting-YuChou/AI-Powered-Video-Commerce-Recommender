@@ -17,6 +17,7 @@ from fastapi import Body, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from auth import AuthValidationError, BearerTokenValidator
+from cache_codec import json_dumps
 from config import Config
 from feature_store import FeatureStore
 from kafka_client import close_kafka, init_kafka
@@ -32,6 +33,7 @@ from service_common import (
     component_health,
     configure_service_logging,
     create_service_app,
+    RoundRobinAsyncClientPool,
 )
 from system_store import SystemStore
 from telemetry import inject_http_headers
@@ -48,6 +50,8 @@ feature_store: Optional[FeatureStore] = None
 system_store: Optional[SystemStore] = None
 kafka_manager = None
 proxy_client: Optional[httpx.AsyncClient] = None
+recommendation_proxy_pool: Optional[RoundRobinAsyncClientPool] = None
+interaction_proxy_pool: Optional[RoundRobinAsyncClientPool] = None
 rate_limiter: Optional[RedisRateLimiter] = None
 object_storage: Optional[ObjectStorage] = None
 bearer_token_validator: Optional[BearerTokenValidator] = None
@@ -99,7 +103,11 @@ async def auth_and_rate_limit(request: Request, call_next):
                         headers={request_id_header: request_id},
                     )
 
-        if not authenticated and auth_mode in {"api_key", "api_key_or_bearer"} and api_key:
+        if (
+            not authenticated
+            and auth_mode in {"api_key", "api_key_or_bearer"}
+            and api_key
+        ):
             if request.headers.get("x-api-key") == api_key:
                 authenticated = True
             elif auth_mode == "api_key":
@@ -113,10 +121,18 @@ async def auth_and_rate_limit(request: Request, call_next):
 
         if auth_mode == "api_key" and not api_key_enabled:
             authenticated = True
-        elif auth_mode == "api_key_or_bearer" and not api_key_enabled and not bearer_enabled:
+        elif (
+            auth_mode == "api_key_or_bearer"
+            and not api_key_enabled
+            and not bearer_enabled
+        ):
             authenticated = True
 
-        if not authenticated and auth_mode in {"api_key", "bearer", "api_key_or_bearer"}:
+        if not authenticated and auth_mode in {
+            "api_key",
+            "bearer",
+            "api_key_or_bearer",
+        }:
             return build_error_response(
                 status_code=401,
                 code="UNAUTHORIZED",
@@ -141,13 +157,15 @@ async def auth_and_rate_limit(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup_event():
-    global feature_store, system_store, kafka_manager, proxy_client, rate_limiter, object_storage, bearer_token_validator
+    global feature_store, system_store, kafka_manager, proxy_client, recommendation_proxy_pool, interaction_proxy_pool, rate_limiter, object_storage, bearer_token_validator
 
     runtime = app.state.runtime
     runtime.config = Config()
     configure_service_logging(runtime)
 
-    feature_store = FeatureStore(runtime.config.redis_config, runtime.config.cache_config)
+    feature_store = FeatureStore(
+        runtime.config.redis_config, runtime.config.cache_config
+    )
     await feature_store.initialize()
 
     if runtime.config.database_config.enable:
@@ -164,8 +182,13 @@ async def startup_event():
         if runtime.config.security_config.oidc_enabled
         else None
     )
-    if runtime.config.security_config.auth_mode == "bearer" and bearer_token_validator is None:
-        raise ValueError("SECURITY_AUTH_MODE=bearer requires OIDC/JWT validation to be enabled")
+    if (
+        runtime.config.security_config.auth_mode == "bearer"
+        and bearer_token_validator is None
+    ):
+        raise ValueError(
+            "SECURITY_AUTH_MODE=bearer requires OIDC/JWT validation to be enabled"
+        )
 
     if runtime.config.kafka_config.enable:
         try:
@@ -178,18 +201,33 @@ async def startup_event():
             kafka_manager = None
 
     timeout_config = runtime.config.service_topology_config
+    proxy_timeout = httpx.Timeout(
+        connect=timeout_config.proxy_connect_timeout_seconds,
+        read=timeout_config.proxy_read_timeout_seconds,
+        write=timeout_config.proxy_write_timeout_seconds,
+        pool=timeout_config.proxy_pool_timeout_seconds,
+    )
+    proxy_limits = httpx.Limits(
+        max_connections=timeout_config.proxy_max_connections,
+        max_keepalive_connections=timeout_config.proxy_max_keepalive_connections,
+        keepalive_expiry=timeout_config.proxy_keepalive_expiry_seconds,
+    )
     proxy_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(
-            connect=timeout_config.proxy_connect_timeout_seconds,
-            read=timeout_config.proxy_read_timeout_seconds,
-            write=timeout_config.proxy_write_timeout_seconds,
-            pool=timeout_config.proxy_pool_timeout_seconds,
+        timeout=proxy_timeout,
+        limits=proxy_limits,
+    )
+    recommendation_proxy_pool = RoundRobinAsyncClientPool(
+        RoundRobinAsyncClientPool.parse_urls(
+            timeout_config.recommendation_service_urls,
+            fallback=timeout_config.recommendation_service_url,
         ),
-        limits=httpx.Limits(
-            max_connections=timeout_config.proxy_max_connections,
-            max_keepalive_connections=timeout_config.proxy_max_keepalive_connections,
-            keepalive_expiry=timeout_config.proxy_keepalive_expiry_seconds,
-        ),
+        timeout=proxy_timeout,
+        limits=proxy_limits,
+    )
+    interaction_proxy_pool = RoundRobinAsyncClientPool(
+        [timeout_config.interaction_ingest_service_url],
+        timeout=proxy_timeout,
+        limits=proxy_limits,
     )
     rate_limiter = RedisRateLimiter(
         redis_client=feature_store.redis_client,
@@ -200,6 +238,10 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    if recommendation_proxy_pool:
+        await recommendation_proxy_pool.aclose()
+    if interaction_proxy_pool:
+        await interaction_proxy_pool.aclose()
     if proxy_client:
         await proxy_client.aclose()
     if feature_store:
@@ -228,6 +270,15 @@ async def livez():
 
 @app.get("/readyz")
 async def readyz():
+    return await _gateway_readiness_response(include_worker_heartbeats=False)
+
+
+@app.get("/readyz/full")
+async def readyz_full():
+    return await _gateway_readiness_response(include_worker_heartbeats=True)
+
+
+async def _gateway_readiness_response(*, include_worker_heartbeats: bool):
     runtime = app.state.runtime
     feature_store_health = await feature_store.health_check()
     database_health = {"status": "healthy", "response_time_ms": 0.0}
@@ -242,6 +293,9 @@ async def readyz():
     recommendation_health = await _probe_health(
         f"{runtime.config.service_topology_config.recommendation_service_url}/readyz"
     )
+    ranking_health = await _probe_health(
+        f"{runtime.config.service_topology_config.ranking_service_url}/readyz"
+    )
     interaction_health = await _probe_health(
         f"{runtime.config.service_topology_config.interaction_ingest_service_url}/readyz"
     )
@@ -252,7 +306,9 @@ async def readyz():
         kafka_health = {
             "status": producer_health.get("status", "unhealthy"),
             "response_time_ms": 0.0,
-            "error": None if producer_health.get("connected") else "Kafka producer unavailable",
+            "error": None
+            if producer_health.get("connected")
+            else "Kafka producer unavailable",
         }
     elif runtime.config.kafka_config.enable:
         kafka_health = {"status": "unhealthy", "error": "Kafka producer unavailable"}
@@ -261,13 +317,16 @@ async def readyz():
         "redis": feature_store_health,
         "database": database_health,
         "recommendation_service": recommendation_health,
+        "ranking_service": ranking_health,
         "interaction_ingest_service": interaction_health,
         "kafka": kafka_health,
     }
 
-    if runtime.config.kafka_config.enable:
+    if include_worker_heartbeats and runtime.config.kafka_config.enable:
         for worker_name in ("content-worker", "feature-worker", "model-trainer"):
-            checks[worker_name] = await feature_store.get_service_heartbeat_status(worker_name)
+            checks[worker_name] = await feature_store.get_service_heartbeat_status(
+                worker_name
+            )
 
     return build_readiness_response(runtime, checks)
 
@@ -275,7 +334,9 @@ async def readyz():
 @app.post("/api/recommendations")
 async def recommendations(request: Request, payload: RecommendationRequest = Body(...)):
     return await _proxy_json_request(
-        url=f"{app.state.runtime.config.service_topology_config.recommendation_service_url}/api/recommendations",
+        proxy_pool=recommendation_proxy_pool,
+        path="/api/recommendations",
+        target="recommendation-service",
         payload=payload.dict(),
         request=request,
     )
@@ -284,7 +345,9 @@ async def recommendations(request: Request, payload: RecommendationRequest = Bod
 @app.post("/api/interactions")
 async def interactions(request: Request, payload: UserInteractionRequest = Body(...)):
     return await _proxy_json_request(
-        url=f"{app.state.runtime.config.service_topology_config.interaction_ingest_service_url}/api/interactions",
+        proxy_pool=interaction_proxy_pool,
+        path="/api/interactions",
+        target="interaction-ingest-service",
         payload=payload.dict(),
         request=request,
     )
@@ -316,11 +379,14 @@ async def upload_content(
         chunk_size=runtime.config.data_config.upload_chunk_size_bytes,
     )
     storage_path = file_path
+    inflight_recorded = False
     try:
         if object_storage:
             storage_path = await object_storage.persist_staged_file(
                 file_path,
-                object_name=object_storage.build_object_name(content_id=content_id, suffix=suffix),
+                object_name=object_storage.build_object_name(
+                    content_id=content_id, suffix=suffix
+                ),
                 content_type=file.content_type,
             )
             if storage_path != file_path and os.path.exists(file_path):
@@ -365,7 +431,9 @@ async def upload_content(
                 error_message="Failed to enqueue video processing task",
                 storage_path=storage_path,
             )
-        raise HTTPException(status_code=503, detail="Failed to enqueue video processing task")
+        raise HTTPException(
+            status_code=503, detail="Failed to enqueue video processing task"
+        )
     runtime.observability.record_content_upload(priority, "queued")
 
     return {
@@ -411,7 +479,9 @@ async def analytics(request: Request):
         code="SYSTEM_STORE_UNAVAILABLE",
         message="Analytics require the Postgres-backed system store",
         request_id=request_id,
-        headers={app.state.runtime.config.monitoring_config.request_id_header: request_id},
+        headers={
+            app.state.runtime.config.monitoring_config.request_id_header: request_id
+        },
     )
 
 
@@ -431,7 +501,9 @@ async def health_check():
         kafka_health = {
             "status": producer_health.get("status", "healthy"),
             "response_time_ms": 0.0,
-            "error": None if producer_health.get("connected") else "Kafka producer unavailable",
+            "error": None
+            if producer_health.get("connected")
+            else "Kafka producer unavailable",
         }
     elif app.state.runtime.config.kafka_config.enable:
         kafka_health = {"status": "degraded", "error": "Kafka producer unavailable"}
@@ -475,7 +547,9 @@ async def health_check():
 
     if app.state.runtime.config.kafka_config.enable:
         for worker_name in ("content-worker", "feature-worker", "model-trainer"):
-            worker_health = await feature_store.get_service_heartbeat_status(worker_name)
+            worker_health = await feature_store.get_service_heartbeat_status(
+                worker_name
+            )
             components[worker_name] = component_health(
                 worker_health.get("status", "unhealthy"),
                 None,
@@ -512,7 +586,9 @@ def validate_upload_file(file: UploadFile, config: Config) -> str:
         raise HTTPException(status_code=400, detail="Filename is required")
     if suffix not in {ext.lower() for ext in config.data_config.allowed_extensions}:
         raise HTTPException(status_code=400, detail="File extension not supported")
-    if content_type not in {mime.lower() for mime in config.data_config.allowed_mime_types}:
+    if content_type not in {
+        mime.lower() for mime in config.data_config.allowed_mime_types
+    }:
         raise HTTPException(status_code=400, detail="File MIME type not supported")
     return suffix
 
@@ -541,7 +617,9 @@ async def stream_upload_to_temp_file(
                     break
                 bytes_written += len(chunk)
                 if bytes_written > max_size:
-                    raise HTTPException(status_code=413, detail="Uploaded file exceeds size limit")
+                    raise HTTPException(
+                        status_code=413, detail="Uploaded file exceeds size limit"
+                    )
                 tmp_file.write(chunk)
         except Exception:
             tmp_file.close()
@@ -553,9 +631,17 @@ async def stream_upload_to_temp_file(
     return file_path, bytes_written
 
 
-async def _proxy_json_request(url: str, payload: dict, request: Request) -> Response:
-    if proxy_client is None:
-        raise HTTPException(status_code=503, detail="Gateway proxy client is unavailable")
+async def _proxy_json_request(
+    proxy_pool: Optional[RoundRobinAsyncClientPool],
+    path: str,
+    target: str,
+    payload: dict,
+    request: Request,
+) -> Response:
+    if proxy_pool is None:
+        raise HTTPException(
+            status_code=503, detail="Gateway proxy client is unavailable"
+        )
 
     headers = {"Content-Type": "application/json"}
     request_id_header = app.state.runtime.config.monitoring_config.request_id_header
@@ -568,14 +654,35 @@ async def _proxy_json_request(url: str, payload: dict, request: Request) -> Resp
         headers[internal_header] = internal_key
     inject_http_headers(headers)
 
+    inflight_recorded = False
     try:
-        upstream = await proxy_client.post(url, json=payload, headers=headers)
+        try:
+            content = await request.body()
+        except Exception:
+            content = json_dumps(payload)
+        if not content:
+            content = json_dumps(payload)
+        app.state.runtime.observability.inc_upstream_inflight(target)
+        inflight_recorded = True
+        upstream = await proxy_pool.post(path, content=content, headers=headers)
+        app.state.runtime.observability.record_upstream_request(
+            target, upstream.status_code
+        )
     except httpx.TimeoutException as exc:
+        app.state.runtime.observability.record_upstream_request(target, "timeout")
         logger.error(f"Gateway proxy timeout: {exc}")
-        raise HTTPException(status_code=504, detail="Upstream service timed out") from exc
+        raise HTTPException(
+            status_code=504, detail="Upstream service timed out"
+        ) from exc
     except httpx.HTTPError as exc:
+        app.state.runtime.observability.record_upstream_request(target, "error")
         logger.error(f"Gateway proxy request failed: {exc}")
-        raise HTTPException(status_code=502, detail="Upstream service unavailable") from exc
+        raise HTTPException(
+            status_code=502, detail="Upstream service unavailable"
+        ) from exc
+    finally:
+        if inflight_recorded:
+            app.state.runtime.observability.dec_upstream_inflight(target)
 
     content_type = upstream.headers.get("content-type", "application/json")
     response_headers = {}
@@ -606,13 +713,19 @@ async def _probe_health(url: str) -> dict:
     started_at = time.time()
     try:
         response = await proxy_client.get(url, headers=headers)
-        payload = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        payload = (
+            response.json()
+            if response.headers.get("content-type", "").startswith("application/json")
+            else {}
+        )
         return {
             "status": _normalize_probe_status(
                 payload.get("status", "healthy" if response.is_success else "degraded")
             ),
             "response_time_ms": round((time.time() - started_at) * 1000, 2),
-            "error": payload.get("error", {}).get("message") if isinstance(payload.get("error"), dict) else None,
+            "error": payload.get("error", {}).get("message")
+            if isinstance(payload.get("error"), dict)
+            else None,
         }
     except Exception as exc:
         return {

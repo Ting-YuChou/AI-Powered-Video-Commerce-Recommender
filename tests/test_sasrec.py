@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from config import CacheConfig, RecommendationConfig
-from models import CandidateProduct, UserFeatures
+from models import CandidateProduct, ContentFeatures, UserFeatures
 from recommender import RecommendationEngine
 from sasrec import SASRecCandidateEngine
 
@@ -118,8 +118,10 @@ class FakeFeatureStore:
     def __init__(self, interactions=None):
         self.cache_config = CacheConfig(hot_path_read_timeout_ms=50)
         self.interactions = interactions or []
+        self.interaction_reads = 0
 
     async def get_user_interactions(self, user_id, limit=100):
+        self.interaction_reads += 1
         return list(self.interactions)
 
     async def get_user_features(self, user_id, cache_default=False):
@@ -227,16 +229,111 @@ class FailingSASRec(FakeSASRec):
 
 @pytest.mark.asyncio
 async def test_generate_candidates_skips_sasrec_when_disabled():
+    feature_store = FakeFeatureStore(interactions=[_event("seen")])
     engine = RecommendationEngine(
-        FakeFeatureStore(interactions=[_event("seen")]),
+        feature_store,
         FakeVectorSearch(),
-        RecommendationConfig(enable_sasrec=False, candidates_per_source=2, max_total_candidates=10),
+        RecommendationConfig(
+            enable_sasrec=False,
+            candidates_per_source=2,
+            max_total_candidates=10,
+            serving_recent_interaction_limit=0,
+        ),
     )
 
     candidates, profile = await engine.generate_candidates("u1", include_profile=True)
 
     assert [candidate.source for candidate in candidates] == ["trending_pool"]
     assert profile["source_counts"]["sasrec"] == 0
+    assert feature_store.interaction_reads == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_reads_recent_interactions_when_configured():
+    feature_store = FakeFeatureStore(interactions=[_event("trend")])
+    engine = RecommendationEngine(
+        feature_store,
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_sasrec=False,
+            candidates_per_source=2,
+            max_total_candidates=10,
+            serving_recent_interaction_limit=10,
+        ),
+    )
+
+    candidates, _ = await engine.generate_candidates("u1", include_profile=True)
+
+    assert candidates == []
+    assert feature_store.interaction_reads == 1
+
+
+@pytest.mark.asyncio
+async def test_content_and_random_retrieval_use_bounded_executor():
+    class ExecutorCFEngine:
+        is_trained = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def run_in_retrieval_executor(self, func, *args, **kwargs):
+            self.calls.append(func.__name__)
+            return func(*args, **kwargs)
+
+    class SyncVectorSearch:
+        embedding_dim = 2
+        product_metadata = {
+            "content": {"category": "cat"},
+            "random": {"category": "cat"},
+        }
+
+        def search_similar_products_sync(self, embedding, k=10, filter_categories=None):
+            return [
+                CandidateProduct(
+                    product_id="content",
+                    content_similarity_score=0.9,
+                    combined_score=0.9,
+                    source="content_similarity",
+                )
+            ][:k]
+
+        def get_random_products_sync(self, k=10):
+            return [
+                CandidateProduct(
+                    product_id="random",
+                    popularity_score=0.2,
+                    combined_score=0.2,
+                    source="random",
+                )
+            ][:k]
+
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[]),
+        SyncVectorSearch(),
+        RecommendationConfig(
+            enable_sasrec=False,
+            candidates_per_source=2,
+            max_total_candidates=2,
+            max_live_content_candidates=1,
+            max_random_candidates=1,
+            max_pool_trending_candidates=0,
+        ),
+    )
+    executor_cf = ExecutorCFEngine()
+    engine.cf_engine = executor_cf
+
+    candidates, _ = await engine.generate_candidates(
+        "u1",
+        content_features=ContentFeatures(content_id="c1", visual_embedding=[1.0, 0.0]),
+        include_profile=True,
+        user_interactions=[],
+    )
+
+    assert [candidate.product_id for candidate in candidates] == ["content", "random"]
+    assert executor_cf.calls == [
+        "search_similar_products_sync",
+        "get_random_products_sync",
+    ]
 
 
 @pytest.mark.asyncio

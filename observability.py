@@ -147,11 +147,19 @@ def configure_logging(monitoring_config) -> None:
     root_logger.addHandler(handler)
     root_logger.setLevel(log_level)
 
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for logger_name in ("uvicorn", "uvicorn.error"):
         logger = logging.getLogger(logger_name)
         logger.handlers.clear()
         logger.propagate = True
         logger.setLevel(log_level)
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.handlers.clear()
+    access_logger.propagate = True
+    access_logger.setLevel(logging.WARNING)
+
+    third_party_level = logging.WARNING if log_level <= logging.INFO else log_level
+    for logger_name in ("httpcore", "httpx", "aiokafka", "opentelemetry"):
+        logging.getLogger(logger_name).setLevel(third_party_level)
 
 
 class ObservabilityManager:
@@ -341,6 +349,215 @@ class ObservabilityManager:
             buckets=(0, 1, 5, 10, 25, 50, 100, 250, 500, 1000),
             registry=self.registry,
         )
+        self.ranking_batch_queue_depth = Gauge(
+            "video_commerce_ranking_batch_queue_depth",
+            "Queued ranking requests in the local micro-batcher",
+            registry=self.registry,
+        )
+        self.ranking_batch_size = Histogram(
+            "video_commerce_ranking_batch_size",
+            "Ranking requests combined per micro-batch",
+            ["path"],
+            buckets=(1, 2, 4, 8, 16, 32, 64),
+            registry=self.registry,
+        )
+        self.ranking_batch_candidates = Histogram(
+            "video_commerce_ranking_batch_candidates",
+            "Candidate products processed per ranking batch",
+            ["path"],
+            buckets=(1, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
+            registry=self.registry,
+        )
+        self.ranking_batch_queue_wait_seconds = Histogram(
+            "video_commerce_ranking_batch_queue_wait_seconds",
+            "Maximum request queue wait before a ranking batch dispatches",
+            ["path"],
+            buckets=(
+                0.0005,
+                0.001,
+                0.0025,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+            ),
+            registry=self.registry,
+        )
+        self.ranking_batch_fill_ratio = Histogram(
+            "video_commerce_ranking_batch_fill_ratio",
+            "Fraction of configured maximum batch size used by each ranking batch",
+            ["path"],
+            buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0),
+            registry=self.registry,
+        )
+        self.ranking_batch_target_fill_ratio = Histogram(
+            "video_commerce_ranking_batch_target_fill_ratio",
+            "Fraction of configured target batch size used by each ranking batch",
+            ["path"],
+            buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0),
+            registry=self.registry,
+        )
+        self.ranking_batch_stage_seconds = Histogram(
+            "video_commerce_ranking_batch_stage_seconds",
+            "Ranking micro-batch execution time by stage",
+            ["path", "stage"],
+            buckets=(
+                0.0005,
+                0.001,
+                0.0025,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2,
+                5,
+            ),
+            registry=self.registry,
+        )
+        self.ranking_active_batches = Gauge(
+            "video_commerce_ranking_active_batches",
+            "Ranking batches currently executing",
+            registry=self.registry,
+        )
+        self.ranking_cancelled_total = Counter(
+            "video_commerce_ranking_cancelled_total",
+            "Ranking requests cancelled or expired before inference",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.ranking_direct_total = Counter(
+            "video_commerce_ranking_direct_total",
+            "Ranking requests handled outside normal micro-batch execution",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.ranking_runner_queue_depth = Gauge(
+            "video_commerce_ranking_runner_queue_depth",
+            "Queued ranking micro-batches inside each ranking runner",
+            registry=self.registry,
+        )
+        self.ranking_runner_batches_total = Counter(
+            "video_commerce_ranking_runner_batches_total",
+            "Ranking runner micro-batches by outcome",
+            ["status"],
+            registry=self.registry,
+        )
+        self.ranking_runner_endpoint_inflight = Gauge(
+            "video_commerce_ranking_runner_endpoint_inflight_batches",
+            "Coordinator in-flight ranking batches by runner endpoint",
+            ["endpoint"],
+            registry=self.registry,
+        )
+        self.ranking_runner_endpoint_available_connections = Gauge(
+            "video_commerce_ranking_runner_endpoint_available_connections",
+            "Coordinator available ranking-runner persistent connections by endpoint",
+            ["endpoint"],
+            registry=self.registry,
+        )
+        self.ranking_runner_endpoint_events_total = Counter(
+            "video_commerce_ranking_runner_endpoint_events_total",
+            "Coordinator runner endpoint events",
+            ["endpoint", "event"],
+            registry=self.registry,
+        )
+        self.ranking_runner_endpoint_state = Gauge(
+            "video_commerce_ranking_runner_endpoint_state",
+            "Coordinator runner endpoint state as a one-hot gauge",
+            ["endpoint", "state"],
+            registry=self.registry,
+        )
+        self.ranking_runner_endpoint_missing_refreshes = Gauge(
+            "video_commerce_ranking_runner_endpoint_missing_refreshes",
+            "Consecutive DNS refreshes missing a known runner endpoint",
+            ["endpoint"],
+            registry=self.registry,
+        )
+        self.ranking_runner_endpoint_removed_total = Counter(
+            "video_commerce_ranking_runner_endpoint_removed_total",
+            "Coordinator runner endpoint removals by reason",
+            ["endpoint", "reason"],
+            registry=self.registry,
+        )
+        self.ranking_runner_late_writes_total = Counter(
+            "video_commerce_ranking_runner_late_writes_total",
+            "Ranking runner responses that could not be written because the client disconnected",
+            ["exception_type"],
+            registry=self.registry,
+        )
+        self.ranking_wait_for_runner_slot_seconds = Histogram(
+            "video_commerce_ranking_wait_for_runner_slot_seconds",
+            "Time spent waiting for a ranking-runner dispatch slot",
+            buckets=(
+                0.0005,
+                0.001,
+                0.0025,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2,
+                5,
+            ),
+            registry=self.registry,
+        )
+        self.ranking_runner_payload_bytes = Histogram(
+            "video_commerce_ranking_runner_payload_bytes",
+            "Encoded ranking-runner request payload bytes by internal payload version",
+            ["payload_version"],
+            buckets=(
+                1024,
+                4096,
+                16384,
+                65536,
+                262144,
+                1048576,
+                4194304,
+                16777216,
+                33554432,
+            ),
+            registry=self.registry,
+        )
+        self.ranking_coordinator_client_errors_total = Counter(
+            "video_commerce_ranking_coordinator_client_errors_total",
+            "Ranking-service coordinator client errors by reason",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.upstream_requests_total = Counter(
+            "video_commerce_upstream_requests_total",
+            "Internal upstream HTTP requests by target and status",
+            ["target", "status"],
+            registry=self.registry,
+        )
+        self.upstream_inflight = Gauge(
+            "video_commerce_upstream_inflight",
+            "Internal upstream HTTP requests currently in flight",
+            ["target"],
+            registry=self.registry,
+        )
+        self.best_effort_tasks_total = Counter(
+            "video_commerce_best_effort_tasks_total",
+            "Best-effort background tasks by task name and outcome",
+            ["task", "status"],
+            registry=self.registry,
+        )
+        self.best_effort_queue_depth = Gauge(
+            "video_commerce_best_effort_queue_depth",
+            "Queued best-effort background tasks in this worker",
+            registry=self.registry,
+        )
         self.interactions_ingested_total = Counter(
             "video_commerce_interactions_ingested_total",
             "Interaction ingest events by action and status",
@@ -355,10 +572,14 @@ class ObservabilityManager:
         )
         self._process = psutil.Process()
 
-    def record_request(self, method: str, path: str, status_code: int, duration: float) -> None:
+    def record_request(
+        self, method: str, path: str, status_code: int, duration: float
+    ) -> None:
         status = str(status_code)
         self.http_requests_total.labels(method=method, path=path, status=status).inc()
-        self.http_request_duration_seconds.labels(method=method, path=path).observe(duration)
+        self.http_request_duration_seconds.labels(method=method, path=path).observe(
+            duration
+        )
 
     def record_exception(self, method: str, path: str, exception_type: str) -> None:
         self.http_request_exceptions_total.labels(
@@ -367,7 +588,9 @@ class ObservabilityManager:
             exception_type=exception_type,
         ).inc()
 
-    def record_database_query(self, operation: str, duration: float, status: str = "success") -> None:
+    def record_database_query(
+        self, operation: str, duration: float, status: str = "success"
+    ) -> None:
         self.database_queries_total.labels(operation=operation, status=status).inc()
         self.database_query_duration_seconds.labels(
             operation=operation,
@@ -393,7 +616,9 @@ class ObservabilityManager:
     def record_kafka_produce(self, topic: str, status: str) -> None:
         self.kafka_messages_produced_total.labels(topic=topic, status=status).inc()
 
-    def record_kafka_consume(self, topic: str, group_id: str, status: str, duration: float) -> None:
+    def record_kafka_consume(
+        self, topic: str, group_id: str, status: str, duration: float
+    ) -> None:
         self.kafka_messages_consumed_total.labels(
             topic=topic,
             group_id=group_id,
@@ -407,19 +632,25 @@ class ObservabilityManager:
     def record_kafka_retry(self, topic: str, group_id: str) -> None:
         self.kafka_message_retries_total.labels(topic=topic, group_id=group_id).inc()
 
-    def record_kafka_dead_letter(self, source_topic: str, dead_letter_topic: str) -> None:
+    def record_kafka_dead_letter(
+        self, source_topic: str, dead_letter_topic: str
+    ) -> None:
         self.kafka_dead_letter_messages_total.labels(
             source_topic=source_topic,
             dead_letter_topic=dead_letter_topic,
         ).inc()
 
-    def record_worker_message(self, service: str, topic: str, status: str, duration: float) -> None:
+    def record_worker_message(
+        self, service: str, topic: str, status: str, duration: float
+    ) -> None:
         self.worker_messages_processed_total.labels(
             service=service,
             topic=topic,
             status=status,
         ).inc()
-        self.worker_message_processing_seconds.labels(service=service, topic=topic).observe(duration)
+        self.worker_message_processing_seconds.labels(
+            service=service, topic=topic
+        ).observe(duration)
 
     def update_worker_heartbeat(self, service: str, instance_id: str) -> None:
         self.worker_heartbeat_timestamp_seconds.labels(
@@ -445,8 +676,148 @@ class ObservabilityManager:
             cache_hit=str(bool(cache_hit)).lower(),
             serving_path=serving_path,
         ).inc()
-        self.recommendation_candidates.labels(stage="retrieved").observe(candidate_count)
+        self.recommendation_candidates.labels(stage="retrieved").observe(
+            candidate_count
+        )
         self.recommendation_candidates.labels(stage="ranked").observe(ranked_count)
+
+    def set_ranking_queue_depth(self, depth: int) -> None:
+        self.ranking_batch_queue_depth.set(max(0, int(depth)))
+
+    def record_ranking_batch(
+        self,
+        *,
+        request_count: int,
+        candidate_count: int,
+        queue_wait_seconds: float,
+        path: str,
+        max_batch_requests: int | None = None,
+        target_batch_requests: int | None = None,
+    ) -> None:
+        self.ranking_batch_size.labels(path=path).observe(max(0, int(request_count)))
+        self.ranking_batch_candidates.labels(path=path).observe(
+            max(0, int(candidate_count))
+        )
+        self.ranking_batch_queue_wait_seconds.labels(path=path).observe(
+            max(0.0, float(queue_wait_seconds))
+        )
+        if max_batch_requests:
+            fill_ratio = max(0.0, min(1.0, float(request_count) / max_batch_requests))
+            self.ranking_batch_fill_ratio.labels(path=path).observe(fill_ratio)
+        if target_batch_requests:
+            target_fill_ratio = max(
+                0.0, min(2.0, float(request_count) / target_batch_requests)
+            )
+            self.ranking_batch_target_fill_ratio.labels(path=path).observe(
+                target_fill_ratio
+            )
+
+    def record_ranking_batch_stage(
+        self,
+        *,
+        path: str,
+        stage: str,
+        duration_seconds: float,
+    ) -> None:
+        self.ranking_batch_stage_seconds.labels(path=path, stage=stage).observe(
+            max(0.0, float(duration_seconds))
+        )
+
+    def inc_ranking_active_batches(self) -> None:
+        self.ranking_active_batches.inc()
+
+    def dec_ranking_active_batches(self) -> None:
+        self.ranking_active_batches.dec()
+
+    def record_ranking_cancelled(self, reason: str) -> None:
+        self.ranking_cancelled_total.labels(reason=reason).inc()
+
+    def record_ranking_direct(self, reason: str) -> None:
+        self.ranking_direct_total.labels(reason=reason).inc()
+
+    def set_ranking_runner_queue_depth(self, depth: int) -> None:
+        self.ranking_runner_queue_depth.set(max(0, int(depth)))
+
+    def record_ranking_runner_batch(self, status: str) -> None:
+        self.ranking_runner_batches_total.labels(status=status).inc()
+
+    def set_ranking_runner_endpoint_inflight(
+        self, endpoint: str, inflight_batches: int
+    ) -> None:
+        self.ranking_runner_endpoint_inflight.labels(endpoint=endpoint).set(
+            max(0, int(inflight_batches))
+        )
+
+    def set_ranking_runner_endpoint_available_connections(
+        self, endpoint: str, available_connections: int
+    ) -> None:
+        self.ranking_runner_endpoint_available_connections.labels(
+            endpoint=endpoint
+        ).set(max(0, int(available_connections)))
+
+    def record_ranking_runner_endpoint_event(self, endpoint: str, event: str) -> None:
+        self.ranking_runner_endpoint_events_total.labels(
+            endpoint=endpoint, event=event
+        ).inc()
+
+    def set_ranking_runner_endpoint_state(self, endpoint: str, state: str) -> None:
+        states = ("active", "draining", "failed", "overloaded")
+        for candidate in states:
+            self.ranking_runner_endpoint_state.labels(
+                endpoint=endpoint, state=candidate
+            ).set(1 if candidate == state else 0)
+
+    def set_ranking_runner_endpoint_missing_refreshes(
+        self, endpoint: str, missing_refreshes: int
+    ) -> None:
+        self.ranking_runner_endpoint_missing_refreshes.labels(endpoint=endpoint).set(
+            max(0, int(missing_refreshes))
+        )
+
+    def record_ranking_runner_endpoint_removed(
+        self, endpoint: str, reason: str
+    ) -> None:
+        self.ranking_runner_endpoint_removed_total.labels(
+            endpoint=endpoint, reason=reason
+        ).inc()
+
+    def record_ranking_runner_late_write(self, exception_type: str) -> None:
+        self.ranking_runner_late_writes_total.labels(
+            exception_type=exception_type
+        ).inc()
+
+    def record_ranking_wait_for_runner_slot(self, duration_seconds: float) -> None:
+        self.ranking_wait_for_runner_slot_seconds.observe(
+            max(0.0, float(duration_seconds))
+        )
+
+    def observe_ranking_runner_payload_bytes(
+        self,
+        *,
+        payload_version: str,
+        size_bytes: int,
+    ) -> None:
+        self.ranking_runner_payload_bytes.labels(
+            payload_version=str(payload_version)
+        ).observe(max(0, int(size_bytes)))
+
+    def record_ranking_coordinator_client_error(self, reason: str) -> None:
+        self.ranking_coordinator_client_errors_total.labels(reason=reason).inc()
+
+    def inc_upstream_inflight(self, target: str) -> None:
+        self.upstream_inflight.labels(target=target).inc()
+
+    def dec_upstream_inflight(self, target: str) -> None:
+        self.upstream_inflight.labels(target=target).dec()
+
+    def record_upstream_request(self, target: str, status: str | int) -> None:
+        self.upstream_requests_total.labels(target=target, status=str(status)).inc()
+
+    def record_best_effort_task(self, task: str, status: str) -> None:
+        self.best_effort_tasks_total.labels(task=task, status=status).inc()
+
+    def set_best_effort_queue_depth(self, depth: int) -> None:
+        self.best_effort_queue_depth.set(max(0, int(depth)))
 
     def record_interaction_ingest(self, action: str, status: str) -> None:
         self.interactions_ingested_total.labels(action=action, status=status).inc()
@@ -468,7 +839,10 @@ class ObservabilityManager:
         if feature_store and getattr(feature_store, "redis_client", None):
             await self._collect_redis_metrics("state", feature_store.redis_client)
             cache_client = getattr(feature_store, "cache_redis_client", None)
-            if cache_client is not None and cache_client is not feature_store.redis_client:
+            if (
+                cache_client is not None
+                and cache_client is not feature_store.redis_client
+            ):
                 await self._collect_redis_metrics("cache", cache_client)
 
         if kafka_manager:
@@ -500,8 +874,12 @@ class ObservabilityManager:
             self.redis_connected_clients.labels(role=role).set(
                 redis_info.get("connected_clients", 0)
             )
-            self.redis_used_memory_bytes.labels(role=role).set(redis_info.get("used_memory", 0))
-            self.redis_maxmemory_bytes.labels(role=role).set(redis_info.get("maxmemory", 0))
+            self.redis_used_memory_bytes.labels(role=role).set(
+                redis_info.get("used_memory", 0)
+            )
+            self.redis_maxmemory_bytes.labels(role=role).set(
+                redis_info.get("maxmemory", 0)
+            )
             self.redis_memory_fragmentation_ratio.labels(role=role).set(
                 redis_info.get("mem_fragmentation_ratio", 0)
             )
