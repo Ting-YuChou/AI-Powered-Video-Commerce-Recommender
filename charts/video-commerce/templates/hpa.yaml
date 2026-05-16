@@ -1,0 +1,50 @@
+{{- if and .Values.caddy.enabled .Values.caddy.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" "caddy") }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: caddy
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "video-commerce.componentName" (dict "root" . "name" "caddy") }}
+  minReplicas: {{ .Values.caddy.hpa.minReplicas }}
+  maxReplicas: {{ .Values.caddy.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.caddy.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- range $key, $workload := .Values.backend.workloads }}
+{{- if and $workload.enabled $workload.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" $ "name" $workload.name) }}
+  labels:
+    {{- include "video-commerce.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $workload.name }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "video-commerce.componentName" (dict "root" $ "name" $workload.name) }}
+  minReplicas: {{ $workload.hpa.minReplicas }}
+  maxReplicas: {{ $workload.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $workload.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}

@@ -6,11 +6,16 @@
 ARG PYTHON_VERSION=3.10
 ARG BUILD_ENV=production
 ARG DEBIAN_FRONTEND=noninteractive
+ARG APP_UID=10001
+ARG APP_GID=10001
 
 # =============================================================================
 # Stage 1: Base Dependencies
 # =============================================================================
 FROM python:${PYTHON_VERSION}-slim as base
+
+ARG APP_UID=10001
+ARG APP_GID=10001
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -39,8 +44,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /tmp/*
 
-# Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /bin/bash appuser
+# Create non-root user with stable IDs for Kubernetes securityContext/fsGroup.
+RUN groupadd --system --gid "${APP_GID}" appuser \
+    && useradd --system --uid "${APP_UID}" --gid appuser --home-dir /app --shell /bin/bash appuser
 
 # Set working directory
 WORKDIR /app
@@ -179,6 +185,9 @@ CMD ["pytest", "-q", "tests"]
 # =============================================================================
 FROM nvidia/cuda:11.8-runtime-ubuntu20.04 as gpu-runtime
 
+ARG APP_UID=10001
+ARG APP_GID=10001
+
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
     python3.10 \
@@ -214,8 +223,9 @@ RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://
 # Install FAISS GPU
 RUN pip install --no-cache-dir faiss-gpu
 
-# Create non-root user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# Create non-root user with stable IDs for Kubernetes securityContext/fsGroup.
+RUN groupadd --system --gid "${APP_GID}" appuser \
+    && useradd --system --uid "${APP_UID}" --gid appuser --home-dir /app --shell /bin/bash appuser
 RUN chown -R appuser:appuser /app
 USER appuser
 

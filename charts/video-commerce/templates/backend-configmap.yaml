@@ -1,0 +1,145 @@
+{{- include "video-commerce.requireS3ObjectStorage" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "video-commerce.fullname" . }}-backend-config
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+data:
+  ENVIRONMENT: {{ .Values.appConfig.environment | quote }}
+  API_CORS_ORIGINS: {{ .Values.appConfig.apiCorsOrigins | quote }}
+  API_CORS_CREDENTIALS: {{ .Values.appConfig.apiCorsCredentials | quote }}
+  API_RATE_LIMIT_REQUESTS: {{ .Values.appConfig.apiRateLimitRequests | quote }}
+  REDIS_HOST: {{ .Values.external.redis.host | quote }}
+  REDIS_PORT: {{ .Values.external.redis.port | quote }}
+  REDIS_DB: {{ .Values.external.redis.db | quote }}
+  REDIS_MAX_CONNECTIONS: {{ .Values.external.redis.maxConnections | quote }}
+  REDIS_CACHE_HOST: {{ default .Values.external.redis.host .Values.external.redisCache.host | quote }}
+  REDIS_CACHE_PORT: {{ .Values.external.redisCache.port | quote }}
+  REDIS_CACHE_DB: {{ .Values.external.redisCache.db | quote }}
+  REDIS_CACHE_MAX_CONNECTIONS: {{ .Values.external.redisCache.maxConnections | quote }}
+  REDIS_CACHE_SOCKET_TIMEOUT: {{ .Values.external.redisCache.socketTimeout | quote }}
+  REDIS_CACHE_SOCKET_CONNECT_TIMEOUT: {{ .Values.external.redisCache.socketConnectTimeout | quote }}
+  KAFKA_BOOTSTRAP_SERVERS: {{ .Values.external.kafka.bootstrapServers | quote }}
+  KAFKA_ENABLE: "true"
+  KAFKA_CONSUMER_ENABLE_AUTO_COMMIT: {{ .Values.external.kafka.consumerEnableAutoCommit | quote }}
+  KAFKA_CONSUMER_HANDLER_RETRIES: {{ .Values.external.kafka.consumerHandlerRetries | quote }}
+  KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS: {{ .Values.external.kafka.consumerHandlerRetryBackoffMs | quote }}
+  KAFKA_DEAD_LETTER_ENABLE: {{ .Values.external.kafka.deadLetterEnable | quote }}
+  KAFKA_DEAD_LETTER_TOPIC: {{ .Values.external.kafka.deadLetterTopic | quote }}
+  FEATURE_PIPELINE_MODE: {{ .Values.appConfig.featurePipelineMode | quote }}
+  FLINK_FEATURE_OUTPUT_NAMESPACE: {{ .Values.appConfig.flinkFeatureOutputNamespace | quote }}
+  DATABASE_ENABLE: {{ .Values.external.database.enable | quote }}
+  DATABASE_POOL_SIZE: {{ .Values.external.database.poolSize | quote }}
+  DATABASE_MAX_OVERFLOW: {{ .Values.external.database.maxOverflow | quote }}
+  DATABASE_AUTO_CREATE_SCHEMA: {{ .Values.external.database.autoCreateSchema | quote }}
+  MODEL_CACHE_DIR: {{ .Values.appConfig.modelCacheDir | quote }}
+  VECTOR_INDEX_PATH: {{ .Values.appConfig.vectorIndexPath | quote }}
+  RECOMMENDATION_CF_INDEX_PATH: {{ .Values.appConfig.recommendationCfIndexPath | quote }}
+  DATA_UPLOAD_DIR: {{ .Values.appConfig.dataUploadDir | quote }}
+  DATA_LOAD_SAMPLE_DATA: "false"
+  DATA_MAX_FILE_SIZE: {{ .Values.appConfig.dataMaxFileSize | quote }}
+  MODEL_LAZY_LOAD: {{ .Values.appConfig.modelLazyLoad | quote }}
+  MODEL_TORCH_NUM_THREADS: {{ .Values.appConfig.modelTorchNumThreads | quote }}
+  MODEL_TORCH_NUM_INTEROP_THREADS: {{ .Values.appConfig.modelTorchNumInteropThreads | quote }}
+  OBJECT_STORAGE_BACKEND: {{ .Values.external.objectStorage.backend | quote }}
+  OBJECT_STORAGE_ENDPOINT_URL: {{ .Values.external.objectStorage.endpointUrl | quote }}
+  OBJECT_STORAGE_REGION: {{ .Values.external.objectStorage.region | quote }}
+  OBJECT_STORAGE_BUCKET: {{ .Values.external.objectStorage.bucket | quote }}
+  OBJECT_STORAGE_PREFIX: {{ .Values.external.objectStorage.prefix | quote }}
+  OBJECT_STORAGE_FORCE_PATH_STYLE: {{ .Values.external.objectStorage.forcePathStyle | quote }}
+  OBJECT_STORAGE_CREATE_BUCKET_ON_STARTUP: {{ .Values.external.objectStorage.createBucketOnStartup | quote }}
+  OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS: {{ .Values.external.objectStorage.connectTimeoutSeconds | quote }}
+  OBJECT_STORAGE_READ_TIMEOUT_SECONDS: {{ .Values.external.objectStorage.readTimeoutSeconds | quote }}
+  OBJECT_STORAGE_MAX_ATTEMPTS: {{ .Values.external.objectStorage.maxAttempts | quote }}
+  OBJECT_STORAGE_CHECKSUM_ALGORITHM: {{ .Values.external.objectStorage.checksumAlgorithm | quote }}
+  OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION: {{ .Values.external.objectStorage.serverSideEncryption | quote }}
+  OBJECT_STORAGE_DOWNLOAD_DIR: {{ .Values.appConfig.objectStorageDownloadDir | quote }}
+  RANKING_BATCH_MAX_REQUESTS: {{ .Values.appConfig.ranking.batchMaxRequests | quote }}
+  RANKING_BATCH_TARGET_REQUESTS: {{ .Values.appConfig.ranking.batchTargetRequests | quote }}
+  RANKING_BATCH_WAIT_MS: {{ .Values.appConfig.ranking.batchWaitMs | quote }}
+  RANKING_BATCH_QUEUE_SIZE: {{ .Values.appConfig.ranking.batchQueueSize | quote }}
+  RANKING_BATCH_RUNNER_COUNT: {{ .Values.appConfig.ranking.batchRunnerCount | quote }}
+  RANKING_COORDINATOR_DISPATCH_CONCURRENCY: {{ .Values.appConfig.ranking.coordinatorDispatchConcurrency | quote }}
+  RANKING_RUNNER_QUEUE_SIZE: {{ .Values.appConfig.ranking.runnerQueueSize | quote }}
+  RANKING_RUNNER_BATCH_CONCURRENCY: {{ .Values.appConfig.ranking.runnerBatchConcurrency | quote }}
+  RANKING_INFERENCE_EXECUTOR_WORKERS: {{ .Values.appConfig.ranking.inferenceExecutorWorkers | quote }}
+  RANKING_INFERENCE_PROCESS_WORKERS: {{ .Values.appConfig.ranking.inferenceProcessWorkers | quote }}
+  RANKING_MAX_QUEUE_WAIT_MS: {{ .Values.appConfig.ranking.maxQueueWaitMs | quote }}
+  RANKING_PRODUCT_FEATURE_CACHE_SIZE: {{ .Values.appConfig.ranking.productFeatureCacheSize | quote }}
+  RANKING_REALTIME_WINDOW_FEATURES_ENABLED: {{ .Values.appConfig.ranking.realtimeWindowFeaturesEnabled | quote }}
+  RANKING_RUNNER_PAYLOAD_V2_ENABLED: {{ .Values.appConfig.ranking.runnerPayloadV2Enabled | quote }}
+  RANKING_RUNNER_PAYLOAD_MAX_BYTES: {{ .Values.appConfig.ranking.runnerPayloadMaxBytes | quote }}
+  CACHE_CANDIDATE_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.candidateCacheRaceTimeoutMs | quote }}
+  CACHE_RECOMMENDATION_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.recommendationCacheRaceTimeoutMs | quote }}
+  CACHE_BACKGROUND_TASK_QUEUE_SIZE: {{ .Values.appConfig.cache.backgroundTaskQueueSize | quote }}
+  CACHE_BACKGROUND_TASK_WORKER_COUNT: {{ .Values.appConfig.cache.backgroundTaskWorkerCount | quote }}
+  RECOMMENDATION_USER_EMBEDDING_CACHE_SIZE: {{ .Values.appConfig.recommendation.userEmbeddingCacheSize | quote }}
+  RECOMMENDATION_USER_EMBEDDING_CACHE_TIME_BUCKET_SECONDS: {{ .Values.appConfig.recommendation.userEmbeddingCacheTimeBucketSeconds | quote }}
+  RECOMMENDATION_KNOWN_USER_SNAPSHOT_ENABLED: {{ .Values.appConfig.recommendation.knownUserSnapshotEnabled | quote }}
+  RECOMMENDATION_KNOWN_USER_SNAPSHOT_REFRESH_INTERVAL_SECONDS: {{ .Values.appConfig.recommendation.knownUserSnapshotRefreshIntervalSeconds | quote }}
+  RECOMMENDATION_KNOWN_USER_SNAPSHOT_MAX_USERS: {{ .Values.appConfig.recommendation.knownUserSnapshotMaxUsers | quote }}
+  RECOMMENDATION_CONTENT_FEATURES_SNAPSHOT_ENABLED: {{ .Values.appConfig.recommendation.contentFeaturesSnapshotEnabled | quote }}
+  RECOMMENDATION_CONTENT_FEATURES_SNAPSHOT_REFRESH_INTERVAL_SECONDS: {{ .Values.appConfig.recommendation.contentFeaturesSnapshotRefreshIntervalSeconds | quote }}
+  RECOMMENDATION_CONTENT_FEATURES_SNAPSHOT_MAX_ITEMS: {{ .Values.appConfig.recommendation.contentFeaturesSnapshotMaxItems | quote }}
+  RECOMMENDATION_RETRIEVAL_EXECUTOR_WORKERS: {{ .Values.appConfig.recommendation.retrievalExecutorWorkers | quote }}
+  RECOMMENDATION_SERVING_RECENT_INTERACTION_LIMIT: {{ .Values.appConfig.recommendation.servingRecentInteractionLimit | quote }}
+  MONITORING_LOG_LEVEL: {{ .Values.appConfig.monitoring.logLevel | quote }}
+  MONITORING_ENABLE_METRICS: {{ .Values.appConfig.monitoring.enableMetrics | quote }}
+  MONITORING_ENABLE_PROMETHEUS_METRICS: {{ .Values.appConfig.monitoring.enablePrometheusMetrics | quote }}
+  MONITORING_ENABLE_REQUEST_LOGGING: {{ .Values.appConfig.monitoring.enableRequestLogging | quote }}
+  MONITORING_REQUEST_LOG_SAMPLE_RATE: {{ .Values.appConfig.monitoring.requestLogSampleRate | quote }}
+  MONITORING_ERROR_REQUEST_LOG_SAMPLE_RATE: {{ .Values.appConfig.monitoring.errorRequestLogSampleRate | quote }}
+  MONITORING_ENABLE_PROFILING_LOGS: {{ .Values.appConfig.monitoring.enableProfilingLogs | quote }}
+  MONITORING_PROFILING_LOG_MIN_DURATION_MS: {{ .Values.appConfig.monitoring.profilingLogMinDurationMs | quote }}
+  MONITORING_WORKER_HEARTBEAT_INTERVAL_SECONDS: {{ .Values.appConfig.monitoring.workerHeartbeatIntervalSeconds | quote }}
+  MONITORING_WORKER_HEARTBEAT_TTL_SECONDS: {{ .Values.appConfig.monitoring.workerHeartbeatTtlSeconds | quote }}
+  MONITORING_ENABLE_TRACING: {{ .Values.appConfig.monitoring.enableTracing | quote }}
+  MONITORING_TRACING_SAMPLE_RATE: {{ .Values.appConfig.monitoring.tracingSampleRate | quote }}
+  MONITORING_WORKER_METRICS_HOST: {{ .Values.appConfig.monitoring.workerMetricsHost | quote }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.appConfig.monitoring.otlpEndpoint | quote }}
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: {{ .Values.appConfig.monitoring.tracingSampleRate | quote }}
+  SERVICE_RECOMMENDATION_SERVICE_URL: {{ printf "http://%s:8001" (include "video-commerce.componentName" (dict "root" . "name" "recommendation-service")) | quote }}
+  SERVICE_RECOMMENDATION_SERVICE_URLS: {{ printf "http://%s:8001" (include "video-commerce.componentName" (dict "root" . "name" "recommendation-service")) | quote }}
+  SERVICE_RANKING_SERVICE_URL: {{ printf "http://%s:8003" (include "video-commerce.componentName" (dict "root" . "name" "ranking-service")) | quote }}
+  SERVICE_RANKING_SERVICE_URLS: {{ printf "http://%s:8003" (include "video-commerce.componentName" (dict "root" . "name" "ranking-service")) | quote }}
+  SERVICE_RANKING_COORDINATOR_HOST: {{ include "video-commerce.componentName" (dict "root" . "name" "ranking-coordinator") | quote }}
+  SERVICE_RANKING_COORDINATOR_BIND_HOST: "0.0.0.0"
+  SERVICE_RANKING_COORDINATOR_PORT: "8013"
+  SERVICE_RANKING_COORDINATOR_BACKLOG: "4096"
+  SERVICE_RANKING_COORDINATOR_CLIENT_POOL_SIZE: {{ .Values.appConfig.service.rankingCoordinatorClientPoolSize | quote }}
+  SERVICE_RANKING_COORDINATOR_DIRECT_ENABLED: {{ .Values.appConfig.service.rankingCoordinatorDirectEnabled | quote }}
+  SERVICE_RANKING_COORDINATOR_CONNECT_TIMEOUT_SECONDS: {{ .Values.appConfig.service.rankingCoordinatorConnectTimeoutSeconds | quote }}
+  SERVICE_RANKING_COORDINATOR_REQUEST_TIMEOUT_SECONDS: {{ .Values.appConfig.service.rankingCoordinatorRequestTimeoutSeconds | quote }}
+  SERVICE_RANKING_RUNNER_URLS: {{ printf "%s:8014" (include "video-commerce.componentName" (dict "root" . "name" "ranking-runner")) | quote }}
+  SERVICE_RANKING_RUNNER_BIND_HOST: "0.0.0.0"
+  SERVICE_RANKING_RUNNER_PORT: "8014"
+  SERVICE_RANKING_RUNNER_BACKLOG: "4096"
+  SERVICE_RANKING_RUNNER_STREAM_LIMIT: "33554432"
+  SERVICE_RANKING_RUNNER_CONNECT_TIMEOUT_SECONDS: {{ .Values.appConfig.service.rankingRunnerConnectTimeoutSeconds | quote }}
+  SERVICE_RANKING_RUNNER_REQUEST_TIMEOUT_SECONDS: {{ .Values.appConfig.service.rankingRunnerRequestTimeoutSeconds | quote }}
+  SERVICE_RANKING_RUNNER_UNHEALTHY_COOLDOWN_SECONDS: {{ .Values.appConfig.service.rankingRunnerUnhealthyCooldownSeconds | quote }}
+  SERVICE_RANKING_RUNNER_DNS_REFRESH_SECONDS: {{ .Values.appConfig.service.rankingRunnerDnsRefreshSeconds | quote }}
+  SERVICE_RANKING_RUNNER_ENDPOINT_MISSING_REFRESHES: {{ .Values.appConfig.service.rankingRunnerEndpointMissingRefreshes | quote }}
+  SERVICE_RANKING_RUNNER_ENDPOINT_MISSING_GRACE_SECONDS: {{ .Values.appConfig.service.rankingRunnerEndpointMissingGraceSeconds | quote }}
+  SERVICE_INTERACTION_INGEST_SERVICE_URL: {{ printf "http://%s:8002" (include "video-commerce.componentName" (dict "root" . "name" "interaction-ingest-service")) | quote }}
+  SERVICE_MAX_INFLIGHT_RECOMMENDATIONS: {{ .Values.appConfig.service.maxInflightRecommendations | quote }}
+  SERVICE_RANKING_SERVICE_FALLBACK_ENABLED: {{ .Values.appConfig.service.rankingServiceFallbackEnabled | quote }}
+  SERVICE_RANKING_SINGLE_COORDINATOR_ENABLED: {{ .Values.appConfig.service.rankingSingleCoordinatorEnabled | quote }}
+  SERVICE_PROXY_POOL_TIMEOUT_SECONDS: {{ .Values.appConfig.service.proxyPoolTimeoutSeconds | quote }}
+  SERVICE_PROXY_MAX_CONNECTIONS: {{ .Values.appConfig.service.proxyMaxConnections | quote }}
+  SERVICE_PROXY_MAX_KEEPALIVE_CONNECTIONS: {{ .Values.appConfig.service.proxyMaxKeepaliveConnections | quote }}
+  SERVICE_PROXY_KEEPALIVE_EXPIRY_SECONDS: {{ .Values.appConfig.service.proxyKeepaliveExpirySeconds | quote }}
+  SECURITY_AUTH_MODE: {{ .Values.appConfig.security.authMode | quote }}
+  SECURITY_INTERNAL_SERVICE_HEADER: {{ .Values.appConfig.security.internalServiceHeader | quote }}
+  SECURITY_OIDC_ENABLED: {{ .Values.appConfig.security.oidcEnabled | quote }}
+  SECURITY_OIDC_REQUIRED: {{ .Values.appConfig.security.oidcRequired | quote }}
+  SECURITY_OIDC_ISSUER: {{ .Values.appConfig.security.oidcIssuer | quote }}
+  SECURITY_OIDC_AUDIENCE: {{ .Values.appConfig.security.oidcAudience | quote }}
+  SECURITY_OIDC_JWKS_URL: {{ .Values.appConfig.security.oidcJwksUrl | quote }}
+  SECURITY_JWT_ALGORITHMS: {{ .Values.appConfig.security.jwtAlgorithms | quote }}
+  {{- range $key, $value := .Values.appConfig.extraEnv }}
+  {{ $key }}: {{ $value | toString | quote }}
+  {{- end }}

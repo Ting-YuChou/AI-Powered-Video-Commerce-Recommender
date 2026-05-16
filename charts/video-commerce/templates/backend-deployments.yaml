@@ -1,0 +1,149 @@
+{{- range $key, $workload := .Values.backend.workloads }}
+{{- if $workload.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" $ "name" $workload.name) }}
+  labels:
+    {{- include "video-commerce.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $workload.name }}
+spec:
+  replicas: {{ $workload.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" $ "component" $workload.name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "video-commerce.selectorLabels" (dict "root" $ "component" $workload.name) | nindent 8 }}
+      annotations:
+        checksum/backend-config: {{ include (print $.Template.BasePath "/backend-configmap.yaml") $ | sha256sum }}
+        {{- if and $.Values.secrets.create (not $.Values.secrets.existingSecret) }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") $ | sha256sum }}
+        {{- end }}
+        {{- with $.Values.backend.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $workload.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "video-commerce.serviceAccountName" $ }}
+      automountServiceAccountToken: {{ $.Values.serviceAccount.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ $.Values.backend.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml $.Values.securityContext.pod | nindent 8 }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.backend.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.backend.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.backend.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $workload.name }}
+          image: {{ include "video-commerce.backendImage" $ | quote }}
+          imagePullPolicy: {{ $.Values.images.backend.pullPolicy }}
+          {{- with $workload.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $workload.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: {{ default "http" $workload.service.portName }}
+              containerPort: {{ $workload.service.targetPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "video-commerce.fullname" $ }}-backend-config
+          env:
+            {{- include "video-commerce.secretEnv" $ | nindent 12 }}
+            {{- include "video-commerce.mapEnv" $workload.env | nindent 12 }}
+          resources:
+            {{- toYaml $workload.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $.Values.securityContext.container | nindent 12 }}
+          volumeMounts:
+            - name: model-cache
+              mountPath: /app/models
+            - name: upload-data
+              mountPath: /app/uploads
+            - name: object-storage-downloads
+              mountPath: /tmp/object-storage
+            - name: logs
+              mountPath: /app/logs
+            - name: tmp
+              mountPath: /tmp
+          {{- if eq $workload.probes.type "http" }}
+          livenessProbe:
+            httpGet:
+              path: {{ $workload.probes.livenessPath }}
+              port: {{ default "http" $workload.service.portName }}
+            initialDelaySeconds: {{ $workload.probes.initialDelaySeconds }}
+            periodSeconds: {{ $workload.probes.periodSeconds }}
+            timeoutSeconds: {{ $workload.probes.timeoutSeconds }}
+            failureThreshold: {{ $workload.probes.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ $workload.probes.readinessPath }}
+              port: {{ default "http" $workload.service.portName }}
+            initialDelaySeconds: {{ $workload.probes.initialDelaySeconds }}
+            periodSeconds: {{ $workload.probes.periodSeconds }}
+            timeoutSeconds: {{ $workload.probes.timeoutSeconds }}
+            failureThreshold: {{ $workload.probes.failureThreshold }}
+          {{- else if eq $workload.probes.type "tcp" }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ default "tcp" $workload.service.portName }}
+            initialDelaySeconds: {{ $workload.probes.initialDelaySeconds }}
+            periodSeconds: {{ $workload.probes.periodSeconds }}
+            timeoutSeconds: {{ $workload.probes.timeoutSeconds }}
+            failureThreshold: {{ $workload.probes.failureThreshold }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ default "tcp" $workload.service.portName }}
+            initialDelaySeconds: {{ $workload.probes.initialDelaySeconds }}
+            periodSeconds: {{ $workload.probes.periodSeconds }}
+            timeoutSeconds: {{ $workload.probes.timeoutSeconds }}
+            failureThreshold: {{ $workload.probes.failureThreshold }}
+          {{- else if eq $workload.probes.type "metrics" }}
+          livenessProbe:
+            httpGet:
+              path: {{ $workload.probes.livenessPath }}
+              port: {{ default "metrics" $workload.service.portName }}
+            initialDelaySeconds: {{ $workload.probes.initialDelaySeconds }}
+            periodSeconds: {{ $workload.probes.periodSeconds }}
+            timeoutSeconds: {{ $workload.probes.timeoutSeconds }}
+            failureThreshold: {{ $workload.probes.failureThreshold }}
+          {{- end }}
+      volumes:
+        - name: model-cache
+          emptyDir:
+            {{- toYaml $.Values.backend.emptyDirs.models | nindent 12 }}
+        - name: upload-data
+          emptyDir:
+            {{- toYaml $.Values.backend.emptyDirs.uploads | nindent 12 }}
+        - name: object-storage-downloads
+          emptyDir:
+            {{- toYaml $.Values.backend.emptyDirs.objectStorage | nindent 12 }}
+        - name: logs
+          emptyDir:
+            {{- toYaml $.Values.backend.emptyDirs.logs | nindent 12 }}
+        - name: tmp
+          emptyDir:
+            {{- toYaml $.Values.backend.emptyDirs.tmp | nindent 12 }}
+{{- end }}
+{{- end }}

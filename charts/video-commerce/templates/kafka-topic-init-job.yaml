@@ -1,0 +1,39 @@
+{{- if .Values.kafkaTopicInitJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "video-commerce.fullname" . }}-kafka-topic-init
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-topic-init
+spec:
+  backoffLimit: {{ .Values.kafkaTopicInitJob.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.kafkaTopicInitJob.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "video-commerce.selectorLabels" (dict "root" . "component" "kafka-topic-init") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: kafka-topic-init
+          image: "{{ .Values.kafkaTopicInitJob.image.repository }}:{{ .Values.kafkaTopicInitJob.image.tag }}"
+          imagePullPolicy: {{ .Values.kafkaTopicInitJob.image.pullPolicy }}
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: {{ .Values.external.kafka.bootstrapServers | quote }}
+            {{- with .Values.kafkaTopicInitJob.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          command:
+            - sh
+            - -ec
+            - |
+              {{- range $topic, $config := .Values.kafkaTopicInitJob.topics }}
+              kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --create --if-not-exists --topic {{ $topic }} --partitions {{ $config.partitions }} --replication-factor {{ $config.replicationFactor }}
+              {{- end }}
+{{- end }}
