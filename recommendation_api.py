@@ -272,6 +272,12 @@ def _is_mmr_slate_diversity_enabled(recommendation_config: Optional[Any]) -> boo
     )
 
 
+def _is_realtime_window_features_enabled(runtime: Any) -> bool:
+    config = getattr(runtime, "config", None)
+    ranking_config = getattr(config, "ranking_config", None)
+    return bool(getattr(ranking_config, "realtime_window_features_enabled", False))
+
+
 def _should_initialize_local_ranker(runtime) -> bool:
     topology = runtime.config.service_topology_config
     has_remote_ranker = bool(ranking_coordinator_client_pool or ranking_client_pool)
@@ -1330,7 +1336,7 @@ async def get_recommendations(
             raise HTTPException(status_code=499, detail="Client disconnected")
 
         ranking_context = payload.context
-        if runtime.config.ranking_config.realtime_window_features_enabled:
+        if _is_realtime_window_features_enabled(runtime):
             stage_started = time.perf_counter()
             ranking_context = await _attach_realtime_window_features(
                 payload.context,
