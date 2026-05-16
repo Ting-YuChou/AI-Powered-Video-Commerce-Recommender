@@ -278,6 +278,21 @@ class ContentFeatures(BaseModel):
     processing_time: Optional[float] = Field(None, description="Processing time in seconds")
     created_at: float = Field(default_factory=time.time, description="Feature extraction timestamp")
 
+class RealtimeWindowFeatures(BaseModel):
+    """Realtime aggregate features produced by the Flink interaction pipeline."""
+    entity_type: str = Field(..., description="Feature entity type: user, product, or category")
+    entity_id: str = Field(..., description="Feature entity identifier")
+    window: str = Field(..., description="Window label, such as 5m, 1h, or 24h")
+    views: int = Field(0, ge=0, description="View events in the window")
+    clicks: int = Field(0, ge=0, description="Click events in the window")
+    add_to_cart: int = Field(0, ge=0, description="Add-to-cart events in the window")
+    purchases: int = Field(0, ge=0, description="Purchase events in the window")
+    total_events: int = Field(0, ge=0, description="All interaction events in the window")
+    click_through_rate: float = Field(0.0, ge=0, description="Window CTR")
+    conversion_rate: float = Field(0.0, ge=0, description="Window CVR")
+    window_start: float = Field(0.0, description="Window start timestamp")
+    window_end: float = Field(0.0, description="Window end timestamp")
+
 class ProductData(BaseModel):
     """Product catalog data model."""
     product_id: str = Field(..., description="Product identifier")
@@ -361,7 +376,7 @@ __all__ = [
     "ProductRecommendation", "RecommendationResponse", "ContentUploadResponse", 
     "AnalyticsResponse", "HealthResponse", "ComponentHealth",
     # Internal models
-    "UserFeatures", "ContentFeatures", "ProductData", "CandidateProduct", 
+    "UserFeatures", "ContentFeatures", "RealtimeWindowFeatures", "ProductData", "CandidateProduct", 
     "RankingFeatures", "SystemMetrics", "TwoTowerTrainingSample",
     # Configuration models
     "RedisConfig", "ModelConfig"

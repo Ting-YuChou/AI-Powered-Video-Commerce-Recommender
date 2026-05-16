@@ -37,6 +37,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def should_run_python_feature_worker(config: Config) -> bool:
+    """Return false when Flink has fully taken over interaction feature writes."""
+    pipeline_config = getattr(config, "feature_pipeline_config", None)
+    mode = getattr(pipeline_config, "mode", "python")
+    return str(mode or "python").lower() != "flink"
+
+
 class FeatureUpdaterWorker:
     """
     Kafka worker for updating user and content features.
@@ -469,6 +476,11 @@ async def main():
     
     # Load configuration
     config = Config()
+    if not should_run_python_feature_worker(config):
+        logger.info(
+            "Skipping Python feature updater because FEATURE_PIPELINE_MODE=flink"
+        )
+        return
     
     # Create and initialize worker
     worker = FeatureUpdaterWorker(config)

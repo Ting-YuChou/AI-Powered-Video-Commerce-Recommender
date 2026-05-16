@@ -41,7 +41,7 @@ from dcn import (
 
 logger = logging.getLogger(__name__)
 
-RANKING_FEATURE_SCHEMA_VERSION = "ranking_v1_29"
+RANKING_FEATURE_SCHEMA_VERSION = "ranking_v1_30"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
 
 
@@ -243,22 +243,42 @@ class FeatureExtractor:
     Feature extractor that converts raw data into model-ready features.
     """
 
-    def __init__(self):
+    WINDOW_FEATURE_NAMES = ("5m", "1h", "24h")
+    WINDOW_FEATURE_METRICS = (
+        "views",
+        "clicks",
+        "add_to_cart",
+        "purchases",
+        "click_through_rate",
+        "conversion_rate",
+    )
+    WINDOW_FEATURE_ENTITIES = ("user", "product", "category")
+
+    def __init__(self, enable_realtime_window_features: bool = False):
         self.user_scaler = StandardScaler()
         self.context_scaler = StandardScaler()
         self.is_fitted = False
+        self.enable_realtime_window_features = enable_realtime_window_features
 
         # Feature dimensions
         self.user_feature_dim = 10
         self.product_feature_dim = 8
         self.context_feature_dim = 6
         self.candidate_feature_dim = 4
+        self.realtime_window_feature_dim = (
+            len(self.WINDOW_FEATURE_ENTITIES)
+            * len(self.WINDOW_FEATURE_NAMES)
+            * len(self.WINDOW_FEATURE_METRICS)
+            if self.enable_realtime_window_features
+            else 0
+        )
 
         self.total_feature_dim = (
             self.user_feature_dim
             + self.product_feature_dim
             + self.context_feature_dim
             + self.candidate_feature_dim
+            + self.realtime_window_feature_dim
         )
 
     def extract_user_features(
@@ -373,6 +393,49 @@ class FeatureExtractor:
 
         return features
 
+    def extract_realtime_window_features(
+        self,
+        user_features: UserFeatures,
+        product_metadata: Dict[str, Any],
+        context: Dict[str, Any],
+        candidate: Any,
+    ) -> np.ndarray:
+        """Extract optional Flink realtime window features from request context."""
+        if not self.enable_realtime_window_features:
+            return np.zeros(0, dtype=np.float32)
+
+        realtime_context = context.get("_realtime_window_features") or {}
+        product_id = str(_candidate_get(candidate, "product_id", ""))
+        category = (
+            product_metadata.get("category")
+            or context.get("product_category")
+            or context.get("category")
+            or ""
+        )
+        entity_ids = {
+            "user": user_features.user_id,
+            "product": product_id,
+            "category": str(category),
+        }
+
+        values: List[float] = []
+        for entity_type in self.WINDOW_FEATURE_ENTITIES:
+            entity_id = entity_ids.get(entity_type) or ""
+            window_payloads = realtime_context.get(f"{entity_type}:{entity_id}", {})
+            for window in self.WINDOW_FEATURE_NAMES:
+                payload = window_payloads.get(window, {}) if entity_id else {}
+                values.extend(
+                    [
+                        float(payload.get("views", 0)) / 1000.0,
+                        float(payload.get("clicks", 0)) / 1000.0,
+                        float(payload.get("add_to_cart", 0)) / 1000.0,
+                        float(payload.get("purchases", 0)) / 1000.0,
+                        float(payload.get("click_through_rate", 0.0)),
+                        float(payload.get("conversion_rate", 0.0)),
+                    ]
+                )
+        return np.nan_to_num(np.asarray(values, dtype=np.float32), 0.0)
+
     def create_ranking_features(
         self,
         user_features: UserFeatures,
@@ -390,10 +453,22 @@ class FeatureExtractor:
             )
             context_feats = self.extract_context_features(context, current_time)
             candidate_feats = self.extract_candidate_features(candidate)
+            realtime_window_feats = self.extract_realtime_window_features(
+                user_features,
+                product_metadata,
+                context,
+                candidate,
+            )
 
             # Concatenate all features
             combined_features = np.concatenate(
-                [user_feats, product_feats, context_feats, candidate_feats]
+                [
+                    user_feats,
+                    product_feats,
+                    context_feats,
+                    candidate_feats,
+                    realtime_window_feats,
+                ]
             )
 
             # Handle any NaN or infinite values
@@ -414,7 +489,9 @@ class RankingModel:
 
     def __init__(self, config: RankingConfig):
         self.config = config
-        self.feature_extractor = FeatureExtractor()
+        self.feature_extractor = FeatureExtractor(
+            enable_realtime_window_features=config.realtime_window_features_enabled
+        )
 
         # Model components
         self.model: Optional[MultiObjectiveRankingModel] = None
@@ -678,10 +755,12 @@ class RankingModel:
         product_dim = self.feature_extractor.product_feature_dim
         context_dim = self.feature_extractor.context_feature_dim
         candidate_dim = self.feature_extractor.candidate_feature_dim
+        realtime_dim = self.feature_extractor.realtime_window_feature_dim
         total_dim = self.feature_extractor.total_feature_dim
         product_start = user_dim
         context_start = product_start + product_dim
         candidate_start = context_start + context_dim
+        realtime_start = candidate_start + candidate_dim
         total_candidates = sum(
             len(request.get("candidates") or []) for request in requests
         )
@@ -711,6 +790,7 @@ class RankingModel:
             )
             product_rows: List[np.ndarray] = []
             candidate_rows: List[Tuple[float, float, float, float]] = []
+            realtime_rows: List[np.ndarray] = []
 
             for candidate in candidates:
                 try:
@@ -732,6 +812,15 @@ class RankingModel:
                             _candidate_get(candidate, "combined_score") or 0.0,
                         )
                     )
+                    if realtime_dim:
+                        realtime_rows.append(
+                            self.feature_extractor.extract_realtime_window_features(
+                                user_features,
+                                product_metadata,
+                                context,
+                                candidate,
+                            )
+                        )
                     product_rows.append(product_feats)
                     valid_candidates.append((candidate, product_metadata))
                     row_count += 1
@@ -755,6 +844,11 @@ class RankingModel:
                     row_start:row_end,
                     candidate_start : candidate_start + candidate_dim,
                 ] = np.asarray(candidate_rows, dtype=np.float32)
+                if realtime_dim:
+                    feature_matrix[
+                        row_start:row_end,
+                        realtime_start : realtime_start + realtime_dim,
+                    ] = np.asarray(realtime_rows, dtype=np.float32)
 
             prepared_requests.append(
                 {

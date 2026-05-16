@@ -62,6 +62,18 @@ class FakeRedis:
         self.lrange_calls.append((key, start, end))
         return self.data.get(key, [])[start : end + 1]
 
+    async def zrange(self, key, start, end):
+        values = self.data.get(key, [])
+        if end == -1:
+            return values[start:]
+        return values[start : end + 1]
+
+    async def zrevrange(self, key, start, end):
+        values = list(reversed(self.data.get(key, [])))
+        if end == -1:
+            return values[start:]
+        return values[start : end + 1]
+
     async def get(self, key):
         self.get_calls.append(key)
         return self.data.get(key)
@@ -265,6 +277,66 @@ async def test_log_user_interactions_batch_refreshes_compact_sequence_token():
     token = json.loads(fake.data["ust:200:u1"])
     assert token["length"] == 2
     assert token["latest_event_id"] == "e2"
+
+
+@pytest.mark.asyncio
+async def test_get_user_interactions_reads_flink_zset_newest_first():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uiz:u1"] = [
+        json.dumps(
+            {
+                "product_id": "p1",
+                "action": "view",
+                "timestamp": 1.0,
+                "occurred_at": 1.0,
+                "event_id": "e1",
+            }
+        ),
+        json.dumps(
+            {
+                "product_id": "p2",
+                "action": "click",
+                "timestamp": 2.0,
+                "occurred_at": 2.0,
+                "event_id": "e2",
+            }
+        ),
+    ]
+
+    interactions = await store.get_user_interactions("u1", limit=10)
+
+    assert [event["event_id"] for event in interactions] == ["e2", "e1"]
+
+
+@pytest.mark.asyncio
+async def test_get_realtime_window_features_decodes_flink_payloads():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["rtwf:user:u1:5m"] = json.dumps(
+        {
+            "schema_version": 1,
+            "entity_type": "user",
+            "entity_id": "u1",
+            "window": "5m",
+            "views": 10,
+            "clicks": 2,
+            "add_to_cart": 1,
+            "purchases": 1,
+            "total_events": 14,
+            "click_through_rate": 0.2,
+            "conversion_rate": 0.5,
+            "window_start": 100.0,
+            "window_end": 400.0,
+        }
+    )
+
+    features = await store.get_realtime_window_features("user", "u1")
+
+    assert features["5m"].views == 10
+    assert features["5m"].click_through_rate == 0.2
 
 
 @pytest.mark.asyncio

@@ -577,6 +577,10 @@ class RankingConfig(BaseSettings):
         50000,
         description="Per-process cache size for static product ranking feature components",
     )
+    realtime_window_features_enabled: bool = Field(
+        False,
+        description="Include Flink realtime window features in ranking feature vectors",
+    )
     max_queue_wait_ms: float = Field(
         150.0,
         description="Maximum time a ranking request may wait in the queue before failing fast",
@@ -887,6 +891,54 @@ class KafkaConfig(BaseSettings):
 
     class Config:
         env_prefix = "KAFKA_"
+
+
+class FeaturePipelineConfig(BaseSettings):
+    """Interaction feature pipeline rollout configuration."""
+
+    mode: str = Field(
+        "python",
+        description="Feature pipeline mode: python, flink_shadow, or flink",
+    )
+    flink_feature_output_namespace: str = Field(
+        "shadow",
+        env="FLINK_FEATURE_OUTPUT_NAMESPACE",
+        description="Flink Redis output namespace: shadow or official",
+    )
+    flink_checkpoint_dir: str = Field(
+        "file:///flink/checkpoints",
+        env="FLINK_CHECKPOINT_DIR",
+        description="Flink checkpoint storage directory",
+    )
+    flink_watermark_out_of_orderness_seconds: int = Field(
+        300,
+        env="FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS",
+        description="Maximum interaction event-time out-of-orderness accepted by Flink watermarks",
+    )
+    flink_allowed_lateness_seconds: int = Field(
+        600,
+        env="FLINK_ALLOWED_LATENESS_SECONDS",
+        description="Allowed lateness for Flink realtime feature windows",
+    )
+
+    @validator("mode")
+    def validate_mode(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"python", "flink_shadow", "flink"}:
+            raise ValueError("mode must be one of: python, flink_shadow, flink")
+        return normalized
+
+    @validator("flink_feature_output_namespace")
+    def validate_namespace(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"shadow", "official"}:
+            raise ValueError(
+                "flink_feature_output_namespace must be one of: shadow, official"
+            )
+        return normalized
+
+    class Config:
+        env_prefix = "FEATURE_PIPELINE_"
 
 
 class SecurityConfig(BaseSettings):
@@ -1324,6 +1376,7 @@ class Config:
         self.data_config = DataConfig()
         self.object_storage_config = ObjectStorageConfig()
         self.kafka_config = KafkaConfig()
+        self.feature_pipeline_config = FeaturePipelineConfig()
         self.security_config = SecurityConfig()
         self.service_topology_config = ServiceTopologyConfig()
         self.database_config = DatabaseConfig()

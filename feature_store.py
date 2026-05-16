@@ -22,6 +22,7 @@ from models import (
     CandidateProduct,
     UserFeatures,
     ContentFeatures,
+    RealtimeWindowFeatures,
     InteractionType,
     SystemMetrics,
 )
@@ -42,6 +43,8 @@ POSITIVE_SEQUENCE_ACTIONS = {
     InteractionType.ADD_TO_CART.value,
     InteractionType.PURCHASE.value,
 }
+
+REALTIME_WINDOW_NAMES = ("5m", "1h", "24h")
 
 
 class FeatureStore:
@@ -78,7 +81,9 @@ class FeatureStore:
             "content_features": "cf:",
             "content_status": "cs:",
             "user_interactions": "ui:",
+            "user_interactions_zset": "uiz:",
             "user_sequence_token": "ust:",
+            "realtime_window_features": "rtwf:",
             "recommendations_cache": "rc:",
             "candidate_cache": "cc:",
             "product_metadata": "pm:",
@@ -412,6 +417,10 @@ class FeatureStore:
             return None
         return parts[1] or None
 
+    @staticmethod
+    def _feature_namespace_prefix(namespace: str = "official") -> str:
+        return "flink:shadow:" if str(namespace or "").lower() == "shadow" else ""
+
     # User Features Management
     async def get_user_features(
         self, user_id: str, cache_default: bool = True
@@ -738,6 +747,74 @@ class FeatureStore:
             logger.error(f"Error getting content processed time for {content_id}: {e}")
             return None
 
+    async def get_realtime_window_features(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        namespace: str = "official",
+        windows: Iterable[str] = REALTIME_WINDOW_NAMES,
+    ) -> Dict[str, RealtimeWindowFeatures]:
+        """Read Flink-produced realtime window features for one entity."""
+        result = await self.get_realtime_window_features_batch(
+            [(entity_type, entity_id)],
+            namespace=namespace,
+            windows=windows,
+        )
+        return result.get(f"{entity_type}:{entity_id}", {})
+
+    async def get_realtime_window_features_batch(
+        self,
+        entities: Iterable[Tuple[str, str]],
+        *,
+        namespace: str = "official",
+        windows: Iterable[str] = REALTIME_WINDOW_NAMES,
+    ) -> Dict[str, Dict[str, RealtimeWindowFeatures]]:
+        """Batch-read Flink realtime features keyed by '<entity_type>:<entity_id>'."""
+        entity_list = [
+            (str(entity_type), str(entity_id))
+            for entity_type, entity_id in entities
+            if entity_type and entity_id
+        ]
+        window_list = [str(window) for window in windows]
+        if not entity_list or not window_list:
+            return {}
+
+        namespace_prefix = self._feature_namespace_prefix(namespace)
+        client = self._client_for_key_type("user_features")
+        keys: List[str] = []
+        key_meta: List[Tuple[str, str, str]] = []
+        for entity_type, entity_id in entity_list:
+            for window in window_list:
+                keys.append(
+                    f"{namespace_prefix}{self.prefixes['realtime_window_features']}"
+                    f"{entity_type}:{entity_id}:{window}"
+                )
+                key_meta.append((entity_type, entity_id, window))
+
+        try:
+            raw_values = await client.mget(keys)
+        except Exception as e:
+            logger.error(f"Error reading realtime window features: {e}")
+            return {}
+
+        features: Dict[str, Dict[str, RealtimeWindowFeatures]] = {}
+        for raw, (entity_type, entity_id, window) in zip(raw_values, key_meta):
+            if not raw:
+                continue
+            try:
+                payload = json_loads(raw)
+                payload.setdefault("entity_type", entity_type)
+                payload.setdefault("entity_id", entity_id)
+                payload.setdefault("window", window)
+                entity_key = f"{entity_type}:{entity_id}"
+                features.setdefault(entity_key, {})[window] = RealtimeWindowFeatures(
+                    **payload
+                )
+            except Exception:
+                continue
+        return features
+
     # Interaction Logging
     async def log_user_interaction(
         self,
@@ -837,6 +914,14 @@ class FeatureStore:
     ) -> List[Dict[str, Any]]:
         """Get recent user interactions."""
         try:
+            zset_interactions = await self._get_user_interactions_zset(
+                user_id,
+                limit=limit,
+                newest_first=True,
+            )
+            if zset_interactions:
+                return zset_interactions
+
             key = f"{self.prefixes['user_interactions']}{user_id}"
             interactions_data = await self._client_for_key_type(
                 "user_interactions"
@@ -864,6 +949,21 @@ class FeatureStore:
             if limit <= 0:
                 return []
 
+            zset_sequence = await self._get_user_interactions_zset(
+                user_id,
+                limit=limit,
+                newest_first=False,
+            )
+            if zset_sequence:
+                return [
+                    interaction
+                    for interaction in (
+                        self._normalize_sequence_interaction(user_id, item)
+                        for item in zset_sequence
+                    )
+                    if interaction is not None
+                ]
+
             key = f"{self.prefixes['user_interactions']}{user_id}"
             interactions_data = await self._client_for_key_type(
                 "user_interactions"
@@ -890,6 +990,42 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error getting user sequence for {user_id}: {e}")
             return []
+
+    async def _get_user_interactions_zset(
+        self,
+        user_id: str,
+        *,
+        limit: int,
+        newest_first: bool,
+        namespace: str = "official",
+    ) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
+        client = self._client_for_key_type("user_interactions")
+        if newest_first and not hasattr(client, "zrevrange"):
+            return []
+        if not newest_first and not hasattr(client, "zrange"):
+            return []
+
+        key = (
+            f"{self._feature_namespace_prefix(namespace)}"
+            f"{self.prefixes['user_interactions_zset']}{user_id}"
+        )
+        try:
+            if newest_first:
+                interactions_data = await client.zrevrange(key, 0, limit - 1)
+            else:
+                interactions_data = await client.zrange(key, -limit, -1)
+        except Exception:
+            return []
+
+        interactions = []
+        for data in interactions_data:
+            try:
+                interactions.append(self._loads_redis_json(data))
+            except Exception:
+                continue
+        return interactions
 
     async def get_user_sequence_token(
         self, user_id: str, limit: int = 200

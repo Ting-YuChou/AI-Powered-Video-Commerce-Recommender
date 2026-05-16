@@ -33,6 +33,11 @@ x-common-service: &common-service
     KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS: ${KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS:-250}
     KAFKA_DEAD_LETTER_ENABLE: ${KAFKA_DEAD_LETTER_ENABLE:-true}
     KAFKA_DEAD_LETTER_TOPIC: ${KAFKA_DEAD_LETTER_TOPIC:-dead-letter-events}
+    FEATURE_PIPELINE_MODE: ${FEATURE_PIPELINE_MODE:-python}
+    FLINK_FEATURE_OUTPUT_NAMESPACE: ${FLINK_FEATURE_OUTPUT_NAMESPACE:-shadow}
+    FLINK_CHECKPOINT_DIR: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints}
+    FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS: ${FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS:-300}
+    FLINK_ALLOWED_LATENESS_SECONDS: ${FLINK_ALLOWED_LATENESS_SECONDS:-600}
     DATABASE_ENABLE: "true"
     DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://video_commerce:${POSTGRES_PASSWORD:-video_commerce}@postgres:5432/video_commerce}
     DATABASE_URL_FILE: ${DATABASE_URL_FILE:-}
@@ -70,6 +75,7 @@ x-common-service: &common-service
     RANKING_INFERENCE_PROCESS_WORKERS: ${RANKING_INFERENCE_PROCESS_WORKERS:-0}
     RANKING_MAX_QUEUE_WAIT_MS: ${RANKING_MAX_QUEUE_WAIT_MS:-150}
     RANKING_PRODUCT_FEATURE_CACHE_SIZE: ${RANKING_PRODUCT_FEATURE_CACHE_SIZE:-50000}
+    RANKING_REALTIME_WINDOW_FEATURES_ENABLED: ${RANKING_REALTIME_WINDOW_FEATURES_ENABLED:-false}
     RANKING_RUNNER_PAYLOAD_V2_ENABLED: ${RANKING_RUNNER_PAYLOAD_V2_ENABLED:-true}
     RANKING_RUNNER_PAYLOAD_MAX_BYTES: ${RANKING_RUNNER_PAYLOAD_MAX_BYTES:-33554432}
     CACHE_CANDIDATE_CACHE_RACE_TIMEOUT_MS: ${CACHE_CANDIDATE_CACHE_RACE_TIMEOUT_MS:-5}
@@ -608,6 +614,111 @@ services:
       - video-commerce-network
     restart: "no"
 
+  flink-jobmanager:
+    image: flink:1.19.1-scala_2.12-java11
+    profiles: ["flink"]
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: rocksdb
+        state.checkpoints.dir: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints}
+        state.savepoints.dir: ${FLINK_SAVEPOINT_DIR:-file:///flink/savepoints}
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.timeout: 10min
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+    ports:
+      - "127.0.0.1:8081:8081"
+    expose:
+      - "6123"
+      - "8081"
+      - "9249"
+    volumes:
+      - flink_checkpoints:/flink/checkpoints
+      - flink_savepoints:/flink/savepoints
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  flink-taskmanager:
+    image: flink:1.19.1-scala_2.12-java11
+    profiles: ["flink"]
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-4}
+        state.backend: rocksdb
+        state.checkpoints.dir: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints}
+        state.savepoints.dir: ${FLINK_SAVEPOINT_DIR:-file:///flink/savepoints}
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+    expose:
+      - "6121"
+      - "6122"
+      - "9249"
+    volumes:
+      - flink_checkpoints:/flink/checkpoints
+      - flink_savepoints:/flink/savepoints
+    depends_on:
+      - flink-jobmanager
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
+  flink-interaction-features:
+    profiles: ["flink"]
+    build:
+      context: ./flink-jobs/interaction-features
+      dockerfile: Dockerfile
+    command:
+      - sh
+      - -lc
+      - |
+        until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
+        flink run -d \
+          -m flink-jobmanager:8081 \
+          -c com.videocommerce.flink.InteractionFeatureJob \
+          /opt/flink/usrlib/interaction-features.jar
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_USER_INTERACTIONS_TOPIC: ${KAFKA_USER_INTERACTIONS_TOPIC:-user-interactions}
+      KAFKA_FEATURE_UPDATES_TOPIC: ${KAFKA_FEATURE_UPDATES_TOPIC:-feature-updates}
+      KAFKA_DEAD_LETTER_TOPIC: ${KAFKA_DEAD_LETTER_TOPIC:-dead-letter-events}
+      FLINK_INTERACTION_FEATURE_CONSUMER_GROUP: ${FLINK_INTERACTION_FEATURE_CONSUMER_GROUP:-video-commerce-flink-feature-v1}
+      FLINK_FEATURE_OUTPUT_NAMESPACE: ${FLINK_FEATURE_OUTPUT_NAMESPACE:-shadow}
+      FLINK_CHECKPOINT_DIR: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints}
+      FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS: ${FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS:-300}
+      FLINK_ALLOWED_LATENESS_SECONDS: ${FLINK_ALLOWED_LATENESS_SECONDS:-600}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-video_commerce}
+      POSTGRES_USER: ${POSTGRES_USER:-video_commerce}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-video_commerce}
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - flink_checkpoints:/flink/checkpoints
+      - flink_savepoints:/flink/savepoints
+    networks:
+      - video-commerce-network
+    restart: "no"
+
   prometheus:
     image: prom/prometheus:latest
     command:
@@ -835,6 +946,8 @@ volumes:
   redis_cache_data:
   postgres_data:
   kafka_data:
+  flink_checkpoints:
+  flink_savepoints:
   prometheus_data:
   alertmanager_data:
   grafana_data:
