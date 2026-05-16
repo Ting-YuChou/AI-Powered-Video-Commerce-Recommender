@@ -1,6 +1,9 @@
 # AI-Powered Video Commerce Recommender
 
-Production-oriented single-VM deployment for a video commerce recommendation system built as a microservice stack:
+Production-oriented video commerce recommendation system built as a split-service microservice stack. The repository supports:
+
+- Docker Compose for the production-like single-VM target.
+- Helm/Kubernetes for multi-node application deployments with external managed stateful services.
 
 - `caddy` serves the frontend and terminates public traffic.
 - `gateway-api` is the only HTTP entrypoint for backend routes.
@@ -9,9 +12,11 @@ Production-oriented single-VM deployment for a video commerce recommendation sys
 - `content-worker`, `feature-worker`, and `model-trainer` process async work.
 - `redis`, `postgres`, and `kafka` back the runtime data plane.
 
-`app.py` is no longer the production entrypoint. The supported production path is Docker Compose plus the service modules above.
+`app.py` is no longer the production entrypoint. Use the split service modules above through Docker Compose or the Helm chart.
 
 ## Quick Start
+
+The fastest local path is Docker Compose.
 
 ### Prerequisites
 
@@ -45,6 +50,33 @@ The default public edge URL is `http://localhost`. Set `CADDY_SITE_ADDRESS=your.
 
 Observability validation steps live in `docs/operations/observability-validation.md`.
 
+## Kubernetes Deployment
+
+The Helm chart lives in `charts/video-commerce/`. It deploys the application
+services only; Postgres, Redis, Kafka, and S3-compatible object storage are
+expected to be external managed services.
+
+Required Kubernetes production assumptions:
+
+- `OBJECT_STORAGE_BACKEND=s3`; pod-local `/app/models`, `/app/uploads`, and
+  `/tmp/object-storage` are scratch `emptyDir` volumes.
+- Caddy remains the only public edge service.
+- `ranking-runner` uses a headless Service so `ranking-coordinator` can resolve
+  runner pod endpoints through DNS.
+- Kafka topics must exist before startup unless the optional
+  `kafkaTopicInitJob.enabled=true` path is intentionally used.
+
+Basic validation:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work alpine/helm:3.14.0 lint charts/video-commerce
+docker run --rm -v "$PWD:/work" -w /work alpine/helm:3.14.0 template video-commerce charts/video-commerce >/tmp/video-commerce.yaml
+docker run --rm -v /tmp:/work ghcr.io/yannh/kubeconform:latest -strict -summary /work/video-commerce.yaml
+```
+
+Deployment details and production values examples live in
+`docs/operations/kubernetes-deployment.md`.
+
 ## Production Defaults
 
 - Only `caddy` exposes host ports.
@@ -56,6 +88,9 @@ Observability validation steps live in `docs/operations/observability-validation
 - `*_FILE` environment variables are supported for secret injection.
 - Optional `OBJECT_STORAGE_BACKEND=s3` enables durable upload persistence via an S3-compatible backend.
 - Production startup fails fast when API/internal keys, Redis password, or non-default Postgres credentials are missing.
+- Kubernetes multi-node deployments require external Postgres, Redis, Kafka,
+  and S3-compatible object storage; the Helm chart does not install those
+  stateful services.
 
 ## Environment Variables
 
@@ -130,10 +165,13 @@ GitHub Actions now expects:
 ## Notes
 
 - `docker-compose.yml` is the production deployment source of truth for the single-VM target.
+- `charts/video-commerce/` is the Helm deployment source of truth for the
+  multi-node Kubernetes application target.
 - `monitoring/prometheus.yml` defines Prometheus scrape targets.
 - `monitoring/prometheus-rules.yml` defines alert rules loaded by Prometheus.
 - `Code.Frontend/Dockerfile` builds the frontend and packages it behind Caddy.
 - Operational docs:
+  - `docs/operations/kubernetes-deployment.md`
   - `docs/operations/object-storage-and-auth.md`
   - `docs/operations/slo-and-alerting.md`
   - `docs/operations/deploy-rollback-runbook.md`
