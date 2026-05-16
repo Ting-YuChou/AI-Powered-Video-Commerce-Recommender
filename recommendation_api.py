@@ -12,7 +12,7 @@ import random
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from fastapi import Body, HTTPException, Request, Response
@@ -270,6 +270,12 @@ def _is_mmr_slate_diversity_enabled(recommendation_config: Optional[Any]) -> boo
         bool(getattr(recommendation_config, "enable_slate_diversity", False))
         and method == "mmr"
     )
+
+
+def _is_realtime_window_features_enabled(runtime: Any) -> bool:
+    config = getattr(runtime, "config", None)
+    ranking_config = getattr(config, "ranking_config", None)
+    return bool(getattr(ranking_config, "realtime_window_features_enabled", False))
 
 
 def _should_initialize_local_ranker(runtime) -> bool:
@@ -1329,11 +1335,25 @@ async def get_recommendations(
         if await _is_request_disconnected(http_request):
             raise HTTPException(status_code=499, detail="Client disconnected")
 
+        ranking_context = payload.context
+        if _is_realtime_window_features_enabled(runtime):
+            stage_started = time.perf_counter()
+            ranking_context = await _attach_realtime_window_features(
+                payload.context,
+                payload.user_id,
+                candidates,
+                product_metadata_map,
+            )
+            profile["realtime_window_features_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000,
+                2,
+            )
+
         stage_started = time.perf_counter()
         ranked_recommendations, ranking_profile = await _rank_candidates_for_request(
             candidates=candidates,
             user_features=user_features,
-            context=payload.context,
+            context=ranking_context,
             product_metadata_map=product_metadata_map,
             k=ranker_k,
             http_request=http_request,
@@ -1662,6 +1682,47 @@ async def _rank_candidates_for_request(
         )
     except (RankingQueueFullError, RankingQueueTimeoutError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+async def _attach_realtime_window_features(
+    context: Dict[str, Any],
+    user_id: str,
+    candidates: List[CandidateProduct],
+    product_metadata_map: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Attach Flink realtime window features to the ranking context."""
+    if feature_store is None:
+        return context
+
+    entities: Set[Tuple[str, str]] = {("user", user_id)}
+    for candidate in candidates:
+        product_id = getattr(candidate, "product_id", None)
+        if product_id:
+            entities.add(("product", str(product_id)))
+            category = (product_metadata_map.get(str(product_id)) or {}).get("category")
+            if category:
+                entities.add(("category", str(category)))
+
+    feature_map = await _bounded_hot_path_read(
+        app.state.runtime,
+        "realtime_window_features",
+        feature_store.get_realtime_window_features_batch(entities),
+        {},
+    )
+    if not feature_map:
+        return context
+
+    serialized = {
+        entity_key: {
+            window: features.dict()
+            for window, features in windows.items()
+        }
+        for entity_key, windows in feature_map.items()
+    }
+    return {
+        **(context or {}),
+        "_realtime_window_features": serialized,
+    }
 
 
 async def _rank_candidates_remote(

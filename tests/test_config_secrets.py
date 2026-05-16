@@ -85,6 +85,49 @@ def test_config_reads_separate_cache_redis_env(monkeypatch):
     reset_config()
 
 
+def test_config_reads_flink_feature_pipeline_env(monkeypatch):
+    monkeypatch.setenv("FEATURE_PIPELINE_MODE", "flink_shadow")
+    monkeypatch.setenv("FLINK_FEATURE_OUTPUT_NAMESPACE", "shadow")
+    monkeypatch.setenv("FLINK_CHECKPOINT_DIR", "file:///tmp/flink-checkpoints")
+    monkeypatch.setenv("FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS", "120")
+    monkeypatch.setenv("FLINK_ALLOWED_LATENESS_SECONDS", "300")
+    monkeypatch.setenv("RANKING_REALTIME_WINDOW_FEATURES_ENABLED", "true")
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.feature_pipeline_config.mode == "flink_shadow"
+    assert config.feature_pipeline_config.flink_feature_output_namespace == "shadow"
+    assert (
+        config.feature_pipeline_config.flink_checkpoint_dir
+        == "file:///tmp/flink-checkpoints"
+    )
+    assert (
+        config.feature_pipeline_config.flink_watermark_out_of_orderness_seconds == 120
+    )
+    assert config.feature_pipeline_config.flink_allowed_lateness_seconds == 300
+    assert config.ranking_config.realtime_window_features_enabled is True
+
+    reset_config()
+
+
+def test_config_reads_official_flink_cutover_env(monkeypatch):
+    monkeypatch.setenv("FEATURE_PIPELINE_MODE", "flink")
+    monkeypatch.setenv("FLINK_FEATURE_OUTPUT_NAMESPACE", "official")
+    monkeypatch.setenv("RANKING_REALTIME_WINDOW_FEATURES_ENABLED", "true")
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.feature_pipeline_config.mode == "flink"
+    assert config.feature_pipeline_config.flink_feature_output_namespace == "official"
+    assert config.ranking_config.realtime_window_features_enabled is True
+
+    reset_config()
+
+
 def test_explicit_monitoring_log_level_wins_over_development_env(monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "development")
     monkeypatch.setenv("MONITORING_LOG_LEVEL", "INFO")

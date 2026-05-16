@@ -209,6 +209,77 @@ def test_prepare_request_matrix_reuses_static_product_features_without_changing_
     np.testing.assert_allclose(matrix[1], expected)
 
 
+def test_realtime_window_features_are_optional_and_zero_filled():
+    base = RankingModel(RankingConfig())
+    enabled = RankingModel(RankingConfig(realtime_window_features_enabled=True))
+    assert base.feature_extractor.total_feature_dim == 28
+    assert enabled.feature_extractor.total_feature_dim > base.feature_extractor.total_feature_dim
+
+    user_features = UserFeatures(user_id="u1", total_interactions=1, last_active=time.time())
+    candidate = CandidateProduct(product_id="p1", combined_score=0.5, source="test")
+    metadata = {"category": "cat", "brand": "brand", "price": 10.0}
+
+    matrix, _, _ = enabled.prepare_request_matrix(
+        [candidate],
+        user_features,
+        {},
+        product_metadata_map={"p1": metadata},
+    )
+
+    assert matrix.shape[1] == enabled.feature_extractor.total_feature_dim
+    np.testing.assert_allclose(
+        matrix[0, -enabled.feature_extractor.realtime_window_feature_dim :],
+        np.zeros(enabled.feature_extractor.realtime_window_feature_dim, dtype=np.float32),
+    )
+
+
+def test_realtime_window_features_populate_ranking_vector():
+    ranking = RankingModel(RankingConfig(realtime_window_features_enabled=True))
+    user_features = UserFeatures(user_id="u1", total_interactions=1, last_active=time.time())
+    candidate = CandidateProduct(product_id="p1", combined_score=0.5, source="test")
+    metadata = {"category": "cat", "brand": "brand", "price": 10.0}
+    context = {
+        "_realtime_window_features": {
+            "user:u1": {
+                "5m": {
+                    "views": 10,
+                    "clicks": 2,
+                    "add_to_cart": 1,
+                    "purchases": 1,
+                    "click_through_rate": 0.2,
+                    "conversion_rate": 0.5,
+                }
+            },
+            "product:p1": {
+                "5m": {
+                    "views": 20,
+                    "clicks": 5,
+                    "add_to_cart": 2,
+                    "purchases": 1,
+                    "click_through_rate": 0.25,
+                    "conversion_rate": 0.2,
+                }
+            },
+        }
+    }
+
+    matrix, _, _ = ranking.prepare_request_matrix(
+        [candidate],
+        user_features,
+        context,
+        product_metadata_map={"p1": metadata},
+    )
+
+    tail = matrix[0, -ranking.feature_extractor.realtime_window_feature_dim :]
+    assert tail[0] == pytest.approx(0.01)
+    assert tail[1] == pytest.approx(0.002)
+    product_offset = (
+        len(ranking.feature_extractor.WINDOW_FEATURE_NAMES)
+        * len(ranking.feature_extractor.WINDOW_FEATURE_METRICS)
+    )
+    assert tail[product_offset] == pytest.approx(0.02)
+
+
 def test_prepare_batch_matrix_matches_request_matrix_rows(monkeypatch):
     fixed_now = 1_700_000_000.0
     monkeypatch.setattr(ranking_module.time, "time", lambda: fixed_now)
