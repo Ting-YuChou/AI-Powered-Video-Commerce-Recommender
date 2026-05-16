@@ -1,0 +1,28 @@
+{{- if .Values.caddy.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "video-commerce.fullname" . }}-caddy-config
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+data:
+  Caddyfile: |
+    {$CADDY_SITE_ADDRESS::8080} {
+        encode zstd gzip
+
+        route {
+            @gateway path /api/* /health /livez /readyz /readyz/full /docs /redoc /openapi.json
+            reverse_proxy @gateway {{ include "video-commerce.componentName" (dict "root" . "name" "gateway-api") }}:8000 {
+                transport http {
+                    keepalive 30s
+                    keepalive_idle_conns 1024
+                    keepalive_idle_conns_per_host 1024
+                }
+            }
+
+            root * /srv
+            try_files {path} /index.html
+            file_server
+        }
+    }
+{{- end }}

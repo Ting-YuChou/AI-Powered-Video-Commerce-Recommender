@@ -1,0 +1,11 @@
+apiVersion: v2
+name: video-commerce
+description: Kubernetes deployment chart for the AI video commerce split-service stack.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - video-commerce
+  - recommendations
+  - ai
+  - fastapi

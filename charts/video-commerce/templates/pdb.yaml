@@ -1,0 +1,40 @@
+{{- if and .Values.caddy.enabled .Values.caddy.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" "caddy") }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: caddy
+spec:
+  {{- if hasKey .Values.caddy.pdb "minAvailable" }}
+  minAvailable: {{ .Values.caddy.pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.caddy.pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" . "component" "caddy") | nindent 6 }}
+{{- end }}
+{{- range $key, $workload := .Values.backend.workloads }}
+{{- if and $workload.enabled $workload.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" $ "name" $workload.name) }}
+  labels:
+    {{- include "video-commerce.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $workload.name }}
+spec:
+  {{- if hasKey $workload.pdb "minAvailable" }}
+  minAvailable: {{ $workload.pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ $workload.pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" $ "component" $workload.name) | nindent 6 }}
+{{- end }}
+{{- end }}

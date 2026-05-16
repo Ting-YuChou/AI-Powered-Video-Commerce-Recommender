@@ -1,0 +1,21 @@
+Video Commerce has been rendered for namespace {{ .Release.Namespace }}.
+
+Public traffic should enter only through the Caddy service:
+  {{ include "video-commerce.componentName" (dict "root" . "name" "caddy") }}
+
+Required external dependencies:
+  - Postgres: set secrets.values.databaseUrl or use secrets.existingSecret
+  - Redis state/cache: set external.redis.*, external.redisCache.*, and Redis secret keys
+  - Kafka: set external.kafka.bootstrapServers and pre-create required topics
+  - S3-compatible storage: set external.objectStorage.* and object-storage secret keys
+
+Required Kafka topics:
+  user-interactions, video-processing-tasks, recommendation-events, feature-updates, dead-letter-events
+
+Example install:
+  helm upgrade --install {{ .Release.Name }} ./charts/video-commerce \
+    --namespace {{ .Release.Namespace }} --create-namespace \
+    --set images.backend.repository=REGISTRY/video-commerce-backend \
+    --set images.backend.tag=TAG \
+    --set images.frontend.repository=REGISTRY/video-commerce-edge \
+    --set images.frontend.tag=TAG

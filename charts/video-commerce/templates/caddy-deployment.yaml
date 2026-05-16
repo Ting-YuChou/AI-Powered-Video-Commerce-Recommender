@@ -1,0 +1,96 @@
+{{- if .Values.caddy.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" "caddy") }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: caddy
+spec:
+  replicas: {{ .Values.caddy.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" . "component" "caddy") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "video-commerce.selectorLabels" (dict "root" . "component" "caddy") | nindent 8 }}
+      annotations:
+        checksum/caddy-config: {{ include (print $.Template.BasePath "/caddy-configmap.yaml") . | sha256sum }}
+        {{- with .Values.caddy.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "video-commerce.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.securityContext.pod | nindent 8 }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.caddy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.caddy.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.caddy.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: caddy
+          image: {{ include "video-commerce.frontendImage" . | quote }}
+          imagePullPolicy: {{ .Values.images.frontend.pullPolicy }}
+          env:
+            - name: CADDY_SITE_ADDRESS
+              value: {{ .Values.caddy.siteAddress | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.caddy.service.targetPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.caddy.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext.container | nindent 12 }}
+          volumeMounts:
+            - name: caddy-config
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+              readOnly: true
+            - name: caddy-data
+              mountPath: /data
+            - name: caddy-runtime-config
+              mountPath: /config
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: caddy-config
+          configMap:
+            name: {{ include "video-commerce.fullname" . }}-caddy-config
+        - name: caddy-data
+          emptyDir: {}
+        - name: caddy-runtime-config
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

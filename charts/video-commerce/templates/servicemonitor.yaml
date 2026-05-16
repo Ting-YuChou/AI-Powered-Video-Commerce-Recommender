@@ -1,0 +1,31 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+{{- range $key, $workload := .Values.backend.workloads }}
+{{- if and $workload.enabled $workload.service.enabled $workload.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" $ "name" $workload.name) }}
+  labels:
+    {{- include "video-commerce.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $workload.name }}
+    {{- with $.Values.monitoring.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with $.Values.monitoring.serviceMonitor.namespace }}
+  namespaceSelector:
+    matchNames:
+      - {{ . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" $ "component" $workload.name) | nindent 6 }}
+  endpoints:
+    - port: {{ default "http" $workload.service.portName }}
+      path: {{ default "/metrics" $workload.serviceMonitor.path }}
+      interval: {{ $.Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ $.Values.monitoring.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- end }}
+{{- end }}

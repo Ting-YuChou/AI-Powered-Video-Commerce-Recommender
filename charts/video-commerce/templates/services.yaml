@@ -1,0 +1,59 @@
+{{- if .Values.caddy.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" "caddy") }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: caddy
+  {{- with .Values.caddy.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.caddy.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.caddy.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "video-commerce.selectorLabels" (dict "root" . "component" "caddy") | nindent 4 }}
+{{- end }}
+{{- range $key, $workload := .Values.backend.workloads }}
+{{- if and $workload.enabled $workload.service.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" $ "name" $workload.name) }}
+  labels:
+    {{- include "video-commerce.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $workload.name }}
+  {{- if or (and $.Values.monitoring.prometheusAnnotations $workload.serviceMonitor.enabled) $workload.service.annotations }}
+  annotations:
+    {{- if and $.Values.monitoring.prometheusAnnotations $workload.serviceMonitor.enabled }}
+    prometheus.io/scrape: "true"
+    prometheus.io/path: {{ default "/metrics" $workload.serviceMonitor.path | quote }}
+    prometheus.io/port: {{ $workload.service.port | quote }}
+    {{- end }}
+    {{- with $workload.service.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ default "ClusterIP" $workload.service.type }}
+  {{- if $workload.service.headless }}
+  clusterIP: None
+  publishNotReadyAddresses: {{ default false $workload.service.publishNotReadyAddresses }}
+  {{- end }}
+  ports:
+    - name: {{ default "http" $workload.service.portName }}
+      port: {{ $workload.service.port }}
+      targetPort: {{ default "http" $workload.service.portName }}
+      protocol: TCP
+  selector:
+    {{- include "video-commerce.selectorLabels" (dict "root" $ "component" $workload.name) | nindent 4 }}
+{{- end }}
+{{- end }}

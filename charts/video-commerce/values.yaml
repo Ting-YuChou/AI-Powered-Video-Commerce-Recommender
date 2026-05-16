@@ -1,0 +1,632 @@
+# Default values for the video-commerce Kubernetes chart.
+#
+# This chart deploys only the application services. Postgres, Redis, Kafka, and
+# S3-compatible object storage are expected to be external managed services.
+
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  imagePullSecrets: []
+  commonLabels: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+  automountServiceAccountToken: false
+
+images:
+  backend:
+    repository: video-commerce-backend
+    tag: ci
+    pullPolicy: IfNotPresent
+  frontend:
+    repository: video-commerce-edge
+    tag: ci
+    pullPolicy: IfNotPresent
+
+securityContext:
+  pod:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  container:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop:
+        - ALL
+
+secrets:
+  create: true
+  existingSecret: ""
+  keys:
+    apiApiKey: API_API_KEY
+    internalServiceKey: SECURITY_INTERNAL_SERVICE_KEY
+    redisPassword: REDIS_PASSWORD
+    redisCachePassword: REDIS_CACHE_PASSWORD
+    databaseUrl: DATABASE_URL
+    objectStorageAccessKeyId: OBJECT_STORAGE_ACCESS_KEY_ID
+    objectStorageSecretAccessKey: OBJECT_STORAGE_SECRET_ACCESS_KEY
+    jwtSharedSecret: SECURITY_JWT_SHARED_SECRET
+  values:
+    apiApiKey: ""
+    internalServiceKey: ""
+    redisPassword: ""
+    redisCachePassword: ""
+    databaseUrl: ""
+    objectStorageAccessKeyId: ""
+    objectStorageSecretAccessKey: ""
+    jwtSharedSecret: ""
+  extraStringData: {}
+
+external:
+  redis:
+    host: ""
+    port: 6379
+    db: 0
+    maxConnections: 1000
+  redisCache:
+    host: ""
+    port: 6379
+    db: 0
+    maxConnections: 1000
+    socketTimeout: 1
+    socketConnectTimeout: 1
+  kafka:
+    bootstrapServers: ""
+    consumerEnableAutoCommit: false
+    consumerHandlerRetries: 3
+    consumerHandlerRetryBackoffMs: 250
+    deadLetterEnable: true
+    deadLetterTopic: dead-letter-events
+  database:
+    enable: true
+    poolSize: 5
+    maxOverflow: 5
+    autoCreateSchema: true
+  objectStorage:
+    backend: s3
+    endpointUrl: ""
+    region: us-east-1
+    bucket: ""
+    prefix: uploads
+    forcePathStyle: true
+    createBucketOnStartup: false
+    connectTimeoutSeconds: 5
+    readTimeoutSeconds: 60
+    maxAttempts: 3
+    checksumAlgorithm: ""
+    serverSideEncryption: ""
+
+appConfig:
+  environment: production
+  apiCorsOrigins: "https://localhost,http://localhost,https://127.0.0.1,http://127.0.0.1"
+  apiCorsCredentials: "false"
+  apiRateLimitRequests: 120000
+  featurePipelineMode: python
+  flinkFeatureOutputNamespace: shadow
+  modelCacheDir: /app/models
+  vectorIndexPath: /app/models/vector_index.faiss
+  recommendationCfIndexPath: /app/models/cf_vector_index.faiss
+  dataUploadDir: /app/uploads
+  objectStorageDownloadDir: /tmp/object-storage
+  dataMaxFileSize: "104857600"
+  modelLazyLoad: "true"
+  modelTorchNumThreads: 1
+  modelTorchNumInteropThreads: 1
+  monitoring:
+    logLevel: INFO
+    enableMetrics: true
+    enablePrometheusMetrics: true
+    enableRequestLogging: true
+    requestLogSampleRate: 0.01
+    errorRequestLogSampleRate: 0.01
+    enableProfilingLogs: false
+    profilingLogMinDurationMs: 250
+    workerHeartbeatIntervalSeconds: 15
+    workerHeartbeatTtlSeconds: 45
+    enableTracing: false
+    tracingSampleRate: 0.01
+    workerMetricsHost: 0.0.0.0
+    otlpEndpoint: ""
+  recommendation:
+    userEmbeddingCacheSize: 20000
+    userEmbeddingCacheTimeBucketSeconds: 1
+    knownUserSnapshotEnabled: true
+    knownUserSnapshotRefreshIntervalSeconds: 60
+    knownUserSnapshotMaxUsers: 200000
+    contentFeaturesSnapshotEnabled: true
+    contentFeaturesSnapshotRefreshIntervalSeconds: 60
+    contentFeaturesSnapshotMaxItems: 100000
+    retrievalExecutorWorkers: 2
+    servingRecentInteractionLimit: 0
+  ranking:
+    batchMaxRequests: 64
+    batchTargetRequests: 32
+    batchWaitMs: 48
+    batchQueueSize: 32768
+    batchRunnerCount: 16
+    coordinatorDispatchConcurrency: 16
+    runnerQueueSize: 0
+    runnerBatchConcurrency: 1
+    inferenceExecutorWorkers: 16
+    inferenceProcessWorkers: 0
+    maxQueueWaitMs: 150
+    productFeatureCacheSize: 50000
+    realtimeWindowFeaturesEnabled: false
+    runnerPayloadV2Enabled: true
+    runnerPayloadMaxBytes: "33554432"
+  cache:
+    candidateCacheRaceTimeoutMs: 5
+    recommendationCacheRaceTimeoutMs: 5
+    backgroundTaskQueueSize: 8192
+    backgroundTaskWorkerCount: 4
+  service:
+    maxInflightRecommendations: 40
+    rankingServiceFallbackEnabled: false
+    rankingSingleCoordinatorEnabled: true
+    proxyPoolTimeoutSeconds: 5
+    proxyMaxConnections: 2000
+    proxyMaxKeepaliveConnections: 1000
+    proxyKeepaliveExpirySeconds: 30
+    rankingCoordinatorClientPoolSize: 128
+    rankingCoordinatorDirectEnabled: true
+    rankingCoordinatorConnectTimeoutSeconds: 1
+    rankingCoordinatorRequestTimeoutSeconds: 2
+    rankingRunnerConnectTimeoutSeconds: 1
+    rankingRunnerRequestTimeoutSeconds: 1.5
+    rankingRunnerUnhealthyCooldownSeconds: 0.2
+    rankingRunnerDnsRefreshSeconds: 5
+    rankingRunnerEndpointMissingRefreshes: 3
+    rankingRunnerEndpointMissingGraceSeconds: 30
+    trainerIntervalSeconds: 3600
+  security:
+    authMode: api_key
+    internalServiceHeader: X-Internal-Service-Key
+    oidcEnabled: false
+    oidcRequired: false
+    oidcIssuer: ""
+    oidcAudience: ""
+    oidcJwksUrl: ""
+    jwtAlgorithms: RS256
+  extraEnv: {}
+
+caddy:
+  enabled: true
+  replicaCount: 2
+  siteAddress: ":8080"
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+    annotations: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  hpa:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+backend:
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  terminationGracePeriodSeconds: 60
+  emptyDirs:
+    models: {}
+    uploads: {}
+    objectStorage: {}
+    logs: {}
+    tmp: {}
+  workloads:
+    gatewayApi:
+      enabled: true
+      name: gateway-api
+      replicaCount: 2
+      command: ["sh", "-lc"]
+      args:
+        - 'python -m uvicorn gateway_api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log'
+      env:
+        API_PORT: "8000"
+        SERVICE_GATEWAY_PORT: "8000"
+        SERVICE_GATEWAY_WORKERS: "4"
+      service:
+        enabled: true
+        port: 8000
+        targetPort: 8000
+        portName: http
+        annotations: {}
+      probes:
+        type: http
+        livenessPath: /livez
+        readinessPath: /readyz
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          memory: 2Gi
+      hpa:
+        enabled: true
+        minReplicas: 2
+        maxReplicas: 8
+        targetCPUUtilizationPercentage: 70
+      pdb:
+        enabled: true
+        minAvailable: 1
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    recommendationService:
+      enabled: true
+      name: recommendation-service
+      replicaCount: 2
+      command: ["sh", "-lc"]
+      args:
+        - 'python -m uvicorn recommendation_api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-4} --no-access-log'
+      env:
+        API_PORT: "8001"
+        SERVICE_RECOMMENDATION_PORT: "8001"
+        SERVICE_RECOMMENDATION_WORKERS: "4"
+      service:
+        enabled: true
+        port: 8001
+        targetPort: 8001
+        portName: http
+        annotations: {}
+      probes:
+        type: http
+        livenessPath: /livez
+        readinessPath: /readyz
+        initialDelaySeconds: 45
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 12
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      hpa:
+        enabled: true
+        minReplicas: 2
+        maxReplicas: 10
+        targetCPUUtilizationPercentage: 70
+      pdb:
+        enabled: true
+        minAvailable: 1
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    rankingService:
+      enabled: true
+      name: ranking-service
+      replicaCount: 2
+      command: ["sh", "-lc"]
+      args:
+        - 'python -m uvicorn ranking_proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-4} --no-access-log'
+      env:
+        API_PORT: "8003"
+        SERVICE_RANKING_PORT: "8003"
+        SERVICE_RANKING_WORKERS: "4"
+      service:
+        enabled: true
+        port: 8003
+        targetPort: 8003
+        portName: http
+        annotations: {}
+      probes:
+        type: http
+        livenessPath: /livez
+        readinessPath: /readyz
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          memory: 2Gi
+      hpa:
+        enabled: true
+        minReplicas: 2
+        maxReplicas: 8
+        targetCPUUtilizationPercentage: 70
+      pdb:
+        enabled: true
+        minAvailable: 1
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    rankingCoordinator:
+      enabled: true
+      name: ranking-coordinator
+      replicaCount: 1
+      command: ["python", "ranking_coordinator.py"]
+      env:
+        API_PORT: "8013"
+        SERVICE_RANKING_COORDINATOR_HOST: ""
+        SERVICE_RANKING_COORDINATOR_BIND_HOST: "0.0.0.0"
+        SERVICE_RANKING_COORDINATOR_PORT: "8013"
+      service:
+        enabled: true
+        port: 8013
+        targetPort: 8013
+        portName: tcp
+        annotations: {}
+      probes:
+        type: tcp
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 12
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      hpa:
+        enabled: false
+      pdb:
+        enabled: false
+      serviceMonitor:
+        enabled: false
+        path: /metrics
+    rankingRunner:
+      enabled: true
+      name: ranking-runner
+      replicaCount: 4
+      command: ["python", "ranking_runner.py"]
+      env:
+        API_PORT: "8014"
+        SERVICE_RANKING_RUNNER_BIND_HOST: "0.0.0.0"
+        SERVICE_RANKING_RUNNER_PORT: "8014"
+      service:
+        enabled: true
+        headless: true
+        publishNotReadyAddresses: false
+        port: 8014
+        targetPort: 8014
+        portName: tcp
+        annotations: {}
+      probes:
+        type: tcp
+        initialDelaySeconds: 120
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 18
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      hpa:
+        enabled: true
+        minReplicas: 4
+        maxReplicas: 32
+        targetCPUUtilizationPercentage: 75
+      pdb:
+        enabled: true
+        minAvailable: 1
+      serviceMonitor:
+        enabled: false
+        path: /metrics
+    interactionIngestService:
+      enabled: true
+      name: interaction-ingest-service
+      replicaCount: 2
+      command: ["sh", "-lc"]
+      args:
+        - 'python -m uvicorn interaction_ingest_api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log'
+      env:
+        API_PORT: "8002"
+        SERVICE_INTERACTION_PORT: "8002"
+        SERVICE_INTERACTION_WORKERS: "2"
+      service:
+        enabled: true
+        port: 8002
+        targetPort: 8002
+        portName: http
+        annotations: {}
+      probes:
+        type: http
+        livenessPath: /livez
+        readinessPath: /readyz
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          memory: 1Gi
+      hpa:
+        enabled: true
+        minReplicas: 2
+        maxReplicas: 8
+        targetCPUUtilizationPercentage: 70
+      pdb:
+        enabled: true
+        minAvailable: 1
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    contentWorker:
+      enabled: true
+      name: content-worker
+      replicaCount: 1
+      command: ["python", "-m", "kafka_workers.video_processor"]
+      env:
+        MODEL_LAZY_LOAD: "false"
+        WORKER_TYPE: content_processor
+        MONITORING_WORKER_METRICS_PORT: "9101"
+      service:
+        enabled: true
+        port: 9101
+        targetPort: 9101
+        portName: metrics
+        annotations: {}
+      probes:
+        type: metrics
+        livenessPath: /metrics
+        initialDelaySeconds: 120
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      hpa:
+        enabled: false
+      pdb:
+        enabled: false
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    featureWorker:
+      enabled: true
+      name: feature-worker
+      replicaCount: 2
+      command: ["python", "-m", "kafka_workers.feature_updater"]
+      env:
+        WORKER_TYPE: feature_updater
+        MONITORING_WORKER_METRICS_PORT: "9102"
+      service:
+        enabled: true
+        port: 9102
+        targetPort: 9102
+        portName: metrics
+        annotations: {}
+      probes:
+        type: metrics
+        livenessPath: /metrics
+        initialDelaySeconds: 30
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          memory: 1Gi
+      hpa:
+        enabled: false
+      pdb:
+        enabled: false
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    modelTrainer:
+      enabled: true
+      name: model-trainer
+      replicaCount: 1
+      command: ["python", "-m", "model_trainer"]
+      env:
+        RANKING_ENABLE_PERIODIC_TRAINING: "true"
+        SERVICE_TRAINER_INTERVAL_SECONDS: "3600"
+        MONITORING_WORKER_METRICS_PORT: "9103"
+      service:
+        enabled: true
+        port: 9103
+        targetPort: 9103
+        portName: metrics
+        annotations: {}
+      probes:
+        type: metrics
+        livenessPath: /metrics
+        initialDelaySeconds: 120
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      hpa:
+        enabled: false
+      pdb:
+        enabled: false
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: video-commerce.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+monitoring:
+  prometheusAnnotations: true
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    scrapeTimeout: 10s
+    labels: {}
+    namespace: ""
+
+kafkaTopicInitJob:
+  enabled: false
+  image:
+    repository: confluentinc/cp-kafka
+    tag: 7.5.0
+    pullPolicy: IfNotPresent
+  topics:
+    user-interactions:
+      partitions: 6
+      replicationFactor: 3
+    video-processing-tasks:
+      partitions: 3
+      replicationFactor: 3
+    recommendation-events:
+      partitions: 3
+      replicationFactor: 3
+    feature-updates:
+      partitions: 3
+      replicationFactor: 3
+    dead-letter-events:
+      partitions: 3
+      replicationFactor: 3
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  extraEnv: []
