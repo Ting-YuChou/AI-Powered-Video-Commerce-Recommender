@@ -107,3 +107,27 @@ async def test_round_robin_pool_skips_temporarily_unhealthy_upstream():
         assert str(client.base_url).rstrip("/") == "http://b:8000"
     finally:
         await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_round_robin_pool_ignores_environment_proxy_config(monkeypatch):
+    monkeypatch.setenv("ALL_PROXY", "http://proxyproxy.orb.internal:8305")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxyproxy.orb.internal:8305")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxyproxy.orb.internal:8305")
+    monkeypatch.setenv(
+        "NO_PROXY",
+        "localhost,127.0.0.1,::1,fd07:b51a:cc66:f0::/64,*.orb.internal",
+    )
+
+    pool = RoundRobinAsyncClientPool(
+        ["http://a:8000", "http://b:8000"],
+        timeout=httpx.Timeout(1.0),
+        limits=httpx.Limits(max_connections=2),
+    )
+    try:
+        index, client = pool._choose_client()
+
+        assert index == 0
+        assert str(client.base_url).rstrip("/") == "http://a:8000"
+    finally:
+        await pool.aclose()

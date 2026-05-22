@@ -104,6 +104,15 @@ class ModelConfig(BaseSettings):
     batch_size: int = Field(32, description="Processing batch size")
     max_video_length: int = Field(300, description="Maximum video length in seconds")
     num_keyframes: int = Field(8, description="Number of keyframes to extract")
+    ffmpeg_frame_extraction_enabled: bool = Field(
+        True, description="Use FFmpeg/ffprobe for video metadata and keyframe extraction"
+    )
+    ffmpeg_timeout_seconds: float = Field(
+        30.0, description="Timeout for each FFmpeg/ffprobe command"
+    )
+    ffmpeg_target_width: int = Field(
+        640, description="Maximum frame width produced by FFmpeg extraction"
+    )
 
     # Performance settings
     enable_quantization: bool = Field(False, description="Enable model quantization")
