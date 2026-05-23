@@ -4,8 +4,8 @@ import pytest
 from fastapi import HTTPException, UploadFile
 from starlette.datastructures import Headers
 
-from config import Config
-from gateway_api import stream_upload_to_temp_file, validate_upload_file
+from video_commerce.common.config import Config
+from video_commerce.services.gateway.api import stream_upload_to_temp_file, validate_upload_file
 
 
 def test_validate_upload_file_rejects_bad_extension():

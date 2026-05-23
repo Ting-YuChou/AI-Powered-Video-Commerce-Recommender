@@ -12,7 +12,7 @@ Production-oriented video commerce recommendation system built as a split-servic
 - `content-worker`, `feature-worker`, and `model-trainer` process async work.
 - `redis`, `postgres`, and `kafka` back the runtime data plane.
 
-`app.py` is no longer the production entrypoint. Use the split service modules above through Docker Compose or the Helm chart.
+`video_commerce/services/legacy_app/app.py` is no longer the production entrypoint. Use the split service modules above through Docker Compose or the Helm chart.
 
 ## Quick Start
 
@@ -128,13 +128,16 @@ SECURITY_OIDC_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
 
 ## Service Layout
 
-- `gateway_api.py`
-- `recommendation_api.py`
-- `interaction_ingest_api.py`
-- `kafka_workers/video_processor.py`
-- `kafka_workers/feature_updater.py`
-- `model_trainer.py`
-- `system_store.py`
+- `video_commerce/services/gateway/api.py`
+- `video_commerce/services/recommendation/api.py`
+- `video_commerce/services/interaction_ingest/api.py`
+- `video_commerce/services/ranking_service/proxy_asgi.py`
+- `video_commerce/services/ranking_coordinator/main.py`
+- `video_commerce/services/ranking_runner/main.py`
+- `video_commerce/services/content_worker/video_processor.py`
+- `video_commerce/services/feature_worker/feature_updater.py`
+- `video_commerce/services/model_trainer/main.py`
+- `video_commerce/data_plane/system_store.py`
 
 ## Repository Layout
 
@@ -142,6 +145,11 @@ SECURITY_OIDC_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
 - `docs/data/`: dataset, BigQuery, and CSV ingestion guides.
 - `docs/ml/`: model training guides.
 - `docs/operations/`: deployment and production operations docs.
+- `video_commerce/common/`: shared config, schemas, auth, service helpers, telemetry, and observability.
+- `video_commerce/data_plane/`: Kafka, Redis feature store, Postgres system store, and object storage integrations.
+- `video_commerce/ml/`: content processing, recommendation, ranking, vector search, and model artifact code.
+- `video_commerce/ranking_runtime/`: ranking batching, payload, coordinator, and runner protocol helpers.
+- `video_commerce/services/*/ARCHITECTURE.md`: per-service responsibilities, interfaces, dependencies, and startup commands.
 - `scripts/load_dataset.py`: local dataset loading utility.
 - `data/embeddings/`: local embedding artifacts such as `video_embeddings_128d.npy`.
 

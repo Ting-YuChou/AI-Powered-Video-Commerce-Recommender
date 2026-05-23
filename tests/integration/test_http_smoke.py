@@ -23,14 +23,14 @@ def _headers() -> dict:
 
 
 def test_gateway_livez():
-    response = httpx.get(f"{_base_url()}/livez", timeout=10.0)
+    response = httpx.get(f"{_base_url()}/livez", timeout=10.0, trust_env=False)
 
     assert response.status_code == 200
     assert response.json()["service"] == "gateway-api"
 
 
 def test_gateway_readyz():
-    response = httpx.get(f"{_base_url()}/readyz", timeout=10.0)
+    response = httpx.get(f"{_base_url()}/readyz", timeout=10.0, trust_env=False)
 
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
@@ -42,6 +42,7 @@ def test_recommendations_round_trip():
         json={"user_id": "integration-user", "k": 3, "context": {"source": "integration-test"}},
         headers=_headers(),
         timeout=20.0,
+        trust_env=False,
     )
 
     assert response.status_code == 200
@@ -62,6 +63,7 @@ def test_interactions_round_trip():
         },
         headers=_headers(),
         timeout=20.0,
+        trust_env=False,
     )
 
     assert response.status_code == 202

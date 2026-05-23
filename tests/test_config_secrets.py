@@ -1,6 +1,6 @@
 import pytest
 
-from config import Config, reset_config
+from video_commerce.common.config import Config, reset_config
 
 
 def test_config_reads_secret_file_env(monkeypatch, tmp_path):

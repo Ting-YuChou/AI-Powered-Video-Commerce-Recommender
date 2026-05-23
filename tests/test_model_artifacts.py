@@ -1,9 +1,9 @@
 import asyncio
 import hashlib
 
-from config import ModelConfig, ObjectStorageConfig, RecommendationConfig
-from model_artifacts import ModelArtifactManager
-from object_storage import ObjectStorage
+from video_commerce.common.config import ModelConfig, ObjectStorageConfig, RecommendationConfig
+from video_commerce.ml.model_artifacts import ModelArtifactManager
+from video_commerce.data_plane.object_storage import ObjectStorage
 
 
 class FakeSystemStore:

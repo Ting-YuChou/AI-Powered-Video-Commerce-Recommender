@@ -5,9 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pytest
 
-from cache_codec import json_dumps, json_loads
-from ranking_coordinator_client import decode_response
-from ranking_runner import RankingRunner
+from video_commerce.common.cache_codec import json_dumps, json_loads
+from video_commerce.ranking_runtime.ranking_coordinator_client import decode_response
+from video_commerce.services.ranking_runner.main import RankingRunner
 
 
 class SlowRankingModel:

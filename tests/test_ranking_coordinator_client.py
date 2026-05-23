@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from ranking_coordinator_client import (
+from video_commerce.ranking_runtime.ranking_coordinator_client import (
     HEALTH_OPERATION,
     RANK_OPERATION,
     RankingCoordinatorClientPool,
@@ -13,7 +13,7 @@ from ranking_coordinator_client import (
     encode_response,
     read_frame,
 )
-from ranking_runner_client import (
+from video_commerce.ranking_runtime.ranking_runner_client import (
     BATCH_RANK_OPERATION,
     RankingRunnerClientPool,
     RankingRunnerEndpoint,

@@ -1,4 +1,4 @@
-from cache_codec import CacheDecodeError, json_dumps, json_loads, pack_cache_payload, unpack_cache_payload
+from video_commerce.common.cache_codec import CacheDecodeError, json_dumps, json_loads, pack_cache_payload, unpack_cache_payload
 
 
 def test_msgpack_cache_round_trip():

@@ -4,7 +4,7 @@ import faiss
 import numpy as np
 import pytest
 
-from cf_cold_start import (
+from video_commerce.ml.cf_cold_start import (
     ContentToCFAdapter,
     build_content_feature,
     build_hybrid_synthetic_embedding,
@@ -13,9 +13,9 @@ from cf_cold_start import (
     metadata_affinity,
     save_item_embedding_sidecar,
 )
-from config import RecommendationConfig, VectorConfig
-from recommender import RecommendationEngine, TwoTowerRetrievalEngine
-from vector_search import VectorSearchEngine
+from video_commerce.common.config import RecommendationConfig, VectorConfig
+from video_commerce.ml.recommender import RecommendationEngine, TwoTowerRetrievalEngine
+from video_commerce.ml.vector_search import VectorSearchEngine
 
 
 def test_content_to_cf_adapter_predicts_normalized_cf_embedding():

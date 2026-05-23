@@ -6,12 +6,12 @@ import numpy as np
 import pytest
 import torch
 
-from config import RankingConfig
-from dcn import DeepAndCrossNetwork, LowRankCrossLayer
-from models import CandidateProduct, UserFeatures
-from ranking import MultiObjectiveRankingModel, RankingModel
-from ranking_batcher import RankingBatcher
-from two_tower import ItemFeatureEncoder, TwoTowerModel, TwoTowerTrainer
+from video_commerce.common.config import RankingConfig
+from video_commerce.ml.dcn import DeepAndCrossNetwork, LowRankCrossLayer
+from video_commerce.common.models import CandidateProduct, UserFeatures
+from video_commerce.ml.ranking import MultiObjectiveRankingModel, RankingModel
+from video_commerce.ranking_runtime.ranking_batcher import RankingBatcher
+from video_commerce.ml.two_tower import ItemFeatureEncoder, TwoTowerModel, TwoTowerTrainer
 
 
 def test_deep_and_cross_network_outputs_finite_expected_shape():

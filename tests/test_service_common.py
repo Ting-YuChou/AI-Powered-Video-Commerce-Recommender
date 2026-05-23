@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 from types import SimpleNamespace
 
-from service_common import (
+from video_commerce.common.service_common import (
     RoundRobinAsyncClientPool,
     ServiceRuntime,
     _should_log_request,

@@ -1,5 +1,5 @@
-from config import CacheConfig, RedisConfig
-from feature_store import FeatureStore
+from video_commerce.common.config import CacheConfig, RedisConfig
+from video_commerce.data_plane.feature_store import FeatureStore
 
 
 def test_feature_store_routes_cache_keys_to_cache_redis_client():
