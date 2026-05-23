@@ -108,8 +108,8 @@ appConfig:
   apiCorsOrigins: "https://localhost,http://localhost,https://127.0.0.1,http://127.0.0.1"
   apiCorsCredentials: "false"
   apiRateLimitRequests: 120000
-  featurePipelineMode: python
-  flinkFeatureOutputNamespace: shadow
+  featurePipelineMode: flink
+  flinkFeatureOutputNamespace: official
   modelCacheDir: /app/models
   vectorIndexPath: /app/models/vector_index.faiss
   recommendationCfIndexPath: /app/models/cf_vector_index.faiss

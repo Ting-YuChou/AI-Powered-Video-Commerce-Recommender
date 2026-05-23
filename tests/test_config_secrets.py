@@ -85,6 +85,20 @@ def test_config_reads_separate_cache_redis_env(monkeypatch):
     reset_config()
 
 
+def test_feature_pipeline_defaults_to_official_flink(monkeypatch):
+    monkeypatch.delenv("FEATURE_PIPELINE_MODE", raising=False)
+    monkeypatch.delenv("FLINK_FEATURE_OUTPUT_NAMESPACE", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.feature_pipeline_config.mode == "flink"
+    assert config.feature_pipeline_config.flink_feature_output_namespace == "official"
+
+    reset_config()
+
+
 def test_config_reads_flink_feature_pipeline_env(monkeypatch):
     monkeypatch.setenv("FEATURE_PIPELINE_MODE", "flink_shadow")
     monkeypatch.setenv("FLINK_FEATURE_OUTPUT_NAMESPACE", "shadow")

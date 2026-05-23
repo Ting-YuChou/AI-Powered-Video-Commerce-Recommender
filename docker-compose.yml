@@ -33,11 +33,12 @@ x-common-service: &common-service
     KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS: ${KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS:-250}
     KAFKA_DEAD_LETTER_ENABLE: ${KAFKA_DEAD_LETTER_ENABLE:-true}
     KAFKA_DEAD_LETTER_TOPIC: ${KAFKA_DEAD_LETTER_TOPIC:-dead-letter-events}
-    FEATURE_PIPELINE_MODE: ${FEATURE_PIPELINE_MODE:-python}
-    FLINK_FEATURE_OUTPUT_NAMESPACE: ${FLINK_FEATURE_OUTPUT_NAMESPACE:-shadow}
-    FLINK_CHECKPOINT_DIR: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints}
+    FEATURE_PIPELINE_MODE: ${FEATURE_PIPELINE_MODE:-flink}
+    FLINK_FEATURE_OUTPUT_NAMESPACE: ${FLINK_FEATURE_OUTPUT_NAMESPACE:-official}
+    FLINK_CHECKPOINT_DIR: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints/runtime}
     FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS: ${FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS:-300}
     FLINK_ALLOWED_LATENESS_SECONDS: ${FLINK_ALLOWED_LATENESS_SECONDS:-600}
+    FLINK_KAFKA_TRANSACTION_TIMEOUT_MS: ${FLINK_KAFKA_TRANSACTION_TIMEOUT_MS:-600000}
     DATABASE_ENABLE: "true"
     DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://video_commerce:${POSTGRES_PASSWORD:-video_commerce}@postgres:5432/video_commerce}
     DATABASE_URL_FILE: ${DATABASE_URL_FILE:-}
@@ -610,6 +611,19 @@ services:
       - video-commerce-network
     restart: "no"
 
+  flink-volume-init:
+    image: flink:1.19.1-scala_2.12-java11
+    profiles: ["flink"]
+    user: "0:0"
+    entrypoint: ["sh", "-lc"]
+    command: >
+      "mkdir -p /flink/checkpoints /flink/savepoints
+      && { test -d /flink/checkpoints/runtime || mkdir -m 0777 /flink/checkpoints/runtime; }
+      && { test -d /flink/savepoints/runtime || mkdir -m 0777 /flink/savepoints/runtime; }"
+    volumes:
+      - flink_checkpoints:/flink/checkpoints
+      - flink_savepoints:/flink/savepoints
+
   flink-jobmanager:
     image: flink:1.19.1-scala_2.12-java11
     profiles: ["flink"]
@@ -618,8 +632,8 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         state.backend: rocksdb
-        state.checkpoints.dir: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints}
-        state.savepoints.dir: ${FLINK_SAVEPOINT_DIR:-file:///flink/savepoints}
+        state.checkpoints.dir: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints/runtime}
+        state.savepoints.dir: ${FLINK_SAVEPOINT_DIR:-file:///flink/savepoints/runtime}
         execution.checkpointing.interval: 30s
         execution.checkpointing.timeout: 10min
         execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
@@ -636,6 +650,9 @@ services:
       - flink_savepoints:/flink/savepoints
     networks:
       - video-commerce-network
+    depends_on:
+      flink-volume-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   flink-taskmanager:
@@ -647,8 +664,8 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-4}
         state.backend: rocksdb
-        state.checkpoints.dir: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints}
-        state.savepoints.dir: ${FLINK_SAVEPOINT_DIR:-file:///flink/savepoints}
+        state.checkpoints.dir: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints/runtime}
+        state.savepoints.dir: ${FLINK_SAVEPOINT_DIR:-file:///flink/savepoints/runtime}
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9249
     expose:
@@ -659,7 +676,10 @@ services:
       - flink_checkpoints:/flink/checkpoints
       - flink_savepoints:/flink/savepoints
     depends_on:
-      - flink-jobmanager
+      flink-volume-init:
+        condition: service_completed_successfully
+      flink-jobmanager:
+        condition: service_started
     networks:
       - video-commerce-network
     restart: unless-stopped
@@ -684,10 +704,11 @@ services:
       KAFKA_FEATURE_UPDATES_TOPIC: ${KAFKA_FEATURE_UPDATES_TOPIC:-feature-updates}
       KAFKA_DEAD_LETTER_TOPIC: ${KAFKA_DEAD_LETTER_TOPIC:-dead-letter-events}
       FLINK_INTERACTION_FEATURE_CONSUMER_GROUP: ${FLINK_INTERACTION_FEATURE_CONSUMER_GROUP:-video-commerce-flink-feature-v1}
-      FLINK_FEATURE_OUTPUT_NAMESPACE: ${FLINK_FEATURE_OUTPUT_NAMESPACE:-shadow}
-      FLINK_CHECKPOINT_DIR: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints}
+      FLINK_FEATURE_OUTPUT_NAMESPACE: ${FLINK_FEATURE_OUTPUT_NAMESPACE:-official}
+      FLINK_CHECKPOINT_DIR: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints/runtime}
       FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS: ${FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS:-300}
       FLINK_ALLOWED_LATENESS_SECONDS: ${FLINK_ALLOWED_LATENESS_SECONDS:-600}
+      FLINK_KAFKA_TRANSACTION_TIMEOUT_MS: ${FLINK_KAFKA_TRANSACTION_TIMEOUT_MS:-600000}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_DB: 0

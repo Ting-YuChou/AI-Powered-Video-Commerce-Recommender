@@ -906,16 +906,16 @@ class FeaturePipelineConfig(BaseSettings):
     """Interaction feature pipeline rollout configuration."""
 
     mode: str = Field(
-        "python",
+        "flink",
         description="Feature pipeline mode: python, flink_shadow, or flink",
     )
     flink_feature_output_namespace: str = Field(
-        "shadow",
+        "official",
         env="FLINK_FEATURE_OUTPUT_NAMESPACE",
         description="Flink Redis output namespace: shadow or official",
     )
     flink_checkpoint_dir: str = Field(
-        "file:///flink/checkpoints",
+        "file:///flink/checkpoints/runtime",
         env="FLINK_CHECKPOINT_DIR",
         description="Flink checkpoint storage directory",
     )

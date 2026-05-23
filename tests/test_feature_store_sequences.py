@@ -340,6 +340,30 @@ async def test_get_realtime_window_features_decodes_flink_payloads():
 
 
 @pytest.mark.asyncio
+async def test_get_realtime_window_features_uses_official_namespace_by_default():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+
+    await store.get_realtime_window_features("user", "u1", windows=("5m",))
+
+    assert fake.get_calls == ["rtwf:user:u1:5m"]
+
+
+@pytest.mark.asyncio
+async def test_get_realtime_window_features_can_read_shadow_namespace_explicitly():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+
+    await store.get_realtime_window_features(
+        "user", "u1", namespace="shadow", windows=("5m",)
+    )
+
+    assert fake.get_calls == ["flink:shadow:rtwf:user:u1:5m"]
+
+
+@pytest.mark.asyncio
 async def test_cold_user_serving_context_does_not_fallback_to_lrange():
     store = FeatureStore(RedisConfig(), CacheConfig())
     fake = FakeRedis()
