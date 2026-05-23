@@ -1348,9 +1348,9 @@ async def load_dataset_from_csv(
         if features_csv.exists():
             # Check for embeddings .npy file
             embeddings_npy = dataset_path / "video_embeddings_128d.npy"
-            # Also check in parent directory (project root)
+            # Also check the repository-level embeddings folder.
             if not embeddings_npy.exists():
-                embeddings_npy = Path("video_embeddings_128d.npy")
+                embeddings_npy = Path("data/embeddings/video_embeddings_128d.npy")
             
             embeddings_path = str(embeddings_npy) if embeddings_npy.exists() else None
             if embeddings_path:

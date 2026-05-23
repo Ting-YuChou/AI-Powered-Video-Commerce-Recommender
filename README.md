@@ -136,6 +136,15 @@ SECURITY_OIDC_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
 - `model_trainer.py`
 - `system_store.py`
 
+## Repository Layout
+
+- `docs/architecture/`: system design notes.
+- `docs/data/`: dataset, BigQuery, and CSV ingestion guides.
+- `docs/ml/`: model training guides.
+- `docs/operations/`: deployment and production operations docs.
+- `scripts/load_dataset.py`: local dataset loading utility.
+- `data/embeddings/`: local embedding artifacts such as `video_embeddings_128d.npy`.
+
 ## Tests And CI
 
 ```bash
