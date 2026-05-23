@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import torch
 import asyncio
+import json
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image, ImageEnhance
@@ -184,6 +185,241 @@ class ContentProcessor:
     
     async def _extract_keyframes(self, video_path: str) -> Tuple[List[np.ndarray], Dict]:
         """Extract keyframes from video file."""
+        if self.config.ffmpeg_frame_extraction_enabled:
+            try:
+                keyframes, video_info = await self._extract_keyframes_ffmpeg(video_path)
+                if keyframes:
+                    logger.info(
+                        "Extracted %s keyframes from video using FFmpeg",
+                        len(keyframes),
+                    )
+                    return keyframes, video_info
+                logger.warning(
+                    "FFmpeg keyframe extraction returned no frames; falling back to OpenCV"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "FFmpeg keyframe extraction failed; falling back to OpenCV: %s",
+                    exc,
+                )
+
+        return await self._extract_keyframes_opencv(video_path)
+
+    async def _extract_keyframes_ffmpeg(self, video_path: str) -> Tuple[List[np.ndarray], Dict]:
+        """Extract uniformly sampled RGB keyframes using ffprobe and ffmpeg."""
+        video_info = await self._probe_video_metadata(video_path)
+        frame_count = int(video_info.get("frame_count") or 0)
+        fps = float(video_info.get("fps") or 0)
+        duration = float(video_info.get("duration") or 0)
+
+        if frame_count <= 0 and duration > 0 and fps > 0:
+            frame_count = int(duration * fps)
+
+        if duration > self.max_video_length and fps > 0:
+            logger.warning(
+                "Video duration %ss exceeds limit %ss",
+                duration,
+                self.max_video_length,
+            )
+            frame_count = min(frame_count, int(self.max_video_length * fps))
+            video_info["frame_count"] = frame_count
+
+        frame_indices = self._keyframe_indices(frame_count)
+        if not frame_indices:
+            return [], video_info
+
+        select_filter = "+".join(f"eq(n\\,{idx})" for idx in frame_indices)
+        target_width = max(1, int(self.config.ffmpeg_target_width))
+        filter_graph = (
+            f"select={select_filter},"
+            f"scale=min({target_width}\\,iw):-2,"
+            "format=rgb24"
+        )
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            video_path,
+            "-vf",
+            filter_graph,
+            "-vsync",
+            "vfr",
+            "-frames:v",
+            str(len(frame_indices)),
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "pipe:1",
+        ]
+        output = await self._run_media_command(command)
+        keyframes = self._parse_ppm_frames(output)
+        if len(keyframes) != len(frame_indices):
+            raise ValueError(
+                f"FFmpeg extracted {len(keyframes)} of {len(frame_indices)} requested frames"
+            )
+        return keyframes, video_info
+
+    async def _probe_video_metadata(self, video_path: str) -> Dict[str, Any]:
+        """Read video metadata using ffprobe."""
+        command = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            video_path,
+        ]
+        output = await self._run_media_command(command)
+        payload = json.loads(output.decode("utf-8"))
+        streams = payload.get("streams") or []
+        video_stream = next(
+            (stream for stream in streams if stream.get("codec_type") == "video"),
+            None,
+        )
+        if not video_stream:
+            raise ValueError("ffprobe did not report a video stream")
+
+        format_info = payload.get("format") or {}
+        fps = self._parse_frame_rate(
+            video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate")
+        )
+        duration = self._parse_float(
+            video_stream.get("duration"),
+            default=self._parse_float(format_info.get("duration"), default=0.0),
+        )
+        frame_count = self._parse_int(video_stream.get("nb_frames"), default=0)
+        if frame_count <= 0 and duration > 0 and fps > 0:
+            frame_count = int(duration * fps)
+
+        return {
+            "duration": duration,
+            "fps": fps,
+            "frame_count": frame_count,
+            "has_audio": any(stream.get("codec_type") == "audio" for stream in streams),
+            "width": self._parse_int(video_stream.get("width"), default=0),
+            "height": self._parse_int(video_stream.get("height"), default=0),
+        }
+
+    async def _run_media_command(self, command: List[str]) -> bytes:
+        """Run an FFmpeg/ffprobe command and return stdout."""
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self.config.ffmpeg_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise TimeoutError(f"{command[0]} timed out") from exc
+
+        if process.returncode != 0:
+            message = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"{command[0]} failed: {message}")
+        return stdout
+
+    def _parse_ppm_frames(self, payload: bytes) -> List[np.ndarray]:
+        """Parse concatenated binary PPM frames from FFmpeg image2pipe output."""
+        frames: List[np.ndarray] = []
+        index = 0
+        length = len(payload)
+
+        while index < length:
+            index = self._skip_ppm_whitespace_and_comments(payload, index)
+            if index >= length:
+                break
+            if payload[index : index + 2] != b"P6":
+                raise ValueError("Unexpected FFmpeg frame format")
+            index += 2
+
+            width_token, index = self._read_ppm_token(payload, index)
+            height_token, index = self._read_ppm_token(payload, index)
+            max_value_token, index = self._read_ppm_token(payload, index)
+            width = int(width_token)
+            height = int(height_token)
+            max_value = int(max_value_token)
+            if width <= 0 or height <= 0 or max_value != 255:
+                raise ValueError("Unsupported FFmpeg PPM frame")
+            if index >= length or payload[index] not in b" \t\r\n":
+                raise ValueError("Invalid FFmpeg PPM frame payload")
+            index += 1
+
+            frame_size = width * height * 3
+            if index + frame_size > length:
+                raise ValueError("Truncated FFmpeg PPM frame")
+            frame = np.frombuffer(
+                payload[index : index + frame_size],
+                dtype=np.uint8,
+            ).copy()
+            frames.append(frame.reshape((height, width, 3)))
+            index += frame_size
+
+        return frames
+
+    def _skip_ppm_whitespace_and_comments(self, payload: bytes, index: int) -> int:
+        while index < len(payload):
+            if payload[index] in b" \t\r\n":
+                index += 1
+                continue
+            if payload[index] == ord("#"):
+                while index < len(payload) and payload[index] not in b"\r\n":
+                    index += 1
+                continue
+            break
+        return index
+
+    def _read_ppm_token(self, payload: bytes, index: int) -> Tuple[str, int]:
+        index = self._skip_ppm_whitespace_and_comments(payload, index)
+        start = index
+        while index < len(payload) and payload[index] not in b" \t\r\n":
+            index += 1
+        if start == index:
+            raise ValueError("Invalid FFmpeg PPM header")
+        return payload[start:index].decode("ascii"), index
+
+    def _keyframe_indices(self, frame_count: int) -> List[int]:
+        if frame_count <= 0 or self.max_keyframes <= 0:
+            return []
+        sample_count = min(self.max_keyframes, frame_count)
+        return np.linspace(0, frame_count - 1, sample_count, dtype=int).tolist()
+
+    def _parse_frame_rate(self, value: Any) -> float:
+        if not value:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        if "/" in value:
+            numerator, denominator = value.split("/", 1)
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return 0.0
+            return float(numerator) / denominator_value
+        return self._parse_float(value, default=0.0)
+
+    def _parse_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _parse_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    async def _extract_keyframes_opencv(self, video_path: str) -> Tuple[List[np.ndarray], Dict]:
+        """Extract keyframes from video file using OpenCV."""
         keyframes = []
         video_info = {}
         
@@ -211,10 +447,7 @@ class ContentProcessor:
             }
             
             # Calculate frame indices for uniform sampling
-            if frame_count > 0:
-                frame_indices = np.linspace(0, frame_count - 1, min(self.max_keyframes, frame_count), dtype=int)
-            else:
-                frame_indices = []
+            frame_indices = self._keyframe_indices(frame_count)
             
             # Extract keyframes
             for frame_idx in frame_indices:

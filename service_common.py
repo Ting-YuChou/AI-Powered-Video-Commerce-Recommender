@@ -84,7 +84,12 @@ class RoundRobinAsyncClientPool:
             raise ValueError("At least one upstream URL is required")
         self.base_urls = urls
         self._clients = [
-            httpx.AsyncClient(base_url=base_url, timeout=timeout, limits=limits)
+            httpx.AsyncClient(
+                base_url=base_url,
+                timeout=timeout,
+                limits=limits,
+                trust_env=False,
+            )
             for base_url in self.base_urls
         ]
         self._next_index = 0
