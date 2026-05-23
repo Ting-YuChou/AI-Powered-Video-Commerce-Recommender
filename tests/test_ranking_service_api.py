@@ -5,11 +5,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import ranking_service_api
-from models import CandidateProduct, ProductRecommendation, UserFeatures
-from ranking_batcher import RankingBatcher
-from ranking_coordinator_client import RankingCoordinatorResponse
-from ranking_payloads import RankRequest, coerce_rank_payload
+from video_commerce.services.ranking_service import api as ranking_service_api
+from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
+from video_commerce.ranking_runtime.ranking_batcher import RankingBatcher
+from video_commerce.ranking_runtime.ranking_coordinator_client import RankingCoordinatorResponse
+from video_commerce.ranking_runtime.ranking_payloads import RankRequest, coerce_rank_payload
 
 
 class FakeRankingModel:

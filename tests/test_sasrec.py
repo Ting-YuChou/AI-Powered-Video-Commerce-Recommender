@@ -3,10 +3,10 @@ import time
 import numpy as np
 import pytest
 
-from config import CacheConfig, RecommendationConfig
-from models import CandidateProduct, ContentFeatures, UserFeatures
-from recommender import RecommendationEngine
-from sasrec import SASRecCandidateEngine
+from video_commerce.common.config import CacheConfig, RecommendationConfig
+from video_commerce.common.models import CandidateProduct, ContentFeatures, UserFeatures
+from video_commerce.ml.recommender import RecommendationEngine
+from video_commerce.ml.sasrec import SASRecCandidateEngine
 
 
 def _event(product_id, action="view", timestamp=1.0):

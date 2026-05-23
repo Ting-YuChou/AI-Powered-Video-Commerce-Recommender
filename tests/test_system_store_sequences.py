@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from system_store import build_chronological_user_sequences
+from video_commerce.data_plane.system_store import build_chronological_user_sequences
 
 
 def _event(user_id, product_id, action, event_id, timestamp):

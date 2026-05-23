@@ -19,10 +19,10 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import Config
-from feature_store import FeatureStore
-from vector_search import VectorSearchEngine
-import data
+from video_commerce.common.config import Config
+from video_commerce.data_plane.feature_store import FeatureStore
+from video_commerce.ml.vector_search import VectorSearchEngine
+from video_commerce.ml import data
 
 # Configure logging
 logging.basicConfig(

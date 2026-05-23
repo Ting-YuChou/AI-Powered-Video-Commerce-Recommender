@@ -126,7 +126,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 EXPOSE 8000
 
 # Default command
-CMD ["python", "-m", "uvicorn", "gateway_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "video_commerce.services.gateway.api:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # =============================================================================
 # Stage 5: Development Build
@@ -165,7 +165,7 @@ ENV MONITORING_LOG_LEVEL=DEBUG
 EXPOSE 8000 8888
 
 # Development command (can be overridden)
-CMD ["python", "-m", "uvicorn", "gateway_api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["python", "-m", "uvicorn", "video_commerce.services.gateway.api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
 # =============================================================================
 # Stage 6: Test Runtime
@@ -234,7 +234,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD curl -f http://localhost:8000/readyz || exit 1
 
 EXPOSE 8000
-CMD ["python", "-m", "uvicorn", "gateway_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "video_commerce.services.gateway.api:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # =============================================================================
 # Build Instructions and Examples

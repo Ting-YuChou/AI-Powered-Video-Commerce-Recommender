@@ -192,7 +192,7 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn gateway_api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log
+      - python -m uvicorn video_commerce.services.gateway.api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log
     environment:
       <<: *common-env
       API_PORT: 8000
@@ -229,7 +229,7 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn recommendation_api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-8} --no-access-log
+      - python -m uvicorn video_commerce.services.recommendation.api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-8} --no-access-log
     environment:
       <<: *common-env
       API_PORT: 8001
@@ -259,9 +259,7 @@ services:
 
   ranking-runner:
     <<: *common-service
-    command:
-      - python
-      - ranking_runner.py
+    command: python -m video_commerce.services.ranking_runner.main
     environment:
       <<: *common-env
       API_PORT: ${SERVICE_RANKING_RUNNER_PORT:-8014}
@@ -285,9 +283,7 @@ services:
 
   ranking-coordinator:
     <<: *common-service
-    command:
-      - python
-      - ranking_coordinator.py
+    command: python -m video_commerce.services.ranking_coordinator.main
     environment:
       <<: *common-env
       API_PORT: ${SERVICE_RANKING_COORDINATOR_PORT:-8013}
@@ -317,7 +313,7 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn ranking_proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-4} --no-access-log
+      - python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-4} --no-access-log
     environment:
       <<: *common-env
       API_PORT: 8003
@@ -342,7 +338,7 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn interaction_ingest_api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log
+      - python -m uvicorn video_commerce.services.interaction_ingest.api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log
     environment:
       <<: *common-env
       API_PORT: 8002
@@ -375,7 +371,7 @@ services:
 
   content-worker:
     <<: *common-service
-    command: python -m kafka_workers.video_processor
+    command: python -m video_commerce.services.content_worker.video_processor
     environment:
       <<: *common-env
       MODEL_LAZY_LOAD: "false"
@@ -404,7 +400,7 @@ services:
 
   feature-worker:
     <<: *common-service
-    command: python -m kafka_workers.feature_updater
+    command: python -m video_commerce.services.feature_worker.feature_updater
     environment:
       <<: *common-env
       WORKER_TYPE: feature_updater
@@ -432,7 +428,7 @@ services:
 
   model-trainer:
     <<: *common-service
-    command: python -m model_trainer
+    command: python -m video_commerce.services.model_trainer.main
     environment:
       <<: *common-env
       RANKING_ENABLE_PERIODIC_TRAINING: "true"

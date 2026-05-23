@@ -4,8 +4,8 @@ import os
 
 import pytest
 
-from config import ObjectStorageConfig
-from object_storage import ObjectStorage
+from video_commerce.common.config import ObjectStorageConfig
+from video_commerce.data_plane.object_storage import ObjectStorage
 
 
 async def _persist_and_materialize(storage: ObjectStorage, path: str):

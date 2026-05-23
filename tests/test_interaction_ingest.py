@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-import interaction_ingest_api
-from models import InteractionType, UserInteractionRequest
+from video_commerce.services.interaction_ingest import api as interaction_ingest_api
+from video_commerce.common.models import InteractionType, UserInteractionRequest
 
 
 class DummyKafkaManager:

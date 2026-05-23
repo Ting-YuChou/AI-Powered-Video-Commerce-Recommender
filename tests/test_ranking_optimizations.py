@@ -10,24 +10,24 @@ import torch
 from fastapi import HTTPException
 from starlette.responses import Response
 
-from config import RankingConfig, RecommendationConfig
-from feature_store import FeatureStore
-from models import (
+from video_commerce.common.config import RankingConfig, RecommendationConfig
+from video_commerce.data_plane.feature_store import FeatureStore
+from video_commerce.common.models import (
     CandidateProduct,
     ContentFeatures,
     ProductRecommendation,
     RecommendationRequest,
     UserFeatures,
 )
-from model_trainer import ModelTrainerService
-import recommendation_api as recommendation_api_module
-from ranking import (
+from video_commerce.services.model_trainer.main import ModelTrainerService
+from video_commerce.services.recommendation import api as recommendation_api_module
+from video_commerce.ml.ranking import (
     RANKING_FEATURE_SCHEMA_VERSION,
     RANKING_TRAINING_DATA_SOURCE,
     RankingModel,
 )
-import ranking as ranking_module
-from recommendation_api import (
+from video_commerce.ml import ranking as ranking_module
+from video_commerce.services.recommendation.api import (
     _BestEffortTaskQueue,
     _await_candidate_cache_race,
     _await_recommendation_cache_race,
@@ -47,8 +47,8 @@ from recommendation_api import (
     _refresh_serving_version_context,
     _user_feature_cache_token,
 )
-from recommender import TwoTowerRetrievalEngine
-from slate_diversity import select_mmr_recommendations
+from video_commerce.ml.recommender import TwoTowerRetrievalEngine
+from video_commerce.ml.slate_diversity import select_mmr_recommendations
 
 
 def _hash_context(context):

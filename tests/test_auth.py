@@ -2,8 +2,8 @@ import pytest
 
 jwt = pytest.importorskip("jwt")
 
-from auth import AuthValidationError, BearerTokenValidator
-from config import SecurityConfig
+from video_commerce.common.auth import AuthValidationError, BearerTokenValidator
+from video_commerce.common.config import SecurityConfig
 
 
 def test_bearer_token_validator_accepts_hs256_token():

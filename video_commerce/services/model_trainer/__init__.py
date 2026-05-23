@@ -1,0 +1,2 @@
+"""Offline model trainer service."""
+

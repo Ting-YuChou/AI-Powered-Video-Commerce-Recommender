@@ -2,10 +2,10 @@ import json
 
 import pytest
 
-from cache_codec import pack_cache_payload
-from config import CacheConfig, RedisConfig
-from feature_store import FeatureStore
-from models import ContentFeatures
+from video_commerce.common.cache_codec import pack_cache_payload
+from video_commerce.common.config import CacheConfig, RedisConfig
+from video_commerce.data_plane.feature_store import FeatureStore
+from video_commerce.common.models import ContentFeatures
 
 
 class FakePipeline:

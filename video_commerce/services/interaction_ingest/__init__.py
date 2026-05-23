@@ -1,0 +1,2 @@
+"""Interaction ingest service."""
+

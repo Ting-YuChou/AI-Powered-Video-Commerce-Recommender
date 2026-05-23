@@ -2,11 +2,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from cache_codec import json_dumps
-import ranking_coordinator as ranking_coordinator_module
-from ranking_coordinator import RankingCoordinator
-from ranking_coordinator_client import decode_response
-from ranking_batcher import RankingQueueTimeoutError
+from video_commerce.common.cache_codec import json_dumps
+from video_commerce.services.ranking_coordinator import main as ranking_coordinator_module
+from video_commerce.services.ranking_coordinator.main import RankingCoordinator
+from video_commerce.ranking_runtime.ranking_coordinator_client import decode_response
+from video_commerce.ranking_runtime.ranking_batcher import RankingQueueTimeoutError
 
 
 @pytest.mark.asyncio

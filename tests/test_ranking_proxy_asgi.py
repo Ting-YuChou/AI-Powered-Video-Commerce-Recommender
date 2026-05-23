@@ -1,10 +1,10 @@
 import pytest
 from types import SimpleNamespace
 
-from cache_codec import json_loads
-from ranking_coordinator_client import RankingCoordinatorTimeout
-import ranking_proxy_asgi
-from ranking_proxy_asgi import RankingProxyApp
+from video_commerce.common.cache_codec import json_loads
+from video_commerce.ranking_runtime.ranking_coordinator_client import RankingCoordinatorTimeout
+from video_commerce.services.ranking_service import proxy_asgi as ranking_proxy_asgi
+from video_commerce.services.ranking_service.proxy_asgi import RankingProxyApp
 
 
 class TimeoutCoordinatorClient:

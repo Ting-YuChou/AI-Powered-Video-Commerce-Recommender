@@ -1,4 +1,4 @@
-from observability import ObservabilityManager
+from video_commerce.common.observability import ObservabilityManager
 
 
 def test_observability_manager_exposes_app_worker_and_dependency_metrics():

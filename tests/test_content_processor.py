@@ -17,8 +17,8 @@ if importlib.util.find_spec("pytesseract") is None:
     }
     sys.modules["pytesseract"] = pytesseract_stub
 
-from config import ModelConfig
-from content_processor import ContentProcessor
+from video_commerce.common.config import ModelConfig
+from video_commerce.ml.content_processor import ContentProcessor
 
 
 def _processor(**overrides):

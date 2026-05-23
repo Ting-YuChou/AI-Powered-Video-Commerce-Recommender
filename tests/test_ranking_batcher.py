@@ -4,16 +4,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from cache_codec import json_dumps, json_loads
-from models import CandidateProduct, ProductRecommendation, UserFeatures
-from ranking_batcher import (
+from video_commerce.common.cache_codec import json_dumps, json_loads
+from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
+from video_commerce.ranking_runtime.ranking_batcher import (
     RankingBatcher,
     RankingQueueTimeoutError,
     normalize_ranking_batch_payloads,
     run_ranking_batch_payloads,
 )
-from ranking_coordinator_client import RankingCoordinatorResponse
-from ranking_runner_client import RankingRunnerTimeout
+from video_commerce.ranking_runtime.ranking_coordinator_client import RankingCoordinatorResponse
+from video_commerce.ranking_runtime.ranking_runner_client import RankingRunnerTimeout
 
 
 class FakeRankingModel:

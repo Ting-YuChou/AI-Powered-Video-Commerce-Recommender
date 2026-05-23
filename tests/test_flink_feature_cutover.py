@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from kafka_workers.feature_updater import should_run_python_feature_worker
+from video_commerce.services.feature_worker.feature_updater import should_run_python_feature_worker
 from scripts import promote_flink_feature_shadow
 
 

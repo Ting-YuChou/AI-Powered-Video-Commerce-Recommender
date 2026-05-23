@@ -1,4 +1,4 @@
-from telemetry import inject_trace_headers, kafka_consumer_span
+from video_commerce.common.telemetry import inject_trace_headers, kafka_consumer_span
 
 
 def test_telemetry_helpers_are_noop_without_required_context():

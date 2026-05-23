@@ -243,7 +243,7 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn gateway_api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log'
+        - 'python -m uvicorn video_commerce.services.gateway.api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log'
       env:
         API_PORT: "8000"
         SERVICE_GATEWAY_PORT: "8000"
@@ -285,7 +285,7 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn recommendation_api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-4} --no-access-log'
+        - 'python -m uvicorn video_commerce.services.recommendation.api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-4} --no-access-log'
       env:
         API_PORT: "8001"
         SERVICE_RECOMMENDATION_PORT: "8001"
@@ -327,7 +327,7 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn ranking_proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-4} --no-access-log'
+        - 'python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-4} --no-access-log'
       env:
         API_PORT: "8003"
         SERVICE_RANKING_PORT: "8003"
@@ -367,7 +367,7 @@ backend:
       enabled: true
       name: ranking-coordinator
       replicaCount: 1
-      command: ["python", "ranking_coordinator.py"]
+      command: ["python", "-m", "video_commerce.services.ranking_coordinator.main"]
       env:
         API_PORT: "8013"
         SERVICE_RANKING_COORDINATOR_HOST: ""
@@ -402,7 +402,7 @@ backend:
       enabled: true
       name: ranking-runner
       replicaCount: 4
-      command: ["python", "ranking_runner.py"]
+      command: ["python", "-m", "video_commerce.services.ranking_runner.main"]
       env:
         API_PORT: "8014"
         SERVICE_RANKING_RUNNER_BIND_HOST: "0.0.0.0"
@@ -444,7 +444,7 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn interaction_ingest_api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log'
+        - 'python -m uvicorn video_commerce.services.interaction_ingest.api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log'
       env:
         API_PORT: "8002"
         SERVICE_INTERACTION_PORT: "8002"
@@ -484,7 +484,7 @@ backend:
       enabled: true
       name: content-worker
       replicaCount: 1
-      command: ["python", "-m", "kafka_workers.video_processor"]
+      command: ["python", "-m", "video_commerce.services.content_worker.video_processor"]
       env:
         MODEL_LAZY_LOAD: "false"
         WORKER_TYPE: content_processor
@@ -519,7 +519,7 @@ backend:
       enabled: true
       name: feature-worker
       replicaCount: 2
-      command: ["python", "-m", "kafka_workers.feature_updater"]
+      command: ["python", "-m", "video_commerce.services.feature_worker.feature_updater"]
       env:
         WORKER_TYPE: feature_updater
         MONITORING_WORKER_METRICS_PORT: "9102"
@@ -553,7 +553,7 @@ backend:
       enabled: true
       name: model-trainer
       replicaCount: 1
-      command: ["python", "-m", "model_trainer"]
+      command: ["python", "-m", "video_commerce.services.model_trainer.main"]
       env:
         RANKING_ENABLE_PERIODIC_TRAINING: "true"
         SERVICE_TRAINER_INTERVAL_SECONDS: "3600"
