@@ -240,6 +240,7 @@ site/
 # --------------------------------------------------------
 *.md
 !README.md
+!AGENTS.md
 !LICENSE
 !docs/
 !docs/**/*.md
@@ -254,6 +255,7 @@ datasets/
 *.npz
 video_embeddings_*.npy
 load_dataset.py
+!scripts/load_dataset.py
 
 # Generated reports and load test outputs
 # ---------------------------------------
