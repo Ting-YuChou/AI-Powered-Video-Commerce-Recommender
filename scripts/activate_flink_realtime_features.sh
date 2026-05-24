@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Start the official Flink feature pipeline and enable ranking consumption of
-# Flink realtime window features. This is the cutover path after shadow checks.
+# Flink realtime window features. Shadow promotion remains an explicit
+# compatibility option, not part of the normal production path.
 
 export FEATURE_PIPELINE_MODE="${FEATURE_PIPELINE_MODE:-flink}"
 export FLINK_FEATURE_OUTPUT_NAMESPACE="${FLINK_FEATURE_OUTPUT_NAMESPACE:-official}"

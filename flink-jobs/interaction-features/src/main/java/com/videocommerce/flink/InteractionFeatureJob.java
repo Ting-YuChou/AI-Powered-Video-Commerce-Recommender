@@ -91,7 +91,7 @@ public class InteractionFeatureJob {
     parsed
         .getSideOutput(DLQ_TAG)
         .map(new DlqJsonMapper())
-        .sinkTo(buildKafkaSink(config.kafkaBootstrapServers, config.deadLetterTopic, null))
+        .sinkTo(buildKafkaSink(config.kafkaBootstrapServers, config.deadLetterTopic, null, config))
         .name("invalid-event-dlq");
 
     DataStream<InteractionEvent> events =
@@ -128,7 +128,8 @@ public class InteractionFeatureJob {
             buildKafkaSink(
                 config.kafkaBootstrapServers,
                 config.featureUpdatesTopic,
-                "interaction-features-updates"))
+                "interaction-features-updates",
+                config))
         .name("feature-update-events");
 
     DataStream<EntityEvent> entityEvents =
@@ -208,7 +209,7 @@ public class InteractionFeatureJob {
   }
 
   private static KafkaSink<String> buildKafkaSink(
-      String bootstrapServers, String topic, String transactionalIdPrefix) {
+      String bootstrapServers, String topic, String transactionalIdPrefix, JobConfig config) {
     var builder =
         KafkaSink.<String>builder()
             .setBootstrapServers(bootstrapServers)
@@ -220,7 +221,9 @@ public class InteractionFeatureJob {
     if (transactionalIdPrefix != null && !transactionalIdPrefix.isBlank()) {
       builder
           .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
-          .setTransactionalIdPrefix(transactionalIdPrefix + "-" + UUID.randomUUID() + "-");
+          .setTransactionalIdPrefix(transactionalIdPrefix + "-" + UUID.randomUUID() + "-")
+          .setProperty(
+              "transaction.timeout.ms", Integer.toString(config.kafkaTransactionTimeoutMs));
     } else {
       builder.setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE);
     }
@@ -626,6 +629,7 @@ public class InteractionFeatureJob {
     public int jdbcBatchSize;
     public long jdbcBatchIntervalMs;
     public int jdbcMaxRetries;
+    public int kafkaTransactionTimeoutMs;
 
     static JobConfig fromEnv() {
       JobConfig config = new JobConfig();
@@ -634,11 +638,11 @@ public class InteractionFeatureJob {
       config.featureUpdatesTopic = env("KAFKA_FEATURE_UPDATES_TOPIC", "feature-updates");
       config.deadLetterTopic = env("KAFKA_DEAD_LETTER_TOPIC", "dead-letter-events");
       config.consumerGroupId = env("FLINK_INTERACTION_FEATURE_CONSUMER_GROUP", "video-commerce-flink-feature-v1");
-      config.checkpointDir = env("FLINK_CHECKPOINT_DIR", "file:///flink/checkpoints");
+      config.checkpointDir = env("FLINK_CHECKPOINT_DIR", "file:///flink/checkpoints/runtime");
       config.watermarkOutOfOrdernessSeconds = envInt("FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS", 300);
       config.allowedLatenessSeconds = envInt("FLINK_ALLOWED_LATENESS_SECONDS", 600);
       config.dedupStateTtlDays = envInt("FLINK_EVENT_DEDUP_TTL_DAYS", 7);
-      config.outputNamespace = env("FLINK_FEATURE_OUTPUT_NAMESPACE", "shadow");
+      config.outputNamespace = env("FLINK_FEATURE_OUTPUT_NAMESPACE", "official");
       config.redisHost = env("REDIS_HOST", "redis");
       config.redisPort = envInt("REDIS_PORT", 6379);
       config.redisDb = envInt("REDIS_DB", 0);
@@ -652,6 +656,7 @@ public class InteractionFeatureJob {
       config.jdbcBatchSize = envInt("FLINK_JDBC_BATCH_SIZE", 500);
       config.jdbcBatchIntervalMs = envLong("FLINK_JDBC_BATCH_INTERVAL_MS", 2000L);
       config.jdbcMaxRetries = envInt("FLINK_JDBC_MAX_RETRIES", 5);
+      config.kafkaTransactionTimeoutMs = envInt("FLINK_KAFKA_TRANSACTION_TIMEOUT_MS", 600_000);
       return config;
     }
 

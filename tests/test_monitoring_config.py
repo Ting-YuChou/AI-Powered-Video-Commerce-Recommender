@@ -31,6 +31,7 @@ def test_compose_provisions_tracing_and_grafana():
     assert "postgres-exporter:" in compose
     assert "redis-cache-exporter:" in compose
     assert "kafka-exporter:" in compose
+    assert "flink-volume-init:" in compose
     assert "flink-jobmanager:" in compose
     assert "flink-taskmanager:" in compose
     assert "flink-interaction-features:" in compose
