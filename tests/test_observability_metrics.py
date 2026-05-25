@@ -13,6 +13,7 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     manager.record_worker_message(
         "feature-worker", "user-interactions", "success", 0.04
     )
+    manager.record_asr_transcription("completed", 0.7)
     manager.record_recommendation(
         result="success",
         cache_hit=True,
@@ -46,6 +47,8 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "video_commerce_kafka_messages_consumed_total" in payload
     assert "video_commerce_database_query_duration_seconds_bucket" in payload
     assert "video_commerce_worker_messages_processed_total" in payload
+    assert "video_commerce_asr_transcriptions_total" in payload
+    assert "video_commerce_asr_transcription_duration_seconds" in payload
     assert "video_commerce_recommendation_requests_total" in payload
     assert "video_commerce_ranking_batch_queue_depth" in payload
     assert "video_commerce_ranking_direct_total" in payload

@@ -53,6 +53,10 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     assert config.cache_config.background_task_queue_size == 8192
     assert config.recommendation_config.known_user_snapshot_enabled is True
     assert config.recommendation_config.content_features_snapshot_enabled is True
+    assert config.recommendation_config.speech_category_candidates_enabled is False
+    assert config.model_config.speech_to_text_enabled is False
+    assert config.model_config.speech_to_text_model == "Qwen/Qwen3-ASR-0.6B"
+    assert config.kafka_config.consumer_max_poll_interval_ms == 600000
     assert config.service_topology_config.ranking_single_coordinator_enabled is True
     assert config.service_topology_config.ranking_coordinator_host == ""
     assert config.service_topology_config.ranking_coordinator_port == 8013

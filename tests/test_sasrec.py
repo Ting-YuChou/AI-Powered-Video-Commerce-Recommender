@@ -158,6 +158,23 @@ class FakeVectorSearch:
         return []
 
 
+class RecordingCategoryFeatureStore(FakeFeatureStore):
+    def __init__(self):
+        super().__init__(interactions=[])
+        self.category_calls = []
+
+    async def get_category_pool(self, category, k, exclude_items=None):
+        self.category_calls.append(category)
+        return [
+            CandidateProduct(
+                product_id=f"category-{category}",
+                popularity_score=0.5,
+                combined_score=0.5,
+                source="category_pool",
+            )
+        ][:k]
+
+
 class FakeNewItemVectorSearch:
     embedding_dim = 8
 
@@ -334,6 +351,122 @@ async def test_content_and_random_retrieval_use_bounded_executor():
         "search_similar_products_sync",
         "get_random_products_sync",
     ]
+
+
+@pytest.mark.asyncio
+async def test_speech_categories_feed_category_pools_after_explicit_context():
+    feature_store = RecordingCategoryFeatureStore()
+    engine = RecommendationEngine(
+        feature_store,
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_sasrec=False,
+            speech_category_candidates_enabled=True,
+            preferred_category_pool_count=3,
+            candidates_per_source=2,
+            max_total_candidates=10,
+        ),
+    )
+    features = ContentFeatures(
+        content_id="spoken",
+        visual_embedding=[],
+        category_scores={"electronics": 0.8},
+        audio_features={
+            "has_audio": True,
+            "audio_transcript": "手機 headphones",
+            "transcription_status": "completed",
+            "speech_categories": ["electronics"],
+        },
+    )
+
+    _, profile = await engine.generate_candidates(
+        "u1",
+        content_features=features,
+        context={"category": "request-category"},
+        user_features=UserFeatures(user_id="u1", preferred_categories=["user-category"]),
+        user_interactions=[],
+        include_profile=True,
+    )
+
+    assert feature_store.category_calls == [
+        "request-category",
+        "electronics",
+        "user-category",
+    ]
+    assert profile["preferred_categories"] == feature_store.category_calls
+    assert profile["has_transcript"] is True
+    assert profile["speech_category_candidates_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_speech_categories_do_not_change_candidates_when_flag_disabled():
+    feature_store = RecordingCategoryFeatureStore()
+    engine = RecommendationEngine(
+        feature_store,
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_sasrec=False,
+            speech_category_candidates_enabled=False,
+            candidates_per_source=2,
+            max_total_candidates=10,
+        ),
+    )
+
+    _, profile = await engine.generate_candidates(
+        "u1",
+        content_features=ContentFeatures(
+            content_id="spoken",
+            visual_embedding=[],
+            category_scores={"electronics": 0.8},
+            audio_features={
+                "audio_transcript": "手機",
+                "transcription_status": "completed",
+                "speech_categories": ["electronics"],
+            },
+        ),
+        user_features=UserFeatures(user_id="u1"),
+        user_interactions=[],
+        include_profile=True,
+    )
+
+    assert feature_store.category_calls == []
+    assert profile["has_transcript"] is True
+    assert profile["speech_category_candidates_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_failed_asr_does_not_enable_content_categories_when_speech_flag_enabled():
+    feature_store = RecordingCategoryFeatureStore()
+    engine = RecommendationEngine(
+        feature_store,
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_sasrec=False,
+            speech_category_candidates_enabled=True,
+            preferred_category_pool_count=3,
+            candidates_per_source=2,
+            max_total_candidates=10,
+        ),
+    )
+
+    _, profile = await engine.generate_candidates(
+        "u1",
+        content_features=ContentFeatures(
+            content_id="failed-speech",
+            visual_embedding=[],
+            category_scores={"beauty": 0.9, "electronics": 0.8},
+            audio_features={
+                "transcription_status": "degraded",
+                "speech_categories": [],
+            },
+        ),
+        user_features=UserFeatures(user_id="u1", preferred_categories=["user-category"]),
+        user_interactions=[],
+        include_profile=True,
+    )
+
+    assert feature_store.category_calls == ["user-category"]
+    assert profile["speech_category_candidates_used"] is False
 
 
 @pytest.mark.asyncio

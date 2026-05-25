@@ -351,6 +351,7 @@ class KafkaConsumerClient:
                     enable_auto_commit=self.config.consumer_enable_auto_commit,
                     auto_commit_interval_ms=self.config.consumer_auto_commit_interval_ms,
                     max_poll_records=self.config.consumer_max_poll_records,
+                    max_poll_interval_ms=self.config.consumer_max_poll_interval_ms,
                     session_timeout_ms=self.config.session_timeout_ms,
                     request_timeout_ms=self.config.request_timeout_ms,
                     key_deserializer=lambda k: k.decode('utf-8') if k else None,

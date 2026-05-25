@@ -16,6 +16,7 @@ and S3-compatible object storage must be provided outside the chart.
   - `ranking-coordinator`
   - `ranking-runner`
   - `content-worker`
+  - optional GPU-backed `asr-service` for uploaded-video speech transcription
   - `feature-worker`
   - `model-trainer`
 - `ranking-runner` uses a headless Service so `ranking-coordinator` can resolve
@@ -32,6 +33,7 @@ Create or provision these before installing the chart:
 - Redis for state and optionally a separate Redis for recommendation cache.
 - Kafka brokers reachable from the cluster.
 - S3-compatible object storage bucket.
+- NVIDIA GPU nodes and a model-cache volume when `asr.enabled=true`.
 
 Kafka topics must exist unless `kafkaTopicInitJob.enabled=true` is used:
 
@@ -104,6 +106,69 @@ ingress:
         - path: /
           pathType: Prefix
 ```
+
+## Optional Speech-To-Text Worker
+
+Speech-to-text is isolated from the normal backend image. The content worker
+extracts bounded 16 kHz mono audio and calls the internal ASR service through
+the OpenAI-compatible transcription endpoint. ASR failures are degraded
+content features: CLIP/OCR processing can still complete.
+
+`Dockerfile.asr` runs a private multipart adapter around the `qwen-asr`
+Python inference API. Do not replace it with the `qwen-asr-serve` command
+without also updating the content-worker client contract; the upstream server
+uses a chat-completions audio request format.
+
+The adapter admits one GPU transcription at a time by default
+(`asr.maxConcurrentTranscriptions`) and rejects requests that wait longer than
+`asr.queueWaitSeconds` with `503`. The content worker can retry this
+pre-inference capacity response, but it does not retry an ASR request after an
+HTTP timeout because the original GPU inference may still be running.
+
+Video processing remains inside the Kafka handler until features are stored.
+Keep `external.kafka.consumerMaxPollIntervalMs` large enough for FFmpeg,
+CLIP/OCR, and one ASR attempt; the chart default is `600000` milliseconds for
+this offline worker path.
+
+Build and publish the isolated GPU image from `Dockerfile.asr`, then enable
+transcript capture without recommendation impact first:
+
+```yaml
+images:
+  asr:
+    repository: registry.example.com/video-commerce-asr
+    tag: "2026-05-24"
+
+appConfig:
+  speechToText:
+    enabled: true
+    model: Qwen/Qwen3-ASR-0.6B
+  recommendation:
+    speechCategoryCandidatesEnabled: false
+
+asr:
+  enabled: true
+  model: Qwen/Qwen3-ASR-0.6B
+  maxConcurrentTranscriptions: "1"
+  queueWaitSeconds: "5"
+  modelCache:
+    existingClaim: video-commerce-asr-models
+  nodeSelector:
+    accelerator: nvidia-gpu
+```
+
+After transcript quality and `video_commerce_asr_transcriptions_total` /
+`video_commerce_asr_transcription_duration_seconds` are reviewed, enable
+speech-derived category candidates:
+
+```yaml
+appConfig:
+  recommendation:
+    speechCategoryCandidatesEnabled: true
+```
+
+The ASR Service is internal-only. Do not log transcript text or copy it to
+Kafka feature update events or content job payloads.
 
 Install:
 

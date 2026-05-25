@@ -113,6 +113,24 @@ class ModelConfig(BaseSettings):
     ffmpeg_target_width: int = Field(
         640, description="Maximum frame width produced by FFmpeg extraction"
     )
+    speech_to_text_enabled: bool = Field(
+        False, description="Transcribe uploaded video audio through the internal ASR service"
+    )
+    speech_to_text_base_url: str = Field(
+        "http://asr-service:8010", description="Internal ASR service base URL"
+    )
+    speech_to_text_model: str = Field(
+        "Qwen/Qwen3-ASR-0.6B", description="Speech-to-text model identifier"
+    )
+    speech_to_text_timeout_seconds: float = Field(
+        120.0, description="HTTP timeout for a speech-to-text request"
+    )
+    speech_to_text_max_attempts: int = Field(
+        2, description="Maximum internal ASR request attempts per video"
+    )
+    speech_to_text_max_transcript_chars: int = Field(
+        4000, description="Maximum transcript characters retained in content features"
+    )
 
     # Performance settings
     enable_quantization: bool = Field(False, description="Enable model quantization")
@@ -195,6 +213,10 @@ class RecommendationConfig(BaseSettings):
     max_live_content_candidates: int = Field(
         20,
         description="Maximum content-similar candidates to fetch live per request",
+    )
+    speech_category_candidates_enabled: bool = Field(
+        False,
+        description="Use content categories inferred from transcribed speech in candidate pools",
     )
     max_pool_trending_candidates: int = Field(
         30,
@@ -871,6 +893,10 @@ class KafkaConfig(BaseSettings):
         5000, description="Auto commit interval"
     )
     consumer_max_poll_records: int = Field(500, description="Max records per poll")
+    consumer_max_poll_interval_ms: int = Field(
+        600000,
+        description="Maximum handler processing interval before consumer rebalance",
+    )
     consumer_handler_retries: int = Field(
         3, description="Handler retry attempts before DLQ/fail"
     )
@@ -1501,6 +1527,14 @@ class Config:
         # Validate batch sizes
         if self.model_config.batch_size <= 0:
             errors.append("Model batch size must be positive")
+        if self.model_config.speech_to_text_timeout_seconds <= 0:
+            errors.append("Speech-to-text timeout must be positive")
+        if self.model_config.speech_to_text_max_attempts <= 0:
+            errors.append("Speech-to-text max attempts must be positive")
+        if self.model_config.speech_to_text_max_transcript_chars <= 0:
+            errors.append("Speech-to-text maximum transcript length must be positive")
+        if self.kafka_config.consumer_max_poll_interval_ms <= 0:
+            errors.append("Kafka consumer maximum poll interval must be positive")
 
         # Validate file paths
         if not os.path.exists(os.path.dirname(self.model_config.cache_dir)):

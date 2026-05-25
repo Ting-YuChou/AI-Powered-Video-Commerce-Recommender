@@ -200,6 +200,21 @@ class VideoProcessorWorker:
             
             # Store features in Redis
             await self.feature_store.store_content_features(content_id, features)
+
+            audio_features = features.audio_features
+            transcription_status = (
+                audio_features.transcription_status
+                if audio_features is not None
+                else "not_attempted"
+            )
+            self.observability.record_asr_transcription(
+                transcription_status,
+                float(
+                    audio_features.transcription_time_seconds
+                    if audio_features and audio_features.transcription_time_seconds
+                    else 0.0
+                ),
+            )
             
             # Update vector search index
             if features.visual_embedding:
@@ -234,6 +249,13 @@ class VideoProcessorWorker:
                         'status': 'completed',
                         'has_visual_embedding': features.visual_embedding is not None,
                         'detected_objects': features.detected_objects,
+                        'has_transcript': bool(
+                            audio_features and audio_features.audio_transcript
+                        ),
+                        'transcription_status': transcription_status,
+                        'has_speech_categories': bool(
+                            audio_features and audio_features.speech_categories
+                        ),
                         'processing_time': features.processing_time
                     },
                     request_id=request_id,

@@ -23,6 +23,7 @@ data:
   KAFKA_BOOTSTRAP_SERVERS: {{ .Values.external.kafka.bootstrapServers | quote }}
   KAFKA_ENABLE: "true"
   KAFKA_CONSUMER_ENABLE_AUTO_COMMIT: {{ .Values.external.kafka.consumerEnableAutoCommit | quote }}
+  KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS: {{ .Values.external.kafka.consumerMaxPollIntervalMs | quote }}
   KAFKA_CONSUMER_HANDLER_RETRIES: {{ .Values.external.kafka.consumerHandlerRetries | quote }}
   KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS: {{ .Values.external.kafka.consumerHandlerRetryBackoffMs | quote }}
   KAFKA_DEAD_LETTER_ENABLE: {{ .Values.external.kafka.deadLetterEnable | quote }}
@@ -42,6 +43,12 @@ data:
   MODEL_LAZY_LOAD: {{ .Values.appConfig.modelLazyLoad | quote }}
   MODEL_TORCH_NUM_THREADS: {{ .Values.appConfig.modelTorchNumThreads | quote }}
   MODEL_TORCH_NUM_INTEROP_THREADS: {{ .Values.appConfig.modelTorchNumInteropThreads | quote }}
+  MODEL_SPEECH_TO_TEXT_ENABLED: {{ .Values.appConfig.speechToText.enabled | quote }}
+  MODEL_SPEECH_TO_TEXT_BASE_URL: {{ default (printf "http://%s:%v" (include "video-commerce.componentName" (dict "root" . "name" .Values.asr.name)) .Values.asr.service.port) .Values.appConfig.speechToText.baseUrl | quote }}
+  MODEL_SPEECH_TO_TEXT_MODEL: {{ .Values.appConfig.speechToText.model | quote }}
+  MODEL_SPEECH_TO_TEXT_TIMEOUT_SECONDS: {{ .Values.appConfig.speechToText.timeoutSeconds | quote }}
+  MODEL_SPEECH_TO_TEXT_MAX_ATTEMPTS: {{ .Values.appConfig.speechToText.maxAttempts | quote }}
+  MODEL_SPEECH_TO_TEXT_MAX_TRANSCRIPT_CHARS: {{ .Values.appConfig.speechToText.maxTranscriptChars | quote }}
   OBJECT_STORAGE_BACKEND: {{ .Values.external.objectStorage.backend | quote }}
   OBJECT_STORAGE_ENDPOINT_URL: {{ .Values.external.objectStorage.endpointUrl | quote }}
   OBJECT_STORAGE_REGION: {{ .Values.external.objectStorage.region | quote }}
@@ -84,6 +91,7 @@ data:
   RECOMMENDATION_CONTENT_FEATURES_SNAPSHOT_MAX_ITEMS: {{ .Values.appConfig.recommendation.contentFeaturesSnapshotMaxItems | quote }}
   RECOMMENDATION_RETRIEVAL_EXECUTOR_WORKERS: {{ .Values.appConfig.recommendation.retrievalExecutorWorkers | quote }}
   RECOMMENDATION_SERVING_RECENT_INTERACTION_LIMIT: {{ .Values.appConfig.recommendation.servingRecentInteractionLimit | quote }}
+  RECOMMENDATION_SPEECH_CATEGORY_CANDIDATES_ENABLED: {{ .Values.appConfig.recommendation.speechCategoryCandidatesEnabled | quote }}
   MONITORING_LOG_LEVEL: {{ .Values.appConfig.monitoring.logLevel | quote }}
   MONITORING_ENABLE_METRICS: {{ .Values.appConfig.monitoring.enableMetrics | quote }}
   MONITORING_ENABLE_PROMETHEUS_METRICS: {{ .Values.appConfig.monitoring.enablePrometheusMetrics | quote }}
