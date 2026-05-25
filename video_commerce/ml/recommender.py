@@ -1823,6 +1823,7 @@ class RecommendationEngine:
         self,
         user_features: Optional[UserFeatures],
         context: Dict[str, Any],
+        content_features: Optional[ContentFeatures] = None,
     ) -> List[str]:
         """Resolve the small set of categories to pull from precomputed pools."""
         categories: List[str] = []
@@ -1830,6 +1831,14 @@ class RecommendationEngine:
             value = context.get(key)
             if isinstance(value, str) and value:
                 categories.append(value)
+
+        audio_features = content_features.audio_features if content_features else None
+        if (
+            self.config.speech_category_candidates_enabled
+            and audio_features
+            and audio_features.transcription_status == "completed"
+        ):
+            categories.extend(audio_features.speech_categories)
 
         if user_features:
             categories.extend(user_features.preferred_categories)
@@ -1885,6 +1894,8 @@ class RecommendationEngine:
                 "source_overlap_counts": {},
                 "merged_source_counts": {},
                 "sasrec_sequence_length": 0,
+                "has_transcript": False,
+                "speech_category_candidates_used": False,
             }
 
             async def timed_stage(
@@ -1973,9 +1984,22 @@ class RecommendationEngine:
             profile["sasrec_sequence_length"] = len(sasrec_sequence)
             user_features_dict = user_features_obj.dict() if user_features_obj else {}
             preferred_categories = self._resolve_preferred_categories(
-                user_features_obj, context
+                user_features_obj, context, content_features
             )
             profile["preferred_categories"] = preferred_categories
+            audio_features = content_features.audio_features if content_features else None
+            speech_categories = (
+                list(audio_features.speech_categories)
+                if audio_features is not None
+                else []
+            )
+            profile["has_transcript"] = bool(
+                audio_features and audio_features.audio_transcript
+            )
+            profile["speech_category_candidates_used"] = bool(
+                self.config.speech_category_candidates_enabled
+                and any(category in preferred_categories for category in speech_categories)
+            )
             target_candidates = min(
                 max(k_per_source, self.config.candidates_per_source),
                 self.config.max_total_candidates,
@@ -2271,6 +2295,8 @@ class RecommendationEngine:
                     "source_overlap_counts": {},
                     "merged_source_counts": {},
                     "sasrec_sequence_length": 0,
+                    "has_transcript": False,
+                    "speech_category_candidates_used": False,
                     "error": str(e),
                 }
             return []

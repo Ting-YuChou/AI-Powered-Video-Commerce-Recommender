@@ -25,6 +25,10 @@ images:
     repository: video-commerce-edge
     tag: ci
     pullPolicy: IfNotPresent
+  asr:
+    repository: video-commerce-asr
+    tag: ci
+    pullPolicy: IfNotPresent
 
 securityContext:
   pod:
@@ -80,6 +84,7 @@ external:
   kafka:
     bootstrapServers: ""
     consumerEnableAutoCommit: false
+    consumerMaxPollIntervalMs: 600000
     consumerHandlerRetries: 3
     consumerHandlerRetryBackoffMs: 250
     deadLetterEnable: true
@@ -119,6 +124,13 @@ appConfig:
   modelLazyLoad: "true"
   modelTorchNumThreads: 1
   modelTorchNumInteropThreads: 1
+  speechToText:
+    enabled: false
+    baseUrl: ""
+    model: Qwen/Qwen3-ASR-0.6B
+    timeoutSeconds: 120
+    maxAttempts: 2
+    maxTranscriptChars: 4000
   monitoring:
     logLevel: INFO
     enableMetrics: true
@@ -145,6 +157,7 @@ appConfig:
     contentFeaturesSnapshotMaxItems: 100000
     retrievalExecutorWorkers: 2
     servingRecentInteractionLimit: 0
+    speechCategoryCandidatesEnabled: false
   ranking:
     batchMaxRequests: 64
     batchTargetRequests: 32
@@ -584,6 +597,40 @@ backend:
       serviceMonitor:
         enabled: true
         path: /metrics
+
+asr:
+  enabled: false
+  name: asr-service
+  replicaCount: 1
+  model: Qwen/Qwen3-ASR-0.6B
+  maxAudioBytes: "16777216"
+  maxInferenceBatchSize: "1"
+  maxNewTokens: "2048"
+  maxConcurrentTranscriptions: "1"
+  queueWaitSeconds: "5"
+  service:
+    port: 8010
+    annotations: {}
+  probes:
+    initialDelaySeconds: 180
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 5
+  resources:
+    requests:
+      cpu: "2"
+      memory: 8Gi
+      nvidia.com/gpu: "1"
+    limits:
+      memory: 16Gi
+      nvidia.com/gpu: "1"
+  modelCache:
+    existingClaim: ""
+    emptyDir: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 ingress:
   enabled: false

@@ -4,6 +4,7 @@ import json
 import sys
 import types
 
+import httpx
 import pytest
 import numpy as np
 
@@ -185,3 +186,167 @@ async def test_ffmpeg_empty_frames_falls_back_to_opencv(monkeypatch):
 
     assert keyframes == [fallback_frame]
     assert video_info["duration"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_speech_to_text_success_retains_transcript_and_model(monkeypatch, tmp_path):
+    processor = _processor(
+        speech_to_text_enabled=True,
+        speech_to_text_model="Qwen/Qwen3-ASR-0.6B",
+    )
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"wav")
+
+    async def fake_extract_audio(_video_path, _video_info):
+        return str(audio_file)
+
+    async def fake_request(_audio_path):
+        return "新品手機 headphones 特價"
+
+    monkeypatch.setattr(processor, "_extract_audio_wav", fake_extract_audio)
+    monkeypatch.setattr(processor, "_request_transcription", fake_request)
+
+    features = await processor._extract_audio_features(
+        "video.mp4", {"has_audio": True, "duration": 4.0}
+    )
+
+    assert features.transcription_status == "completed"
+    assert features.audio_transcript == "新品手機 headphones 特價"
+    assert features.speech_detected is True
+    assert features.asr_model == "Qwen/Qwen3-ASR-0.6B"
+    assert features.transcription_time_seconds is not None
+    assert not audio_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_speech_to_text_skips_video_without_audio(monkeypatch):
+    processor = _processor(speech_to_text_enabled=True)
+
+    async def fail_extract_audio(_video_path, _video_info):
+        raise AssertionError("audio extraction should not run")
+
+    monkeypatch.setattr(processor, "_extract_audio_wav", fail_extract_audio)
+
+    features = await processor._extract_audio_features(
+        "video.mp4", {"has_audio": False, "duration": 4.0}
+    )
+
+    assert features.transcription_status == "skipped_no_audio"
+    assert features.audio_transcript is None
+
+
+@pytest.mark.asyncio
+async def test_speech_to_text_disabled_does_not_extract_audio(monkeypatch):
+    processor = _processor(speech_to_text_enabled=False)
+
+    async def fail_extract_audio(_video_path, _video_info):
+        raise AssertionError("audio extraction should not run when STT is disabled")
+
+    monkeypatch.setattr(processor, "_extract_audio_wav", fail_extract_audio)
+
+    features = await processor._extract_audio_features(
+        "video.mp4", {"has_audio": True, "duration": 4.0}
+    )
+
+    assert features.transcription_status == "disabled"
+    assert features.audio_transcript is None
+
+
+@pytest.mark.asyncio
+async def test_speech_to_text_empty_result_records_no_speech(monkeypatch, tmp_path):
+    processor = _processor(speech_to_text_enabled=True)
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"wav")
+
+    async def fake_extract_audio(_video_path, _video_info):
+        return str(audio_file)
+
+    async def empty_request(_audio_path):
+        return "  "
+
+    monkeypatch.setattr(processor, "_extract_audio_wav", fake_extract_audio)
+    monkeypatch.setattr(processor, "_request_transcription", empty_request)
+
+    features = await processor._extract_audio_features(
+        "video.mp4", {"has_audio": True, "duration": 4.0}
+    )
+
+    assert features.transcription_status == "no_speech"
+    assert features.audio_transcript is None
+    assert features.speech_detected is False
+    assert not audio_file.exists()
+
+
+@pytest.mark.parametrize(
+    "asr_error",
+    [TimeoutError("asr timeout"), RuntimeError("asr HTTP failure")],
+)
+@pytest.mark.asyncio
+async def test_speech_to_text_failure_degrades_without_raising(
+    monkeypatch, tmp_path, asr_error
+):
+    processor = _processor(speech_to_text_enabled=True)
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"wav")
+
+    async def fake_extract_audio(_video_path, _video_info):
+        return str(audio_file)
+
+    async def fail_request(_audio_path):
+        raise asr_error
+
+    monkeypatch.setattr(processor, "_extract_audio_wav", fake_extract_audio)
+    monkeypatch.setattr(processor, "_request_transcription", fail_request)
+
+    features = await processor._extract_audio_features(
+        "video.mp4", {"has_audio": True, "duration": 4.0}
+    )
+
+    assert features.transcription_status == "degraded"
+    assert features.audio_transcript is None
+    assert features.speech_detected is False
+    assert not audio_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_speech_to_text_read_timeout_is_not_retried(monkeypatch, tmp_path):
+    processor = _processor(speech_to_text_enabled=True, speech_to_text_max_attempts=2)
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"wav")
+    calls = 0
+
+    class TimeoutClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise httpx.ReadTimeout("inference is still running")
+
+    monkeypatch.setattr(
+        "video_commerce.ml.content_processor.httpx.AsyncClient",
+        lambda **_kwargs: TimeoutClient(),
+    )
+
+    with pytest.raises(RuntimeError):
+        await processor._request_transcription(str(audio_file))
+
+    assert calls == 1
+
+
+def test_bilingual_speech_and_ocr_map_to_canonical_categories():
+    processor = _processor()
+
+    commerce = processor._analyze_commerce_content(
+        {"text_blocks": ["skincare"], "price_mentions": []},
+        [],
+        "這款手機搭配 headphones 現在有折扣",
+    )
+
+    assert commerce["speech_categories"] == ["electronics"]
+    assert commerce["ocr_categories"] == ["beauty"]
+    assert commerce["category_scores"]["electronics"] > commerce["category_scores"]["beauty"]

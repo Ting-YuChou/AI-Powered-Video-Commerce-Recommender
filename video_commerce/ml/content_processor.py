@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 import tempfile
 import os
+import httpx
 
 # ML/AI imports
 from transformers import CLIPModel, CLIPProcessor
@@ -28,7 +29,7 @@ import pytesseract
 from pytesseract import Output
 
 # Local imports
-from video_commerce.common.models import ContentFeatures
+from video_commerce.common.models import AudioFeatures, ContentFeatures
 from video_commerce.common.config import ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -63,9 +64,31 @@ class ContentProcessor:
         
         # Commerce-related keywords for filtering
         self.commerce_keywords = {
-            'price_indicators': ['$', '€', '£', '¥', 'price', 'cost', 'buy', 'sale', 'discount', '%', 'off'],
-            'product_keywords': ['product', 'item', 'model', 'brand', 'new', 'latest', 'review'],
-            'action_words': ['buy', 'purchase', 'order', 'shop', 'get', 'available', 'stock']
+            'price_indicators': ['$', '€', '£', '¥', 'price', 'cost', 'buy', 'sale', 'discount', '%', 'off', '價格', '特價', '折扣'],
+            'product_keywords': ['product', 'item', 'model', 'brand', 'new', 'latest', 'review', '產品', '商品', '品牌', '新品', '開箱'],
+            'action_words': ['buy', 'purchase', 'order', 'shop', 'get', 'available', 'stock', '購買', '下單', '現貨']
+        }
+        self.category_keywords = {
+            'electronics': [
+                'electronics', 'phone', 'smartphone', 'headphone', 'headphones',
+                'earbud', 'earbuds', 'laptop', 'camera', 'tablet', 'speaker',
+                '手機', '耳機', '筆電', '電腦', '电脑', '相機', '相机', '平板', '音響',
+            ],
+            'fashion': [
+                'clothing', 'shirt', 'dress', 'shoes', 'sneakers', 'jacket',
+                'bag', 'watch', 'jewelry', '衣服', '上衣', '洋裝', '连衣裙',
+                '鞋', '球鞋', '外套', '包包', '手錶', '手表', '珠寶', '珠宝',
+            ],
+            'home': [
+                'furniture', 'kitchen', 'home decor', 'sofa', 'chair',
+                '家具', '廚房', '厨房', '家飾', '家饰', '沙發', '沙发', '椅子',
+            ],
+            'beauty': [
+                'cosmetics', 'skincare', 'perfume', 'makeup',
+                '化妝品', '化妆品', '保養', '保养', '香水', '彩妝', '彩妆',
+            ],
+            'books': ['book', 'books', 'novel', '書', '书', '小說', '小说'],
+            'toys': ['toy', 'gaming', 'game', '玩具', '遊戲', '游戏'],
         }
         
         logger.info(f"ContentProcessor initialized with device: {self.device}")
@@ -146,12 +169,20 @@ class ContentProcessor:
             
             # Extract text using OCR
             text_features = await self._extract_text_features(keyframes)
+
+            # Extract audio speech without making it a hard dependency for the job.
+            audio_features = await self._extract_audio_features(video_path, video_info)
             
             # Basic object detection using CLIP
             detected_objects = await self._detect_objects(keyframes)
             
             # Analyze commerce-related content
-            commerce_features = self._analyze_commerce_content(text_features, detected_objects)
+            commerce_features = self._analyze_commerce_content(
+                text_features,
+                detected_objects,
+                audio_features.audio_transcript or "",
+            )
+            audio_features.speech_categories = commerce_features.get("speech_categories", [])
             
             processing_time = time.time() - start_time
             
@@ -165,14 +196,12 @@ class ContentProcessor:
                 product_mentions=commerce_features.get('product_mentions', []),
                 category_scores=commerce_features.get('category_scores', {}),
                 processing_time=processing_time,
-                audio_features={
-                    'has_audio': video_info.get('has_audio', False),
-                    'audio_length': video_info.get('duration', 0)
-                },
+                audio_features=audio_features,
                 text_features={
                     'total_text_regions': len(text_features.get('text_blocks', [])),
                     'commerce_score': commerce_features.get('commerce_score', 0.0),
-                    'price_mentions': text_features.get('price_mentions', [])
+                    'price_mentions': text_features.get('price_mentions', []),
+                    'ocr_categories': commerce_features.get('ocr_categories', []),
                 }
             )
             
@@ -327,6 +356,126 @@ class ContentProcessor:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"{command[0]} failed: {message}")
         return stdout
+
+    async def _extract_audio_features(
+        self, video_path: str, video_info: Dict[str, Any]
+    ) -> AudioFeatures:
+        """Transcribe audio through the internal ASR service when configured."""
+        has_audio = bool(video_info.get("has_audio", False))
+        audio_features = AudioFeatures(
+            has_audio=has_audio,
+            audio_length=float(video_info.get("duration") or 0),
+            transcription_status="not_attempted",
+        )
+        if not has_audio:
+            audio_features.transcription_status = "skipped_no_audio"
+            return audio_features
+        if not self.config.speech_to_text_enabled:
+            audio_features.transcription_status = "disabled"
+            return audio_features
+
+        audio_features.asr_model = self.config.speech_to_text_model
+        started_at = time.perf_counter()
+        temp_audio_path: Optional[str] = None
+        try:
+            temp_audio_path = await self._extract_audio_wav(video_path, video_info)
+            transcript = await self._request_transcription(temp_audio_path)
+            transcript = transcript.strip()[: self.config.speech_to_text_max_transcript_chars]
+            audio_features.audio_transcript = transcript or None
+            audio_features.speech_detected = bool(transcript)
+            audio_features.transcription_status = (
+                "completed" if transcript else "no_speech"
+            )
+        except Exception as exc:
+            audio_features.speech_detected = False
+            audio_features.transcription_status = "degraded"
+            logger.warning("Speech transcription unavailable; preserving other features: %s", type(exc).__name__)
+        finally:
+            audio_features.transcription_time_seconds = time.perf_counter() - started_at
+            if temp_audio_path:
+                try:
+                    os.remove(temp_audio_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning("Failed to clean temporary audio extraction: %s", exc)
+        return audio_features
+
+    async def _extract_audio_wav(
+        self, video_path: str, video_info: Dict[str, Any]
+    ) -> str:
+        """Extract bounded mono PCM audio suitable for speech recognition."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as output:
+            audio_path = output.name
+        duration = float(video_info.get("duration") or self.max_video_length)
+        duration = max(0.1, min(duration, float(self.max_video_length)))
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            video_path,
+            "-t",
+            str(duration),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "wav",
+            audio_path,
+        ]
+        try:
+            await self._run_media_command(command)
+        except Exception:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+            raise
+        return audio_path
+
+    async def _request_transcription(self, audio_path: str) -> str:
+        """Call the internal OpenAI-compatible ASR endpoint with finite retries."""
+        endpoint = (
+            self.config.speech_to_text_base_url.rstrip("/")
+            + "/v1/audio/transcriptions"
+        )
+        max_attempts = max(1, int(self.config.speech_to_text_max_attempts))
+        timeout = httpx.Timeout(float(self.config.speech_to_text_timeout_seconds))
+        last_error: Optional[Exception] = None
+        for attempt in range(max_attempts):
+            try:
+                async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                    with open(audio_path, "rb") as audio_file:
+                        response = await client.post(
+                            endpoint,
+                            data={"model": self.config.speech_to_text_model},
+                            files={"file": ("audio.wav", audio_file, "audio/wav")},
+                        )
+                response.raise_for_status()
+                payload = response.json()
+                return str(payload.get("text") or "")
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                # A timed-out request may still be running inference on the GPU.
+                break
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code not in {429, 503}:
+                    break
+            except httpx.ConnectError as exc:
+                last_error = exc
+            except (httpx.HTTPError, ValueError, OSError) as exc:
+                last_error = exc
+                break
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(0.1 * (attempt + 1))
+        raise RuntimeError("Internal speech-to-text request failed") from last_error
 
     def _parse_ppm_frames(self, payload: bytes) -> List[np.ndarray]:
         """Parse concatenated binary PPM frames from FFmpeg image2pipe output."""
@@ -646,26 +795,47 @@ class ContentProcessor:
             logger.error(f"Error detecting objects: {e}")
             return []
     
-    def _analyze_commerce_content(self, text_features: Dict, detected_objects: List[str]) -> Dict[str, Any]:
+    def _categories_from_text(self, text_values: List[str]) -> Dict[str, float]:
+        """Map bilingual commerce words to canonical catalog categories."""
+        matches: Dict[str, float] = {}
+        for category, keywords in self.category_keywords.items():
+            hit_count = 0
+            for text in text_values:
+                text_lower = str(text).lower()
+                if any(keyword in text_lower for keyword in keywords):
+                    hit_count += 1
+            if hit_count:
+                matches[category] = min(1.0, 0.5 + (0.1 * hit_count))
+        return matches
+
+    def _analyze_commerce_content(
+        self,
+        text_features: Dict,
+        detected_objects: List[str],
+        audio_transcript: str = "",
+    ) -> Dict[str, Any]:
         """Analyze commerce-related aspects of the content."""
         try:
             text_blocks = text_features.get('text_blocks', [])
             price_mentions = text_features.get('price_mentions', [])
+            semantic_text_blocks = list(text_blocks)
+            if audio_transcript:
+                semantic_text_blocks.append(audio_transcript)
             
             # Calculate commerce score based on various factors
             commerce_score = 0.0
             
             # Text-based commerce indicators
             commerce_text_count = 0
-            for text in text_blocks:
+            for text in semantic_text_blocks:
                 text_lower = text.lower()
                 for keyword_category in self.commerce_keywords.values():
                     if any(keyword in text_lower for keyword in keyword_category):
                         commerce_text_count += 1
                         break
             
-            if text_blocks:
-                commerce_score += (commerce_text_count / len(text_blocks)) * 0.4
+            if semantic_text_blocks:
+                commerce_score += (commerce_text_count / len(semantic_text_blocks)) * 0.4
             
             # Price mentions boost
             if price_mentions:
@@ -696,6 +866,18 @@ class ContentProcessor:
                 score = len([obj for obj in detected_objects if obj in keywords]) / max(len(detected_objects), 1)
                 if score > 0:
                     category_scores[category] = score
+
+            ocr_category_scores = self._categories_from_text(text_blocks)
+            speech_category_scores = self._categories_from_text(
+                [audio_transcript] if audio_transcript else []
+            )
+            for category, score in ocr_category_scores.items():
+                category_scores[category] = max(category_scores.get(category, 0.0), score)
+            for category, score in speech_category_scores.items():
+                category_scores[category] = max(
+                    category_scores.get(category, 0.0),
+                    min(1.0, score + 0.2),
+                )
             
             # Extract potential product mentions from text
             product_mentions = []
@@ -707,9 +889,11 @@ class ContentProcessor:
             return {
                 'commerce_score': commerce_score,
                 'category_scores': category_scores,
+                'ocr_categories': list(ocr_category_scores.keys()),
+                'speech_categories': list(speech_category_scores.keys()),
                 'product_mentions': product_mentions[:10],  # Limit to top 10
                 'has_pricing_info': len(price_mentions) > 0,
-                'commerce_text_ratio': commerce_text_count / max(len(text_blocks), 1)
+                'commerce_text_ratio': commerce_text_count / max(len(semantic_text_blocks), 1)
             }
             
         except Exception as e:
@@ -717,6 +901,8 @@ class ContentProcessor:
             return {
                 'commerce_score': 0.0,
                 'category_scores': {},
+                'ocr_categories': [],
+                'speech_categories': [],
                 'product_mentions': [],
                 'has_pricing_info': False,
                 'commerce_text_ratio': 0.0

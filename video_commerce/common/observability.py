@@ -304,6 +304,19 @@ class ObservabilityManager:
             buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300),
             registry=self.registry,
         )
+        self.asr_transcriptions_total = Counter(
+            "video_commerce_asr_transcriptions_total",
+            "Uploaded content ASR attempts by outcome",
+            ["status"],
+            registry=self.registry,
+        )
+        self.asr_transcription_duration_seconds = Histogram(
+            "video_commerce_asr_transcription_duration_seconds",
+            "Audio extraction and ASR latency in seconds",
+            ["status"],
+            buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300),
+            registry=self.registry,
+        )
         self.worker_training_runs_total = Counter(
             "video_commerce_worker_training_runs_total",
             "Model trainer runs by trigger and status",
@@ -651,6 +664,10 @@ class ObservabilityManager:
         self.worker_message_processing_seconds.labels(
             service=service, topic=topic
         ).observe(duration)
+
+    def record_asr_transcription(self, status: str, duration: float = 0.0) -> None:
+        self.asr_transcriptions_total.labels(status=status).inc()
+        self.asr_transcription_duration_seconds.labels(status=status).observe(duration)
 
     def update_worker_heartbeat(self, service: str, instance_id: str) -> None:
         self.worker_heartbeat_timestamp_seconds.labels(

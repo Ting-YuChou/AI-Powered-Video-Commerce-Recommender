@@ -1,0 +1,124 @@
+{{- if .Values.asr.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" .Values.asr.name) }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ .Values.asr.name }}
+spec:
+  replicas: {{ .Values.asr.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" . "component" .Values.asr.name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "video-commerce.selectorLabels" (dict "root" . "component" .Values.asr.name) | nindent 8 }}
+      {{- with .Values.asr.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "video-commerce.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.securityContext.pod | nindent 8 }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.asr.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.asr.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.asr.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Values.asr.name }}
+          image: {{ printf "%s:%s" .Values.images.asr.repository .Values.images.asr.tag | quote }}
+          imagePullPolicy: {{ .Values.images.asr.pullPolicy }}
+          env:
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: HUGGINGFACE_HUB_CACHE
+              value: /models/huggingface/hub
+            - name: ASR_MODEL
+              value: {{ .Values.asr.model | quote }}
+            - name: ASR_DEVICE
+              value: "cuda:0"
+            - name: ASR_MAX_AUDIO_BYTES
+              value: {{ .Values.asr.maxAudioBytes | quote }}
+            - name: ASR_MAX_INFERENCE_BATCH_SIZE
+              value: {{ .Values.asr.maxInferenceBatchSize | quote }}
+            - name: ASR_MAX_NEW_TOKENS
+              value: {{ .Values.asr.maxNewTokens | quote }}
+            - name: ASR_MAX_CONCURRENT_TRANSCRIPTIONS
+              value: {{ .Values.asr.maxConcurrentTranscriptions | quote }}
+            - name: ASR_QUEUE_WAIT_SECONDS
+              value: {{ .Values.asr.queueWaitSeconds | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.asr.service.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.asr.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.asr.probes.periodSeconds }}
+            timeoutSeconds: {{ .Values.asr.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.asr.probes.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.asr.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.asr.probes.periodSeconds }}
+            timeoutSeconds: {{ .Values.asr.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.asr.probes.failureThreshold }}
+          resources:
+            {{- toYaml .Values.asr.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext.container | nindent 12 }}
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: model-cache
+          {{- if .Values.asr.modelCache.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.asr.modelCache.existingClaim | quote }}
+          {{- else }}
+          emptyDir:
+            {{- toYaml .Values.asr.modelCache.emptyDir | nindent 12 }}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" .Values.asr.name) }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ .Values.asr.name }}
+  {{- with .Values.asr.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.asr.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "video-commerce.selectorLabels" (dict "root" . "component" .Values.asr.name) | nindent 4 }}
+{{- end }}

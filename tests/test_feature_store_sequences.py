@@ -436,7 +436,16 @@ async def test_content_feature_snapshot_serves_known_content_from_memory():
     store = FeatureStore(RedisConfig(), CacheConfig())
     fake = FakeRedis()
     store.redis_client = fake
-    features = ContentFeatures(content_id="content-1", visual_embedding=[0.1, 0.2])
+    features = ContentFeatures(
+        content_id="content-1",
+        visual_embedding=[0.1, 0.2],
+        audio_features={
+            "has_audio": True,
+            "audio_transcript": "手機 headphones",
+            "transcription_status": "completed",
+            "speech_categories": ["electronics"],
+        },
+    )
     fake.data["cf:content-1"] = pack_cache_payload(
         "content_features", features.dict()
     )
@@ -448,4 +457,5 @@ async def test_content_feature_snapshot_serves_known_content_from_memory():
 
     assert count == 1
     assert result == features
+    assert result.audio_features.audio_transcript == "手機 headphones"
     assert fake.get_calls == []

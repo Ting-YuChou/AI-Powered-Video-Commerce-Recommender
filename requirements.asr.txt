@@ -1,0 +1,5 @@
+# Isolated GPU ASR runtime. Keep this separate from the backend requirements.
+fastapi==0.104.1
+python-multipart==0.0.6
+qwen-asr==0.0.6
+uvicorn[standard]==0.24.0

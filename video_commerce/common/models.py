@@ -264,11 +264,32 @@ class UserFeatures(BaseModel):
     last_active: float = Field(default_factory=time.time, description="Last activity timestamp")
     demographics: Dict[str, Any] = Field(default_factory=dict, description="User demographics")
 
+class AudioFeatures(BaseModel):
+    """Speech and audio metadata extracted from uploaded video content."""
+    has_audio: bool = Field(False, description="Whether the media reports an audio stream")
+    audio_length: Optional[float] = Field(None, description="Audio duration in seconds")
+    audio_transcript: Optional[str] = Field(None, description="Speech-to-text transcript")
+    transcription_status: str = Field("not_attempted", description="ASR processing outcome")
+    asr_model: Optional[str] = Field(None, description="ASR model identifier")
+    speech_detected: Optional[bool] = Field(None, description="Whether non-empty speech was transcribed")
+    transcription_time_seconds: Optional[float] = Field(
+        None, description="Audio extraction and ASR latency in seconds"
+    )
+    speech_categories: List[str] = Field(
+        default_factory=list, description="Canonical commerce categories inferred from speech"
+    )
+    audio_sentiment: Optional[float] = Field(
+        None, description="Optional imported audio sentiment feature"
+    )
+
+    class Config:
+        extra = "allow"
+
 class ContentFeatures(BaseModel):
     """Content feature representation extracted from videos."""
     content_id: str = Field(..., description="Content identifier")
     visual_embedding: List[float] = Field(..., description="CLIP visual embedding")
-    audio_features: Optional[Dict[str, Any]] = Field(None, description="Audio analysis features")
+    audio_features: Optional[AudioFeatures] = Field(None, description="Audio analysis features")
     text_features: Optional[Dict[str, Any]] = Field(None, description="Extracted text features")
     duration_seconds: Optional[float] = Field(None, description="Video duration")
     detected_objects: List[str] = Field(default_factory=list, description="Detected objects in video")
@@ -376,7 +397,7 @@ __all__ = [
     "ProductRecommendation", "RecommendationResponse", "ContentUploadResponse", 
     "AnalyticsResponse", "HealthResponse", "ComponentHealth",
     # Internal models
-    "UserFeatures", "ContentFeatures", "RealtimeWindowFeatures", "ProductData", "CandidateProduct", 
+    "UserFeatures", "AudioFeatures", "ContentFeatures", "RealtimeWindowFeatures", "ProductData", "CandidateProduct",
     "RankingFeatures", "SystemMetrics", "TwoTowerTrainingSample",
     # Configuration models
     "RedisConfig", "ModelConfig"
