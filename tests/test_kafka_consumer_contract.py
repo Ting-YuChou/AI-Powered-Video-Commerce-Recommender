@@ -16,9 +16,13 @@ async def test_consumer_passes_configured_max_poll_interval(monkeypatch):
             return None
 
     monkeypatch.setattr(kafka_client, "AIOKafkaConsumer", FakeConsumer)
-    config = KafkaConfig(consumer_max_poll_interval_ms=600000)
+    config = KafkaConfig(
+        consumer_max_poll_interval_ms=600000,
+        dead_letter_enable=False,
+    )
     client = kafka_client.KafkaConsumerClient(config, group_id="content-processor")
 
     await client.start(["video-processing-tasks"])
 
     assert captured["max_poll_interval_ms"] == 600000
+    assert client.dlq_producer is None
