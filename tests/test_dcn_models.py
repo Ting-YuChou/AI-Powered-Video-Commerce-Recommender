@@ -437,6 +437,145 @@ async def test_ranking_dcn_direct_and_microbatch_inference_outputs_shapes():
 
 
 @pytest.mark.asyncio
+async def test_ranking_torch_compile_disabled_uses_eager_inference(monkeypatch):
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("torch.compile should not be called")
+
+    monkeypatch.setattr(torch, "compile", fail_compile)
+    ranking = RankingModel(
+        RankingConfig(
+            architecture="dcn",
+            hidden_dims=[16, 8],
+            torch_compile_enabled=False,
+        )
+    )
+
+    await ranking.load_model()
+    predictions, _ = ranking.run_inference_batch(
+        np.zeros((4, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
+    )
+    status = ranking.health_check()
+
+    assert ranking._compiled_model is None
+    assert status["torch_compile_enabled"] is False
+    assert status["torch_compile_active"] is False
+    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+
+
+@pytest.mark.asyncio
+async def test_ranking_torch_compile_enabled_uses_compiled_wrapper(monkeypatch):
+    wrappers = []
+    compile_calls = []
+
+    class FakeCompiledModel:
+        def __init__(self, model):
+            self.model = model
+            self.calls = []
+
+        def __call__(self, features):
+            self.calls.append(tuple(features.shape))
+            return self.model(features)
+
+    def fake_compile(model, **kwargs):
+        compile_calls.append((model, kwargs))
+        wrapper = FakeCompiledModel(model)
+        wrappers.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    ranking = RankingModel(
+        RankingConfig(
+            architecture="dcn",
+            hidden_dims=[16, 8],
+            batch_target_requests=3,
+            torch_compile_enabled=True,
+            torch_compile_backend="inductor",
+            torch_compile_mode="default",
+            torch_compile_dynamic=True,
+        )
+    )
+
+    await ranking.load_model()
+    predictions, _ = ranking.run_inference_batch(
+        np.zeros((4, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
+    )
+    stats = ranking.get_stats()
+
+    assert len(compile_calls) == 1
+    assert compile_calls[0][0] is ranking.model
+    assert compile_calls[0][1] == {
+        "backend": "inductor",
+        "mode": "default",
+        "dynamic": True,
+        "fullgraph": True,
+    }
+    assert ranking._compiled_model is wrappers[0]
+    assert wrappers[0].calls[0] == (3, ranking.feature_extractor.total_feature_dim)
+    assert wrappers[0].calls[-1] == (4, ranking.feature_extractor.total_feature_dim)
+    assert stats["torch_compile_enabled"] is True
+    assert stats["torch_compile_active"] is True
+    assert stats["torch_compile_error"] is None
+    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+
+
+@pytest.mark.asyncio
+async def test_ranking_torch_compile_failure_falls_back_to_eager(monkeypatch):
+    def fail_compile(*args, **kwargs):
+        raise RuntimeError("compile failed")
+
+    monkeypatch.setattr(torch, "compile", fail_compile)
+    ranking = RankingModel(
+        RankingConfig(
+            architecture="dcn",
+            hidden_dims=[16, 8],
+            torch_compile_enabled=True,
+        )
+    )
+
+    await ranking.load_model()
+    predictions, _ = ranking.run_inference_batch(
+        np.zeros((2, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
+    )
+    status = ranking.health_check()
+
+    assert ranking._compiled_model is None
+    assert status["torch_compile_enabled"] is True
+    assert status["torch_compile_active"] is False
+    assert "compile failed" in status["torch_compile_error"]
+    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+
+
+@pytest.mark.asyncio
+async def test_ranking_model_rebuild_invalidates_compiled_wrapper(monkeypatch):
+    class FakeCompiledModel:
+        def __init__(self, model):
+            self.model = model
+
+        def __call__(self, features):
+            return self.model(features)
+
+    monkeypatch.setattr(
+        torch,
+        "compile",
+        lambda model, **kwargs: FakeCompiledModel(model),
+    )
+    ranking = RankingModel(
+        RankingConfig(
+            architecture="dcn",
+            hidden_dims=[16, 8],
+            torch_compile_enabled=True,
+        )
+    )
+    await ranking.load_model()
+
+    assert ranking._compiled_model is not None
+    ranking._initialize_model(architecture="mlp", hidden_dims=[16, 8])
+
+    assert ranking._compiled_model is None
+    assert ranking.get_stats()["torch_compile_active"] is False
+
+
+@pytest.mark.asyncio
 async def test_ranking_dcn_v2_low_rank_trains_and_infers_with_batch_size_one():
     config = RankingConfig(
         architecture="dcn_v2_low_rank",

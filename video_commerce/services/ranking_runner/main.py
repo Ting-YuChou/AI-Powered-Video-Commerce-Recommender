@@ -138,6 +138,7 @@ class RankingRunner:
             backlog=topology.ranking_runner_backlog,
             limit=topology.ranking_runner_stream_limit,
         )
+        compile_status = self.ranking_model.get_stats()
         logger.info(
             "ranking_runner_started",
             extra={
@@ -149,6 +150,12 @@ class RankingRunner:
                 "torch_num_interop_threads": torch.get_num_interop_threads(),
                 "runner_batch_concurrency": runner_concurrency,
                 "runner_queue_size": runner_queue_size,
+                "torch_compile_enabled": compile_status["torch_compile_enabled"],
+                "torch_compile_active": compile_status["torch_compile_active"],
+                "torch_compile_backend": compile_status["torch_compile_backend"],
+                "torch_compile_mode": compile_status["torch_compile_mode"],
+                "torch_compile_dynamic": compile_status["torch_compile_dynamic"],
+                "torch_compile_error": compile_status["torch_compile_error"],
             },
         )
 
