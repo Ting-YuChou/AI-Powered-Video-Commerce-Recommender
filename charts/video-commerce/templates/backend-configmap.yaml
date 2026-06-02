@@ -77,6 +77,10 @@ data:
   RANKING_REALTIME_WINDOW_FEATURES_ENABLED: {{ .Values.appConfig.ranking.realtimeWindowFeaturesEnabled | quote }}
   RANKING_RUNNER_PAYLOAD_V2_ENABLED: {{ .Values.appConfig.ranking.runnerPayloadV2Enabled | quote }}
   RANKING_RUNNER_PAYLOAD_MAX_BYTES: {{ .Values.appConfig.ranking.runnerPayloadMaxBytes | quote }}
+  RANKING_TORCH_COMPILE_ENABLED: {{ .Values.appConfig.ranking.torchCompileEnabled | quote }}
+  RANKING_TORCH_COMPILE_BACKEND: {{ .Values.appConfig.ranking.torchCompileBackend | quote }}
+  RANKING_TORCH_COMPILE_MODE: {{ .Values.appConfig.ranking.torchCompileMode | quote }}
+  RANKING_TORCH_COMPILE_DYNAMIC: {{ .Values.appConfig.ranking.torchCompileDynamic | quote }}
   CACHE_CANDIDATE_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.candidateCacheRaceTimeoutMs | quote }}
   CACHE_RECOMMENDATION_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.recommendationCacheRaceTimeoutMs | quote }}
   CACHE_BACKGROUND_TASK_QUEUE_SIZE: {{ .Values.appConfig.cache.backgroundTaskQueueSize | quote }}

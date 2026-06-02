@@ -624,6 +624,22 @@ class RankingConfig(BaseSettings):
         32 * 1024 * 1024,
         description="Maximum encoded ranking-runner batch payload size before failing fast",
     )
+    torch_compile_enabled: bool = Field(
+        False,
+        description="Enable torch.compile for ranking inference only",
+    )
+    torch_compile_backend: str = Field(
+        "inductor",
+        description="torch.compile backend for ranking inference",
+    )
+    torch_compile_mode: str = Field(
+        "default",
+        description="torch.compile mode for ranking inference",
+    )
+    torch_compile_dynamic: bool = Field(
+        True,
+        description="Enable dynamic shape support for compiled ranking inference",
+    )
 
     # Multi-objective settings
     enable_multi_objective: bool = Field(

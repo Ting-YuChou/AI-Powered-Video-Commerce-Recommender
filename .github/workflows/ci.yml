@@ -56,6 +56,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Pull Docker test dependencies
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose --profile test pull \
+              redis redis-cache postgres zookeeper kafka kafka-init; then
+              exit 0
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
       - name: Run backend tests inside Docker
         run: docker compose --profile test run --rm backend-tests
 

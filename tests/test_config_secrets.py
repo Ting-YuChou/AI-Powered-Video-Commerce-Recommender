@@ -146,6 +146,40 @@ def test_config_reads_official_flink_cutover_env(monkeypatch):
     reset_config()
 
 
+def test_config_reads_ranking_torch_compile_env(monkeypatch):
+    for env_name in (
+        "RANKING_TORCH_COMPILE_ENABLED",
+        "RANKING_TORCH_COMPILE_BACKEND",
+        "RANKING_TORCH_COMPILE_MODE",
+        "RANKING_TORCH_COMPILE_DYNAMIC",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.ranking_config.torch_compile_enabled is False
+    assert config.ranking_config.torch_compile_backend == "inductor"
+    assert config.ranking_config.torch_compile_mode == "default"
+    assert config.ranking_config.torch_compile_dynamic is True
+
+    monkeypatch.setenv("RANKING_TORCH_COMPILE_ENABLED", "true")
+    monkeypatch.setenv("RANKING_TORCH_COMPILE_BACKEND", "eager")
+    monkeypatch.setenv("RANKING_TORCH_COMPILE_MODE", "reduce-overhead")
+    monkeypatch.setenv("RANKING_TORCH_COMPILE_DYNAMIC", "false")
+
+    reset_config()
+    config = Config()
+
+    assert config.ranking_config.torch_compile_enabled is True
+    assert config.ranking_config.torch_compile_backend == "eager"
+    assert config.ranking_config.torch_compile_mode == "reduce-overhead"
+    assert config.ranking_config.torch_compile_dynamic is False
+
+    reset_config()
+
+
 def test_explicit_monitoring_log_level_wins_over_development_env(monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "development")
     monkeypatch.setenv("MONITORING_LOG_LEVEL", "INFO")

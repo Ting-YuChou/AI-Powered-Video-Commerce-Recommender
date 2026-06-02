@@ -138,6 +138,7 @@ async def startup_event():
             _periodic_ranking_checkpoint_sync(runtime),
             name="ranking-service-checkpoint-sync",
         )
+    compile_status = ranking_model.get_stats()
 
     logger.info(
         "ranking_service_worker_started",
@@ -150,6 +151,12 @@ async def startup_event():
             "batch_max_requests": runtime.config.ranking_config.batch_max_requests,
             "batch_wait_ms": runtime.config.ranking_config.batch_wait_ms,
             "batch_runner_count": runtime.config.ranking_config.batch_runner_count,
+            "torch_compile_enabled": compile_status["torch_compile_enabled"],
+            "torch_compile_active": compile_status["torch_compile_active"],
+            "torch_compile_backend": compile_status["torch_compile_backend"],
+            "torch_compile_mode": compile_status["torch_compile_mode"],
+            "torch_compile_dynamic": compile_status["torch_compile_dynamic"],
+            "torch_compile_error": compile_status["torch_compile_error"],
         },
     )
 

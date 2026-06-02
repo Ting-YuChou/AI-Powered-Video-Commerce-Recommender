@@ -517,6 +517,8 @@ class RankingModel:
         self.checkpoint_reload_count = 0
         self._checkpoint_reload_lock = asyncio.Lock()
         self.torch_inference_available = True
+        self._compiled_model: Optional[Any] = None
+        self.torch_compile_error: Optional[str] = None
         self.enable_profiling_logs = False
         self.profiling_log_min_duration_ms = 250.0
         self._product_feature_cache_max_size = max(
@@ -545,6 +547,7 @@ class RankingModel:
             cross_layers=cross_layers,
             low_rank_dim=low_rank_dim,
         )
+        self._clear_compiled_model()
 
     def _build_model_instance(
         self,
@@ -569,6 +572,98 @@ class RankingModel:
             weight_decay=1e-5,
         )
         return model, optimizer
+
+    def _torch_compile_status(self) -> Dict[str, Any]:
+        return {
+            "torch_compile_enabled": bool(
+                getattr(self.config, "torch_compile_enabled", False)
+            ),
+            "torch_compile_active": self._compiled_model is not None,
+            "torch_compile_backend": getattr(
+                self.config,
+                "torch_compile_backend",
+                "inductor",
+            ),
+            "torch_compile_mode": getattr(self.config, "torch_compile_mode", "default"),
+            "torch_compile_dynamic": bool(
+                getattr(self.config, "torch_compile_dynamic", True)
+            ),
+            "torch_compile_error": self.torch_compile_error,
+        }
+
+    def _clear_compiled_model(self, error: Optional[str] = None) -> None:
+        self._compiled_model = None
+        self.torch_compile_error = error
+
+    def _compile_model_for_inference(self) -> None:
+        self._clear_compiled_model()
+        if not getattr(self.config, "torch_compile_enabled", False):
+            return
+        if self.model is None:
+            self.torch_compile_error = "model_not_loaded"
+            return
+        if not hasattr(torch, "compile"):
+            self.torch_compile_error = "torch.compile unavailable"
+            logger.warning("ranking_torch_compile_unavailable")
+            return
+
+        backend = getattr(self.config, "torch_compile_backend", "inductor")
+        mode = getattr(self.config, "torch_compile_mode", "default")
+        dynamic = bool(getattr(self.config, "torch_compile_dynamic", True))
+        warmup_batch_size = max(
+            1,
+            int(getattr(self.config, "batch_target_requests", 1) or 1),
+        )
+        was_training = self.model.training
+        self.model.eval()
+
+        try:
+            compiled_model = torch.compile(
+                self.model,
+                backend=backend,
+                mode=mode,
+                dynamic=dynamic,
+                fullgraph=True,
+            )
+            dummy_features = torch.zeros(
+                warmup_batch_size,
+                self.feature_extractor.total_feature_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            with torch.inference_mode():
+                compiled_model(dummy_features)
+            self._compiled_model = compiled_model
+            self.torch_compile_error = None
+            logger.info(
+                "ranking_torch_compile_ready",
+                extra={
+                    "backend": backend,
+                    "mode": mode,
+                    "dynamic": dynamic,
+                    "fullgraph": True,
+                    "warmup_batch_size": warmup_batch_size,
+                    "device": str(self.device),
+                },
+            )
+        except Exception as exc:
+            self._clear_compiled_model(f"{type(exc).__name__}: {exc}")
+            logger.warning(
+                "ranking_torch_compile_failed",
+                extra={
+                    "backend": backend,
+                    "mode": mode,
+                    "dynamic": dynamic,
+                    "fullgraph": True,
+                    "warmup_batch_size": warmup_batch_size,
+                    "device": str(self.device),
+                    "exception_type": type(exc).__name__,
+                    "exception_repr": repr(exc),
+                },
+            )
+        finally:
+            if was_training:
+                self.model.train()
 
     def _load_shape_compatible_state_dict(
         self,
@@ -675,6 +770,7 @@ class RankingModel:
 
             # Set to evaluation mode initially
             self.loaded_model_path = resolved_model_path
+            self._compile_model_for_inference()
 
             logger.info("Ranking model loaded successfully")
 
@@ -897,7 +993,21 @@ class RankingModel:
             )
 
             model_stage_started = time.perf_counter()
-            predictions = model(features_tensor)
+            inference_model = self._compiled_model or model
+            try:
+                predictions = inference_model(features_tensor)
+            except Exception as exc:
+                if self._compiled_model is None:
+                    raise
+                self._clear_compiled_model(f"{type(exc).__name__}: {exc}")
+                logger.warning(
+                    "ranking_torch_compile_inference_failed",
+                    extra={
+                        "exception_type": type(exc).__name__,
+                        "exception_repr": repr(exc),
+                    },
+                )
+                predictions = model(features_tensor)
             model_forward_ms = round(
                 (time.perf_counter() - model_stage_started) * 1000, 2
             )
@@ -1356,6 +1466,7 @@ class RankingModel:
             logger.warning("No valid training samples prepared")
             return None
 
+        self._clear_compiled_model()
         self.model.train()
 
         for epoch in range(self.config.epochs):
@@ -1392,6 +1503,7 @@ class RankingModel:
         self.is_trained = True
         self.last_training_time = time.time()
         self.model_version = f"ranking-{int(self.last_training_time)}"
+        self._compile_model_for_inference()
 
         logger.info("Model training completed")
         return self.loaded_model_path
@@ -1681,7 +1793,7 @@ class RankingModel:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get model statistics."""
-        return {
+        stats = {
             "is_trained": self.is_trained,
             "model_version": self.model_version,
             "last_training_time": self.last_training_time,
@@ -1701,6 +1813,8 @@ class RankingModel:
             if self.model
             else None,
         }
+        stats.update(self._torch_compile_status())
+        return stats
 
     def health_check(self) -> Dict[str, Any]:
         """Perform health check on the ranking model."""
@@ -1722,6 +1836,7 @@ class RankingModel:
                 else None,
                 "torch_inference_available": self.torch_inference_available,
             }
+            status.update(self._torch_compile_status())
 
             # Test inference if model is loaded
             if self.model:

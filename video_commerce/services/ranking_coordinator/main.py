@@ -141,6 +141,24 @@ class RankingCoordinator:
             backlog=self.config.service_topology_config.ranking_coordinator_backlog,
             limit=self.config.service_topology_config.ranking_coordinator_stream_limit,
         )
+        compile_status = (
+            self.ranking_model.get_stats()
+            if self.ranking_model
+            else {
+                "torch_compile_enabled": (
+                    self.config.ranking_config.torch_compile_enabled
+                ),
+                "torch_compile_active": False,
+                "torch_compile_backend": (
+                    self.config.ranking_config.torch_compile_backend
+                ),
+                "torch_compile_mode": self.config.ranking_config.torch_compile_mode,
+                "torch_compile_dynamic": (
+                    self.config.ranking_config.torch_compile_dynamic
+                ),
+                "torch_compile_error": None,
+            }
+        )
         logger.info(
             "ranking_coordinator_started",
             extra={
@@ -153,6 +171,12 @@ class RankingCoordinator:
                 "batch_max_requests": self.config.ranking_config.batch_max_requests,
                 "batch_target_requests": self.config.ranking_config.batch_target_requests,
                 "batch_wait_ms": self.config.ranking_config.batch_wait_ms,
+                "torch_compile_enabled": compile_status["torch_compile_enabled"],
+                "torch_compile_active": compile_status["torch_compile_active"],
+                "torch_compile_backend": compile_status["torch_compile_backend"],
+                "torch_compile_mode": compile_status["torch_compile_mode"],
+                "torch_compile_dynamic": compile_status["torch_compile_dynamic"],
+                "torch_compile_error": compile_status["torch_compile_error"],
                 "batch_runner_count": self.config.ranking_config.batch_runner_count,
                 "ranking_runner_urls": runner_urls,
                 "coordinator_dispatch_concurrency": self.config.ranking_config.coordinator_dispatch_concurrency,
