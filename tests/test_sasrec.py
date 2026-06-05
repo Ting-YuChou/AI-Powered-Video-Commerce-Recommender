@@ -5,6 +5,7 @@ import pytest
 
 from video_commerce.common.config import CacheConfig, RecommendationConfig
 from video_commerce.common.models import CandidateProduct, ContentFeatures, UserFeatures
+from video_commerce.ml import sasrec as sasrec_module
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.ml.sasrec import SASRecCandidateEngine
 
@@ -59,6 +60,11 @@ def test_sasrec_training_samples_pad_and_truncate_unknown_items():
     assert label_ids.tolist() == [2, 3, 4]
 
 
+def test_sasrec_config_rejects_invalid_attention_shape():
+    with pytest.raises(ValueError, match="sasrec_embedding_dim"):
+        _small_sasrec_config(sasrec_embedding_dim=8, sasrec_num_heads=3)
+
+
 @pytest.mark.asyncio
 async def test_sasrec_train_save_load_and_infer_candidates(tmp_path):
     config = _small_sasrec_config()
@@ -93,6 +99,39 @@ async def test_sasrec_train_save_load_and_infer_candidates(tmp_path):
     assert all(candidate.source == "sasrec" for candidate in candidates)
     assert all(candidate.product_id not in {"p1", "p2"} for candidate in candidates)
     assert all(0.0 <= candidate.collaborative_score <= 1.0 for candidate in candidates)
+
+
+@pytest.mark.asyncio
+async def test_sasrec_training_failure_preserves_existing_state(monkeypatch):
+    config = _small_sasrec_config()
+    engine = SASRecCandidateEngine(config)
+    trained = await engine.train_model(
+        {"u1": [_event("p1", timestamp=1), _event("p2", timestamp=2)]},
+        catalog_product_ids={"p1", "p2"},
+    )
+    assert trained is True
+    original_model = engine.model
+    original_product_to_id = dict(engine.product_to_id)
+    original_id_to_product = dict(engine.id_to_product)
+    original_sample_count = engine.training_sample_count
+
+    class RaisingSASRecModel:
+        def __init__(self, **kwargs):
+            raise RuntimeError("model init failed")
+
+    monkeypatch.setattr(sasrec_module, "SASRecModel", RaisingSASRecModel)
+
+    with pytest.raises(RuntimeError, match="model init failed"):
+        await engine.train_model(
+            {"u1": [_event("p3", timestamp=1), _event("p4", timestamp=2)]},
+            catalog_product_ids={"p3", "p4"},
+        )
+
+    assert engine.is_trained is True
+    assert engine.model is original_model
+    assert engine.product_to_id == original_product_to_id
+    assert engine.id_to_product == original_id_to_product
+    assert engine.training_sample_count == original_sample_count
 
 
 @pytest.mark.asyncio
@@ -144,6 +183,11 @@ class FakeFeatureStore:
         return []
 
 
+class TrainingFeatureStore(FakeFeatureStore):
+    async def get_all_user_features_map(self):
+        return {}
+
+
 class FakeVectorSearch:
     embedding_dim = 8
     product_metadata = {
@@ -170,6 +214,54 @@ class RecordingSequenceSystemStore:
 class FakeArtifactManager:
     def __init__(self, system_store):
         self.system_store = system_store
+
+
+class TrainingSequenceSystemStore:
+    async def get_training_interactions(self, limit=50000):
+        return [
+            _event("p1", timestamp=1),
+            _event("p2", timestamp=2),
+            _event("p3", timestamp=3),
+        ]
+
+    async def get_user_training_sequences(self, **kwargs):
+        return {
+            "u1": [
+                _event("p1", timestamp=1),
+                _event("p2", timestamp=2),
+                _event("p3", timestamp=3),
+            ]
+        }
+
+
+class NonTrainingCFEngine:
+    is_trained = False
+
+    def __init__(self):
+        self.calls = []
+
+    async def train_model(self, interactions, user_features_map=None):
+        self.calls.append(
+            {
+                "interactions": list(interactions),
+                "user_features_map": dict(user_features_map or {}),
+            }
+        )
+
+
+class RaisingTrainingSASRec:
+    is_trained = False
+
+    async def train_model(self, sequences, *, catalog_product_ids):
+        raise RuntimeError("sasrec training failed")
+
+
+class RecordingTrendingEngine:
+    def __init__(self):
+        self.calls = []
+
+    async def update_trending_scores(self, interactions):
+        self.calls.append(list(interactions))
 
 
 class RecordingCategoryFeatureStore(FakeFeatureStore):
@@ -313,6 +405,32 @@ async def test_sasrec_training_sequences_can_disable_lookback():
     await engine._update_sasrec_from_sequences()
 
     assert system_store.calls[0]["since"] is None
+
+
+@pytest.mark.asyncio
+async def test_sasrec_training_failure_does_not_abort_model_update():
+    system_store = TrainingSequenceSystemStore()
+    engine = RecommendationEngine(
+        TrainingFeatureStore(interactions=[]),
+        FakeVectorSearch(),
+        RecommendationConfig(enable_sasrec=True),
+        artifact_manager=FakeArtifactManager(system_store),
+    )
+    engine.cf_engine = NonTrainingCFEngine()
+    engine.sasrec_engine = RaisingTrainingSASRec()
+    engine.trending_engine = RecordingTrendingEngine()
+    refresh_calls = []
+
+    async def refresh_serving_pools():
+        refresh_calls.append(True)
+
+    engine.refresh_serving_pools = refresh_serving_pools
+
+    await engine._update_models_from_interactions()
+
+    assert len(engine.cf_engine.calls) == 1
+    assert len(engine.trending_engine.calls) == 1
+    assert refresh_calls == [True]
 
 
 @pytest.mark.asyncio

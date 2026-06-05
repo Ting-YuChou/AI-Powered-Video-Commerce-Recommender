@@ -1572,54 +1572,60 @@ class RecommendationEngine:
             )
             return
 
-        max_events = max(
-            int(self.config.sasrec_min_sequence_length),
-            int(self.config.sasrec_max_sequence_length) + 1,
-        )
-        lookback_days = max(0, int(self.training_sequence_lookback_days or 0))
-        since = time.time() - (lookback_days * 86400) if lookback_days > 0 else None
-        sequences = (
-            await self.artifact_manager.system_store.get_user_training_sequences(
-                max_events_per_user=max_events,
-                min_sequence_length=self.config.sasrec_min_sequence_length,
-                since=since,
+        try:
+            max_events = max(
+                int(self.config.sasrec_min_sequence_length),
+                int(self.config.sasrec_max_sequence_length) + 1,
             )
-        )
-        if not sequences:
-            logger.info(
-                "Skipping SASRec training because no positive user sequences are available"
+            lookback_days = max(0, int(self.training_sequence_lookback_days or 0))
+            since = time.time() - (lookback_days * 86400) if lookback_days > 0 else None
+            sequences = (
+                await self.artifact_manager.system_store.get_user_training_sequences(
+                    max_events_per_user=max_events,
+                    min_sequence_length=self.config.sasrec_min_sequence_length,
+                    since=since,
+                )
             )
-            return
+            if not sequences:
+                logger.info(
+                    "Skipping SASRec training because no positive user sequences are available"
+                )
+                return
 
-        trained = await self.sasrec_engine.train_model(
-            sequences,
-            catalog_product_ids=self.vector_search.product_metadata.keys(),
-        )
-        if not trained or not self.sasrec_engine.is_trained:
-            return
+            trained = await self.sasrec_engine.train_model(
+                sequences,
+                catalog_product_ids=self.vector_search.product_metadata.keys(),
+            )
+            if not trained or not self.sasrec_engine.is_trained:
+                return
 
-        checkpoint_path, vocab_path, metadata_path = self._sasrec_artifact_paths()
-        await asyncio.to_thread(
-            self.sasrec_engine.save_artifacts,
-            checkpoint_path,
-            vocab_path,
-            metadata_path,
-        )
-        model_version = self.sasrec_engine.model_version or f"sasrec-{int(time.time())}"
-        artifact_record = await self.artifact_manager.persist_sasrec_artifacts(
-            checkpoint_path=checkpoint_path,
-            vocab_path=vocab_path,
-            metadata_path=metadata_path,
-            model_version=model_version,
-            payload={
-                "sequence_count": len(sequences),
-                "training_sample_count": self.sasrec_engine.training_sample_count,
-                "last_training_time": self.sasrec_engine.last_training_time,
-            },
-        )
-        self.loaded_sasrec_version = (
-            artifact_record.model_version if artifact_record else model_version
-        )
+            checkpoint_path, vocab_path, metadata_path = self._sasrec_artifact_paths()
+            await asyncio.to_thread(
+                self.sasrec_engine.save_artifacts,
+                checkpoint_path,
+                vocab_path,
+                metadata_path,
+            )
+            model_version = self.sasrec_engine.model_version or f"sasrec-{int(time.time())}"
+            artifact_record = await self.artifact_manager.persist_sasrec_artifacts(
+                checkpoint_path=checkpoint_path,
+                vocab_path=vocab_path,
+                metadata_path=metadata_path,
+                model_version=model_version,
+                payload={
+                    "sequence_count": len(sequences),
+                    "training_sample_count": self.sasrec_engine.training_sample_count,
+                    "last_training_time": self.sasrec_engine.last_training_time,
+                },
+            )
+            self.loaded_sasrec_version = (
+                artifact_record.model_version if artifact_record else model_version
+            )
+        except Exception as exc:
+            logger.warning(
+                "SASRec training update failed; continuing without new sequential artifacts: %s",
+                exc,
+            )
 
     def _sasrec_artifact_paths(self) -> Tuple[str, str, str]:
         if self.artifact_manager:

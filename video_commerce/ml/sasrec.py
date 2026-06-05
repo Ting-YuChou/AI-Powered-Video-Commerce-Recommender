@@ -26,6 +26,56 @@ from video_commerce.common.models import CandidateProduct
 logger = logging.getLogger(__name__)
 
 
+class SASRecBlock(nn.Module):
+    """Small causal self-attention block used to avoid fragile Transformer kernels."""
+
+    def __init__(
+        self,
+        *,
+        embedding_dim: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attention_dropout = nn.Dropout(dropout)
+        self.attention_norm = nn.LayerNorm(embedding_dim)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedding_dim * 4, embedding_dim),
+        )
+        self.feed_forward_dropout = nn.Dropout(dropout)
+        self.feed_forward_norm = nn.LayerNorm(embedding_dim)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        *,
+        causal_mask: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        attended, _ = self.self_attention(
+            hidden,
+            hidden,
+            hidden,
+            attn_mask=causal_mask,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )
+        hidden = self.attention_norm(hidden + self.attention_dropout(attended))
+        feed_forward = self.feed_forward(hidden)
+        return self.feed_forward_norm(
+            hidden + self.feed_forward_dropout(feed_forward)
+        )
+
+
 class SASRecModel(nn.Module):
     """Minimal SASRec-style next-item predictor."""
 
@@ -45,15 +95,16 @@ class SASRecModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.item_embedding = nn.Embedding(num_items + 1, embedding_dim, padding_idx=0)
         self.position_embedding = nn.Embedding(max_sequence_length, embedding_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
-            nhead=num_heads,
-            dim_feedforward=embedding_dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
+        self.encoder = nn.ModuleList(
+            [
+                SASRecBlock(
+                    embedding_dim=embedding_dim,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.dropout = nn.Dropout(dropout)
         self.output = nn.Linear(embedding_dim, num_items + 1)
 
@@ -67,11 +118,13 @@ class SASRecModel(nn.Module):
             diagonal=1,
         )
         padding_mask = input_ids.eq(0)
-        encoded = self.encoder(
-            hidden,
-            mask=causal_mask,
-            src_key_padding_mask=padding_mask,
-        )
+        encoded = hidden
+        for block in self.encoder:
+            encoded = block(
+                encoded,
+                causal_mask=causal_mask,
+                padding_mask=padding_mask,
+            )
         return self.output(encoded)
 
 
@@ -113,30 +166,32 @@ class SASRecCandidateEngine:
         catalog = sorted({product_id for product_id in catalog_product_ids if product_id})
         if not catalog:
             logger.warning("Skipping SASRec training because catalog is empty")
+            self.training_sample_count = 0
             self.is_trained = False
             return False
 
-        self.product_to_id = {product_id: idx + 1 for idx, product_id in enumerate(catalog)}
-        self.id_to_product = {idx: product_id for product_id, idx in self.product_to_id.items()}
-        samples = self._build_training_samples(sequences)
-        self.training_sample_count = len(samples)
+        product_to_id = {product_id: idx + 1 for idx, product_id in enumerate(catalog)}
+        id_to_product = {idx: product_id for product_id, idx in product_to_id.items()}
+        samples = self._build_training_samples(sequences, product_to_id=product_to_id)
+        training_sample_count = len(samples)
         if not samples:
             logger.warning("Skipping SASRec training because no usable sequences were found")
+            self.training_sample_count = 0
             self.is_trained = False
             return False
 
-        self.model = SASRecModel(
-            num_items=len(self.product_to_id),
+        model = SASRecModel(
+            num_items=len(product_to_id),
             max_sequence_length=self.max_sequence_length,
             embedding_dim=int(self.config.sasrec_embedding_dim),
             num_heads=int(self.config.sasrec_num_heads),
             num_layers=int(self.config.sasrec_num_layers),
             dropout=float(self.config.sasrec_dropout),
         ).to(self.device)
-        self.model.train()
+        model.train()
 
         optimizer = optim.Adam(
-            self.model.parameters(),
+            model.parameters(),
             lr=float(self.config.sasrec_learning_rate),
             weight_decay=1e-6,
         )
@@ -157,10 +212,10 @@ class SASRecCandidateEngine:
                 labels = torch.tensor(labels_np[batch_idx], dtype=torch.long, device=self.device)
 
                 optimizer.zero_grad()
-                logits = self.model(input_ids)
+                logits = model(input_ids)
                 loss = criterion(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 epoch_loss += float(loss.detach().cpu())
                 batch_count += 1
@@ -171,7 +226,11 @@ class SASRecCandidateEngine:
                 epoch_loss / max(batch_count, 1),
             )
 
-        self.model.eval()
+        model.eval()
+        self.model = model
+        self.product_to_id = product_to_id
+        self.id_to_product = id_to_product
+        self.training_sample_count = training_sample_count
         self.is_trained = True
         self.last_training_time = time.time()
         self.model_version = f"sasrec-{int(self.last_training_time)}"
@@ -186,14 +245,16 @@ class SASRecCandidateEngine:
     def _build_training_samples(
         self,
         sequences: Dict[str, List[Dict[str, Any]]],
+        product_to_id: Optional[Dict[str, int]] = None,
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         samples: List[Tuple[np.ndarray, np.ndarray]] = []
         min_sequence_length = max(2, int(self.config.sasrec_min_sequence_length))
+        product_mapping = product_to_id or self.product_to_id
         for sequence in sequences.values():
             item_ids = [
-                self.product_to_id[event.get("product_id")]
+                product_mapping[event.get("product_id")]
                 for event in sequence
-                if event.get("product_id") in self.product_to_id
+                if event.get("product_id") in product_mapping
             ]
             if len(item_ids) < min_sequence_length:
                 continue
