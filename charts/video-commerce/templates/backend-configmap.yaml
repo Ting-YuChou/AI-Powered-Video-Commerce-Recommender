@@ -33,6 +33,8 @@ data:
   DATABASE_ENABLE: {{ .Values.external.database.enable | quote }}
   DATABASE_POOL_SIZE: {{ .Values.external.database.poolSize | quote }}
   DATABASE_MAX_OVERFLOW: {{ .Values.external.database.maxOverflow | quote }}
+  DATABASE_ANALYTICS_SUMMARY_CACHE_TTL_SECONDS: {{ .Values.external.database.analyticsSummaryCacheTtlSeconds | quote }}
+  DATABASE_TRAINING_SEQUENCE_LOOKBACK_DAYS: {{ .Values.external.database.trainingSequenceLookbackDays | quote }}
   DATABASE_AUTO_CREATE_SCHEMA: {{ .Values.external.database.autoCreateSchema | quote }}
   MODEL_CACHE_DIR: {{ .Values.appConfig.modelCacheDir | quote }}
   VECTOR_INDEX_PATH: {{ .Values.appConfig.vectorIndexPath | quote }}

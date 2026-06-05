@@ -699,6 +699,9 @@ async def startup_event():
         vector_search,
         runtime.config.recommendation_config,
         artifact_manager=artifact_manager,
+        training_sequence_lookback_days=(
+            runtime.config.database_config.training_sequence_lookback_days
+        ),
     )
     await recommendation_engine.load_serving_state()
 

@@ -1377,6 +1377,17 @@ class DatabaseConfig(BaseSettings):
         24,
         description="Time window used by online Postgres analytics summaries",
     )
+    analytics_summary_cache_ttl_seconds: int = Field(
+        15,
+        description=(
+            "Short in-process TTL for Postgres analytics summary queries; "
+            "0 disables caching"
+        ),
+    )
+    training_sequence_lookback_days: int = Field(
+        90,
+        description="Lookback window for training sequence reads; 0 reads all retained history",
+    )
     interaction_retention_days: int = Field(
         90,
         description="Retention window for raw interaction_events rows",

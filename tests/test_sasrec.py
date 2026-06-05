@@ -158,6 +158,20 @@ class FakeVectorSearch:
         return []
 
 
+class RecordingSequenceSystemStore:
+    def __init__(self):
+        self.calls = []
+
+    async def get_user_training_sequences(self, **kwargs):
+        self.calls.append(kwargs)
+        return {}
+
+
+class FakeArtifactManager:
+    def __init__(self, system_store):
+        self.system_store = system_store
+
+
 class RecordingCategoryFeatureStore(FakeFeatureStore):
     def __init__(self):
         super().__init__(interactions=[])
@@ -263,6 +277,42 @@ async def test_generate_candidates_skips_sasrec_when_disabled():
     assert [candidate.source for candidate in candidates] == ["trending_pool"]
     assert profile["source_counts"]["sasrec"] == 0
     assert feature_store.interaction_reads == 0
+
+
+@pytest.mark.asyncio
+async def test_sasrec_training_sequences_use_configured_lookback():
+    system_store = RecordingSequenceSystemStore()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[]),
+        FakeVectorSearch(),
+        RecommendationConfig(enable_sasrec=True),
+        artifact_manager=FakeArtifactManager(system_store),
+        training_sequence_lookback_days=90,
+    )
+
+    started_at = time.time()
+    await engine._update_sasrec_from_sequences()
+    finished_at = time.time()
+
+    assert len(system_store.calls) == 1
+    since = system_store.calls[0]["since"]
+    assert started_at - (90 * 86400) <= since <= finished_at - (90 * 86400)
+
+
+@pytest.mark.asyncio
+async def test_sasrec_training_sequences_can_disable_lookback():
+    system_store = RecordingSequenceSystemStore()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[]),
+        FakeVectorSearch(),
+        RecommendationConfig(enable_sasrec=True),
+        artifact_manager=FakeArtifactManager(system_store),
+        training_sequence_lookback_days=0,
+    )
+
+    await engine._update_sasrec_from_sequences()
+
+    assert system_store.calls[0]["since"] is None
 
 
 @pytest.mark.asyncio

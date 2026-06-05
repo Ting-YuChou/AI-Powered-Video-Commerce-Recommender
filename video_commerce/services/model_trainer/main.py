@@ -85,6 +85,9 @@ class ModelTrainerService:
             self.vector_search,
             self.config.recommendation_config,
             artifact_manager=self.artifact_manager,
+            training_sequence_lookback_days=(
+                self.config.database_config.training_sequence_lookback_days
+            ),
         )
         await self.recommendation_engine.load_models()
 

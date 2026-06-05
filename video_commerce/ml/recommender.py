@@ -1330,11 +1330,13 @@ class RecommendationEngine:
         vector_search: VectorSearchEngine,
         config: RecommendationConfig,
         artifact_manager: Optional[ModelArtifactManager] = None,
+        training_sequence_lookback_days: Optional[int] = None,
     ):
         self.feature_store = feature_store
         self.vector_search = vector_search
         self.config = config
         self.artifact_manager = artifact_manager
+        self.training_sequence_lookback_days = training_sequence_lookback_days
 
         # Recommendation engines
         self.cf_engine = TwoTowerRetrievalEngine(config, vector_search)
@@ -1574,10 +1576,13 @@ class RecommendationEngine:
             int(self.config.sasrec_min_sequence_length),
             int(self.config.sasrec_max_sequence_length) + 1,
         )
+        lookback_days = max(0, int(self.training_sequence_lookback_days or 0))
+        since = time.time() - (lookback_days * 86400) if lookback_days > 0 else None
         sequences = (
             await self.artifact_manager.system_store.get_user_training_sequences(
                 max_events_per_user=max_events,
                 min_sequence_length=self.config.sasrec_min_sequence_length,
+                since=since,
             )
         )
         if not sequences:
