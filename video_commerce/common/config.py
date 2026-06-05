@@ -12,9 +12,9 @@ import json
 from typing import Dict, Any, Optional, List
 
 try:
-    from pydantic.v1 import BaseSettings, Field, validator
+    from pydantic.v1 import BaseSettings, Field, root_validator, validator
 except ImportError:
-    from pydantic import BaseSettings, Field, validator
+    from pydantic import BaseSettings, Field, root_validator, validator
 from pathlib import Path
 import logging
 
@@ -518,6 +518,53 @@ class RecommendationConfig(BaseSettings):
         if value < 0:
             raise ValueError("serving_recent_interaction_limit must be >= 0")
         return value
+
+    @validator(
+        "sasrec_max_sequence_length",
+        "sasrec_embedding_dim",
+        "sasrec_num_heads",
+        "sasrec_num_layers",
+        "sasrec_batch_size",
+        "sasrec_epochs",
+    )
+    def validate_sasrec_positive_ints(cls, value: int, field) -> int:
+        if value <= 0:
+            raise ValueError(f"{field.name} must be > 0")
+        return value
+
+    @validator("sasrec_min_sequence_length")
+    def validate_sasrec_min_sequence_length(cls, value: int) -> int:
+        if value < 2:
+            raise ValueError("sasrec_min_sequence_length must be >= 2")
+        return value
+
+    @validator("sasrec_learning_rate")
+    def validate_sasrec_learning_rate(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("sasrec_learning_rate must be > 0")
+        return value
+
+    @validator("sasrec_dropout")
+    def validate_sasrec_dropout(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("sasrec_dropout must be between 0 and 1")
+        return value
+
+    @validator("sasrec_score_weight")
+    def validate_sasrec_score_weight(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("sasrec_score_weight must be >= 0")
+        return value
+
+    @root_validator(skip_on_failure=True)
+    def validate_sasrec_attention_shape(cls, values):
+        embedding_dim = int(values.get("sasrec_embedding_dim") or 0)
+        num_heads = int(values.get("sasrec_num_heads") or 0)
+        if num_heads > 0 and embedding_dim > 0 and embedding_dim % num_heads != 0:
+            raise ValueError(
+                "sasrec_embedding_dim must be divisible by sasrec_num_heads"
+            )
+        return values
 
     @validator("new_item_pool_refresh_interval_seconds")
     def validate_new_item_pool_refresh_interval_seconds(cls, value: float) -> float:
