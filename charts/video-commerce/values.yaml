@@ -93,6 +93,8 @@ external:
     enable: true
     poolSize: 5
     maxOverflow: 5
+    analyticsSummaryCacheTtlSeconds: 15
+    trainingSequenceLookbackDays: 90
     autoCreateSchema: true
   objectStorage:
     backend: s3

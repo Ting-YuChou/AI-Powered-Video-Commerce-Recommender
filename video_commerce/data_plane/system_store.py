@@ -190,6 +190,13 @@ Index(
     InteractionEvent.event_id,
 )
 Index(
+    "ix_interaction_events_positive_user_sequence",
+    InteractionEvent.user_id,
+    InteractionEvent.occurred_at.desc(),
+    InteractionEvent.event_id.desc(),
+    postgresql_where=InteractionEvent.action.in_(POSITIVE_SEQUENCE_ACTIONS),
+)
+Index(
     "ix_model_checkpoints_latest",
     ModelCheckpoint.model_name,
     ModelCheckpoint.created_at.desc(),
@@ -214,6 +221,7 @@ class SystemStore:
         self.session_factory: async_sessionmaker | None = None
         self.is_connected = False
         self._retention_cleanup_task: asyncio.Task | None = None
+        self._analytics_summary_cache: Dict[int, tuple[float, Dict[str, Any]]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -277,6 +285,13 @@ class SystemStore:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_interaction_events_user_sequence "
                 "ON interaction_events (user_id, occurred_at, event_id)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_interaction_events_positive_user_sequence "
+                "ON interaction_events (user_id, occurred_at DESC, event_id DESC) "
+                "WHERE action IN ('view', 'click', 'add_to_cart', 'purchase')"
             )
         )
         await conn.execute(
@@ -384,6 +399,7 @@ class SystemStore:
         self.engine = None
         self.session_factory = None
         self.is_connected = False
+        self._analytics_summary_cache.clear()
 
     def _install_metrics_listeners(self) -> None:
         if self.engine is None or self.observability is None:
@@ -626,6 +642,15 @@ class SystemStore:
             }
 
         window_hours = max(1, int(self.config.analytics_window_hours))
+        ttl_seconds = max(0, int(self.config.analytics_summary_cache_ttl_seconds))
+        now = time.time()
+        if ttl_seconds > 0:
+            cached = self._analytics_summary_cache.get(window_hours)
+            if cached is not None:
+                cached_at, cached_summary = cached
+                if now - cached_at < ttl_seconds:
+                    return _copy_analytics_summary(cached_summary)
+
         cutoff = _utc_now() - timedelta(hours=window_hours)
 
         async with self.session_factory() as session:
@@ -653,17 +678,23 @@ class SystemStore:
         ctr = clicks / max(views, 1)
         conversion_rate = purchases / max(clicks, 1)
 
-        return {
+        summary = {
             "total_interactions": int(total_interactions or 0),
             "unique_users": int(unique_users or 0),
             "unique_products": int(unique_products or 0),
             "action_counts": dict(action_counts),
             "ctr": round(ctr, 4),
             "conversion_rate": round(conversion_rate, 4),
-            "timestamp": time.time(),
+            "timestamp": now,
             "source": "postgres",
             "window_hours": window_hours,
         }
+        if ttl_seconds > 0:
+            self._analytics_summary_cache[window_hours] = (
+                now,
+                _copy_analytics_summary(summary),
+            )
+        return summary
 
     async def upsert_content_job(
         self,
@@ -719,30 +750,33 @@ class SystemStore:
         if not self.enabled:
             return
 
+        updated_at = _utc_now()
+        stmt = pg_insert(ContentJob).values(
+            content_id=content_id,
+            filename=None,
+            storage_path=storage_path,
+            user_id=None,
+            priority="normal",
+            status=status,
+            error_message=error_message,
+            payload=payload or {},
+            updated_at=updated_at,
+        )
+        update_values = {
+            "status": status,
+            "error_message": error_message,
+            "updated_at": updated_at,
+        }
+        if storage_path is not None:
+            update_values["storage_path"] = storage_path
+        if payload is not None:
+            update_values["payload"] = payload
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[ContentJob.content_id],
+            set_=update_values,
+        )
         async with self.session_factory.begin() as session:
-            current = await session.get(ContentJob, content_id)
-            if current is None:
-                current = ContentJob(
-                    content_id=content_id,
-                    filename=None,
-                    storage_path=storage_path,
-                    user_id=None,
-                    priority="normal",
-                    status=status,
-                    error_message=error_message,
-                    payload=payload or {},
-                    updated_at=_utc_now(),
-                )
-                session.add(current)
-                return
-
-            if storage_path is not None:
-                current.storage_path = storage_path
-            current.status = status
-            current.error_message = error_message
-            if payload is not None:
-                current.payload = payload
-            current.updated_at = _utc_now()
+            await session.execute(stmt)
         self._update_pool_metrics()
 
     async def get_content_job(self, content_id: str) -> Optional[Dict[str, Any]]:
@@ -846,3 +880,9 @@ def _sql_operation(statement: Optional[str]) -> str:
     if not statement:
         return "unknown"
     return statement.strip().split(None, 1)[0].lower() or "unknown"
+
+
+def _copy_analytics_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(summary)
+    copied["action_counts"] = dict(summary.get("action_counts") or {})
+    return copied

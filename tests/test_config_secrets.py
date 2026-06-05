@@ -66,9 +66,25 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
         config.service_topology_config.ranking_runner_endpoint_missing_grace_seconds
         == 30.0
     )
+    assert config.database_config.analytics_summary_cache_ttl_seconds == 15
+    assert config.database_config.training_sequence_lookback_days == 90
     assert config.recommendation_config.preload_product_metadata_on_startup is False
     assert config.recommendation_config.publish_catalog_snapshot_on_startup is False
     assert config.redis_config.cache_host is None
+
+    reset_config()
+
+
+def test_config_reads_database_optimization_env(monkeypatch):
+    monkeypatch.setenv("DATABASE_ANALYTICS_SUMMARY_CACHE_TTL_SECONDS", "0")
+    monkeypatch.setenv("DATABASE_TRAINING_SEQUENCE_LOOKBACK_DAYS", "30")
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.database_config.analytics_summary_cache_ttl_seconds == 0
+    assert config.database_config.training_sequence_lookback_days == 30
 
     reset_config()
 

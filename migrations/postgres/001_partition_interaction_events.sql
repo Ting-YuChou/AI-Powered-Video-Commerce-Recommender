@@ -37,6 +37,9 @@ CREATE INDEX ix_interaction_events_product_id
     ON interaction_events (product_id);
 CREATE INDEX ix_interaction_events_user_sequence
     ON interaction_events (user_id, occurred_at, event_id);
+CREATE INDEX ix_interaction_events_positive_user_sequence
+    ON interaction_events (user_id, occurred_at DESC, event_id DESC)
+    WHERE action IN ('view', 'click', 'add_to_cart', 'purchase');
 
 DO $$
 DECLARE
