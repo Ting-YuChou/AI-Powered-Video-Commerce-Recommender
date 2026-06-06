@@ -30,32 +30,73 @@ api.interceptors.response.use(
     return response;
   },
   (error) => {
-    console.error('API Error:', error);
-    
-    if (error.response?.status === 500) {
-      console.error('Server error - check backend health');
-    } else if (error.response?.status === 404) {
-      console.error('API endpoint not found');
-    } else if (error.code === 'ECONNREFUSED' || error.code === 'ERR_NETWORK') {
-      console.error('Cannot connect to backend server');
-    }
-    
     return Promise.reject(error);
   }
 );
 
+export const interactionActions = {
+  VIEW: 'view',
+  CLICK: 'click',
+  PURCHASE: 'purchase',
+  ADD_TO_CART: 'add_to_cart',
+  REMOVE_FROM_CART: 'remove_from_cart',
+  FAVORITE: 'favorite',
+  SHARE: 'share',
+};
+
+export const buildUploadParams = (userId = 'demo_user', priority = 'normal') => ({
+  user_id: userId,
+  priority,
+});
+
+export const buildRecommendationPayload = (
+  userId,
+  contentId = null,
+  context = {},
+  k = 10
+) => {
+  const requestData = {
+    user_id: userId,
+    k,
+    context: {
+      device: 'web',
+      timestamp: Date.now(),
+      ...context,
+    },
+  };
+
+  if (contentId) {
+    requestData.content_id = contentId;
+  }
+
+  return requestData;
+};
+
+export const buildInteractionPayload = (
+  userId,
+  productId,
+  action,
+  context = {}
+) => ({
+  user_id: userId,
+  product_id: productId,
+  action,
+  context: {
+    timestamp: Date.now(),
+    device: 'web',
+    ...context,
+  },
+});
+
 // API Functions
 export const videoApi = {
   // Upload and process video
-  uploadVideo: async (file, userId = 'demo_user') => {
+  uploadVideo: async (file, userId = 'demo_user', priority = 'normal') => {
     const formData = new FormData();
     formData.append('file', file);
-    formData.append('user_id', userId);
     
     const response = await api.post('/api/content/upload', formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
+      params: buildUploadParams(userId, priority),
       timeout: 60000, // 60 seconds for video upload
     });
     
@@ -70,37 +111,14 @@ export const videoApi = {
   
   // Get recommendations
   getRecommendations: async (userId, contentId = null, context = {}, k = 10) => {
-    const requestData = {
-      user_id: userId,
-      k: k,
-      context: {
-        device: 'web',
-        timestamp: Date.now(),
-        ...context,
-      },
-    };
-    
-    if (contentId) {
-      requestData.content_id = contentId;
-    }
-    
+    const requestData = buildRecommendationPayload(userId, contentId, context, k);
     const response = await api.post('/api/recommendations', requestData);
     return response.data;
   },
   
   // Log user interaction
   logInteraction: async (userId, productId, action, context = {}) => {
-    const requestData = {
-      user_id: userId,
-      product_id: productId,
-      action: action,
-      context: {
-        timestamp: Date.now(),
-        device: 'web',
-        ...context,
-      },
-    };
-    
+    const requestData = buildInteractionPayload(userId, productId, action, context);
     const response = await api.post('/api/interactions', requestData);
     return response.data;
   },
@@ -136,10 +154,20 @@ export const systemApi = {
 // Utility functions
 export const utils = {
   // Poll for content processing completion
-  pollContentStatus: async (contentId, maxAttempts = 120, intervalMs = 3000) => {
+  pollContentStatus: async (
+    contentId,
+    {
+      maxAttempts = 120,
+      intervalMs = 3000,
+      onStatus = null,
+    } = {}
+  ) => {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const status = await videoApi.getContentStatus(contentId);
+        if (onStatus) {
+          onStatus(status, attempt + 1);
+        }
         
         if (status.status === 'completed') {
           return { success: true, status };
