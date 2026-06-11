@@ -6,7 +6,12 @@ from pathlib import Path
 from sqlalchemy.dialects import postgresql
 
 from video_commerce.common.config import DatabaseConfig
-from video_commerce.data_plane.system_store import SystemStore, build_chronological_user_sequences
+from video_commerce.data_plane.system_store import (
+    SystemStore,
+    _impression_context_snapshot,
+    build_chronological_user_sequences,
+    build_ltr_training_samples_from_impression_records,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -82,6 +87,24 @@ def test_build_chronological_user_sequences_keeps_recent_window_in_order():
     )
 
     assert [event["product_id"] for event in sequences["u1"]] == ["p3", "p4"]
+
+
+def test_impression_context_snapshot_drops_large_realtime_features():
+    snapshot = _impression_context_snapshot(
+        {
+            "session_id": "session-1",
+            "surface": "recommendations",
+            "_realtime_window_features": {"p1": {"clicks": 100}},
+            "untrusted_blob": {"large": "value"},
+            "location": "x" * 600,
+        }
+    )
+
+    assert snapshot["session_id"] == "session-1"
+    assert snapshot["surface"] == "recommendations"
+    assert snapshot["location"] == "x" * 512
+    assert "_realtime_window_features" not in snapshot
+    assert "untrusted_blob" not in snapshot
 
 
 class RecordingBeginSession:
@@ -285,12 +308,47 @@ def test_positive_sequence_index_is_declared_in_migrations():
         assert "WHERE action IN ('view', 'click', 'add_to_cart', 'purchase')" in sql
 
 
+def test_recommendation_impression_tables_are_declared_in_migration():
+    migration_003 = (
+        REPO_ROOT / "migrations/postgres/003_recommendation_impressions.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "CREATE TABLE IF NOT EXISTS recommendation_impressions" in migration_003
+    assert "CREATE TABLE IF NOT EXISTS recommendation_impression_items" in migration_003
+    assert "ix_recommendation_impressions_user_created" in migration_003
+    assert "ix_recommendation_impressions_created_at" in migration_003
+    assert "ix_recommendation_impression_items_product_created" in migration_003
+    assert "ux_recommendation_impression_items_impression_product" in migration_003
+
+
 class RecordingConnection:
     def __init__(self):
         self.statements = []
 
     async def execute(self, statement):
         self.statements.append(str(statement))
+
+
+class RecordingSession:
+    def __init__(self):
+        self.statements = []
+
+    async def execute(self, statement):
+        self.statements.append(str(statement.compile(dialect=postgresql.dialect())))
+
+
+class RecordingSessionFactory:
+    def __init__(self):
+        self.session = RecordingSession()
+
+    def begin(self):
+        return self
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 def test_positive_sequence_index_is_ensured_on_startup():
@@ -303,3 +361,156 @@ def test_positive_sequence_index_is_ensured_on_startup():
     assert "ix_interaction_events_positive_user_sequence" in combined_sql
     assert "ON interaction_events (user_id, occurred_at DESC, event_id DESC)" in combined_sql
     assert "WHERE action IN ('view', 'click', 'add_to_cart', 'purchase')" in combined_sql
+
+
+def test_recommendation_impression_indexes_are_ensured_on_startup():
+    conn = RecordingConnection()
+    store = SystemStore(DatabaseConfig(enable=True))
+
+    asyncio.run(store._ensure_operational_indexes(conn))
+
+    combined_sql = "\n".join(conn.statements)
+    assert "ix_recommendation_impressions_user_created" in combined_sql
+    assert "ON recommendation_impressions (user_id, created_at DESC)" in combined_sql
+    assert "ix_recommendation_impressions_created_at" in combined_sql
+    assert "ix_recommendation_impression_items_impression" in combined_sql
+    assert "ix_recommendation_impression_items_product_created" in combined_sql
+    assert "ux_recommendation_impression_items_impression_product" in combined_sql
+
+
+def test_record_recommendation_impression_uses_idempotent_upserts():
+    session_factory = RecordingSessionFactory()
+    store = SystemStore(DatabaseConfig(enable=True))
+    store.session_factory = session_factory
+
+    asyncio.run(
+        store.record_recommendation_impression(
+            {
+                "request_id": "req-1",
+                "user_id": "u1",
+                "timestamp": "2026-06-11T00:00:00Z",
+                "metadata": {
+                    "impression_id": "imp-1",
+                    "session_id": "session-1",
+                    "content_id": "content-1",
+                    "model_version": "v1",
+                    "ranking_model_version": "rank-v1",
+                    "context": {"surface": "recommendations"},
+                    "displayed_items": [
+                        {
+                            "product_id": "p1",
+                            "position": 1,
+                            "candidate_source": "two_tower",
+                            "price": 12.0,
+                            "ranking_score": 0.9,
+                        }
+                    ],
+                },
+            }
+        )
+    )
+
+    combined_sql = "\n".join(session_factory.session.statements)
+    assert "INSERT INTO recommendation_impressions" in combined_sql
+    assert "INSERT INTO recommendation_impression_items" in combined_sql
+    assert "ON CONFLICT" in combined_sql
+    assert "impression_id, product_id" in combined_sql
+
+
+def test_build_ltr_training_samples_from_impressions_adds_no_click_negatives():
+    created_at = datetime.fromtimestamp(1_000, tz=timezone.utc)
+    impression_items = [
+        {
+            "impression_id": "imp-1",
+            "request_id": "req-1",
+            "user_id": "u1",
+            "session_id": "session-1",
+            "content_id": "content-1",
+            "product_id": "p-click",
+            "position": 1,
+            "source": "two_tower",
+            "context": {"surface": "recommendations"},
+            "feature_snapshot": {"price": 12.0, "category": "Shoes", "brand": "A"},
+            "scores": {"ranking_score": 0.9, "combined_score": 0.7},
+            "created_at": created_at,
+        },
+        {
+            "impression_id": "imp-1",
+            "request_id": "req-1",
+            "user_id": "u1",
+            "session_id": "session-1",
+            "content_id": "content-1",
+            "product_id": "p-skip",
+            "position": 2,
+            "source": "popular",
+            "context": {"surface": "recommendations"},
+            "feature_snapshot": {"price": 20.0, "category": "Bags", "brand": "B"},
+            "scores": {"ranking_score": 0.4, "combined_score": 0.3},
+            "created_at": created_at,
+        },
+    ]
+    interactions = [
+        {
+            "event_id": "evt-click",
+            "schema_version": 1,
+            "user_id": "u1",
+            "product_id": "p-click",
+            "action": "click",
+            "context": {"impression_id": "imp-1", "recommendation_position": 1},
+            "occurred_at": datetime.fromtimestamp(1_010, tz=timezone.utc),
+        }
+    ]
+
+    samples = build_ltr_training_samples_from_impression_records(
+        impression_items,
+        interactions,
+    )
+
+    assert [sample["product_id"] for sample in samples] == ["p-click", "p-skip"]
+    assert [sample["action"] for sample in samples] == ["click", "view"]
+    clicked = samples[0]
+    skipped = samples[1]
+    assert clicked["context"]["impression_id"] == "imp-1"
+    assert clicked["context"]["recommendation_source"] == "two_tower"
+    assert clicked["context"]["candidate_scores"]["ranking_score"] == 0.9
+    assert clicked["product_metadata"]["price"] == 12.0
+    assert skipped["event_id"] == "imp-1:p-skip:impression"
+    assert skipped["context"]["recommendation_position"] == 2
+
+
+def test_ltr_impression_matching_requires_same_user_id():
+    created_at = datetime.fromtimestamp(1_000, tz=timezone.utc)
+    impression_items = [
+        {
+            "impression_id": "imp-1",
+            "request_id": "req-1",
+            "user_id": "u1",
+            "product_id": "p1",
+            "position": 1,
+            "source": "two_tower",
+            "context": {},
+            "feature_snapshot": {"price": 12.0},
+            "scores": {"ranking_score": 0.9},
+            "created_at": created_at,
+        }
+    ]
+    interactions = [
+        {
+            "event_id": "evt-spoof",
+            "schema_version": 1,
+            "user_id": "attacker",
+            "product_id": "p1",
+            "action": "purchase",
+            "context": {"impression_id": "imp-1"},
+            "occurred_at": datetime.fromtimestamp(1_010, tz=timezone.utc),
+        }
+    ]
+
+    samples = build_ltr_training_samples_from_impression_records(
+        impression_items,
+        interactions,
+    )
+
+    assert len(samples) == 1
+    assert samples[0]["action"] == "view"
+    assert samples[0]["event_id"] == "imp-1:p1:impression"

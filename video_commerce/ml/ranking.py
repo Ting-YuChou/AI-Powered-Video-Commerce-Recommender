@@ -1523,6 +1523,9 @@ class RankingModel:
             ctr_labels = []
             cvr_labels = []
             gmv_labels = []
+            relevance_labels = []
+            group_ids = []
+            group_mapping: Dict[str, int] = {}
 
             for sample in training_data:
                 product_id = sample.get("product_id")
@@ -1570,6 +1573,18 @@ class RankingModel:
                 gmv_value = self._training_gmv_label(sample, product_metadata, action)
                 gmv_labels.append(gmv_value)
 
+                relevance_labels.append(
+                    self._training_relevance_label(
+                        sample,
+                        product_metadata,
+                        action,
+                    )
+                )
+                group_key = self._training_pairwise_group_key(sample)
+                if group_key not in group_mapping:
+                    group_mapping[group_key] = len(group_mapping)
+                group_ids.append(group_mapping[group_key])
+
             if not features:
                 return torch.empty(0), {}
 
@@ -1586,6 +1601,14 @@ class RankingModel:
                 "gmv": torch.tensor(gmv_labels, dtype=torch.float32)
                 .to(self.device)
                 .unsqueeze(1),
+                "ranking_relevance": torch.tensor(
+                    relevance_labels, dtype=torch.float32
+                )
+                .to(self.device)
+                .unsqueeze(1),
+                "pairwise_group": torch.tensor(group_ids, dtype=torch.long).to(
+                    self.device
+                ),
             }
 
             return features_tensor, labels
@@ -1724,6 +1747,57 @@ class RankingModel:
             ),
         )
 
+    def _training_relevance_label(
+        self,
+        sample: Dict[str, Any],
+        product_metadata: Dict[str, Any],
+        action: str,
+    ) -> float:
+        """Create an ordinal ranking relevance target for pairwise LTR."""
+        normalized_action = str(action or "").lower()
+        if normalized_action == "purchase":
+            gmv_value = self._training_gmv_label(
+                sample,
+                product_metadata,
+                normalized_action,
+            )
+            return 4.0 + float(np.log1p(max(gmv_value, 0.0)))
+        if normalized_action == "add_to_cart":
+            return 3.0
+        if normalized_action == "click":
+            return 2.0
+        if normalized_action == "view":
+            return 1.0
+        return 0.0
+
+    def _training_pairwise_group_key(self, sample: Dict[str, Any]) -> str:
+        """Group samples for pairwise ranking by impression, request, session, then user/time."""
+        context = sample.get("context") or {}
+        impression_id = sample.get("impression_id") or context.get("impression_id")
+        if impression_id:
+            return f"impression:{impression_id}"
+
+        request_id = (
+            sample.get("request_id")
+            or context.get("request_id")
+            or context.get("recommendation_request_id")
+        )
+        if request_id:
+            return f"request:{request_id}"
+
+        session_id = sample.get("session_id") or context.get("session_id")
+        if session_id:
+            return f"session:{session_id}"
+
+        user_id = str(sample.get("user_id") or "unknown")
+        timestamp = self._first_float(
+            sample.get("occurred_at"),
+            sample.get("timestamp"),
+            default=time.time(),
+        )
+        time_bucket = int(max(timestamp, 0.0) // 1800)
+        return f"user_time:{user_id}:{time_bucket}"
+
     @staticmethod
     def _optional_float(*values: Any) -> Optional[float]:
         for value in values:
@@ -1761,11 +1835,111 @@ class RankingModel:
                 + self.config.gmv_weight * gmv_loss
             )
 
+            if (
+                getattr(self.config, "ltr_pairwise_enabled", False)
+                and getattr(self.config, "ltr_pairwise_weight", 0.0) > 0
+            ):
+                pairwise_loss = self._compute_pairwise_ltr_loss(
+                    predictions["ranking_score"],
+                    labels.get("ranking_relevance"),
+                    labels.get("pairwise_group"),
+                )
+                total_loss = (
+                    total_loss
+                    + float(getattr(self.config, "ltr_pairwise_weight", 0.0))
+                    * pairwise_loss
+                )
+
             return total_loss
 
         except Exception as e:
             logger.error(f"Error computing loss: {e}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    def _compute_pairwise_ltr_loss(
+        self,
+        ranking_scores: torch.Tensor,
+        relevance: Optional[torch.Tensor],
+        group_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute RankNet loss over higher/lower relevance pairs in each group."""
+        scores = ranking_scores.reshape(-1)
+        if relevance is None or group_ids is None or scores.numel() < 2:
+            return scores.sum() * 0.0
+
+        pos_indices, neg_indices = self._build_pairwise_ltr_pairs(
+            relevance.reshape(-1),
+            group_ids.reshape(-1),
+        )
+        if pos_indices.numel() == 0:
+            return scores.sum() * 0.0
+
+        score_diff = scores[pos_indices] - scores[neg_indices]
+        return torch.nn.functional.softplus(-score_diff).mean()
+
+    def _build_pairwise_ltr_pairs(
+        self,
+        relevance: torch.Tensor,
+        group_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build deterministic capped positive/negative index pairs per group."""
+        relevance = relevance.reshape(-1)
+        group_ids = group_ids.reshape(-1)
+        device = relevance.device
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        if relevance.numel() != group_ids.numel() or relevance.numel() < 2:
+            return empty, empty
+
+        max_pairs_per_group = int(
+            max(0, getattr(self.config, "ltr_max_pairs_per_group", 0) or 0)
+        )
+        if max_pairs_per_group <= 0:
+            return empty, empty
+        min_gap = float(max(0.0, getattr(self.config, "ltr_min_relevance_gap", 0.0)))
+
+        positive_chunks: List[torch.Tensor] = []
+        negative_chunks: List[torch.Tensor] = []
+        for group_id in torch.unique(group_ids, sorted=True):
+            group_indices = torch.nonzero(
+                group_ids == group_id,
+                as_tuple=False,
+            ).flatten()
+            if group_indices.numel() < 2:
+                continue
+
+            group_relevance = relevance[group_indices]
+            order = torch.argsort(group_relevance, descending=True, stable=True)
+            sorted_indices = group_indices[order]
+            sorted_relevance = group_relevance[order]
+            pairs_for_group = 0
+
+            for high_position in range(sorted_indices.numel() - 1):
+                remaining = max_pairs_per_group - pairs_for_group
+                if remaining <= 0:
+                    break
+                relevance_gap = (
+                    sorted_relevance[high_position]
+                    - sorted_relevance[high_position + 1 :]
+                )
+                valid_offsets = torch.nonzero(
+                    relevance_gap >= min_gap,
+                    as_tuple=False,
+                ).flatten()
+                if valid_offsets.numel() == 0:
+                    continue
+
+                valid_offsets = valid_offsets[:remaining]
+                lower_indices = sorted_indices[high_position + 1 :][valid_offsets]
+                higher_indices = sorted_indices[high_position].repeat(
+                    lower_indices.numel()
+                )
+                positive_chunks.append(higher_indices)
+                negative_chunks.append(lower_indices)
+                pairs_for_group += int(lower_indices.numel())
+
+        if not positive_chunks:
+            return empty, empty
+        return torch.cat(positive_chunks), torch.cat(negative_chunks)
 
     async def save_model(self, model_path: str):
         """Save the trained model to disk."""

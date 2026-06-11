@@ -35,6 +35,8 @@ data:
   DATABASE_MAX_OVERFLOW: {{ .Values.external.database.maxOverflow | quote }}
   DATABASE_ANALYTICS_SUMMARY_CACHE_TTL_SECONDS: {{ .Values.external.database.analyticsSummaryCacheTtlSeconds | quote }}
   DATABASE_TRAINING_SEQUENCE_LOOKBACK_DAYS: {{ .Values.external.database.trainingSequenceLookbackDays | quote }}
+  DATABASE_LTR_IMPRESSION_LOOKBACK_DAYS: {{ .Values.external.database.ltrImpressionLookbackDays | quote }}
+  DATABASE_IMPRESSION_RETENTION_DAYS: {{ .Values.external.database.impressionRetentionDays | quote }}
   DATABASE_AUTO_CREATE_SCHEMA: {{ .Values.external.database.autoCreateSchema | quote }}
   MODEL_CACHE_DIR: {{ .Values.appConfig.modelCacheDir | quote }}
   VECTOR_INDEX_PATH: {{ .Values.appConfig.vectorIndexPath | quote }}
@@ -83,6 +85,10 @@ data:
   RANKING_TORCH_COMPILE_BACKEND: {{ .Values.appConfig.ranking.torchCompileBackend | quote }}
   RANKING_TORCH_COMPILE_MODE: {{ .Values.appConfig.ranking.torchCompileMode | quote }}
   RANKING_TORCH_COMPILE_DYNAMIC: {{ .Values.appConfig.ranking.torchCompileDynamic | quote }}
+  RANKING_LTR_PAIRWISE_ENABLED: {{ .Values.appConfig.ranking.ltrPairwiseEnabled | quote }}
+  RANKING_LTR_PAIRWISE_WEIGHT: {{ .Values.appConfig.ranking.ltrPairwiseWeight | quote }}
+  RANKING_LTR_MAX_PAIRS_PER_GROUP: {{ .Values.appConfig.ranking.ltrMaxPairsPerGroup | quote }}
+  RANKING_LTR_MIN_RELEVANCE_GAP: {{ .Values.appConfig.ranking.ltrMinRelevanceGap | quote }}
   CACHE_CANDIDATE_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.candidateCacheRaceTimeoutMs | quote }}
   CACHE_RECOMMENDATION_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.recommendationCacheRaceTimeoutMs | quote }}
   CACHE_BACKGROUND_TASK_QUEUE_SIZE: {{ .Values.appConfig.cache.backgroundTaskQueueSize | quote }}
@@ -98,6 +104,8 @@ data:
   RECOMMENDATION_RETRIEVAL_EXECUTOR_WORKERS: {{ .Values.appConfig.recommendation.retrievalExecutorWorkers | quote }}
   RECOMMENDATION_SERVING_RECENT_INTERACTION_LIMIT: {{ .Values.appConfig.recommendation.servingRecentInteractionLimit | quote }}
   RECOMMENDATION_SPEECH_CATEGORY_CANDIDATES_ENABLED: {{ .Values.appConfig.recommendation.speechCategoryCandidatesEnabled | quote }}
+  RECOMMENDATION_IMPRESSION_LOGGING_ENABLED: {{ .Values.appConfig.recommendation.impressionLoggingEnabled | quote }}
+  RECOMMENDATION_IMPRESSION_MAX_ITEMS: {{ .Values.appConfig.recommendation.impressionMaxItems | quote }}
   MONITORING_LOG_LEVEL: {{ .Values.appConfig.monitoring.logLevel | quote }}
   MONITORING_ENABLE_METRICS: {{ .Values.appConfig.monitoring.enableMetrics | quote }}
   MONITORING_ENABLE_PROMETHEUS_METRICS: {{ .Values.appConfig.monitoring.enablePrometheusMetrics | quote }}

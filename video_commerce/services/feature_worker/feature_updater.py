@@ -110,10 +110,41 @@ class FeatureUpdaterWorker:
             self.kafka_config.user_interactions_topic,
             self._handle_user_interaction
         )
+        self.consumer.register_handler(
+            self.kafka_config.recommendation_events_topic,
+            self._handle_recommendation_event
+        )
         
-        await self.consumer.start([self.kafka_config.user_interactions_topic])
+        await self.consumer.start([
+            self.kafka_config.user_interactions_topic,
+            self.kafka_config.recommendation_events_topic,
+        ])
         
         logger.info("Feature updater components initialized successfully")
+
+    async def _handle_recommendation_event(
+        self,
+        topic: str,
+        key: Optional[str],
+        value: Dict[str, Any],
+        headers: Optional[List[tuple]]
+    ):
+        """Persist recommendation impression events for offline LTR training."""
+        started_at = time.perf_counter()
+        status = "success"
+        try:
+            if self.system_store:
+                await self.system_store.record_recommendation_impression(value)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            self.observability.record_worker_message(
+                "feature-worker",
+                topic,
+                status,
+                time.perf_counter() - started_at,
+            )
     
     async def _handle_user_interaction(
         self,

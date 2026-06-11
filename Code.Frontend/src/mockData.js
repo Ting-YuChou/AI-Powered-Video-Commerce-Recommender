@@ -15,6 +15,7 @@ export const mockRecommendations = [
     image_url: svgImage('Runner', '#dbeafe', '#2563eb'),
     confidence_score: 0.94,
     ranking_score: 0.89,
+    source: 'mock_cf+content',
     reason: 'Matches the sporty outfit, neutral color palette, and motion-heavy video scene.',
   },
   {
@@ -28,6 +29,7 @@ export const mockRecommendations = [
     image_url: svgImage('Jacket', '#dcfce7', '#16a34a'),
     confidence_score: 0.9,
     ranking_score: 0.84,
+    source: 'mock_content',
     reason: 'OCR and visual features suggest outdoor performance styling and layered apparel.',
   },
   {
@@ -41,6 +43,7 @@ export const mockRecommendations = [
     image_url: svgImage('Watch', '#fef3c7', '#d97706'),
     confidence_score: 0.86,
     ranking_score: 0.81,
+    source: 'mock_cf',
     reason: 'Recommended from active lifestyle cues and prior session interest in wearable tech.',
   },
   {
@@ -54,6 +57,7 @@ export const mockRecommendations = [
     image_url: svgImage('Sling', '#fce7f3', '#db2777'),
     confidence_score: 0.82,
     ranking_score: 0.77,
+    source: 'mock_popularity',
     reason: 'Complements the travel context and has strong click-through history in similar sessions.',
   },
   {
@@ -67,6 +71,7 @@ export const mockRecommendations = [
     image_url: svgImage('Lamp', '#e0f2fe', '#0284c7'),
     confidence_score: 0.76,
     ranking_score: 0.68,
+    source: 'mock_fallback',
     reason: 'Fallback candidate from broad visual similarity when lifestyle and room cues are present.',
   },
   {
@@ -80,6 +85,7 @@ export const mockRecommendations = [
     image_url: svgImage('Bottle', '#ede9fe', '#7c3aed'),
     confidence_score: 0.73,
     ranking_score: 0.64,
+    source: 'mock_trending',
     reason: 'Low-cost accessory candidate for active scenes and high add-to-cart affinity.',
   },
 ];
@@ -129,6 +135,7 @@ export const createMockRecommendationResponse = ({
     content_id: contentId,
     recommendations,
     metadata: {
+      impression_id: `mock-impression-${contentId || 'no-content'}-${k}`,
       total_candidates: 128,
       response_time_ms: 24,
       model_version: 'mock-workbench-v1',

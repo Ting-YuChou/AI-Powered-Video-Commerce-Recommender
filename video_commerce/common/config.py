@@ -337,6 +337,14 @@ class RecommendationConfig(BaseSettings):
         False,
         description="Publish product catalog snapshots to Postgres during recommendation service startup",
     )
+    impression_logging_enabled: bool = Field(
+        True,
+        description="Emit best-effort recommendation impression/slate events for LTR training",
+    )
+    impression_max_items: int = Field(
+        100,
+        description="Maximum displayed top-k items to include in one impression event",
+    )
 
     # Ranking weights
     cf_weight: float = Field(0.4, description="Collaborative filtering weight")
@@ -519,6 +527,12 @@ class RecommendationConfig(BaseSettings):
             raise ValueError("serving_recent_interaction_limit must be >= 0")
         return value
 
+    @validator("impression_max_items")
+    def validate_impression_max_items(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("impression_max_items must be >= 0")
+        return value
+
     @validator(
         "sasrec_max_sequence_length",
         "sasrec_embedding_dim",
@@ -695,6 +709,28 @@ class RankingConfig(BaseSettings):
     ctr_weight: float = Field(1.0, description="Click-through rate weight")
     cvr_weight: float = Field(2.0, description="Conversion rate weight")
     gmv_weight: float = Field(3.0, description="GMV optimization weight")
+    ltr_pairwise_enabled: bool = Field(
+        False,
+        description=(
+            "Enable RankNet-style pairwise learning-to-rank loss during offline "
+            "ranking training"
+        ),
+    )
+    ltr_pairwise_weight: float = Field(
+        0.1,
+        description="Weight applied to pairwise LTR loss when enabled",
+    )
+    ltr_max_pairs_per_group: int = Field(
+        2048,
+        description=(
+            "Maximum pairwise LTR pairs sampled from each request/session/"
+            "user-time group"
+        ),
+    )
+    ltr_min_relevance_gap: float = Field(
+        0.5,
+        description="Minimum relevance-label gap required to form a pairwise LTR pair",
+    )
 
     # Training settings
     epochs: int = Field(100, description="Training epochs")
@@ -730,6 +766,18 @@ class RankingConfig(BaseSettings):
     def validate_low_rank_dim(cls, value: int) -> int:
         if value < 1:
             raise ValueError("low_rank_dim must be >= 1")
+        return value
+
+    @validator("ltr_pairwise_weight", "ltr_min_relevance_gap")
+    def validate_ltr_non_negative_float(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("LTR float settings must be >= 0")
+        return value
+
+    @validator("ltr_max_pairs_per_group")
+    def validate_ltr_max_pairs_per_group(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("ltr_max_pairs_per_group must be >= 0")
         return value
 
     @validator("runner_payload_max_bytes")
@@ -1435,9 +1483,17 @@ class DatabaseConfig(BaseSettings):
         90,
         description="Lookback window for training sequence reads; 0 reads all retained history",
     )
+    ltr_impression_lookback_days: int = Field(
+        30,
+        description="Lookback window for impression-backed LTR training samples",
+    )
     interaction_retention_days: int = Field(
         90,
         description="Retention window for raw interaction_events rows",
+    )
+    impression_retention_days: int = Field(
+        90,
+        description="Retention window for recommendation impression/slate rows",
     )
     enable_retention_cleanup: bool = Field(
         False,
@@ -1460,6 +1516,20 @@ class DatabaseConfig(BaseSettings):
         description="How often to run interaction_events retention cleanup",
     )
     echo_sql: bool = Field(False, description="Enable SQLAlchemy SQL logging")
+
+    @validator(
+        "training_sequence_lookback_days",
+        "ltr_impression_lookback_days",
+        "interaction_retention_days",
+        "impression_retention_days",
+        "partition_backfill_months",
+        "partition_premake_months",
+        "retention_cleanup_interval_seconds",
+    )
+    def validate_non_negative_database_ints(cls, value: int, field) -> int:
+        if value < 0:
+            raise ValueError(f"{field.name} must be >= 0")
+        return value
 
     class Config:
         env_prefix = "DATABASE_"

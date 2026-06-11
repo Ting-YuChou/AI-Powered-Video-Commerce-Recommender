@@ -95,6 +95,8 @@ external:
     maxOverflow: 5
     analyticsSummaryCacheTtlSeconds: 15
     trainingSequenceLookbackDays: 90
+    ltrImpressionLookbackDays: 30
+    impressionRetentionDays: 90
     autoCreateSchema: true
   objectStorage:
     backend: s3
@@ -160,6 +162,8 @@ appConfig:
     retrievalExecutorWorkers: 2
     servingRecentInteractionLimit: 0
     speechCategoryCandidatesEnabled: false
+    impressionLoggingEnabled: true
+    impressionMaxItems: 100
   ranking:
     batchMaxRequests: 64
     batchTargetRequests: 32
@@ -180,6 +184,10 @@ appConfig:
     torchCompileBackend: inductor
     torchCompileMode: default
     torchCompileDynamic: true
+    ltrPairwiseEnabled: false
+    ltrPairwiseWeight: 0.1
+    ltrMaxPairsPerGroup: 2048
+    ltrMinRelevanceGap: 0.5
   cache:
     candidateCacheRaceTimeoutMs: 5
     recommendationCacheRaceTimeoutMs: 5
