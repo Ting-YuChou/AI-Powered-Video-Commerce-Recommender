@@ -519,6 +519,10 @@ class RankingModel:
         self.torch_inference_available = True
         self._compiled_model: Optional[Any] = None
         self.torch_compile_error: Optional[str] = None
+        self.torch_compile_warmup_ms: Optional[float] = None
+        self.torch_compile_fallback_count = 0
+        self.torch_compile_last_fallback_error: Optional[str] = None
+        self.torch_compile_last_inference_path = "eager"
         self.enable_profiling_logs = False
         self.profiling_log_min_duration_ms = 250.0
         self._product_feature_cache_max_size = max(
@@ -589,11 +593,21 @@ class RankingModel:
                 getattr(self.config, "torch_compile_dynamic", True)
             ),
             "torch_compile_error": self.torch_compile_error,
+            "torch_compile_warmup_ms": self.torch_compile_warmup_ms,
+            "torch_compile_fallback_count": self.torch_compile_fallback_count,
+            "torch_compile_last_fallback_error": (
+                self.torch_compile_last_fallback_error
+            ),
+            "torch_compile_last_inference_path": (
+                self.torch_compile_last_inference_path
+            ),
         }
 
     def _clear_compiled_model(self, error: Optional[str] = None) -> None:
         self._compiled_model = None
         self.torch_compile_error = error
+        self.torch_compile_warmup_ms = None
+        self.torch_compile_last_inference_path = "eager"
 
     def _compile_model_for_inference(self) -> None:
         self._clear_compiled_model()
@@ -618,6 +632,7 @@ class RankingModel:
         self.model.eval()
 
         try:
+            compile_started = time.perf_counter()
             compiled_model = torch.compile(
                 self.model,
                 backend=backend,
@@ -633,8 +648,11 @@ class RankingModel:
             )
             with torch.inference_mode():
                 compiled_model(dummy_features)
+            warmup_ms = round((time.perf_counter() - compile_started) * 1000, 2)
             self._compiled_model = compiled_model
             self.torch_compile_error = None
+            self.torch_compile_warmup_ms = warmup_ms
+            self.torch_compile_last_inference_path = "compiled"
             logger.info(
                 "ranking_torch_compile_ready",
                 extra={
@@ -644,6 +662,7 @@ class RankingModel:
                     "fullgraph": True,
                     "warmup_batch_size": warmup_batch_size,
                     "device": str(self.device),
+                    "warmup_ms": warmup_ms,
                 },
             )
         except Exception as exc:
@@ -976,7 +995,7 @@ class RankingModel:
     def run_inference_batch(
         self,
         feature_matrix: np.ndarray,
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         """Run one Torch forward pass for a feature matrix."""
         model = self.model
         if model is None:
@@ -994,23 +1013,30 @@ class RankingModel:
 
             model_stage_started = time.perf_counter()
             inference_model = self._compiled_model or model
+            inference_path = "compiled" if self._compiled_model is not None else "eager"
             try:
                 predictions = inference_model(features_tensor)
             except Exception as exc:
                 if self._compiled_model is None:
                     raise
-                self._clear_compiled_model(f"{type(exc).__name__}: {exc}")
+                fallback_error = f"{type(exc).__name__}: {exc}"
+                self.torch_compile_fallback_count += 1
+                self.torch_compile_last_fallback_error = fallback_error
+                self._clear_compiled_model(fallback_error)
                 logger.warning(
                     "ranking_torch_compile_inference_failed",
                     extra={
                         "exception_type": type(exc).__name__,
                         "exception_repr": repr(exc),
+                        "fallback_count": self.torch_compile_fallback_count,
                     },
                 )
+                inference_path = "eager"
                 predictions = model(features_tensor)
             model_forward_ms = round(
                 (time.perf_counter() - model_stage_started) * 1000, 2
             )
+            self.torch_compile_last_inference_path = inference_path
 
         prediction_arrays = {
             key: value.detach().cpu().numpy().reshape(-1)
@@ -1019,6 +1045,7 @@ class RankingModel:
         return prediction_arrays, {
             "tensor_prep_ms": tensor_prep_ms,
             "model_forward_ms": model_forward_ms,
+            "inference_path": inference_path,
         }
 
     def build_recommendations_from_predictions(
@@ -1242,6 +1269,7 @@ class RankingModel:
                     "model_forward_ms": 0.0,
                     "response_build_ms": 0.0,
                     "total_ms": 0.0,
+                    "inference_path": "fallback",
                     "candidate_count": len(candidates),
                     "ranked_count": len(fallback),
                 }
@@ -1255,6 +1283,7 @@ class RankingModel:
             "model_forward_ms": 0.0,
             "response_build_ms": 0.0,
             "total_ms": 0.0,
+            "inference_path": "none",
             "candidate_count": len(candidates),
             "ranked_count": 0,
         }
@@ -1281,6 +1310,7 @@ class RankingModel:
             predictions, inference_profile = self.run_inference_batch(feature_matrix)
             profile["tensor_prep_ms"] = inference_profile["tensor_prep_ms"]
             profile["model_forward_ms"] = inference_profile["model_forward_ms"]
+            profile["inference_path"] = inference_profile["inference_path"]
 
             (
                 top_recommendations,

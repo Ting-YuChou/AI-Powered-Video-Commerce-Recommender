@@ -201,6 +201,7 @@ def run_ranking_batch_payloads(
                     "model_forward_ms": 0.0,
                     "response_build_ms": 0.0,
                     "total_ms": round(stages["total_execution"] * 1000, 2),
+                    "inference_path": "none",
                     "candidate_count": item["candidate_count"],
                     "ranked_count": 0,
                 },
@@ -216,6 +217,7 @@ def run_ranking_batch_payloads(
     stages["model_forward"] = (
         float(inference_profile.get("model_forward_ms", 0.0)) / 1000.0
     )
+    inference_path = str(inference_profile.get("inference_path", "eager"))
 
     results = []
     response_build_started = time.perf_counter()
@@ -239,6 +241,7 @@ def run_ranking_batch_payloads(
                         "total_ms": round(
                             (time.perf_counter() - batch_execution_started) * 1000, 2
                         ),
+                        "inference_path": inference_path,
                         "candidate_count": item["candidate_count"],
                         "ranked_count": 0,
                     },
@@ -273,6 +276,7 @@ def run_ranking_batch_payloads(
                     "total_ms": round(
                         (time.perf_counter() - batch_execution_started) * 1000, 2
                     ),
+                    "inference_path": inference_path,
                     "candidate_count": item["candidate_count"],
                     "ranked_count": len(recommendations),
                 },

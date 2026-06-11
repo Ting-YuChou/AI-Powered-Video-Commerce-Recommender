@@ -451,7 +451,7 @@ async def test_ranking_torch_compile_disabled_uses_eager_inference(monkeypatch):
     )
 
     await ranking.load_model()
-    predictions, _ = ranking.run_inference_batch(
+    predictions, profile = ranking.run_inference_batch(
         np.zeros((4, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
     )
     status = ranking.health_check()
@@ -459,6 +459,11 @@ async def test_ranking_torch_compile_disabled_uses_eager_inference(monkeypatch):
     assert ranking._compiled_model is None
     assert status["torch_compile_enabled"] is False
     assert status["torch_compile_active"] is False
+    assert status["torch_compile_warmup_ms"] is None
+    assert status["torch_compile_fallback_count"] == 0
+    assert status["torch_compile_last_fallback_error"] is None
+    assert status["torch_compile_last_inference_path"] == "eager"
+    assert profile["inference_path"] == "eager"
     assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
 
 
@@ -496,10 +501,11 @@ async def test_ranking_torch_compile_enabled_uses_compiled_wrapper(monkeypatch):
     )
 
     await ranking.load_model()
-    predictions, _ = ranking.run_inference_batch(
+    predictions, profile = ranking.run_inference_batch(
         np.zeros((4, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
     )
     stats = ranking.get_stats()
+    health = ranking.health_check()
 
     assert len(compile_calls) == 1
     assert compile_calls[0][0] is ranking.model
@@ -515,6 +521,14 @@ async def test_ranking_torch_compile_enabled_uses_compiled_wrapper(monkeypatch):
     assert stats["torch_compile_enabled"] is True
     assert stats["torch_compile_active"] is True
     assert stats["torch_compile_error"] is None
+    assert stats["torch_compile_warmup_ms"] is not None
+    assert stats["torch_compile_warmup_ms"] >= 0.0
+    assert stats["torch_compile_fallback_count"] == 0
+    assert stats["torch_compile_last_fallback_error"] is None
+    assert stats["torch_compile_last_inference_path"] == "compiled"
+    assert health["torch_compile_warmup_ms"] == stats["torch_compile_warmup_ms"]
+    assert health["torch_compile_fallback_count"] == 0
+    assert profile["inference_path"] == "compiled"
     assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
 
 
@@ -533,7 +547,7 @@ async def test_ranking_torch_compile_failure_falls_back_to_eager(monkeypatch):
     )
 
     await ranking.load_model()
-    predictions, _ = ranking.run_inference_batch(
+    predictions, profile = ranking.run_inference_batch(
         np.zeros((2, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
     )
     status = ranking.health_check()
@@ -542,6 +556,57 @@ async def test_ranking_torch_compile_failure_falls_back_to_eager(monkeypatch):
     assert status["torch_compile_enabled"] is True
     assert status["torch_compile_active"] is False
     assert "compile failed" in status["torch_compile_error"]
+    assert status["torch_compile_warmup_ms"] is None
+    assert status["torch_compile_fallback_count"] == 0
+    assert status["torch_compile_last_fallback_error"] is None
+    assert status["torch_compile_last_inference_path"] == "eager"
+    assert profile["inference_path"] == "eager"
+    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+
+
+@pytest.mark.asyncio
+async def test_ranking_torch_compile_inference_failure_records_fallback(monkeypatch):
+    wrappers = []
+
+    class FailingAfterWarmupCompiledModel:
+        def __init__(self, model):
+            self.model = model
+            self.calls = 0
+
+        def __call__(self, features):
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("compiled inference failed")
+            return self.model(features)
+
+    def fake_compile(model, **kwargs):
+        wrapper = FailingAfterWarmupCompiledModel(model)
+        wrappers.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    ranking = RankingModel(
+        RankingConfig(
+            architecture="dcn",
+            hidden_dims=[16, 8],
+            torch_compile_enabled=True,
+        )
+    )
+
+    await ranking.load_model()
+    predictions, profile = ranking.run_inference_batch(
+        np.zeros((2, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
+    )
+    status = ranking.health_check()
+
+    assert wrappers[0].calls == 2
+    assert ranking._compiled_model is None
+    assert profile["inference_path"] == "eager"
+    assert status["torch_compile_active"] is False
+    assert status["torch_compile_fallback_count"] == 1
+    assert "compiled inference failed" in status["torch_compile_error"]
+    assert "compiled inference failed" in status["torch_compile_last_fallback_error"]
+    assert status["torch_compile_last_inference_path"] == "eager"
     assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
 
 
