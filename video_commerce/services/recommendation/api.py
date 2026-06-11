@@ -11,6 +11,7 @@ import os
 import random
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -86,6 +87,19 @@ _serving_version_context_cache: Optional[Dict[str, Any]] = None
 _serving_version_context_paths: Optional[
     Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]
 ] = None
+_IMPRESSION_CONTEXT_KEYS = {
+    "session_id",
+    "surface",
+    "device",
+    "time_of_day",
+    "location",
+    "priority",
+    "demo_mode",
+    "content_id",
+    "category",
+    "request_category",
+    "recommendation_count",
+}
 
 
 class _BestEffortTaskQueue:
@@ -576,6 +590,178 @@ def _count_ranked_source_tokens(
     return counts
 
 
+def _recommendation_field(item: Any, key: str, default: Any = None) -> Any:
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
+def _bounded_impression_context_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value[:512] if isinstance(value, str) else value
+    if isinstance(value, list):
+        bounded = []
+        for item in value[:20]:
+            if isinstance(item, (str, int, float, bool)) or item is None:
+                bounded.append(item[:512] if isinstance(item, str) else item)
+        return bounded
+    return None
+
+
+def _build_impression_context_snapshot(
+    context: Optional[Dict[str, Any]],
+    *,
+    content_id: Optional[str],
+) -> Dict[str, Any]:
+    source = context or {}
+    snapshot: Dict[str, Any] = {}
+    for key in _IMPRESSION_CONTEXT_KEYS:
+        if key not in source:
+            continue
+        bounded = _bounded_impression_context_value(source.get(key))
+        if bounded is not None:
+            snapshot[key] = bounded
+    if content_id is not None:
+        snapshot["content_id"] = content_id
+    return snapshot
+
+
+def _candidate_score_snapshot(candidate: Optional[CandidateProduct]) -> Dict[str, Any]:
+    if candidate is None:
+        return {}
+    return {
+        "collaborative_score": candidate.collaborative_score,
+        "content_similarity_score": candidate.content_similarity_score,
+        "popularity_score": candidate.popularity_score,
+        "combined_score": candidate.combined_score,
+    }
+
+
+def _build_displayed_item_snapshots(
+    recommendations: List[Any],
+    *,
+    candidate_by_product: Dict[str, CandidateProduct],
+    product_metadata_map: Dict[str, Dict[str, Any]],
+    max_items: int,
+) -> List[Dict[str, Any]]:
+    """Build bounded top-k item snapshots for impression-backed LTR."""
+    if max_items <= 0:
+        return []
+
+    displayed_items: List[Dict[str, Any]] = []
+    for position, recommendation in enumerate(recommendations[:max_items], start=1):
+        product_id = _recommendation_field(recommendation, "product_id")
+        if not product_id:
+            continue
+        product_id = str(product_id)
+        candidate = candidate_by_product.get(product_id)
+        metadata = product_metadata_map.get(product_id, {})
+        source = (
+            getattr(candidate, "source", None)
+            or _recommendation_field(recommendation, "source")
+            or _recommendation_field(recommendation, "candidate_source")
+        )
+        scores = _candidate_score_snapshot(candidate)
+        cached_scores = _recommendation_field(recommendation, "candidate_scores", {})
+        if isinstance(cached_scores, dict):
+            scores.update({key: value for key, value in cached_scores.items()})
+        scores.update(
+            {
+                "ranking_score": _recommendation_field(
+                    recommendation,
+                    "ranking_score",
+                    scores.get("combined_score"),
+                ),
+                "confidence_score": _recommendation_field(
+                    recommendation,
+                    "confidence_score",
+                    None,
+                ),
+            }
+        )
+        displayed_items.append(
+            {
+                "product_id": product_id,
+                "position": position,
+                "candidate_source": source,
+                "source": source,
+                "collaborative_score": scores.get("collaborative_score"),
+                "content_similarity_score": scores.get("content_similarity_score"),
+                "popularity_score": scores.get("popularity_score"),
+                "combined_score": scores.get("combined_score"),
+                "ranking_score": scores.get("ranking_score"),
+                "confidence_score": scores.get("confidence_score"),
+                "price": _recommendation_field(
+                    recommendation,
+                    "price",
+                    metadata.get("price"),
+                ),
+                "category": _recommendation_field(
+                    recommendation,
+                    "category",
+                    metadata.get("category"),
+                ),
+                "brand": _recommendation_field(
+                    recommendation,
+                    "brand",
+                    metadata.get("brand"),
+                ),
+                "feature_snapshot": {
+                    "price": _recommendation_field(
+                        recommendation,
+                        "price",
+                        metadata.get("price"),
+                    ),
+                    "category": _recommendation_field(
+                        recommendation,
+                        "category",
+                        metadata.get("category"),
+                    ),
+                    "brand": _recommendation_field(
+                        recommendation,
+                        "brand",
+                        metadata.get("brand"),
+                    ),
+                    "candidate_source": source,
+                },
+                "scores": scores,
+            }
+        )
+    return displayed_items
+
+
+def _attach_displayed_item_snapshot_metadata(
+    recommendation_payloads: List[Dict[str, Any]],
+    displayed_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    snapshots_by_product = {
+        item.get("product_id"): item
+        for item in displayed_items
+        if item.get("product_id")
+    }
+    enriched_payloads: List[Dict[str, Any]] = []
+    for payload in recommendation_payloads:
+        enriched = dict(payload)
+        snapshot = snapshots_by_product.get(enriched.get("product_id"))
+        if snapshot:
+            source = snapshot.get("source") or snapshot.get("candidate_source")
+            if source is not None:
+                enriched.setdefault("source", source)
+                enriched.setdefault("candidate_source", source)
+            enriched.setdefault("candidate_scores", snapshot.get("scores") or {})
+        enriched_payloads.append(enriched)
+    return enriched_payloads
+
+
+def _recommendation_product_ids(recommendations: List[Any]) -> List[str]:
+    product_ids = []
+    for item in recommendations:
+        product_id = _recommendation_field(item, "product_id")
+        if product_id:
+            product_ids.append(str(product_id))
+    return product_ids
+
+
 @app.on_event("startup")
 async def startup_event():
     global feature_store, vector_search, recommendation_engine, ranking_model, ranking_batcher, ranking_client_pool, ranking_coordinator_client_pool, kafka_manager
@@ -1063,6 +1249,52 @@ async def get_recommendations(
             profile["serving_path"] = "recommendation_cache"
             profile["ranked_count"] = len(cached)
             profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+            cache_impression_id = None
+            cached_displayed_items: List[Dict[str, Any]] = []
+            if runtime.config.recommendation_config.impression_logging_enabled:
+                cache_impression_id = uuid.uuid4().hex
+                cached_displayed_items = _build_displayed_item_snapshots(
+                    cached,
+                    candidate_by_product={},
+                    product_metadata_map={},
+                    max_items=int(
+                        runtime.config.recommendation_config.impression_max_items
+                    ),
+                )
+            client_connected = not await _is_request_disconnected(http_request)
+            if kafka_manager and client_connected:
+                _schedule_best_effort_task(
+                    "send_recommendation_event",
+                    kafka_manager.send_recommendation_event(
+                        user_id=payload.user_id,
+                        recommendations=_recommendation_product_ids(cached),
+                        response_time_ms=int((time.time() - start_time) * 1000),
+                        request_id=getattr(http_request.state, "request_id", None),
+                        metadata={
+                            **(
+                                {"impression_id": cache_impression_id}
+                                if cache_impression_id
+                                else {}
+                            ),
+                            "request_id": getattr(http_request.state, "request_id", None),
+                            "session_id": (payload.context or {}).get("session_id"),
+                            "content_id": payload.content_id,
+                            "model_version": "v1.0.0",
+                            "ranking_model_version": serving_versions.get("ranking_model"),
+                            "context": _build_impression_context_snapshot(
+                                payload.context,
+                                content_id=payload.content_id,
+                            ),
+                            "candidate_count": len(cached),
+                            "candidate_source_counts": {},
+                            "ranked_source_counts": {},
+                            "item_snapshot_scope": "returned_top_k",
+                            "displayed_items": cached_displayed_items,
+                        },
+                    ),
+                    timeout_seconds=runtime.config.cache_config.background_write_timeout_ms
+                    / 1000.0,
+                )
             _attach_profile_headers(response, profile)
             _log_recommendation_profile(runtime, payload, profile)
             return _recommendation_json_response(
@@ -1074,6 +1306,11 @@ async def get_recommendations(
                         "response_time_ms": int((time.time() - start_time) * 1000),
                         "model_version": "v1.0.0",
                         "cache_hit": True,
+                        **(
+                            {"impression_id": cache_impression_id}
+                            if cache_impression_id
+                            else {}
+                        ),
                         "cache_freshness": "model_user_sequence_and_catalog_versioned",
                         "content_processed": payload.content_id is not None,
                         **(
@@ -1103,12 +1340,63 @@ async def get_recommendations(
             profile["ranked_count"] = len(shared_result.get("recommendations", []))
             profile["candidate_count"] = shared_result.get("total_candidates", 0)
             profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+            shared_recommendations = shared_result.get("recommendations", [])
+            join_impression_id = None
+            join_displayed_items: List[Dict[str, Any]] = []
+            if runtime.config.recommendation_config.impression_logging_enabled:
+                join_impression_id = uuid.uuid4().hex
+                join_displayed_items = _build_displayed_item_snapshots(
+                    shared_recommendations,
+                    candidate_by_product={},
+                    product_metadata_map={},
+                    max_items=int(
+                        runtime.config.recommendation_config.impression_max_items
+                    ),
+                )
+            if kafka_manager and not await _is_request_disconnected(http_request):
+                _schedule_best_effort_task(
+                    "send_recommendation_event",
+                    kafka_manager.send_recommendation_event(
+                        user_id=payload.user_id,
+                        recommendations=_recommendation_product_ids(
+                            shared_recommendations
+                        ),
+                        response_time_ms=int((time.time() - start_time) * 1000),
+                        request_id=getattr(http_request.state, "request_id", None),
+                        metadata={
+                            **(
+                                {"impression_id": join_impression_id}
+                                if join_impression_id
+                                else {}
+                            ),
+                            "request_id": getattr(http_request.state, "request_id", None),
+                            "session_id": (payload.context or {}).get("session_id"),
+                            "content_id": payload.content_id,
+                            "model_version": "v1.0.0",
+                            "ranking_model_version": serving_versions.get("ranking_model"),
+                            "context": _build_impression_context_snapshot(
+                                payload.context,
+                                content_id=payload.content_id,
+                            ),
+                            "candidate_count": shared_result.get(
+                                "total_candidates",
+                                len(shared_recommendations),
+                            ),
+                            "candidate_source_counts": {},
+                            "ranked_source_counts": {},
+                            "item_snapshot_scope": "returned_top_k",
+                            "displayed_items": join_displayed_items,
+                        },
+                    ),
+                    timeout_seconds=runtime.config.cache_config.background_write_timeout_ms
+                    / 1000.0,
+                )
             _attach_profile_headers(response, profile)
             _log_recommendation_profile(runtime, payload, profile)
             return _recommendation_json_response(
                 _recommendation_payload(
                     user_id=payload.user_id,
-                    recommendations=shared_result.get("recommendations", []),
+                    recommendations=shared_recommendations,
                     metadata={
                         "total_candidates": shared_result.get("total_candidates", 0),
                         "response_time_ms": int((time.time() - start_time) * 1000),
@@ -1116,6 +1404,11 @@ async def get_recommendations(
                         "cache_hit": False,
                         "cache_freshness": "model_user_sequence_and_catalog_versioned",
                         "singleflight_joined": True,
+                        **(
+                            {"impression_id": join_impression_id}
+                            if join_impression_id
+                            else {}
+                        ),
                         "content_processed": shared_result.get(
                             "content_processed",
                             payload.content_id is not None,
@@ -1283,6 +1576,9 @@ async def get_recommendations(
         candidate_source_by_product = {
             candidate.product_id: candidate.source for candidate in candidates
         }
+        candidate_by_product = {
+            candidate.product_id: candidate for candidate in candidates
+        }
         profile["candidate_source_counts"] = _count_candidate_source_tokens(candidates)
         profile["candidate_count_before_eligibility_filter"] = ranked_candidate_count
         profile["candidate_count"] = len(candidates)
@@ -1389,6 +1685,22 @@ async def get_recommendations(
         ranked_recommendation_payloads = [
             recommendation.dict() for recommendation in ranked_recommendations
         ]
+        impression_id = None
+        displayed_items: List[Dict[str, Any]] = []
+        if runtime.config.recommendation_config.impression_logging_enabled:
+            impression_id = uuid.uuid4().hex
+            displayed_items = _build_displayed_item_snapshots(
+                ranked_recommendations,
+                candidate_by_product=candidate_by_product,
+                product_metadata_map=product_metadata_map,
+                max_items=int(
+                    runtime.config.recommendation_config.impression_max_items
+                ),
+            )
+            ranked_recommendation_payloads = _attach_displayed_item_snapshot_metadata(
+                ranked_recommendation_payloads,
+                displayed_items,
+            )
 
         stage_started = time.perf_counter()
         client_connected = not await _is_request_disconnected(http_request)
@@ -1436,12 +1748,23 @@ async def get_recommendations(
                     response_time_ms=int(response_time * 1000),
                     request_id=getattr(http_request.state, "request_id", None),
                     metadata={
+                        **({"impression_id": impression_id} if impression_id else {}),
+                        "request_id": getattr(http_request.state, "request_id", None),
+                        "session_id": (payload.context or {}).get("session_id"),
                         "content_id": payload.content_id,
+                        "model_version": "v1.0.0",
+                        "ranking_model_version": serving_versions.get("ranking_model"),
+                        "context": _build_impression_context_snapshot(
+                            payload.context,
+                            content_id=payload.content_id,
+                        ),
                         "candidate_count": len(candidates),
                         "candidate_source_counts": profile.get(
                             "candidate_source_counts", {}
                         ),
                         "ranked_source_counts": profile.get("ranked_source_counts", {}),
+                        "item_snapshot_scope": "returned_top_k",
+                        "displayed_items": displayed_items,
                     },
                 ),
                 timeout_seconds=runtime.config.cache_config.background_write_timeout_ms
@@ -1472,6 +1795,7 @@ async def get_recommendations(
                     "total_candidates": len(candidates),
                     "response_time_ms": int(response_time * 1000),
                     "model_version": "v1.0.0",
+                    **({"impression_id": impression_id} if impression_id else {}),
                     "cache_freshness": "model_user_sequence_and_catalog_versioned",
                     "cache_hit": False,
                     "content_processed": payload.content_id is not None,

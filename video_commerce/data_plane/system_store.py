@@ -13,7 +13,20 @@ from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, delete, desc, event, func, select, text
+from sqlalchemy import (
+    DateTime,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    delete,
+    desc,
+    event,
+    func,
+    select,
+    text,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -23,6 +36,19 @@ from video_commerce.common.config import DatabaseConfig
 logger = logging.getLogger(__name__)
 
 POSITIVE_SEQUENCE_ACTIONS = ("view", "click", "add_to_cart", "purchase")
+IMPRESSION_CONTEXT_KEYS = {
+    "session_id",
+    "surface",
+    "device",
+    "time_of_day",
+    "location",
+    "priority",
+    "demo_mode",
+    "content_id",
+    "category",
+    "request_category",
+    "recommendation_count",
+}
 
 
 def _utc_now() -> datetime:
@@ -103,6 +129,179 @@ def build_chronological_user_sequences(
     return bounded
 
 
+def _interaction_relevance(action: Any) -> float:
+    normalized = str(action or "").lower()
+    if normalized == "purchase":
+        return 4.0
+    if normalized == "add_to_cart":
+        return 3.0
+    if normalized == "click":
+        return 2.0
+    if normalized == "view":
+        return 1.0
+    return 0.0
+
+
+def _safe_dict(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _bounded_json_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str):
+            return value[:512]
+        return value
+    if isinstance(value, list):
+        bounded = []
+        for item in value[:20]:
+            if isinstance(item, (str, int, float, bool)) or item is None:
+                bounded.append(item[:512] if isinstance(item, str) else item)
+        return bounded
+    return None
+
+
+def _impression_context_snapshot(context: Any) -> Dict[str, Any]:
+    source = _safe_dict(context)
+    snapshot: Dict[str, Any] = {}
+    for key in IMPRESSION_CONTEXT_KEYS:
+        if key not in source:
+            continue
+        bounded = _bounded_json_value(source.get(key))
+        if bounded is not None:
+            snapshot[key] = bounded
+    return snapshot
+
+
+def _timestamp(value: Any, fallback: Optional[datetime] = None) -> float:
+    coerced = _coerce_datetime(value) or fallback or _utc_now()
+    return coerced.timestamp()
+
+
+def _score_snapshot_from_item(item: Mapping[str, Any]) -> Dict[str, Any]:
+    scores = _safe_dict(item.get("scores"))
+    for key in (
+        "collaborative_score",
+        "content_similarity_score",
+        "popularity_score",
+        "combined_score",
+        "ranking_score",
+        "confidence_score",
+    ):
+        if key in item and key not in scores:
+            scores[key] = item.get(key)
+    return scores
+
+
+def build_ltr_training_samples_from_impression_records(
+    impression_items: Iterable[Mapping[str, Any]],
+    interactions: Iterable[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Build slate-level ranking samples with no-click negatives."""
+    strongest_interactions: Dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for interaction in interactions:
+        context = _safe_dict(interaction.get("context"))
+        impression_id = str(context.get("impression_id") or "").strip()
+        product_id = str(interaction.get("product_id") or "").strip()
+        user_id = str(interaction.get("user_id") or "").strip()
+        if not impression_id or not product_id or not user_id:
+            continue
+        key = (impression_id, product_id, user_id)
+        previous = strongest_interactions.get(key)
+        if previous is None or _interaction_relevance(
+            interaction.get("action")
+        ) >= _interaction_relevance(previous.get("action")):
+            strongest_interactions[key] = interaction
+
+    samples: List[Dict[str, Any]] = []
+    for item in impression_items:
+        impression_id = str(item.get("impression_id") or "").strip()
+        product_id = str(item.get("product_id") or "").strip()
+        user_id = str(item.get("user_id") or "").strip()
+        if not impression_id or not product_id or not user_id:
+            continue
+
+        matched_interaction = strongest_interactions.get(
+            (impression_id, product_id, user_id)
+        )
+        action = str(matched_interaction.get("action") if matched_interaction else "view")
+        impression_context = _safe_dict(item.get("context"))
+        interaction_context = (
+            _safe_dict(matched_interaction.get("context"))
+            if matched_interaction
+            else {}
+        )
+        feature_snapshot = _safe_dict(item.get("feature_snapshot"))
+        scores = _score_snapshot_from_item(item)
+        source = (
+            item.get("source")
+            or feature_snapshot.get("candidate_source")
+            or interaction_context.get("recommendation_source")
+        )
+        position = item.get("position")
+        created_at = _coerce_datetime(item.get("created_at")) or _utc_now()
+        occurred_at = (
+            _coerce_datetime(matched_interaction.get("occurred_at"))
+            if matched_interaction
+            else created_at
+        )
+        context = {
+            **impression_context,
+            **interaction_context,
+            "impression_id": impression_id,
+            "recommendation_position": position,
+            "recommendation_source": source,
+            "recommendation_ranking_score": scores.get("ranking_score"),
+            "candidate_scores": scores,
+        }
+        if item.get("content_id") is not None:
+            context["content_id"] = item.get("content_id")
+        if item.get("session_id") is not None:
+            context["session_id"] = item.get("session_id")
+
+        product_metadata = {
+            key: feature_snapshot.get(key)
+            for key in ("price", "category", "brand")
+            if key in feature_snapshot
+        }
+        value = (
+            matched_interaction.get("value")
+            if matched_interaction and "value" in matched_interaction
+            else interaction_context.get("value")
+        )
+        if value is None:
+            value = interaction_context.get("gmv")
+        if value is None and action == "purchase":
+            value = feature_snapshot.get("price")
+
+        sample = {
+            "event_id": (
+                matched_interaction.get("event_id")
+                if matched_interaction
+                else f"{impression_id}:{product_id}:impression"
+            ),
+            "schema_version": (
+                matched_interaction.get("schema_version", 1)
+                if matched_interaction
+                else 1
+            ),
+            "request_id": item.get("request_id"),
+            "user_id": user_id,
+            "product_id": product_id,
+            "action": action,
+            "context": context,
+            "timestamp": _timestamp(occurred_at, created_at),
+            "occurred_at": _timestamp(occurred_at, created_at),
+            "source": source,
+            "candidate_scores": scores,
+            "product_metadata": product_metadata,
+            "value": value,
+        }
+        sample.update(scores)
+        samples.append(sample)
+
+    return samples
+
+
 class Base(DeclarativeBase):
     """Base metadata for system store tables."""
 
@@ -123,6 +322,37 @@ class InteractionEvent(Base):
         nullable=False,
         server_default=func.now(),
     )
+
+
+class RecommendationImpression(Base):
+    __tablename__ = "recommendation_impressions"
+
+    impression_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    session_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    content_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    model_version: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    ranking_model_version: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    context: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RecommendationImpressionItem(Base):
+    __tablename__ = "recommendation_impression_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    impression_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    product_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    feature_snapshot: Mapped[Dict[str, Any]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+    )
+    scores: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ContentJob(Base):
@@ -202,6 +432,26 @@ Index(
     ModelCheckpoint.created_at.desc(),
     ModelCheckpoint.id.desc(),
 )
+Index(
+    "ix_recommendation_impressions_user_created",
+    RecommendationImpression.user_id,
+    RecommendationImpression.created_at.desc(),
+)
+Index(
+    "ix_recommendation_impressions_created_at",
+    RecommendationImpression.created_at.desc(),
+)
+Index(
+    "ix_recommendation_impression_items_product_created",
+    RecommendationImpressionItem.product_id,
+    RecommendationImpressionItem.created_at.desc(),
+)
+Index(
+    "ux_recommendation_impression_items_impression_product",
+    RecommendationImpressionItem.impression_id,
+    RecommendationImpressionItem.product_id,
+    unique=True,
+)
 
 
 @dataclass
@@ -263,6 +513,7 @@ class SystemStore:
         self._update_pool_metrics()
         if self.config.enable_retention_cleanup:
             await self.prune_interaction_events()
+            await self.prune_recommendation_impressions()
             self._retention_cleanup_task = asyncio.create_task(
                 self._run_periodic_retention_cleanup(),
                 name="postgres-interaction-retention-cleanup",
@@ -298,6 +549,37 @@ class SystemStore:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_model_checkpoints_latest "
                 "ON model_checkpoints (model_name, created_at DESC, id DESC)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_recommendation_impressions_user_created "
+                "ON recommendation_impressions (user_id, created_at DESC)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_recommendation_impressions_created_at "
+                "ON recommendation_impressions (created_at DESC)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_recommendation_impression_items_impression "
+                "ON recommendation_impression_items (impression_id)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_recommendation_impression_items_product_created "
+                "ON recommendation_impression_items (product_id, created_at DESC)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ux_recommendation_impression_items_impression_product "
+                "ON recommendation_impression_items (impression_id, product_id)"
             )
         )
 
@@ -466,16 +748,46 @@ class SystemStore:
         self._update_pool_metrics()
         return deleted_count
 
+    async def prune_recommendation_impressions(self) -> int:
+        """Delete recommendation impression/slate rows older than retention."""
+        if not self.enabled:
+            return 0
+        retention_days = int(self.config.impression_retention_days)
+        if retention_days <= 0:
+            return 0
+
+        cutoff = _utc_now() - timedelta(days=retention_days)
+        item_stmt = delete(RecommendationImpressionItem).where(
+            RecommendationImpressionItem.created_at < cutoff
+        )
+        impression_stmt = delete(RecommendationImpression).where(
+            RecommendationImpression.created_at < cutoff
+        )
+        async with self.session_factory.begin() as session:
+            item_result = await session.execute(item_stmt)
+            impression_result = await session.execute(impression_stmt)
+        deleted_count = int(item_result.rowcount or 0) + int(
+            impression_result.rowcount or 0
+        )
+        self._update_pool_metrics()
+        return deleted_count
+
     async def _run_periodic_retention_cleanup(self) -> None:
         interval_seconds = max(60, int(self.config.retention_cleanup_interval_seconds))
         while True:
             try:
                 await asyncio.sleep(interval_seconds)
                 deleted_count = await self.prune_interaction_events()
-                if deleted_count:
+                impression_deleted_count = await self.prune_recommendation_impressions()
+                if deleted_count or impression_deleted_count:
                     logger.info(
-                        "interaction_events_retention_deleted",
-                        extra={"deleted_count": deleted_count},
+                        "postgres_retention_deleted",
+                        extra={
+                            "interaction_events_deleted_count": deleted_count,
+                            "recommendation_impression_rows_deleted_count": (
+                                impression_deleted_count
+                            ),
+                        },
                     )
             except asyncio.CancelledError:
                 raise
@@ -522,6 +834,230 @@ class SystemStore:
         async with self.session_factory.begin() as session:
             await session.execute(stmt)
         self._update_pool_metrics()
+
+    async def record_recommendation_impression(self, event: Mapping[str, Any]) -> None:
+        """Persist one recommendation impression/slate event idempotently."""
+        if not self.enabled:
+            return
+
+        metadata = _safe_dict(event.get("metadata"))
+        impression_id = str(
+            metadata.get("impression_id") or event.get("impression_id") or ""
+        ).strip()
+        user_id = str(event.get("user_id") or metadata.get("user_id") or "").strip()
+        displayed_items = metadata.get("displayed_items") or event.get("displayed_items") or []
+        if not impression_id or not user_id or not isinstance(displayed_items, list):
+            return
+
+        created_at = (
+            _coerce_datetime(event.get("timestamp"))
+            or _coerce_datetime(metadata.get("created_at"))
+            or _utc_now()
+        )
+        session_id = metadata.get("session_id")
+        context = _impression_context_snapshot(
+            metadata.get("context") or metadata.get("request_context")
+        )
+        if session_id is None:
+            session_id = context.get("session_id")
+        if metadata.get("content_id") is not None:
+            context.setdefault("content_id", metadata.get("content_id"))
+        if metadata.get("item_snapshot_scope") is not None:
+            context["item_snapshot_scope"] = str(metadata.get("item_snapshot_scope"))[:64]
+
+        impression_row = {
+            "impression_id": impression_id,
+            "request_id": event.get("request_id") or metadata.get("request_id"),
+            "user_id": user_id,
+            "session_id": session_id,
+            "content_id": metadata.get("content_id"),
+            "model_version": metadata.get("model_version"),
+            "ranking_model_version": metadata.get("ranking_model_version"),
+            "context": context,
+            "created_at": created_at,
+        }
+
+        item_rows = []
+        for raw_item in displayed_items:
+            if not isinstance(raw_item, Mapping):
+                continue
+            product_id = str(raw_item.get("product_id") or "").strip()
+            if not product_id:
+                continue
+            feature_snapshot = _safe_dict(raw_item.get("feature_snapshot"))
+            for key in ("price", "category", "brand"):
+                if key in raw_item and key not in feature_snapshot:
+                    feature_snapshot[key] = raw_item.get(key)
+            source = raw_item.get("source") or raw_item.get("candidate_source")
+            if source is not None:
+                feature_snapshot.setdefault("candidate_source", source)
+            item_rows.append(
+                {
+                    "impression_id": impression_id,
+                    "product_id": product_id,
+                    "position": int(raw_item.get("position") or 0),
+                    "source": source,
+                    "feature_snapshot": feature_snapshot,
+                    "scores": _score_snapshot_from_item(raw_item),
+                    "created_at": created_at,
+                }
+            )
+
+        if not item_rows:
+            return
+
+        impression_stmt = pg_insert(RecommendationImpression).values(impression_row)
+        impression_stmt = impression_stmt.on_conflict_do_update(
+            index_elements=[RecommendationImpression.impression_id],
+            set_={
+                "request_id": impression_stmt.excluded.request_id,
+                "user_id": impression_stmt.excluded.user_id,
+                "session_id": impression_stmt.excluded.session_id,
+                "content_id": impression_stmt.excluded.content_id,
+                "model_version": impression_stmt.excluded.model_version,
+                "ranking_model_version": impression_stmt.excluded.ranking_model_version,
+                "context": impression_stmt.excluded.context,
+                "created_at": impression_stmt.excluded.created_at,
+            },
+        )
+        item_stmt = pg_insert(RecommendationImpressionItem).values(item_rows)
+        item_stmt = item_stmt.on_conflict_do_update(
+            index_elements=[
+                RecommendationImpressionItem.impression_id,
+                RecommendationImpressionItem.product_id,
+            ],
+            set_={
+                "position": item_stmt.excluded.position,
+                "source": item_stmt.excluded.source,
+                "feature_snapshot": item_stmt.excluded.feature_snapshot,
+                "scores": item_stmt.excluded.scores,
+                "created_at": item_stmt.excluded.created_at,
+            },
+        )
+
+        async with self.session_factory.begin() as session:
+            await session.execute(impression_stmt)
+            await session.execute(item_stmt)
+        self._update_pool_metrics()
+
+    async def get_ltr_training_impressions(
+        self,
+        *,
+        limit: int = 50000,
+        lookback_days: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read impression-backed ranking samples with no-click negatives."""
+        if not self.enabled:
+            return []
+        limit = max(0, int(limit))
+        if limit <= 0:
+            return []
+
+        if lookback_days is None:
+            lookback_days = int(self.config.ltr_impression_lookback_days)
+        cutoff = None
+        if int(lookback_days or 0) > 0:
+            cutoff = _utc_now() - timedelta(days=int(lookback_days or 0))
+
+        stmt = (
+            select(RecommendationImpression)
+            .order_by(RecommendationImpression.created_at.desc())
+            .limit(limit)
+        )
+        if cutoff is not None:
+            stmt = stmt.where(RecommendationImpression.created_at >= cutoff)
+
+        async with self.session_factory() as session:
+            result = await session.execute(stmt)
+            impression_rows = result.scalars().all()
+
+            impression_ids = {impression.impression_id for impression in impression_rows}
+            item_rows = []
+            interaction_rows = []
+            if impression_ids:
+                item_stmt = (
+                    select(RecommendationImpressionItem)
+                    .where(
+                        RecommendationImpressionItem.impression_id.in_(
+                            sorted(impression_ids)
+                        )
+                    )
+                    .order_by(
+                        RecommendationImpressionItem.impression_id.asc(),
+                        RecommendationImpressionItem.position.asc(),
+                    )
+                )
+                item_result = await session.execute(item_stmt)
+                item_rows = item_result.scalars().all()
+
+                user_ids = sorted(
+                    {
+                        impression.user_id
+                        for impression in impression_rows
+                        if impression.user_id
+                    }
+                )
+                interaction_stmt = select(InteractionEvent).where(
+                    InteractionEvent.context["impression_id"].as_string().in_(
+                        sorted(impression_ids)
+                    )
+                )
+                if user_ids:
+                    interaction_stmt = interaction_stmt.where(
+                        InteractionEvent.user_id.in_(user_ids)
+                    )
+                if cutoff is not None:
+                    interaction_stmt = interaction_stmt.where(
+                        InteractionEvent.occurred_at >= cutoff
+                    )
+                interaction_result = await session.execute(interaction_stmt)
+                interaction_rows = interaction_result.scalars().all()
+
+        self._update_pool_metrics()
+
+        impressions_by_id = {
+            impression.impression_id: impression for impression in impression_rows
+        }
+        flattened_items: List[Dict[str, Any]] = []
+        for item in item_rows:
+            impression = impressions_by_id.get(item.impression_id)
+            if impression is None:
+                continue
+            flattened_items.append(
+                {
+                    "impression_id": impression.impression_id,
+                    "request_id": impression.request_id,
+                    "user_id": impression.user_id,
+                    "session_id": impression.session_id,
+                    "content_id": impression.content_id,
+                    "model_version": impression.model_version,
+                    "ranking_model_version": impression.ranking_model_version,
+                    "context": impression.context or {},
+                    "created_at": impression.created_at,
+                    "product_id": item.product_id,
+                    "position": item.position,
+                    "source": item.source,
+                    "feature_snapshot": item.feature_snapshot or {},
+                    "scores": item.scores or {},
+                }
+            )
+        interactions = [
+            {
+                "event_id": row.event_id,
+                "schema_version": row.schema_version,
+                "request_id": row.request_id,
+                "user_id": row.user_id,
+                "product_id": row.product_id,
+                "action": row.action,
+                "context": row.context or {},
+                "occurred_at": row.occurred_at,
+            }
+            for row in interaction_rows
+        ]
+        return build_ltr_training_samples_from_impression_records(
+            flattened_items,
+            interactions,
+        )
 
     async def get_training_interactions(self, limit: int = 50000) -> List[Dict[str, Any]]:
         if not self.enabled:

@@ -34,6 +34,8 @@ from video_commerce.services.recommendation.api import (
     _bounded_hot_path_read,
     _build_cache_freshness_context,
     _build_candidate_cache_context,
+    _build_displayed_item_snapshots,
+    _build_impression_context_snapshot,
     _build_recommendation_cache_context,
     _catalog_serving_version_context,
     _count_candidate_source_tokens,
@@ -137,6 +139,113 @@ def test_mmr_lambda_one_preserves_relevance_order():
     )
 
     assert [item.product_id for item in selected] == ["p1", "p2", "p3"]
+
+
+def test_displayed_item_snapshots_include_top_k_ltr_features():
+    recommendations = [
+        ProductRecommendation(
+            product_id="p1",
+            title="Product p1",
+            price=19.0,
+            category="Shoes",
+            brand="Brand A",
+            confidence_score=0.8,
+            ranking_score=0.91,
+        ),
+        ProductRecommendation(
+            product_id="p2",
+            title="Product p2",
+            price=29.0,
+            category="Bags",
+            brand="Brand B",
+            confidence_score=0.7,
+            ranking_score=0.72,
+        ),
+    ]
+    candidate_by_product = {
+        "p1": CandidateProduct(
+            product_id="p1",
+            collaborative_score=0.4,
+            content_similarity_score=0.3,
+            popularity_score=0.2,
+            combined_score=0.65,
+            source="two_tower+content",
+        ),
+        "p2": CandidateProduct(
+            product_id="p2",
+            collaborative_score=0.1,
+            content_similarity_score=0.5,
+            popularity_score=0.4,
+            combined_score=0.55,
+            source="popular",
+        ),
+    }
+
+    snapshots = _build_displayed_item_snapshots(
+        recommendations,
+        candidate_by_product=candidate_by_product,
+        product_metadata_map={},
+        max_items=1,
+    )
+
+    assert len(snapshots) == 1
+    assert snapshots[0]["product_id"] == "p1"
+    assert snapshots[0]["position"] == 1
+    assert snapshots[0]["candidate_source"] == "two_tower+content"
+    assert snapshots[0]["collaborative_score"] == 0.4
+    assert snapshots[0]["content_similarity_score"] == 0.3
+    assert snapshots[0]["popularity_score"] == 0.2
+    assert snapshots[0]["combined_score"] == 0.65
+    assert snapshots[0]["ranking_score"] == 0.91
+    assert snapshots[0]["confidence_score"] == 0.8
+    assert snapshots[0]["feature_snapshot"]["price"] == 19.0
+    assert snapshots[0]["feature_snapshot"]["category"] == "Shoes"
+
+
+def test_displayed_item_snapshots_restore_cached_candidate_scores():
+    snapshots = _build_displayed_item_snapshots(
+        [
+            {
+                "product_id": "p1",
+                "price": 19.0,
+                "ranking_score": 0.91,
+                "confidence_score": 0.8,
+                "source": "two_tower",
+                "candidate_scores": {
+                    "collaborative_score": 0.4,
+                    "combined_score": 0.65,
+                },
+            }
+        ],
+        candidate_by_product={},
+        product_metadata_map={},
+        max_items=1,
+    )
+
+    assert snapshots[0]["candidate_source"] == "two_tower"
+    assert snapshots[0]["collaborative_score"] == 0.4
+    assert snapshots[0]["combined_score"] == 0.65
+    assert snapshots[0]["ranking_score"] == 0.91
+
+
+def test_impression_context_snapshot_excludes_realtime_window_features():
+    snapshot = _build_impression_context_snapshot(
+        {
+            "session_id": "session-1",
+            "surface": "recommendations",
+            "device": "web",
+            "_realtime_window_features": {"p1": {"clicks": 12}},
+            "unbounded": {"nested": "value"},
+        },
+        content_id="content-1",
+    )
+
+    assert snapshot == {
+        "session_id": "session-1",
+        "surface": "recommendations",
+        "device": "web",
+        "content_id": "content-1",
+    }
 
 
 def test_mmr_missing_embeddings_do_not_remove_products():
@@ -587,8 +696,17 @@ class FakeTrainerFeatureStore:
 
 
 class FakeTrainerSystemStore:
+    def __init__(self, *, impression_samples=None, event_samples=None):
+        self.impression_samples = impression_samples
+        self.event_samples = event_samples
+
     async def get_training_interactions(self, limit=50000):
+        if self.event_samples is not None:
+            return self.event_samples
         return [{"user_id": "u1", "product_id": "p1", "action": "click", "context": {}}]
+
+    async def get_ltr_training_impressions(self, *, limit=50000, lookback_days=30):
+        return self.impression_samples or []
 
 
 class FakeTrainerRankingModel:
@@ -662,6 +780,100 @@ async def test_model_trainer_passes_real_feature_context_and_checkpoint_metadata
         == RANKING_TRAINING_DATA_SOURCE
     )
     assert service.observability.runs[-1][1] == "success"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_prefers_impression_backed_ltr_samples():
+    impression_samples = [
+        {
+            "user_id": "u1",
+            "product_id": "p1",
+            "action": "click",
+            "context": {"impression_id": "imp-1"},
+        },
+        {
+            "user_id": "u1",
+            "product_id": "p2",
+            "action": "view",
+            "context": {"impression_id": "imp-1"},
+        },
+    ]
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=2,
+            ltr_pairwise_enabled=True,
+        ),
+        database_config=SimpleNamespace(ltr_impression_lookback_days=7),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = FakeTrainerFeatureStore()
+    service.system_store = FakeTrainerSystemStore(
+        impression_samples=impression_samples,
+        event_samples=[
+            {
+                "user_id": "u2",
+                "product_id": "p9",
+                "action": "purchase",
+                "context": {},
+            }
+        ],
+    )
+    service.ranking_model = FakeTrainerRankingModel()
+    service.vector_search = SimpleNamespace(product_metadata={})
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="test")
+
+    assert service.ranking_model.received["training_data"] == impression_samples
+    assert (
+        service.artifact_manager.payload["training_sample_source"]
+        == "recommendation_impressions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_falls_back_when_impression_samples_are_insufficient():
+    event_samples = [
+        {"user_id": "u2", "product_id": "p9", "action": "click", "context": {}},
+        {"user_id": "u2", "product_id": "p10", "action": "view", "context": {}},
+    ]
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=2,
+            ltr_pairwise_enabled=True,
+        ),
+        database_config=SimpleNamespace(ltr_impression_lookback_days=7),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = FakeTrainerFeatureStore()
+    service.system_store = FakeTrainerSystemStore(
+        impression_samples=[
+            {
+                "user_id": "u1",
+                "product_id": "p1",
+                "action": "click",
+                "context": {"impression_id": "imp-1"},
+            }
+        ],
+        event_samples=event_samples,
+    )
+    service.ranking_model = FakeTrainerRankingModel()
+    service.vector_search = SimpleNamespace(product_metadata={})
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="test")
+
+    assert service.ranking_model.received["training_data"] == event_samples
+    assert (
+        service.artifact_manager.payload["training_sample_source"]
+        == "interaction_events"
+    )
 
 
 def test_user_feature_cache_token_changes_when_personalization_changes():

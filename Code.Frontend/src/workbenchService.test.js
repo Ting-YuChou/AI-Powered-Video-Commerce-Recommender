@@ -23,6 +23,7 @@ describe('mock workbench service', () => {
     }, 3);
     expect(recommendations.recommendations).toHaveLength(3);
     expect(recommendations.metadata).toMatchObject({
+      impression_id: `mock-impression-${upload.content_id}-3`,
       mode: 'mock',
       fallback: true,
     });

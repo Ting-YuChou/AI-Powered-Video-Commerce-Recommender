@@ -147,7 +147,35 @@ class ModelTrainerService:
             logger.warning("Skipping ranking retrain because Postgres system store is unavailable")
             return
 
-        interactions = await self.system_store.get_training_interactions(limit=50000)
+        training_sample_source = "interaction_events"
+        interactions = []
+        if (
+            getattr(self.config.ranking_config, "ltr_pairwise_enabled", False)
+            and hasattr(self.system_store, "get_ltr_training_impressions")
+        ):
+            impression_samples = await self.system_store.get_ltr_training_impressions(
+                limit=50000,
+                lookback_days=getattr(
+                    self.config.database_config,
+                    "ltr_impression_lookback_days",
+                    30,
+                ),
+            )
+            if len(impression_samples) >= self.config.ranking_config.training_min_samples:
+                interactions = impression_samples
+                training_sample_source = "recommendation_impressions"
+            else:
+                logger.info(
+                    "Falling back to event-level ranking training data",
+                    extra={
+                        "trigger": trigger,
+                        "impression_sample_count": len(impression_samples),
+                        "min_samples": self.config.ranking_config.training_min_samples,
+                    },
+                )
+
+        if not interactions:
+            interactions = await self.system_store.get_training_interactions(limit=50000)
         if len(interactions) < self.config.ranking_config.training_min_samples:
             self.observability.record_training_run(
                 trigger,
@@ -159,6 +187,7 @@ class ModelTrainerService:
                 extra={
                     "trigger": trigger,
                     "sample_count": len(interactions),
+                    "training_sample_source": training_sample_source,
                     "min_samples": self.config.ranking_config.training_min_samples,
                 },
             )
@@ -169,6 +198,7 @@ class ModelTrainerService:
             extra={
                 "trigger": trigger,
                 "sample_count": len(interactions),
+                "training_sample_source": training_sample_source,
                 "model_path": self.config.model_config.ranking_model_path,
             },
         )
@@ -195,6 +225,7 @@ class ModelTrainerService:
                         "last_training_time": self.ranking_model.last_training_time,
                         "feature_schema_version": self.ranking_model.feature_schema_version,
                         "training_data_source": self.ranking_model.training_data_source,
+                        "training_sample_source": training_sample_source,
                     },
                 )
                 if record:

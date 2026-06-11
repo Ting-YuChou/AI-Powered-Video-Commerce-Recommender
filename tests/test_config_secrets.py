@@ -68,8 +68,12 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     )
     assert config.database_config.analytics_summary_cache_ttl_seconds == 15
     assert config.database_config.training_sequence_lookback_days == 90
+    assert config.database_config.ltr_impression_lookback_days == 30
+    assert config.database_config.impression_retention_days == 90
     assert config.recommendation_config.preload_product_metadata_on_startup is False
     assert config.recommendation_config.publish_catalog_snapshot_on_startup is False
+    assert config.recommendation_config.impression_logging_enabled is True
+    assert config.recommendation_config.impression_max_items == 100
     assert config.redis_config.cache_host is None
 
     reset_config()
@@ -78,6 +82,8 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
 def test_config_reads_database_optimization_env(monkeypatch):
     monkeypatch.setenv("DATABASE_ANALYTICS_SUMMARY_CACHE_TTL_SECONDS", "0")
     monkeypatch.setenv("DATABASE_TRAINING_SEQUENCE_LOOKBACK_DAYS", "30")
+    monkeypatch.setenv("DATABASE_LTR_IMPRESSION_LOOKBACK_DAYS", "14")
+    monkeypatch.setenv("DATABASE_IMPRESSION_RETENTION_DAYS", "45")
     monkeypatch.delenv("ENVIRONMENT", raising=False)
 
     reset_config()
@@ -85,6 +91,22 @@ def test_config_reads_database_optimization_env(monkeypatch):
 
     assert config.database_config.analytics_summary_cache_ttl_seconds == 0
     assert config.database_config.training_sequence_lookback_days == 30
+    assert config.database_config.ltr_impression_lookback_days == 14
+    assert config.database_config.impression_retention_days == 45
+
+    reset_config()
+
+
+def test_config_reads_recommendation_impression_logging_env(monkeypatch):
+    monkeypatch.setenv("RECOMMENDATION_IMPRESSION_LOGGING_ENABLED", "false")
+    monkeypatch.setenv("RECOMMENDATION_IMPRESSION_MAX_ITEMS", "25")
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.recommendation_config.impression_logging_enabled is False
+    assert config.recommendation_config.impression_max_items == 25
 
     reset_config()
 
@@ -192,6 +214,40 @@ def test_config_reads_ranking_torch_compile_env(monkeypatch):
     assert config.ranking_config.torch_compile_backend == "eager"
     assert config.ranking_config.torch_compile_mode == "reduce-overhead"
     assert config.ranking_config.torch_compile_dynamic is False
+
+    reset_config()
+
+
+def test_config_reads_ranking_ltr_env(monkeypatch):
+    for env_name in (
+        "RANKING_LTR_PAIRWISE_ENABLED",
+        "RANKING_LTR_PAIRWISE_WEIGHT",
+        "RANKING_LTR_MAX_PAIRS_PER_GROUP",
+        "RANKING_LTR_MIN_RELEVANCE_GAP",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.ranking_config.ltr_pairwise_enabled is False
+    assert config.ranking_config.ltr_pairwise_weight == 0.1
+    assert config.ranking_config.ltr_max_pairs_per_group == 2048
+    assert config.ranking_config.ltr_min_relevance_gap == 0.5
+
+    monkeypatch.setenv("RANKING_LTR_PAIRWISE_ENABLED", "true")
+    monkeypatch.setenv("RANKING_LTR_PAIRWISE_WEIGHT", "0.25")
+    monkeypatch.setenv("RANKING_LTR_MAX_PAIRS_PER_GROUP", "128")
+    monkeypatch.setenv("RANKING_LTR_MIN_RELEVANCE_GAP", "1.0")
+
+    reset_config()
+    config = Config()
+
+    assert config.ranking_config.ltr_pairwise_enabled is True
+    assert config.ranking_config.ltr_pairwise_weight == 0.25
+    assert config.ranking_config.ltr_max_pairs_per_group == 128
+    assert config.ranking_config.ltr_min_relevance_gap == 1.0
 
     reset_config()
 

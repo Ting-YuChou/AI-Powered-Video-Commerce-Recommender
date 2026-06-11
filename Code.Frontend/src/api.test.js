@@ -50,4 +50,26 @@ describe('api payload builders', () => {
       },
     });
   });
+
+  it('preserves recommendation impression attribution context', () => {
+    const payload = buildInteractionPayload('user-1', 'product-1', 'click', {
+      impression_id: 'imp-1',
+      recommendation_position: 2,
+      recommendation_ranking_score: 0.81,
+      recommendation_source: 'two_tower+content',
+      content_id: 'content-1',
+      session_id: 'session-1',
+      surface: 'recommendations',
+    });
+
+    expect(payload.context).toMatchObject({
+      impression_id: 'imp-1',
+      recommendation_position: 2,
+      recommendation_ranking_score: 0.81,
+      recommendation_source: 'two_tower+content',
+      content_id: 'content-1',
+      session_id: 'session-1',
+      surface: 'recommendations',
+    });
+  });
 });

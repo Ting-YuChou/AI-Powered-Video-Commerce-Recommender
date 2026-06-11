@@ -1595,6 +1595,15 @@ function VideoCommerceApp() {
           ...buildRequestContext(),
           content_id: currentContentId || null,
           product_title: product.title,
+          impression_id: metadata?.impression_id || null,
+          recommendation_position: product.rank ?? null,
+          recommendation_ranking_score: product.ranking_score ?? null,
+          recommendation_source: (
+            product?.source
+            || product?.raw?.source
+            || product?.raw?.candidate_source
+            || null
+          ),
         }
       );
 
@@ -1644,7 +1653,7 @@ function VideoCommerceApp() {
         mode,
       }, ...previous]);
     }
-  }, [buildRequestContext, currentContentId, mode, service, userId]);
+  }, [buildRequestContext, currentContentId, metadata, mode, service, userId]);
 
   const handleOpenProduct = useCallback(async (product) => {
     setSelectedProduct(product);
