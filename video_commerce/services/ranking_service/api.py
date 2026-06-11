@@ -157,6 +157,16 @@ async def startup_event():
             "torch_compile_mode": compile_status["torch_compile_mode"],
             "torch_compile_dynamic": compile_status["torch_compile_dynamic"],
             "torch_compile_error": compile_status["torch_compile_error"],
+            "torch_compile_warmup_ms": compile_status["torch_compile_warmup_ms"],
+            "torch_compile_fallback_count": compile_status[
+                "torch_compile_fallback_count"
+            ],
+            "torch_compile_last_fallback_error": compile_status[
+                "torch_compile_last_fallback_error"
+            ],
+            "torch_compile_last_inference_path": compile_status[
+                "torch_compile_last_inference_path"
+            ],
         },
     )
 
