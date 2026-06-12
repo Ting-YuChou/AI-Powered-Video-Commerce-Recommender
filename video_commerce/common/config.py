@@ -198,9 +198,25 @@ class RecommendationConfig(BaseSettings):
         150,
         description="Number of products to precompute per category pool",
     )
+    enable_content_cluster_pools: bool = Field(
+        False,
+        description="Enable content-embedding cluster candidate pools",
+    )
+    content_cluster_count: int = Field(
+        128,
+        description="Number of product content clusters to build offline",
+    )
+    serving_cluster_pool_size: int = Field(
+        150,
+        description="Number of products to precompute per content cluster pool",
+    )
     preferred_category_pool_count: int = Field(
         2,
         description="Maximum preferred categories to pull from serving pools per request",
+    )
+    preferred_cluster_pool_count: int = Field(
+        2,
+        description="Maximum content clusters to pull from serving pools per request",
     )
     max_live_cf_candidates: int = Field(
         40,
@@ -225,6 +241,10 @@ class RecommendationConfig(BaseSettings):
     max_pool_category_candidates: int = Field(
         30,
         description="Maximum precomputed category-pool candidates to merge per request",
+    )
+    max_pool_cluster_candidates: int = Field(
+        30,
+        description="Maximum precomputed content-cluster candidates to merge per request",
     )
     max_random_candidates: int = Field(
         10,
@@ -426,6 +446,12 @@ class RecommendationConfig(BaseSettings):
     cf_index_path: str = Field(
         "/tmp/cf_vector_index.faiss", description="CF FAISS index file path"
     )
+    content_cluster_metadata_path: Optional[str] = Field(
+        None, description="Content cluster metadata JSON local path"
+    )
+    content_cluster_centroids_path: Optional[str] = Field(
+        None, description="Content cluster centroid NPZ local path"
+    )
 
     # SASRec sequential retrieval
     enable_sasrec: bool = Field(
@@ -505,6 +531,16 @@ class RecommendationConfig(BaseSettings):
         return normalized
 
     @validator(
+        "content_cluster_count",
+        "serving_cluster_pool_size",
+        "preferred_cluster_pool_count",
+    )
+    def validate_content_cluster_positive_ints(cls, value: int, field) -> int:
+        if value <= 0:
+            raise ValueError(f"{field.name} must be > 0")
+        return value
+
+    @validator(
         "cf_cold_start_neighbors",
         "cf_cold_start_min_valid_neighbors",
         "cf_cold_start_max_items",
@@ -519,6 +555,12 @@ class RecommendationConfig(BaseSettings):
     def validate_max_new_item_candidates(cls, value: int) -> int:
         if value < 0:
             raise ValueError("max_new_item_candidates must be >= 0")
+        return value
+
+    @validator("max_pool_cluster_candidates")
+    def validate_max_pool_cluster_candidates(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_pool_cluster_candidates must be >= 0")
         return value
 
     @validator("serving_recent_interaction_limit")
@@ -673,6 +715,38 @@ class RankingConfig(BaseSettings):
         False,
         description="Include Flink realtime window features in ranking feature vectors",
     )
+    history_embeddings_enabled: bool = Field(
+        False,
+        description="Include separate click/cart/purchase last-N two-tower history embeddings in ranking features",
+    )
+    history_click_last_n: int = Field(
+        20,
+        description="Number of recent click item embeddings averaged for ranking history features",
+    )
+    history_cart_last_n: int = Field(
+        20,
+        description="Number of recent add-to-cart item embeddings averaged for ranking history features",
+    )
+    history_purchase_last_n: int = Field(
+        20,
+        description="Number of recent purchase item embeddings averaged for ranking history features",
+    )
+    history_embedding_dim: int = Field(
+        128,
+        description="Two-tower item embedding dimension used by ranking history features",
+    )
+    history_click_scale: float = Field(
+        1.0,
+        description="Scale applied to click last-N ranking history vectors",
+    )
+    history_cart_scale: float = Field(
+        1.25,
+        description="Scale applied to cart last-N ranking history vectors",
+    )
+    history_purchase_scale: float = Field(
+        1.75,
+        description="Scale applied to purchase last-N ranking history vectors",
+    )
     max_queue_wait_ms: float = Field(
         150.0,
         description="Maximum time a ranking request may wait in the queue before failing fast",
@@ -778,6 +852,32 @@ class RankingConfig(BaseSettings):
     def validate_ltr_max_pairs_per_group(cls, value: int) -> int:
         if value < 0:
             raise ValueError("ltr_max_pairs_per_group must be >= 0")
+        return value
+
+    @validator(
+        "history_click_last_n",
+        "history_cart_last_n",
+        "history_purchase_last_n",
+    )
+    def validate_history_last_n(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("ranking history last-N settings must be >= 0")
+        return value
+
+    @validator("history_embedding_dim")
+    def validate_history_embedding_dim(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("history_embedding_dim must be >= 1")
+        return value
+
+    @validator(
+        "history_click_scale",
+        "history_cart_scale",
+        "history_purchase_scale",
+    )
+    def validate_history_scales(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("ranking history scales must be >= 0")
         return value
 
     @validator("runner_payload_max_bytes")

@@ -15,6 +15,7 @@ from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.ranking_history import merge_item_embedding_maps
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.ml.vector_search import VectorSearchEngine
@@ -95,8 +96,31 @@ class ModelTrainerService:
         ranking_checkpoint = None
         if self.artifact_manager:
             ranking_checkpoint = await self.artifact_manager.sync_latest_ranking_checkpoint()
-        await self.ranking_model.load_model(self.config.model_config.ranking_model_path)
-        if ranking_checkpoint:
+        loaded_existing_checkpoint = False
+        try:
+            await self.ranking_model.load_model(self.config.model_config.ranking_model_path)
+            loaded_existing_checkpoint = True
+        except RuntimeError:
+            if (
+                not self.config.ranking_config.history_embeddings_enabled
+                or not self.config.ranking_config.enable_periodic_training
+            ):
+                raise
+            logger.warning(
+                "ranking_checkpoint_incompatible_for_history_embeddings_fresh_train",
+                extra={"model_path": self.config.model_config.ranking_model_path},
+            )
+            self.ranking_model._initialize_model(
+                architecture=self.config.ranking_config.architecture
+            )
+            if self.ranking_model.model:
+                self.ranking_model.model.eval()
+            self.ranking_model.is_trained = False
+            self.ranking_model.loaded_model_path = (
+                self.config.model_config.ranking_model_path
+            )
+            self.ranking_model.loaded_checkpoint_mtime = 0.0
+        if ranking_checkpoint and loaded_existing_checkpoint:
             self.ranking_model.model_version = ranking_checkpoint.model_version
 
         if self.config.ranking_config.enable_periodic_training:
@@ -210,10 +234,27 @@ class ModelTrainerService:
                 if self.vector_search and self.vector_search.product_metadata
                 else {}
             )
+            recommendation_engine = getattr(self, "recommendation_engine", None)
+            cf_engine = (
+                getattr(recommendation_engine, "cf_engine", None)
+                if recommendation_engine
+                else None
+            )
+            item_embedding_map = merge_item_embedding_maps(
+                getattr(cf_engine, "trained_item_embeddings", None),
+                getattr(cf_engine, "synthetic_item_embeddings", None),
+            )
+            two_tower_model_version = (
+                getattr(recommendation_engine, "loaded_two_tower_version", None)
+                if recommendation_engine
+                else None
+            )
             await self.ranking_model.train_model(
                 interactions,
                 user_features_map=user_features_map,
                 product_metadata_map=product_metadata_map,
+                item_embedding_map=item_embedding_map,
+                two_tower_model_version=two_tower_model_version,
             )
             if self.ranking_model.is_trained and self.artifact_manager:
                 record = await self.artifact_manager.persist_ranking_checkpoint(
