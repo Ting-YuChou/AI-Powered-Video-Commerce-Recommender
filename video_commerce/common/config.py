@@ -715,6 +715,38 @@ class RankingConfig(BaseSettings):
         False,
         description="Include Flink realtime window features in ranking feature vectors",
     )
+    history_embeddings_enabled: bool = Field(
+        False,
+        description="Include separate click/cart/purchase last-N two-tower history embeddings in ranking features",
+    )
+    history_click_last_n: int = Field(
+        20,
+        description="Number of recent click item embeddings averaged for ranking history features",
+    )
+    history_cart_last_n: int = Field(
+        20,
+        description="Number of recent add-to-cart item embeddings averaged for ranking history features",
+    )
+    history_purchase_last_n: int = Field(
+        20,
+        description="Number of recent purchase item embeddings averaged for ranking history features",
+    )
+    history_embedding_dim: int = Field(
+        128,
+        description="Two-tower item embedding dimension used by ranking history features",
+    )
+    history_click_scale: float = Field(
+        1.0,
+        description="Scale applied to click last-N ranking history vectors",
+    )
+    history_cart_scale: float = Field(
+        1.25,
+        description="Scale applied to cart last-N ranking history vectors",
+    )
+    history_purchase_scale: float = Field(
+        1.75,
+        description="Scale applied to purchase last-N ranking history vectors",
+    )
     max_queue_wait_ms: float = Field(
         150.0,
         description="Maximum time a ranking request may wait in the queue before failing fast",
@@ -820,6 +852,32 @@ class RankingConfig(BaseSettings):
     def validate_ltr_max_pairs_per_group(cls, value: int) -> int:
         if value < 0:
             raise ValueError("ltr_max_pairs_per_group must be >= 0")
+        return value
+
+    @validator(
+        "history_click_last_n",
+        "history_cart_last_n",
+        "history_purchase_last_n",
+    )
+    def validate_history_last_n(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("ranking history last-N settings must be >= 0")
+        return value
+
+    @validator("history_embedding_dim")
+    def validate_history_embedding_dim(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("history_embedding_dim must be >= 1")
+        return value
+
+    @validator(
+        "history_click_scale",
+        "history_cart_scale",
+        "history_purchase_scale",
+    )
+    def validate_history_scales(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("ranking history scales must be >= 0")
         return value
 
     @validator("runner_payload_max_bytes")
