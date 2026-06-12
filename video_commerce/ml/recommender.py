@@ -39,6 +39,10 @@ from video_commerce.ml.cf_cold_start import (
     normalize_vector,
     save_item_embedding_sidecar,
 )
+from video_commerce.ml.content_clusters import (
+    build_content_cluster_artifact,
+    save_content_cluster_artifact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1348,6 +1352,7 @@ class RecommendationEngine:
         self.last_model_update = 0
         self.loaded_two_tower_version: Optional[str] = None
         self.loaded_sasrec_version: Optional[str] = None
+        self.loaded_content_cluster_version: Optional[str] = None
 
         logger.info("Recommendation engine initialized (Two-Tower + SASRec retrieval)")
 
@@ -1383,6 +1388,7 @@ class RecommendationEngine:
             logger.info("Loading recommendation serving state")
             await self._try_load_cf_index()
             await self._try_load_sasrec_artifacts()
+            await self._try_load_content_cluster_artifacts()
             await self.refresh_serving_pools()
             await self._prime_hot_serving_caches()
             self.is_initialized = True
@@ -1497,10 +1503,85 @@ class RecommendationEngine:
             logger.warning(f"Could not load SASRec artifacts: {e}")
         return False
 
+    async def _try_load_content_cluster_artifacts(self) -> bool:
+        """Load content-cluster serving artifacts if the source is enabled."""
+        if not self.config.enable_content_cluster_pools:
+            self.loaded_content_cluster_version = None
+            return False
+        load_artifact = getattr(
+            self.vector_search,
+            "load_content_cluster_artifact",
+            None,
+        )
+        if not callable(load_artifact):
+            self.loaded_content_cluster_version = None
+            return False
+        metadata_path, centroids_path = self._content_cluster_artifact_paths()
+        loaded = await asyncio.to_thread(
+            load_artifact,
+            metadata_path=metadata_path,
+            centroids_path=centroids_path,
+        )
+        if loaded:
+            self.loaded_content_cluster_version = (
+                self.vector_search.content_cluster_model_version
+            )
+            return True
+        self.loaded_content_cluster_version = None
+        return False
+
+    async def _update_content_cluster_artifacts(self) -> bool:
+        """Build and persist content-cluster artifacts on the offline update path."""
+        if not self.config.enable_content_cluster_pools:
+            return False
+        get_embeddings = getattr(self.vector_search, "get_all_product_embeddings", None)
+        if not callable(get_embeddings):
+            logger.warning(
+                "Skipping content cluster build because vector backend does not expose embeddings"
+            )
+            return False
+        product_embeddings = get_embeddings()
+        if not product_embeddings:
+            logger.warning("Skipping content cluster build because product embeddings are empty")
+            return False
+
+        metadata_path, centroids_path = self._content_cluster_artifact_paths()
+        try:
+            catalog_context = (
+                self.vector_search.get_catalog_version_context()
+                if hasattr(self.vector_search, "get_catalog_version_context")
+                else {}
+            )
+            artifact = await asyncio.to_thread(
+                build_content_cluster_artifact,
+                product_embeddings,
+                num_clusters=self.config.content_cluster_count,
+                source_catalog_context=catalog_context,
+            )
+            await asyncio.to_thread(
+                save_content_cluster_artifact,
+                artifact,
+                metadata_path=metadata_path,
+                centroids_path=centroids_path,
+            )
+            self.vector_search.apply_content_cluster_artifact(artifact)
+            self.loaded_content_cluster_version = artifact.cluster_model_version
+            logger.info(
+                "Built content cluster artifact %s with %s clusters and %s products",
+                artifact.cluster_model_version,
+                artifact.num_clusters,
+                artifact.product_count,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Content cluster artifact update failed: %s", exc)
+            return False
+
     async def _update_models_from_interactions(self):
         """Update models using recent interaction data."""
         try:
             if not self.artifact_manager or not self.artifact_manager.system_store:
+                await self._update_content_cluster_artifacts()
                 await self.refresh_serving_pools()
                 logger.warning(
                     "Skipping Two-Tower retraining because Postgres system store is unavailable"
@@ -1549,6 +1630,7 @@ class RecommendationEngine:
                     )
 
                 await self._update_sasrec_from_sequences()
+                await self._update_content_cluster_artifacts()
 
                 # Update trending scores (use last 1K for recency)
                 await self.trending_engine.update_trending_scores(interactions[:1000])
@@ -1557,6 +1639,7 @@ class RecommendationEngine:
                 self.last_model_update = time.time()
                 logger.info(f"Updated models with {len(interactions)} interactions")
             else:
+                await self._update_content_cluster_artifacts()
                 await self.refresh_serving_pools()
                 logger.warning("No interactions found for model training")
 
@@ -1641,12 +1724,30 @@ class RecommendationEngine:
             self.config.sasrec_metadata_path or str(base_dir / "sasrec_metadata.json"),
         )
 
+    def _content_cluster_artifact_paths(self) -> Tuple[str, str]:
+        base_dir = Path(self.config.cf_index_path).parent
+        return (
+            self.config.content_cluster_metadata_path
+            or str(base_dir / "content_clusters.metadata.json"),
+            self.config.content_cluster_centroids_path
+            or str(base_dir / "content_clusters.centroids.npz"),
+        )
+
     async def sync_serving_artifacts_if_updated(self) -> bool:
         """Reload retrieval serving artifacts when newer checkpoints are available."""
-        if not self.artifact_manager:
-            return False
-
         updated = False
+        pools_refreshed = False
+        if self.config.enable_content_cluster_pools:
+            previous_cluster_version = self.loaded_content_cluster_version
+            await self._try_load_content_cluster_artifacts()
+            if previous_cluster_version != self.loaded_content_cluster_version:
+                await self.refresh_serving_pools()
+                updated = True
+                pools_refreshed = True
+
+        if not self.artifact_manager:
+            return updated
+
         latest_two_tower = await self.artifact_manager.get_latest_model_checkpoint(
             ModelArtifactManager.TWO_TOWER_MODEL_NAME
         )
@@ -1673,11 +1774,20 @@ class RecommendationEngine:
                     updated or self.loaded_sasrec_version == latest_sasrec.model_version
                 )
 
-        if self.cf_engine.should_refresh_new_item_candidates():
+        if self.cf_engine.should_refresh_new_item_candidates() and not pools_refreshed:
             await asyncio.to_thread(self.cf_engine.refresh_new_item_candidates)
             updated = True
 
         return updated
+
+    def _content_cluster_pool_version(self) -> Optional[str]:
+        if not self.config.enable_content_cluster_pools:
+            return None
+        return self.loaded_content_cluster_version or getattr(
+            self.vector_search,
+            "content_cluster_model_version",
+            None,
+        )
 
     def _compute_serving_pool_score(
         self,
@@ -1714,6 +1824,7 @@ class RecommendationEngine:
             current_time = time.time()
             global_scored: List[Tuple[str, float]] = []
             category_scored: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+            cluster_scored: Dict[int, List[Tuple[str, float]]] = defaultdict(list)
 
             for product_id, metadata in self.vector_search.product_metadata.items():
                 score = self._compute_serving_pool_score(
@@ -1722,6 +1833,15 @@ class RecommendationEngine:
                 global_scored.append((product_id, score))
                 category = metadata.get("category", "unknown")
                 category_scored[category].append((product_id, score))
+                get_cluster_id = getattr(
+                    self.vector_search,
+                    "get_product_cluster_id",
+                    None,
+                )
+                if self.config.enable_content_cluster_pools and callable(get_cluster_id):
+                    cluster_id = get_cluster_id(product_id)
+                    if cluster_id is not None:
+                        cluster_scored[int(cluster_id)].append((product_id, score))
 
             global_scored.sort(key=lambda item: item[1], reverse=True)
             global_top = global_scored[: self.config.serving_trending_pool_size]
@@ -1755,11 +1875,34 @@ class RecommendationEngine:
                 ]
 
             await self.feature_store.store_category_pools(category_pools)
+            cluster_pools: Dict[int, List[CandidateProduct]] = {}
+            cluster_pool_version = self._content_cluster_pool_version()
+            if cluster_pool_version and cluster_scored:
+                for cluster_id, scored_items in cluster_scored.items():
+                    scored_items.sort(key=lambda item: item[1], reverse=True)
+                    cluster_top = scored_items[: self.config.serving_cluster_pool_size]
+                    cluster_max = (
+                        max((score for _, score in cluster_top), default=1.0) or 1.0
+                    )
+                    cluster_pools[cluster_id] = [
+                        CandidateProduct(
+                            product_id=product_id,
+                            popularity_score=float(score / cluster_max),
+                            combined_score=float(score / cluster_max),
+                            source="cluster_pool",
+                        )
+                        for product_id, score in cluster_top
+                    ]
+                await self.feature_store.store_cluster_pools(
+                    cluster_pools,
+                    pool_version=cluster_pool_version,
+                )
             await asyncio.to_thread(self.cf_engine.refresh_new_item_candidates)
             logger.info(
-                "Refreshed serving pools: %s global products, %s categories",
+                "Refreshed serving pools: %s global products, %s categories, %s clusters",
                 len(trending_pool),
                 len(category_pools),
+                len(cluster_pools),
             )
         except Exception as e:
             logger.error(f"Error refreshing serving pools: {e}")
@@ -1860,6 +2003,51 @@ class RecommendationEngine:
                 deduped.append(category)
         return deduped[: self.config.preferred_category_pool_count]
 
+    def _resolve_preferred_content_clusters(
+        self,
+        content_features: Optional[ContentFeatures],
+        user_interactions: List[Dict[str, Any]],
+    ) -> List[int]:
+        """Resolve content-cluster pools from current content and recent positives."""
+        if not self._content_cluster_pool_version():
+            return []
+        cluster_limit = max(1, int(self.config.preferred_cluster_pool_count))
+        clusters: List[int] = []
+
+        if content_features and content_features.visual_embedding:
+            assign_clusters = getattr(
+                self.vector_search,
+                "assign_content_embedding_clusters",
+                None,
+            )
+            if callable(assign_clusters):
+                clusters.extend(
+                    assign_clusters(
+                        content_features.visual_embedding,
+                        limit=cluster_limit,
+                    )
+                )
+
+        for interaction in reversed(user_interactions):
+            if len(clusters) >= cluster_limit:
+                break
+            product_id = interaction.get("product_id")
+            action = interaction.get("action")
+            if not product_id or action not in POSITIVE_SEQUENCE_ACTIONS:
+                continue
+            get_cluster_id = getattr(self.vector_search, "get_product_cluster_id", None)
+            if not callable(get_cluster_id):
+                break
+            cluster_id = get_cluster_id(product_id)
+            if cluster_id is not None:
+                clusters.append(int(cluster_id))
+
+        deduped: List[int] = []
+        for cluster_id in clusters:
+            if cluster_id not in deduped:
+                deduped.append(cluster_id)
+        return deduped[:cluster_limit]
+
     async def generate_candidates(
         self,
         user_id: str,
@@ -1895,12 +2083,14 @@ class RecommendationEngine:
                 "content_candidates_ms": 0.0,
                 "trending_candidates_ms": 0.0,
                 "category_pool_ms": 0.0,
+                "cluster_pool_ms": 0.0,
                 "new_item_candidates_ms": 0.0,
                 "random_candidates_ms": 0.0,
                 "score_merge_ms": 0.0,
                 "total_ms": 0.0,
                 "candidate_count": 0,
                 "preferred_categories": [],
+                "preferred_clusters": [],
                 "source_counts": {},
                 "source_overlap_counts": {},
                 "merged_source_counts": {},
@@ -1998,6 +2188,11 @@ class RecommendationEngine:
                 user_features_obj, context, content_features
             )
             profile["preferred_categories"] = preferred_categories
+            preferred_clusters = self._resolve_preferred_content_clusters(
+                content_features,
+                resolved_user_interactions,
+            )
+            profile["preferred_clusters"] = preferred_clusters
             audio_features = content_features.audio_features if content_features else None
             speech_categories = (
                 list(audio_features.speech_categories)
@@ -2099,6 +2294,39 @@ class RecommendationEngine:
                     category_candidates.extend(result)
                 return category_candidates
 
+            async def fetch_cluster_candidates() -> List[CandidateProduct]:
+                cluster_pool_version = self._content_cluster_pool_version()
+                if (
+                    not cluster_pool_version
+                    or not preferred_clusters
+                    or self.config.max_pool_cluster_candidates <= 0
+                ):
+                    return []
+                per_cluster_limit = max(
+                    1,
+                    self.config.max_pool_cluster_candidates
+                    // max(len(preferred_clusters), 1),
+                )
+                cluster_tasks = [
+                    self.feature_store.get_cluster_pool(
+                        cluster_id,
+                        per_cluster_limit,
+                        exclude_items=exclude_items,
+                        pool_version=cluster_pool_version,
+                    )
+                    for cluster_id in preferred_clusters
+                ]
+                cluster_results = await asyncio.gather(
+                    *cluster_tasks, return_exceptions=True
+                )
+                cluster_candidates: List[CandidateProduct] = []
+                for result in cluster_results:
+                    if isinstance(result, Exception):
+                        logger.warning("cluster_pool_fetch_failed: %s", result)
+                        continue
+                    cluster_candidates.extend(result)
+                return cluster_candidates
+
             async def fetch_new_item_candidates() -> List[CandidateProduct]:
                 if not hasattr(self.cf_engine, "get_new_item_candidates"):
                     return []
@@ -2150,6 +2378,15 @@ class RecommendationEngine:
                 ),
                 name="candidate-source-category",
             )
+            cluster_task = asyncio.create_task(
+                timed_stage(
+                    "cluster_pool_ms",
+                    fetch_cluster_candidates(),
+                    [],
+                    source_timeout_ms,
+                ),
+                name="candidate-source-cluster",
+            )
             new_item_task = asyncio.create_task(
                 timed_stage(
                     "new_item_candidates_ms",
@@ -2166,6 +2403,7 @@ class RecommendationEngine:
                 content_candidates,
                 trending_candidates,
                 category_candidates,
+                cluster_candidates,
                 new_item_candidates,
             ) = await asyncio.gather(
                 cf_task,
@@ -2173,6 +2411,7 @@ class RecommendationEngine:
                 content_task,
                 trending_task,
                 category_task,
+                cluster_task,
                 new_item_task,
             )
 
@@ -2191,6 +2430,7 @@ class RecommendationEngine:
             merge_source("content", content_candidates)
             merge_source("trending_pool", trending_candidates)
             merge_source("category_pool", category_candidates)
+            merge_source("cluster_pool", cluster_candidates)
             merge_source("new_item", new_item_candidates)
 
             # 5. Small random fallback only if stronger sources are still thin
@@ -2296,12 +2536,14 @@ class RecommendationEngine:
                     "content_candidates_ms": 0.0,
                     "trending_candidates_ms": 0.0,
                     "category_pool_ms": 0.0,
+                    "cluster_pool_ms": 0.0,
                     "new_item_candidates_ms": 0.0,
                     "random_candidates_ms": 0.0,
                     "score_merge_ms": 0.0,
                     "total_ms": 0.0,
                     "candidate_count": 0,
                     "preferred_categories": [],
+                    "preferred_clusters": [],
                     "source_counts": {},
                     "source_overlap_counts": {},
                     "merged_source_counts": {},
@@ -2444,6 +2686,11 @@ class RecommendationEngine:
             "sasrec_model_version": self.sasrec_engine.model_version,
             "sasrec_items": len(self.sasrec_engine.product_to_id),
             "sasrec_model_parameters": sasrec_params,
+            "content_cluster_pools_enabled": self.config.enable_content_cluster_pools,
+            "content_cluster_model_version": self.loaded_content_cluster_version,
+            "content_cluster_assignments": len(
+                getattr(self.vector_search, "content_cluster_assignments", {}) or {}
+            ),
             "trending_products": len(self.trending_engine.trending_scores),
             "config": {
                 "tt_embedding_dim": self.config.tt_embedding_dim,

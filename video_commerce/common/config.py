@@ -198,9 +198,25 @@ class RecommendationConfig(BaseSettings):
         150,
         description="Number of products to precompute per category pool",
     )
+    enable_content_cluster_pools: bool = Field(
+        False,
+        description="Enable content-embedding cluster candidate pools",
+    )
+    content_cluster_count: int = Field(
+        128,
+        description="Number of product content clusters to build offline",
+    )
+    serving_cluster_pool_size: int = Field(
+        150,
+        description="Number of products to precompute per content cluster pool",
+    )
     preferred_category_pool_count: int = Field(
         2,
         description="Maximum preferred categories to pull from serving pools per request",
+    )
+    preferred_cluster_pool_count: int = Field(
+        2,
+        description="Maximum content clusters to pull from serving pools per request",
     )
     max_live_cf_candidates: int = Field(
         40,
@@ -225,6 +241,10 @@ class RecommendationConfig(BaseSettings):
     max_pool_category_candidates: int = Field(
         30,
         description="Maximum precomputed category-pool candidates to merge per request",
+    )
+    max_pool_cluster_candidates: int = Field(
+        30,
+        description="Maximum precomputed content-cluster candidates to merge per request",
     )
     max_random_candidates: int = Field(
         10,
@@ -426,6 +446,12 @@ class RecommendationConfig(BaseSettings):
     cf_index_path: str = Field(
         "/tmp/cf_vector_index.faiss", description="CF FAISS index file path"
     )
+    content_cluster_metadata_path: Optional[str] = Field(
+        None, description="Content cluster metadata JSON local path"
+    )
+    content_cluster_centroids_path: Optional[str] = Field(
+        None, description="Content cluster centroid NPZ local path"
+    )
 
     # SASRec sequential retrieval
     enable_sasrec: bool = Field(
@@ -505,6 +531,16 @@ class RecommendationConfig(BaseSettings):
         return normalized
 
     @validator(
+        "content_cluster_count",
+        "serving_cluster_pool_size",
+        "preferred_cluster_pool_count",
+    )
+    def validate_content_cluster_positive_ints(cls, value: int, field) -> int:
+        if value <= 0:
+            raise ValueError(f"{field.name} must be > 0")
+        return value
+
+    @validator(
         "cf_cold_start_neighbors",
         "cf_cold_start_min_valid_neighbors",
         "cf_cold_start_max_items",
@@ -519,6 +555,12 @@ class RecommendationConfig(BaseSettings):
     def validate_max_new_item_candidates(cls, value: int) -> int:
         if value < 0:
             raise ValueError("max_new_item_candidates must be >= 0")
+        return value
+
+    @validator("max_pool_cluster_candidates")
+    def validate_max_pool_cluster_candidates(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_pool_cluster_candidates must be >= 0")
         return value
 
     @validator("serving_recent_interaction_limit")

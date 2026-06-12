@@ -413,12 +413,24 @@ def _refresh_serving_version_context(runtime) -> Dict[str, Any]:
 
 def _serving_version_paths(
     runtime,
-) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+) -> Tuple[
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    cluster_metadata_path, cluster_centroids_path = _content_cluster_artifact_paths(
+        runtime
+    )
     return (
         runtime.config.model_config.ranking_model_path,
         runtime.config.vector_config.index_path,
         runtime.config.recommendation_config.sasrec_checkpoint_path,
         runtime.config.recommendation_config.sasrec_vocab_path,
+        cluster_metadata_path,
+        cluster_centroids_path,
     )
 
 
@@ -427,6 +439,9 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
     vector_path = runtime.config.vector_config.index_path
     sasrec_checkpoint_path = runtime.config.recommendation_config.sasrec_checkpoint_path
     sasrec_vocab_path = runtime.config.recommendation_config.sasrec_vocab_path
+    cluster_metadata_path, cluster_centroids_path = _content_cluster_artifact_paths(
+        runtime
+    )
     return {
         "ranking_model": ranking_model.model_version if ranking_model else None,
         "ranking_checkpoint_mtime": _safe_file_mtime(ranking_path),
@@ -457,8 +472,72 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
         ),
         "sasrec_checkpoint_mtime": _safe_file_mtime(sasrec_checkpoint_path),
         "sasrec_vocab_mtime": _safe_file_mtime(sasrec_vocab_path),
+        "content_cluster_model": (
+            getattr(recommendation_engine, "loaded_content_cluster_version", None)
+            if recommendation_engine
+            else None
+        ),
+        "content_cluster_metadata_mtime": (
+            _safe_file_mtime(cluster_metadata_path)
+            if cluster_metadata_path
+            else None
+        ),
+        "content_cluster_centroids_mtime": (
+            _safe_file_mtime(cluster_centroids_path)
+            if cluster_centroids_path
+            else None
+        ),
+        "content_cluster": _content_cluster_serving_version_context(),
         "vector_index_mtime": _safe_file_mtime(vector_path),
         "catalog": _catalog_serving_version_context(),
+    }
+
+
+def _content_cluster_artifact_paths(runtime) -> Tuple[Optional[str], Optional[str]]:
+    recommendation_config = runtime.config.recommendation_config
+    metadata_path = getattr(
+        recommendation_config,
+        "content_cluster_metadata_path",
+        None,
+    )
+    centroids_path = getattr(
+        recommendation_config,
+        "content_cluster_centroids_path",
+        None,
+    )
+    if metadata_path and centroids_path:
+        return metadata_path, centroids_path
+    cf_index_path = getattr(recommendation_config, "cf_index_path", None)
+    if not cf_index_path:
+        return metadata_path, centroids_path
+    base_dir = Path(cf_index_path).parent
+    return (
+        metadata_path or str(base_dir / "content_clusters.metadata.json"),
+        centroids_path or str(base_dir / "content_clusters.centroids.npz"),
+    )
+
+
+def _content_cluster_serving_version_context() -> Dict[str, Any]:
+    if vector_search is None:
+        return {
+            "cluster_model_version": None,
+            "num_clusters": 0,
+            "assignment_count": 0,
+            "product_count": 0,
+            "created_at": 0,
+        }
+    if hasattr(vector_search, "get_content_cluster_version_context"):
+        return vector_search.get_content_cluster_version_context()
+    return {
+        "cluster_model_version": getattr(
+            vector_search, "content_cluster_model_version", None
+        ),
+        "num_clusters": 0,
+        "assignment_count": len(
+            getattr(vector_search, "content_cluster_assignments", {}) or {}
+        ),
+        "product_count": 0,
+        "created_at": 0,
     }
 
 
