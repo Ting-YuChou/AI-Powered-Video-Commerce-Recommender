@@ -1,6 +1,8 @@
 import importlib.util
 import importlib.machinery
 import json
+import shutil
+import subprocess
 import sys
 import types
 
@@ -23,15 +25,16 @@ from video_commerce.ml.content_processor import ContentProcessor
 
 
 def _processor(**overrides):
-    config = ModelConfig(
-        device="cpu",
-        enable_gpu=False,
-        num_keyframes=3,
-        max_video_length=10,
-        ffmpeg_timeout_seconds=1,
-        ffmpeg_target_width=4,
-        **overrides,
-    )
+    defaults = {
+        "device": "cpu",
+        "enable_gpu": False,
+        "num_keyframes": 3,
+        "max_video_length": 10,
+        "ffmpeg_timeout_seconds": 1,
+        "ffmpeg_target_width": 4,
+    }
+    defaults.update(overrides)
+    config = ModelConfig(**defaults)
     return ContentProcessor(config)
 
 
@@ -85,7 +88,7 @@ async def test_ffprobe_metadata_parses_duration_fps_frame_count_and_audio(monkey
 
 @pytest.mark.asyncio
 async def test_ffmpeg_extraction_parses_rgb_frames_and_respects_keyframe_count(monkeypatch):
-    processor = _processor()
+    processor = _processor(keyframe_sampling_strategy="uniform")
     ffmpeg_commands = []
     frames = [
         _ppm_frame(2, 1, [[[255, 0, 0], [0, 255, 0]]]),
@@ -115,6 +118,216 @@ async def test_ffmpeg_extraction_parses_rgb_frames_and_respects_keyframe_count(m
     assert command[0] == "ffmpeg"
     assert command[command.index("-frames:v") + 1] == "3"
     assert any("select=eq(n\\,0)+eq(n\\,4)+eq(n\\,9)" in arg for arg in command)
+
+
+@pytest.mark.asyncio
+async def test_scene_adaptive_extraction_merges_scene_and_floor_candidates(monkeypatch):
+    processor = _processor(
+        num_keyframes=4,
+        keyframe_floor_seconds=4.0,
+        keyframe_min_scene_gap_seconds=2.0,
+        keyframe_min_luma=0.0,
+        keyframe_min_blur_laplacian_var=0.0,
+        keyframe_dedupe_luma_diff_threshold=0.0,
+    )
+    ffmpeg_commands = []
+    frames = [
+        _ppm_frame(2, 1, [[[255, 0, 0], [0, 255, 0]]]),
+        _ppm_frame(2, 1, [[[0, 0, 255], [255, 255, 0]]]),
+        _ppm_frame(2, 1, [[[255, 0, 255], [0, 255, 255]]]),
+        _ppm_frame(2, 1, [[[255, 255, 255], [128, 128, 128]]]),
+    ]
+
+    async def fake_scene_run(command):
+        assert command[0] == "ffmpeg"
+        assert any("select=gt(scene\\,0.350000),showinfo" in arg for arg in command)
+        return (
+            b"",
+            b"n:0 pts_time:1.0\nn:1 pts_time:1.5\nn:2 pts_time:6.2\n",
+        )
+
+    async def fake_run(command):
+        if command[0] == "ffprobe":
+            return _ffprobe_payload(duration="10.0", fps="10/1", frames="100")
+        ffmpeg_commands.append(command)
+        return b"".join(frames)
+
+    monkeypatch.setattr(processor, "_run_media_command_with_stderr", fake_scene_run)
+    monkeypatch.setattr(processor, "_run_media_command", fake_run)
+
+    keyframes, video_info = await processor._extract_keyframes_ffmpeg("video.mp4")
+
+    assert video_info["duration"] == 10.0
+    assert len(keyframes) == 4
+    command = ffmpeg_commands[0]
+    assert any(
+        "select=eq(n\\,0)+eq(n\\,10)+eq(n\\,62)+eq(n\\,99)" in arg
+        for arg in command
+    )
+
+
+@pytest.mark.asyncio
+async def test_scene_adaptive_extraction_uses_floor_when_no_scene_changes(monkeypatch):
+    processor = _processor(
+        num_keyframes=3,
+        max_video_length=20,
+        keyframe_floor_seconds=8.0,
+        keyframe_min_luma=0.0,
+        keyframe_min_blur_laplacian_var=0.0,
+        keyframe_dedupe_luma_diff_threshold=0.0,
+    )
+    ffmpeg_commands = []
+    frames = [
+        _ppm_frame(1, 1, [[[255, 0, 0]]]),
+        _ppm_frame(1, 1, [[[0, 255, 0]]]),
+        _ppm_frame(1, 1, [[[0, 0, 255]]]),
+    ]
+
+    async def fake_scene_run(command):
+        assert command[0] == "ffmpeg"
+        return b"", b""
+
+    async def fake_run(command):
+        if command[0] == "ffprobe":
+            return _ffprobe_payload(duration="16.0", fps="1/1", frames="16")
+        ffmpeg_commands.append(command)
+        return b"".join(frames)
+
+    monkeypatch.setattr(processor, "_run_media_command_with_stderr", fake_scene_run)
+    monkeypatch.setattr(processor, "_run_media_command", fake_run)
+
+    keyframes, _ = await processor._extract_keyframes_ffmpeg("video.mp4")
+
+    assert len(keyframes) == 3
+    command = ffmpeg_commands[0]
+    assert any("select=eq(n\\,0)+eq(n\\,8)+eq(n\\,15)" in arg for arg in command)
+
+
+def _rgb_from_luma(plane):
+    return np.repeat(plane[:, :, None], 3, axis=2).astype(np.uint8)
+
+
+def test_quality_filter_drops_dark_blurry_and_duplicate_frames():
+    processor = _processor(
+        keyframe_min_luma=8.0,
+        keyframe_min_blur_laplacian_var=10.0,
+        keyframe_dedupe_luma_diff_threshold=4.0,
+    )
+    checker = ((np.indices((16, 16)).sum(axis=0) % 2) * 255).astype(np.uint8)
+    duplicate = np.clip(checker.astype(np.int16) + 2, 0, 255).astype(np.uint8)
+    inverse = (255 - checker).astype(np.uint8)
+
+    frames = [
+        np.zeros((16, 16, 3), dtype=np.uint8),
+        np.full((16, 16, 3), 128, dtype=np.uint8),
+        _rgb_from_luma(checker),
+        _rgb_from_luma(duplicate),
+        _rgb_from_luma(inverse),
+    ]
+
+    filtered = processor._filter_keyframes_for_quality(frames)
+
+    assert len(filtered) == 2
+    np.testing.assert_array_equal(filtered[0], _rgb_from_luma(checker))
+    np.testing.assert_array_equal(filtered[1], _rgb_from_luma(inverse))
+
+
+@pytest.mark.asyncio
+async def test_scene_adaptive_zero_usable_frames_falls_back_to_uniform(monkeypatch):
+    processor = _processor(
+        num_keyframes=2,
+        keyframe_min_luma=300.0,
+        keyframe_min_blur_laplacian_var=0.0,
+        keyframe_dedupe_luma_diff_threshold=0.0,
+    )
+    ffmpeg_commands = []
+    dark_frames = [
+        _ppm_frame(1, 1, [[[0, 0, 0]]]),
+        _ppm_frame(1, 1, [[[0, 0, 0]]]),
+    ]
+    fallback_frames = [
+        _ppm_frame(1, 1, [[[255, 0, 0]]]),
+        _ppm_frame(1, 1, [[[0, 255, 0]]]),
+    ]
+
+    async def fake_scene_run(command):
+        assert command[0] == "ffmpeg"
+        return b"", b"n:0 pts_time:1.0\n"
+
+    async def fake_run(command):
+        if command[0] == "ffprobe":
+            return _ffprobe_payload(duration="2.0", fps="1/1", frames="2")
+        ffmpeg_commands.append(command)
+        if len(ffmpeg_commands) == 1:
+            return b"".join(dark_frames)
+        return b"".join(fallback_frames)
+
+    monkeypatch.setattr(processor, "_run_media_command_with_stderr", fake_scene_run)
+    monkeypatch.setattr(processor, "_run_media_command", fake_run)
+
+    keyframes, _ = await processor._extract_keyframes_ffmpeg("video.mp4")
+
+    assert len(keyframes) == 2
+    assert len(ffmpeg_commands) == 2
+    assert keyframes[0].tolist() == [[[255, 0, 0]]]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
+@pytest.mark.asyncio
+async def test_scene_adaptive_real_ffmpeg_smoke(tmp_path):
+    video_path = tmp_path / "scene-smoke.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=64x64:d=1:r=5",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:s=64x64:d=1:r=5",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=64x64:d=1:r=5",
+            "-filter_complex",
+            "[0:v][1:v][2:v]concat=n=3:v=1:a=0,format=yuv420p[v]",
+            "-map",
+            "[v]",
+            "-c:v",
+            "mpeg4",
+            str(video_path),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    processor = _processor(
+        num_keyframes=4,
+        max_video_length=4,
+        ffmpeg_timeout_seconds=10,
+        ffmpeg_target_width=16,
+        keyframe_scene_threshold=0.1,
+        keyframe_floor_seconds=1.0,
+        keyframe_min_scene_gap_seconds=0.5,
+        keyframe_min_luma=0.0,
+        keyframe_min_blur_laplacian_var=0.0,
+        keyframe_dedupe_luma_diff_threshold=1.0,
+    )
+
+    keyframes, _ = await processor._extract_keyframes_ffmpeg(str(video_path))
+
+    assert 1 <= len(keyframes) <= 4
+    mean_colors = {
+        tuple(np.round(np.mean(frame, axis=(0, 1))).astype(int))
+        for frame in keyframes
+    }
+    assert len(mean_colors) > 1
 
 
 @pytest.mark.parametrize(

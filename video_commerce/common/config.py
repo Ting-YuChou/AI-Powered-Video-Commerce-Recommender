@@ -113,6 +113,32 @@ class ModelConfig(BaseSettings):
     ffmpeg_target_width: int = Field(
         640, description="Maximum frame width produced by FFmpeg extraction"
     )
+    keyframe_sampling_strategy: str = Field(
+        "scene_adaptive",
+        description="Keyframe sampling strategy: scene_adaptive or uniform",
+    )
+    keyframe_scene_threshold: float = Field(
+        0.35, description="FFmpeg scene-change threshold for adaptive keyframes"
+    )
+    keyframe_floor_seconds: float = Field(
+        8.0,
+        description="Maximum interval between adaptive keyframe candidates in seconds",
+    )
+    keyframe_min_scene_gap_seconds: float = Field(
+        1.0,
+        description="Minimum spacing between accepted scene-change candidates",
+    )
+    keyframe_dedupe_luma_diff_threshold: float = Field(
+        4.0,
+        description="Minimum mean luma difference for retaining adjacent keyframes",
+    )
+    keyframe_min_luma: float = Field(
+        8.0, description="Minimum mean luma for retaining extracted keyframes"
+    )
+    keyframe_min_blur_laplacian_var: float = Field(
+        10.0,
+        description="Minimum Laplacian variance for retaining non-blurry keyframes",
+    )
     speech_to_text_enabled: bool = Field(
         False, description="Transcribe uploaded video audio through the internal ASR service"
     )
@@ -1771,6 +1797,27 @@ class Config:
         # Validate batch sizes
         if self.model_config.batch_size <= 0:
             errors.append("Model batch size must be positive")
+        if self.model_config.keyframe_sampling_strategy not in {
+            "scene_adaptive",
+            "uniform",
+        }:
+            errors.append(
+                "Model keyframe sampling strategy must be scene_adaptive or uniform"
+            )
+        if not 0.0 <= self.model_config.keyframe_scene_threshold <= 1.0:
+            errors.append("Model keyframe scene threshold must be between 0.0 and 1.0")
+        if self.model_config.keyframe_floor_seconds <= 0:
+            errors.append("Model keyframe floor seconds must be positive")
+        if self.model_config.keyframe_min_scene_gap_seconds <= 0:
+            errors.append("Model keyframe minimum scene gap must be positive")
+        if self.model_config.keyframe_dedupe_luma_diff_threshold < 0:
+            errors.append("Model keyframe dedupe luma diff threshold must be non-negative")
+        if self.model_config.keyframe_min_luma < 0:
+            errors.append("Model keyframe minimum luma must be non-negative")
+        if self.model_config.keyframe_min_blur_laplacian_var < 0:
+            errors.append(
+                "Model keyframe minimum blur Laplacian variance must be non-negative"
+            )
         if self.model_config.speech_to_text_timeout_seconds <= 0:
             errors.append("Speech-to-text timeout must be positive")
         if self.model_config.speech_to_text_max_attempts <= 0:

@@ -13,6 +13,7 @@ import torch
 import asyncio
 import json
 import logging
+import re
 from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image, ImageEnhance
 import io
@@ -235,7 +236,7 @@ class ContentProcessor:
         return await self._extract_keyframes_opencv(video_path)
 
     async def _extract_keyframes_ffmpeg(self, video_path: str) -> Tuple[List[np.ndarray], Dict]:
-        """Extract uniformly sampled RGB keyframes using ffprobe and ffmpeg."""
+        """Extract RGB keyframes using ffprobe and FFmpeg."""
         video_info = await self._probe_video_metadata(video_path)
         frame_count = int(video_info.get("frame_count") or 0)
         fps = float(video_info.get("fps") or 0)
@@ -253,10 +254,163 @@ class ContentProcessor:
             frame_count = min(frame_count, int(self.max_video_length * fps))
             video_info["frame_count"] = frame_count
 
+        if self.config.keyframe_sampling_strategy == "uniform":
+            return await self._extract_uniform_keyframes_ffmpeg(
+                video_path,
+                video_info,
+                frame_count,
+            )
+
+        try:
+            keyframes = await self._extract_scene_adaptive_keyframes_ffmpeg(
+                video_path,
+                frame_count,
+                fps,
+                duration,
+            )
+            if keyframes:
+                return keyframes, video_info
+            logger.warning(
+                "Scene-adaptive FFmpeg extraction returned no usable frames; "
+                "falling back to uniform FFmpeg extraction"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Scene-adaptive FFmpeg extraction failed; "
+                "falling back to uniform FFmpeg extraction: %s",
+                exc,
+            )
+
+        return await self._extract_uniform_keyframes_ffmpeg(
+            video_path,
+            video_info,
+            frame_count,
+        )
+
+    async def _extract_uniform_keyframes_ffmpeg(
+        self,
+        video_path: str,
+        video_info: Dict[str, Any],
+        frame_count: int,
+    ) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+        """Extract uniformly sampled RGB keyframes using FFmpeg."""
         frame_indices = self._keyframe_indices(frame_count)
         if not frame_indices:
             return [], video_info
+        keyframes = await self._extract_ffmpeg_frames_by_index(video_path, frame_indices)
+        return keyframes, video_info
 
+    async def _extract_scene_adaptive_keyframes_ffmpeg(
+        self,
+        video_path: str,
+        frame_count: int,
+        fps: float,
+        duration: float,
+    ) -> List[np.ndarray]:
+        """Extract bounded scene-aware keyframes and filter low-value frames."""
+        scene_times = await self._detect_scene_change_times_ffmpeg(video_path)
+        frame_indices = self._scene_adaptive_keyframe_indices(
+            frame_count=frame_count,
+            fps=fps,
+            duration=duration,
+            scene_times=scene_times,
+        )
+        if not frame_indices:
+            return []
+
+        keyframes = await self._extract_ffmpeg_frames_by_index(video_path, frame_indices)
+        return self._filter_keyframes_for_quality(keyframes)
+
+    async def _detect_scene_change_times_ffmpeg(self, video_path: str) -> List[float]:
+        """Run FFmpeg scene detection and return selected frame timestamps."""
+        threshold = float(self.config.keyframe_scene_threshold)
+        filter_graph = f"select=gt(scene\\,{threshold:.6f}),showinfo"
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-nostdin",
+            "-i",
+            video_path,
+            "-vf",
+            filter_graph,
+            "-an",
+            "-f",
+            "null",
+            "-",
+        ]
+        _, stderr = await self._run_media_command_with_stderr(command)
+        return self._parse_scene_change_times(stderr)
+
+    def _parse_scene_change_times(self, payload: bytes) -> List[float]:
+        """Parse FFmpeg showinfo `pts_time` entries from stderr."""
+        text = payload.decode("utf-8", errors="replace")
+        times: List[float] = []
+        for match in re.finditer(r"pts_time:([0-9]+(?:\.[0-9]+)?)", text):
+            times.append(float(match.group(1)))
+        return times
+
+    def _scene_adaptive_keyframe_indices(
+        self,
+        *,
+        frame_count: int,
+        fps: float,
+        duration: float,
+        scene_times: List[float],
+    ) -> List[int]:
+        if frame_count <= 0 or fps <= 0 or self.max_keyframes <= 0:
+            return []
+
+        effective_duration = duration if duration > 0 else frame_count / fps
+        effective_duration = max(0.0, min(effective_duration, float(self.max_video_length)))
+        if effective_duration <= 0:
+            effective_duration = frame_count / fps
+
+        candidates = {0}
+        floor_seconds = float(self.config.keyframe_floor_seconds)
+        floor_time = 0.0
+        while floor_time <= effective_duration + 1e-6:
+            candidates.add(self._timestamp_to_frame_index(floor_time, fps, frame_count))
+            floor_time += floor_seconds
+        candidates.add(self._timestamp_to_frame_index(effective_duration, fps, frame_count))
+
+        min_gap = float(self.config.keyframe_min_scene_gap_seconds)
+        last_scene_time: Optional[float] = None
+        for scene_time in sorted(scene_times):
+            if scene_time < 0 or scene_time > effective_duration:
+                continue
+            if last_scene_time is not None and scene_time - last_scene_time < min_gap:
+                continue
+            candidates.add(self._timestamp_to_frame_index(scene_time, fps, frame_count))
+            last_scene_time = scene_time
+
+        ordered_candidates = sorted(candidates)
+        if len(ordered_candidates) <= self.max_keyframes:
+            return ordered_candidates
+
+        positions = np.linspace(
+            0,
+            len(ordered_candidates) - 1,
+            self.max_keyframes,
+            dtype=int,
+        )
+        return [ordered_candidates[int(position)] for position in positions]
+
+    def _timestamp_to_frame_index(
+        self,
+        timestamp: float,
+        fps: float,
+        frame_count: int,
+    ) -> int:
+        frame_index = int(round(max(0.0, timestamp) * fps))
+        return max(0, min(frame_index, frame_count - 1))
+
+    async def _extract_ffmpeg_frames_by_index(
+        self,
+        video_path: str,
+        frame_indices: List[int],
+    ) -> List[np.ndarray]:
         select_filter = "+".join(f"eq(n\\,{idx})" for idx in frame_indices)
         target_width = max(1, int(self.config.ffmpeg_target_width))
         filter_graph = (
@@ -290,7 +444,49 @@ class ContentProcessor:
             raise ValueError(
                 f"FFmpeg extracted {len(keyframes)} of {len(frame_indices)} requested frames"
             )
-        return keyframes, video_info
+        return keyframes
+
+    def _filter_keyframes_for_quality(
+        self,
+        keyframes: List[np.ndarray],
+    ) -> List[np.ndarray]:
+        filtered: List[np.ndarray] = []
+        previous_luma: Optional[np.ndarray] = None
+
+        for frame in keyframes:
+            luma = self._frame_luma(frame)
+            if luma.size == 0:
+                continue
+            if float(np.mean(luma)) < float(self.config.keyframe_min_luma):
+                continue
+            if (
+                self.config.keyframe_min_blur_laplacian_var > 0
+                and min(luma.shape[:2]) >= 3
+                and cv2.Laplacian(luma.astype(np.uint8), cv2.CV_64F).var()
+                < float(self.config.keyframe_min_blur_laplacian_var)
+            ):
+                continue
+
+            luma_signature = cv2.resize(
+                luma,
+                (32, 32),
+                interpolation=cv2.INTER_AREA,
+            ).astype(np.float32)
+            if previous_luma is not None:
+                diff = float(np.mean(np.abs(luma_signature - previous_luma)))
+                if diff < float(self.config.keyframe_dedupe_luma_diff_threshold):
+                    continue
+
+            filtered.append(frame)
+            previous_luma = luma_signature
+
+        return filtered
+
+    def _frame_luma(self, frame: np.ndarray) -> np.ndarray:
+        if frame.ndim != 3 or frame.shape[2] < 3:
+            return np.array([], dtype=np.float32)
+        rgb = frame[:, :, :3].astype(np.float32)
+        return rgb[:, :, 0] * 0.299 + rgb[:, :, 1] * 0.587 + rgb[:, :, 2] * 0.114
 
     async def _probe_video_metadata(self, video_path: str) -> Dict[str, Any]:
         """Read video metadata using ffprobe."""
@@ -337,6 +533,14 @@ class ContentProcessor:
 
     async def _run_media_command(self, command: List[str]) -> bytes:
         """Run an FFmpeg/ffprobe command and return stdout."""
+        stdout, _ = await self._run_media_command_with_stderr(command)
+        return stdout
+
+    async def _run_media_command_with_stderr(
+        self,
+        command: List[str],
+    ) -> Tuple[bytes, bytes]:
+        """Run an FFmpeg/ffprobe command and return stdout and stderr."""
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
@@ -355,7 +559,7 @@ class ContentProcessor:
         if process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"{command[0]} failed: {message}")
-        return stdout
+        return stdout, stderr
 
     async def _extract_audio_features(
         self, video_path: str, video_info: Dict[str, Any]

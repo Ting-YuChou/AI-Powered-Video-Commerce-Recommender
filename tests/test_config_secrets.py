@@ -56,6 +56,13 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     assert config.recommendation_config.speech_category_candidates_enabled is False
     assert config.model_config.speech_to_text_enabled is False
     assert config.model_config.speech_to_text_model == "Qwen/Qwen3-ASR-0.6B"
+    assert config.model_config.keyframe_sampling_strategy == "scene_adaptive"
+    assert config.model_config.keyframe_scene_threshold == 0.35
+    assert config.model_config.keyframe_floor_seconds == 8.0
+    assert config.model_config.keyframe_min_scene_gap_seconds == 1.0
+    assert config.model_config.keyframe_dedupe_luma_diff_threshold == 4.0
+    assert config.model_config.keyframe_min_luma == 8.0
+    assert config.model_config.keyframe_min_blur_laplacian_var == 10.0
     assert config.kafka_config.consumer_max_poll_interval_ms == 600000
     assert config.service_topology_config.ranking_single_coordinator_enabled is True
     assert config.service_topology_config.ranking_coordinator_host == ""
@@ -75,6 +82,30 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     assert config.recommendation_config.impression_logging_enabled is True
     assert config.recommendation_config.impression_max_items == 100
     assert config.redis_config.cache_host is None
+
+    reset_config()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("MODEL_KEYFRAME_SAMPLING_STRATEGY", "random"),
+        ("MODEL_KEYFRAME_SCENE_THRESHOLD", "-0.1"),
+        ("MODEL_KEYFRAME_SCENE_THRESHOLD", "1.1"),
+        ("MODEL_KEYFRAME_FLOOR_SECONDS", "0"),
+        ("MODEL_KEYFRAME_MIN_SCENE_GAP_SECONDS", "0"),
+        ("MODEL_KEYFRAME_DEDUPE_LUMA_DIFF_THRESHOLD", "-1"),
+        ("MODEL_KEYFRAME_MIN_LUMA", "-1"),
+        ("MODEL_KEYFRAME_MIN_BLUR_LAPLACIAN_VAR", "-1"),
+    ],
+)
+def test_config_rejects_invalid_keyframe_sampling_env(monkeypatch, env_name, value):
+    monkeypatch.setenv(env_name, value)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    with pytest.raises(ValueError):
+        Config()
 
     reset_config()
 
