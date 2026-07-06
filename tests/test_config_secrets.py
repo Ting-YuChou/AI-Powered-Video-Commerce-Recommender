@@ -95,7 +95,9 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
         ("MODEL_KEYFRAME_FLOOR_SECONDS", "0"),
         ("MODEL_KEYFRAME_MIN_SCENE_GAP_SECONDS", "0"),
         ("MODEL_KEYFRAME_DEDUPE_LUMA_DIFF_THRESHOLD", "-1"),
+        ("MODEL_KEYFRAME_DEDUPE_LUMA_DIFF_THRESHOLD", "256"),
         ("MODEL_KEYFRAME_MIN_LUMA", "-1"),
+        ("MODEL_KEYFRAME_MIN_LUMA", "256"),
         ("MODEL_KEYFRAME_MIN_BLUR_LAPLACIAN_VAR", "-1"),
     ],
 )

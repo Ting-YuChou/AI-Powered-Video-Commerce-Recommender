@@ -132,10 +132,8 @@ async def test_scene_adaptive_extraction_merges_scene_and_floor_candidates(monke
     )
     ffmpeg_commands = []
     frames = [
-        _ppm_frame(2, 1, [[[255, 0, 0], [0, 255, 0]]]),
-        _ppm_frame(2, 1, [[[0, 0, 255], [255, 255, 0]]]),
-        _ppm_frame(2, 1, [[[255, 0, 255], [0, 255, 255]]]),
-        _ppm_frame(2, 1, [[[255, 255, 255], [128, 128, 128]]]),
+        _ppm_frame(2, 1, [[[value, 0, 0], [0, value, 0]]])
+        for value in (20, 60, 100, 140, 180, 220)
     ]
 
     async def fake_scene_run(command):
@@ -161,7 +159,8 @@ async def test_scene_adaptive_extraction_merges_scene_and_floor_candidates(monke
     assert len(keyframes) == 4
     command = ffmpeg_commands[0]
     assert any(
-        "select=eq(n\\,0)+eq(n\\,10)+eq(n\\,62)+eq(n\\,99)" in arg
+        "select=eq(n\\,0)+eq(n\\,10)+eq(n\\,40)+eq(n\\,62)+eq(n\\,80)+eq(n\\,99)"
+        in arg
         for arg in command
     )
 
@@ -203,8 +202,95 @@ async def test_scene_adaptive_extraction_uses_floor_when_no_scene_changes(monkey
     assert any("select=eq(n\\,0)+eq(n\\,8)+eq(n\\,15)" in arg for arg in command)
 
 
+@pytest.mark.asyncio
+async def test_scene_detection_is_limited_to_effective_video_duration(monkeypatch):
+    processor = _processor(
+        num_keyframes=3,
+        max_video_length=5,
+        keyframe_floor_seconds=2.0,
+        keyframe_min_luma=0.0,
+        keyframe_min_blur_laplacian_var=0.0,
+        keyframe_dedupe_luma_diff_threshold=0.0,
+    )
+    scene_commands = []
+    ffmpeg_commands = []
+
+    async def fake_scene_run(command):
+        scene_commands.append(command)
+        return b"", b"n:0 pts_time:1.0\nn:1 pts_time:7.0\n"
+
+    async def fake_run(command):
+        if command[0] == "ffprobe":
+            return _ffprobe_payload(duration="20.0", fps="10/1", frames="200")
+        ffmpeg_commands.append(command)
+        frame_count = int(command[command.index("-frames:v") + 1])
+        return b"".join(
+            _ppm_frame(1, 1, [[[value, 0, 0]]])
+            for value in np.linspace(32, 224, frame_count, dtype=np.uint8)
+        )
+
+    monkeypatch.setattr(processor, "_run_media_command_with_stderr", fake_scene_run)
+    monkeypatch.setattr(processor, "_run_media_command", fake_run)
+
+    keyframes, video_info = await processor._extract_keyframes_ffmpeg("video.mp4")
+
+    assert len(keyframes) == 3
+    assert video_info["frame_count"] == 50
+    assert len(ffmpeg_commands) == 1
+    scene_command = scene_commands[0]
+    assert scene_command[scene_command.index("-t") + 1] == "5.0"
+
+
 def _rgb_from_luma(plane):
     return np.repeat(plane[:, :, None], 3, axis=2).astype(np.uint8)
+
+
+@pytest.mark.asyncio
+async def test_scene_adaptive_extracts_extra_candidates_before_quality_filtering(
+    monkeypatch,
+):
+    processor = _processor(
+        num_keyframes=3,
+        max_video_length=10,
+        keyframe_floor_seconds=1.0,
+        keyframe_min_luma=8.0,
+        keyframe_min_blur_laplacian_var=0.0,
+        keyframe_dedupe_luma_diff_threshold=4.0,
+    )
+    checker = ((np.indices((16, 16)).sum(axis=0) % 2) * 255).astype(np.uint8)
+    duplicate = np.clip(checker.astype(np.int16) + 2, 0, 255).astype(np.uint8)
+    inverse = (255 - checker).astype(np.uint8)
+    requested_indices = []
+
+    async def fake_detect(*_args):
+        return []
+
+    async def fake_extract(_video_path, indices):
+        requested_indices.extend(indices)
+        frames = []
+        for index in indices:
+            if index == 5:
+                frames.append(_rgb_from_luma(duplicate))
+            elif index == 10:
+                frames.append(np.zeros((16, 16, 3), dtype=np.uint8))
+            elif index % 2 == 0:
+                frames.append(_rgb_from_luma(checker))
+            else:
+                frames.append(_rgb_from_luma(inverse))
+        return frames
+
+    monkeypatch.setattr(processor, "_detect_scene_change_times_ffmpeg", fake_detect)
+    monkeypatch.setattr(processor, "_extract_ffmpeg_frames_by_index", fake_extract)
+
+    keyframes = await processor._extract_scene_adaptive_keyframes_ffmpeg(
+        "video.mp4",
+        frame_count=11,
+        fps=1.0,
+        duration=10.0,
+    )
+
+    assert len(requested_indices) > processor.max_keyframes
+    assert len(keyframes) == processor.max_keyframes
 
 
 def test_quality_filter_drops_dark_blurry_and_duplicate_frames():

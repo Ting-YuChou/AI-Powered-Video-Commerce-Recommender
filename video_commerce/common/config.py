@@ -1812,8 +1812,14 @@ class Config:
             errors.append("Model keyframe minimum scene gap must be positive")
         if self.model_config.keyframe_dedupe_luma_diff_threshold < 0:
             errors.append("Model keyframe dedupe luma diff threshold must be non-negative")
+        if self.model_config.keyframe_dedupe_luma_diff_threshold > 255:
+            errors.append(
+                "Model keyframe dedupe luma diff threshold must be at most 255"
+            )
         if self.model_config.keyframe_min_luma < 0:
             errors.append("Model keyframe minimum luma must be non-negative")
+        if self.model_config.keyframe_min_luma > 255:
+            errors.append("Model keyframe minimum luma must be at most 255")
         if self.model_config.keyframe_min_blur_laplacian_var < 0:
             errors.append(
                 "Model keyframe minimum blur Laplacian variance must be non-negative"

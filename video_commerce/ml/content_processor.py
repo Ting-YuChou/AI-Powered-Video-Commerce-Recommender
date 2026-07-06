@@ -308,20 +308,38 @@ class ContentProcessor:
         duration: float,
     ) -> List[np.ndarray]:
         """Extract bounded scene-aware keyframes and filter low-value frames."""
-        scene_times = await self._detect_scene_change_times_ffmpeg(video_path)
-        frame_indices = self._scene_adaptive_keyframe_indices(
+        if frame_count <= 0 or fps <= 0 or self.max_keyframes <= 0:
+            return []
+
+        effective_duration = self._effective_keyframe_duration(
             frame_count=frame_count,
             fps=fps,
             duration=duration,
+        )
+        scene_times = await self._detect_scene_change_times_ffmpeg(
+            video_path,
+            effective_duration,
+        )
+        candidate_limit = max(self.max_keyframes, self.max_keyframes * 3)
+        frame_indices = self._scene_adaptive_keyframe_indices(
+            frame_count=frame_count,
+            fps=fps,
+            duration=effective_duration,
             scene_times=scene_times,
+            max_indices=candidate_limit,
         )
         if not frame_indices:
             return []
 
         keyframes = await self._extract_ffmpeg_frames_by_index(video_path, frame_indices)
-        return self._filter_keyframes_for_quality(keyframes)
+        filtered = self._filter_keyframes_for_quality(keyframes)
+        return self._thin_ordered_items(filtered, self.max_keyframes)
 
-    async def _detect_scene_change_times_ffmpeg(self, video_path: str) -> List[float]:
+    async def _detect_scene_change_times_ffmpeg(
+        self,
+        video_path: str,
+        effective_duration: float,
+    ) -> List[float]:
         """Run FFmpeg scene detection and return selected frame timestamps."""
         threshold = float(self.config.keyframe_scene_threshold)
         filter_graph = f"select=gt(scene\\,{threshold:.6f}),showinfo"
@@ -333,6 +351,8 @@ class ContentProcessor:
             "-nostdin",
             "-i",
             video_path,
+            "-t",
+            f"{effective_duration:.1f}",
             "-vf",
             filter_graph,
             "-an",
@@ -358,14 +378,16 @@ class ContentProcessor:
         fps: float,
         duration: float,
         scene_times: List[float],
+        max_indices: Optional[int] = None,
     ) -> List[int]:
         if frame_count <= 0 or fps <= 0 or self.max_keyframes <= 0:
             return []
 
-        effective_duration = duration if duration > 0 else frame_count / fps
-        effective_duration = max(0.0, min(effective_duration, float(self.max_video_length)))
-        if effective_duration <= 0:
-            effective_duration = frame_count / fps
+        effective_duration = self._effective_keyframe_duration(
+            frame_count=frame_count,
+            fps=fps,
+            duration=duration,
+        )
 
         candidates = {0}
         floor_seconds = float(self.config.keyframe_floor_seconds)
@@ -386,16 +408,40 @@ class ContentProcessor:
             last_scene_time = scene_time
 
         ordered_candidates = sorted(candidates)
-        if len(ordered_candidates) <= self.max_keyframes:
-            return ordered_candidates
+        limit = self.max_keyframes if max_indices is None else max_indices
+        return self._thin_ordered_items(ordered_candidates, limit)
+
+    def _effective_keyframe_duration(
+        self,
+        *,
+        frame_count: int,
+        fps: float,
+        duration: float,
+    ) -> float:
+        if fps <= 0:
+            return 0.0
+        effective_duration = duration if duration > 0 else frame_count / fps
+        effective_duration = max(
+            0.0,
+            min(effective_duration, float(self.max_video_length)),
+        )
+        if effective_duration <= 0:
+            effective_duration = frame_count / fps
+        return effective_duration
+
+    def _thin_ordered_items(self, items: List[Any], limit: int) -> List[Any]:
+        if limit <= 0:
+            return []
+        if len(items) <= limit:
+            return items
 
         positions = np.linspace(
             0,
-            len(ordered_candidates) - 1,
-            self.max_keyframes,
+            len(items) - 1,
+            limit,
             dtype=int,
         )
-        return [ordered_candidates[int(position)] for position in positions]
+        return [items[int(position)] for position in positions]
 
     def _timestamp_to_frame_index(
         self,
