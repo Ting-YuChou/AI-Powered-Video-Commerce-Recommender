@@ -720,12 +720,18 @@ class FakeTrainerRankingModel:
         self.received = None
 
     async def train_model(
-        self, training_data, *, user_features_map=None, product_metadata_map=None
+        self,
+        training_data,
+        *,
+        user_features_map=None,
+        product_metadata_map=None,
+        training_sample_source=None,
     ):
         self.received = {
             "training_data": training_data,
             "user_features_map": user_features_map,
             "product_metadata_map": product_metadata_map,
+            "training_sample_source": training_sample_source,
         }
 
 
@@ -829,6 +835,67 @@ async def test_model_trainer_prefers_impression_backed_ltr_samples():
 
     assert service.ranking_model.received["training_data"] == impression_samples
     assert (
+        service.ranking_model.received["training_sample_source"]
+        == "recommendation_impressions"
+    )
+    assert (
+        service.artifact_manager.payload["training_sample_source"]
+        == "recommendation_impressions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_prefers_impression_samples_for_listwise_ltr():
+    impression_samples = [
+        {
+            "user_id": "u1",
+            "product_id": "p1",
+            "action": "click",
+            "context": {"impression_id": "imp-1"},
+        },
+        {
+            "user_id": "u1",
+            "product_id": "p2",
+            "action": "view",
+            "context": {"impression_id": "imp-1"},
+        },
+    ]
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=2,
+            ltr_pairwise_enabled=False,
+            ltr_listwise_enabled=True,
+        ),
+        database_config=SimpleNamespace(ltr_impression_lookback_days=7),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = FakeTrainerFeatureStore()
+    service.system_store = FakeTrainerSystemStore(
+        impression_samples=impression_samples,
+        event_samples=[
+            {
+                "user_id": "u2",
+                "product_id": "p9",
+                "action": "purchase",
+                "context": {},
+            }
+        ],
+    )
+    service.ranking_model = FakeTrainerRankingModel()
+    service.vector_search = SimpleNamespace(product_metadata={})
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="test")
+
+    assert service.ranking_model.received["training_data"] == impression_samples
+    assert (
+        service.ranking_model.received["training_sample_source"]
+        == "recommendation_impressions"
+    )
+    assert (
         service.artifact_manager.payload["training_sample_source"]
         == "recommendation_impressions"
     )
@@ -870,6 +937,67 @@ async def test_model_trainer_falls_back_when_impression_samples_are_insufficient
     await service._train_ranking_model(trigger="test")
 
     assert service.ranking_model.received["training_data"] == event_samples
+    assert (
+        service.ranking_model.received["training_sample_source"]
+        == "interaction_events"
+    )
+    assert (
+        service.artifact_manager.payload["training_sample_source"]
+        == "interaction_events"
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_listwise_fallback_keeps_event_source():
+    event_samples = [
+        {
+            "user_id": "u2",
+            "product_id": "p9",
+            "action": "click",
+            "context": {"impression_id": "imp-fallback"},
+        },
+        {
+            "user_id": "u2",
+            "product_id": "p10",
+            "action": "view",
+            "context": {"impression_id": "imp-fallback"},
+        },
+    ]
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=2,
+            ltr_pairwise_enabled=False,
+            ltr_listwise_enabled=True,
+        ),
+        database_config=SimpleNamespace(ltr_impression_lookback_days=7),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = FakeTrainerFeatureStore()
+    service.system_store = FakeTrainerSystemStore(
+        impression_samples=[
+            {
+                "user_id": "u1",
+                "product_id": "p1",
+                "action": "click",
+                "context": {"impression_id": "imp-1"},
+            }
+        ],
+        event_samples=event_samples,
+    )
+    service.ranking_model = FakeTrainerRankingModel()
+    service.vector_search = SimpleNamespace(product_metadata={})
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="test")
+
+    assert service.ranking_model.received["training_data"] == event_samples
+    assert (
+        service.ranking_model.received["training_sample_source"]
+        == "interaction_events"
+    )
     assert (
         service.artifact_manager.payload["training_sample_source"]
         == "interaction_events"

@@ -224,6 +224,9 @@ def test_config_reads_ranking_ltr_env(monkeypatch):
         "RANKING_LTR_PAIRWISE_WEIGHT",
         "RANKING_LTR_MAX_PAIRS_PER_GROUP",
         "RANKING_LTR_MIN_RELEVANCE_GAP",
+        "RANKING_LTR_LISTWISE_ENABLED",
+        "RANKING_LTR_LISTWISE_WEIGHT",
+        "RANKING_LTR_LISTWISE_MIN_GROUP_SIZE",
     ):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.delenv("ENVIRONMENT", raising=False)
@@ -235,11 +238,17 @@ def test_config_reads_ranking_ltr_env(monkeypatch):
     assert config.ranking_config.ltr_pairwise_weight == 0.1
     assert config.ranking_config.ltr_max_pairs_per_group == 2048
     assert config.ranking_config.ltr_min_relevance_gap == 0.5
+    assert config.ranking_config.ltr_listwise_enabled is False
+    assert config.ranking_config.ltr_listwise_weight == 0.1
+    assert config.ranking_config.ltr_listwise_min_group_size == 2
 
     monkeypatch.setenv("RANKING_LTR_PAIRWISE_ENABLED", "true")
     monkeypatch.setenv("RANKING_LTR_PAIRWISE_WEIGHT", "0.25")
     monkeypatch.setenv("RANKING_LTR_MAX_PAIRS_PER_GROUP", "128")
     monkeypatch.setenv("RANKING_LTR_MIN_RELEVANCE_GAP", "1.0")
+    monkeypatch.setenv("RANKING_LTR_LISTWISE_ENABLED", "true")
+    monkeypatch.setenv("RANKING_LTR_LISTWISE_WEIGHT", "0.35")
+    monkeypatch.setenv("RANKING_LTR_LISTWISE_MIN_GROUP_SIZE", "3")
 
     reset_config()
     config = Config()
@@ -248,6 +257,9 @@ def test_config_reads_ranking_ltr_env(monkeypatch):
     assert config.ranking_config.ltr_pairwise_weight == 0.25
     assert config.ranking_config.ltr_max_pairs_per_group == 128
     assert config.ranking_config.ltr_min_relevance_gap == 1.0
+    assert config.ranking_config.ltr_listwise_enabled is True
+    assert config.ranking_config.ltr_listwise_weight == 0.35
+    assert config.ranking_config.ltr_listwise_min_group_size == 3
 
     reset_config()
 
