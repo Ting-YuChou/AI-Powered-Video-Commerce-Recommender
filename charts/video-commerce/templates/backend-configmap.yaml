@@ -97,6 +97,9 @@ data:
   RANKING_LTR_PAIRWISE_WEIGHT: {{ .Values.appConfig.ranking.ltrPairwiseWeight | quote }}
   RANKING_LTR_MAX_PAIRS_PER_GROUP: {{ .Values.appConfig.ranking.ltrMaxPairsPerGroup | quote }}
   RANKING_LTR_MIN_RELEVANCE_GAP: {{ .Values.appConfig.ranking.ltrMinRelevanceGap | quote }}
+  RANKING_LTR_LISTWISE_ENABLED: {{ .Values.appConfig.ranking.ltrListwiseEnabled | quote }}
+  RANKING_LTR_LISTWISE_WEIGHT: {{ .Values.appConfig.ranking.ltrListwiseWeight | quote }}
+  RANKING_LTR_LISTWISE_MIN_GROUP_SIZE: {{ .Values.appConfig.ranking.ltrListwiseMinGroupSize | quote }}
   CACHE_CANDIDATE_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.candidateCacheRaceTimeoutMs | quote }}
   CACHE_RECOMMENDATION_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.recommendationCacheRaceTimeoutMs | quote }}
   CACHE_BACKGROUND_TASK_QUEUE_SIZE: {{ .Values.appConfig.cache.backgroundTaskQueueSize | quote }}

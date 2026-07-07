@@ -174,7 +174,10 @@ class ModelTrainerService:
         training_sample_source = "interaction_events"
         interactions = []
         if (
-            getattr(self.config.ranking_config, "ltr_pairwise_enabled", False)
+            (
+                getattr(self.config.ranking_config, "ltr_pairwise_enabled", False)
+                or getattr(self.config.ranking_config, "ltr_listwise_enabled", False)
+            )
             and hasattr(self.system_store, "get_ltr_training_impressions")
         ):
             impression_samples = await self.system_store.get_ltr_training_impressions(
@@ -255,6 +258,7 @@ class ModelTrainerService:
                 product_metadata_map=product_metadata_map,
                 item_embedding_map=item_embedding_map,
                 two_tower_model_version=two_tower_model_version,
+                training_sample_source=training_sample_source,
             )
             if self.ranking_model.is_trained and self.artifact_manager:
                 record = await self.artifact_manager.persist_ranking_checkpoint(

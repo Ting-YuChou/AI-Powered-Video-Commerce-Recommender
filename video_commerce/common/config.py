@@ -805,6 +805,21 @@ class RankingConfig(BaseSettings):
         0.5,
         description="Minimum relevance-label gap required to form a pairwise LTR pair",
     )
+    ltr_listwise_enabled: bool = Field(
+        True,
+        description=(
+            "Enable ListNet-style listwise learning-to-rank loss during offline "
+            "ranking training"
+        ),
+    )
+    ltr_listwise_weight: float = Field(
+        0.1,
+        description="Weight applied to listwise LTR loss when enabled",
+    )
+    ltr_listwise_min_group_size: int = Field(
+        2,
+        description="Minimum impression slate size required for listwise LTR loss",
+    )
 
     # Training settings
     epochs: int = Field(100, description="Training epochs")
@@ -842,7 +857,7 @@ class RankingConfig(BaseSettings):
             raise ValueError("low_rank_dim must be >= 1")
         return value
 
-    @validator("ltr_pairwise_weight", "ltr_min_relevance_gap")
+    @validator("ltr_pairwise_weight", "ltr_min_relevance_gap", "ltr_listwise_weight")
     def validate_ltr_non_negative_float(cls, value: float) -> float:
         if value < 0:
             raise ValueError("LTR float settings must be >= 0")
@@ -852,6 +867,12 @@ class RankingConfig(BaseSettings):
     def validate_ltr_max_pairs_per_group(cls, value: int) -> int:
         if value < 0:
             raise ValueError("ltr_max_pairs_per_group must be >= 0")
+        return value
+
+    @validator("ltr_listwise_min_group_size")
+    def validate_ltr_listwise_min_group_size(cls, value: int) -> int:
+        if value < 2:
+            raise ValueError("ltr_listwise_min_group_size must be >= 2")
         return value
 
     @validator(

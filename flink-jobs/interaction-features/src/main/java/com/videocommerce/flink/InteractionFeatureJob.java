@@ -67,6 +67,8 @@ public class InteractionFeatureJob {
   private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
   private static final OutputTag<DlqEvent> DLQ_TAG =
       new OutputTag<>("dead-letter-events", TypeInformation.of(DlqEvent.class));
+  private static final String USER_INTERACTIONS_SOURCE_TOPIC = "user-interactions";
+  private static final String RECOMMENDATION_EVENTS_SOURCE_TOPIC = "recommendation-events";
 
   public static void main(String[] args) throws Exception {
     JobConfig config = JobConfig.fromEnv();
@@ -85,7 +87,7 @@ public class InteractionFeatureJob {
 
     SingleOutputStreamOperator<InteractionEvent> parsed =
         env.fromSource(source, WatermarkStrategy.noWatermarks(), "kafka-user-interactions")
-            .process(new ParseInteractionEventFunction())
+            .process(new ParseInteractionEventFunction(config.userInteractionsTopic))
             .returns(InteractionEvent.class);
 
     parsed
@@ -93,6 +95,40 @@ public class InteractionFeatureJob {
         .map(new DlqJsonMapper())
         .sinkTo(buildKafkaSink(config.kafkaBootstrapServers, config.deadLetterTopic, null, config))
         .name("invalid-event-dlq");
+
+    KafkaSource<String> recommendationSource =
+        KafkaSource.<String>builder()
+            .setBootstrapServers(config.kafkaBootstrapServers)
+            .setTopics(config.recommendationEventsTopic)
+            .setGroupId(config.consumerGroupId)
+            .setStartingOffsets(
+                OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST))
+            .setValueOnlyDeserializer(new SimpleStringSchema())
+            .build();
+
+    SingleOutputStreamOperator<RecommendationImpressionEvent> recommendationEvents =
+        env.fromSource(
+                recommendationSource,
+                WatermarkStrategy.noWatermarks(),
+                "kafka-recommendation-events")
+            .process(new ParseRecommendationEventFunction(config.recommendationEventsTopic))
+            .returns(RecommendationImpressionEvent.class);
+
+    recommendationEvents
+        .getSideOutput(DLQ_TAG)
+        .map(new DlqJsonMapper())
+        .sinkTo(buildKafkaSink(config.kafkaBootstrapServers, config.deadLetterTopic, null, config))
+        .name("invalid-recommendation-event-dlq");
+
+    recommendationEvents
+        .addSink(buildRecommendationImpressionSink(config))
+        .name("postgres-recommendation-impressions");
+
+    recommendationEvents
+        .flatMap(new RecommendationImpressionItemFanout())
+        .returns(RecommendationImpressionItemRow.class)
+        .addSink(buildRecommendationImpressionItemSink(config))
+        .name("postgres-recommendation-impression-items");
 
     DataStream<InteractionEvent> events =
         parsed.assignTimestampsAndWatermarks(
@@ -208,6 +244,84 @@ public class InteractionFeatureJob {
             .build());
   }
 
+  private static org.apache.flink.streaming.api.functions.sink.SinkFunction<RecommendationImpressionEvent>
+      buildRecommendationImpressionSink(JobConfig config) {
+    String sql =
+        "INSERT INTO recommendation_impressions "
+            + "(impression_id, request_id, user_id, session_id, content_id, model_version, "
+            + "ranking_model_version, context, created_at) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS json), ?) "
+            + "ON CONFLICT (impression_id) DO UPDATE SET "
+            + "request_id = EXCLUDED.request_id, "
+            + "user_id = EXCLUDED.user_id, "
+            + "session_id = EXCLUDED.session_id, "
+            + "content_id = EXCLUDED.content_id, "
+            + "model_version = EXCLUDED.model_version, "
+            + "ranking_model_version = EXCLUDED.ranking_model_version, "
+            + "context = EXCLUDED.context, "
+            + "created_at = EXCLUDED.created_at";
+    return JdbcSink.sink(
+        sql,
+        (statement, event) -> {
+          statement.setString(1, event.impressionId);
+          statement.setString(2, event.requestId);
+          statement.setString(3, event.userId);
+          statement.setString(4, event.sessionId);
+          statement.setString(5, event.contentId);
+          statement.setString(6, event.modelVersion);
+          statement.setString(7, event.rankingModelVersion);
+          statement.setString(8, jsonString(event.context));
+          statement.setTimestamp(9, Timestamp.from(Instant.ofEpochMilli(event.eventTimeMillis)));
+        },
+        JdbcExecutionOptions.builder()
+            .withBatchSize(config.jdbcBatchSize)
+            .withBatchIntervalMs(config.jdbcBatchIntervalMs)
+            .withMaxRetries(config.jdbcMaxRetries)
+            .build(),
+        new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+            .withUrl(config.postgresJdbcUrl)
+            .withDriverName("org.postgresql.Driver")
+            .withUsername(config.postgresUser)
+            .withPassword(config.postgresPassword)
+            .build());
+  }
+
+  private static org.apache.flink.streaming.api.functions.sink.SinkFunction<RecommendationImpressionItemRow>
+      buildRecommendationImpressionItemSink(JobConfig config) {
+    String sql =
+        "INSERT INTO recommendation_impression_items "
+            + "(impression_id, product_id, position, source, feature_snapshot, scores, created_at) "
+            + "VALUES (?, ?, ?, ?, CAST(? AS json), CAST(? AS json), ?) "
+            + "ON CONFLICT (impression_id, product_id) DO UPDATE SET "
+            + "position = EXCLUDED.position, "
+            + "source = EXCLUDED.source, "
+            + "feature_snapshot = EXCLUDED.feature_snapshot, "
+            + "scores = EXCLUDED.scores, "
+            + "created_at = EXCLUDED.created_at";
+    return JdbcSink.sink(
+        sql,
+        (statement, item) -> {
+          statement.setString(1, item.impressionId);
+          statement.setString(2, item.productId);
+          statement.setInt(3, item.position);
+          statement.setString(4, item.source);
+          statement.setString(5, jsonString(item.featureSnapshot));
+          statement.setString(6, jsonString(item.scores));
+          statement.setTimestamp(7, Timestamp.from(Instant.ofEpochMilli(item.eventTimeMillis)));
+        },
+        JdbcExecutionOptions.builder()
+            .withBatchSize(config.jdbcBatchSize)
+            .withBatchIntervalMs(config.jdbcBatchIntervalMs)
+            .withMaxRetries(config.jdbcMaxRetries)
+            .build(),
+        new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+            .withUrl(config.postgresJdbcUrl)
+            .withDriverName("org.postgresql.Driver")
+            .withUsername(config.postgresUser)
+            .withPassword(config.postgresPassword)
+            .build());
+  }
+
   private static KafkaSink<String> buildKafkaSink(
       String bootstrapServers, String topic, String transactionalIdPrefix, JobConfig config) {
     var builder =
@@ -232,12 +346,48 @@ public class InteractionFeatureJob {
 
   static final class ParseInteractionEventFunction
       extends ProcessFunction<String, InteractionEvent> {
+    private final String sourceTopic;
+
+    ParseInteractionEventFunction() {
+      this(USER_INTERACTIONS_SOURCE_TOPIC);
+    }
+
+    ParseInteractionEventFunction(String sourceTopic) {
+      this.sourceTopic = sourceTopic;
+    }
+
     @Override
     public void processElement(String raw, Context context, Collector<InteractionEvent> out) {
       try {
         out.collect(parseInteractionEvent(raw));
       } catch (Exception exc) {
-        context.output(DLQ_TAG, DlqEvent.invalid(raw, exc));
+        context.output(DLQ_TAG, DlqEvent.invalid(raw, exc, sourceTopic));
+      }
+    }
+  }
+
+  static final class ParseRecommendationEventFunction
+      extends ProcessFunction<String, RecommendationImpressionEvent> {
+    private final String sourceTopic;
+
+    ParseRecommendationEventFunction() {
+      this(RECOMMENDATION_EVENTS_SOURCE_TOPIC);
+    }
+
+    ParseRecommendationEventFunction(String sourceTopic) {
+      this.sourceTopic = sourceTopic;
+    }
+
+    @Override
+    public void processElement(
+        String raw, Context context, Collector<RecommendationImpressionEvent> out) {
+      try {
+        RecommendationImpressionEvent event = parseRecommendationEvent(raw);
+        if (event != null) {
+          out.collect(event);
+        }
+      } catch (Exception exc) {
+        context.output(DLQ_TAG, DlqEvent.invalid(raw, exc, sourceTopic));
       }
     }
   }
@@ -285,6 +435,77 @@ public class InteractionFeatureJob {
     }
     event.productCategory = stringValue(eventContext.get("product_category"));
     event.sessionLengthSeconds = optionalDouble(eventContext.get("session_length"));
+    return event;
+  }
+
+  static RecommendationImpressionEvent parseRecommendationEvent(String raw) throws Exception {
+    Map<String, Object> payload = JSON.readValue(raw, MAP_TYPE);
+    Map<String, Object> metadata = safeMap(payload.get("metadata"));
+    String impressionId =
+        nullableString(firstNonNull(metadata.get("impression_id"), payload.get("impression_id")));
+    String userId = nullableString(firstNonNull(payload.get("user_id"), metadata.get("user_id")));
+    Object rawDisplayedItems =
+        metadata.containsKey("displayed_items")
+            ? metadata.get("displayed_items")
+            : payload.get("displayed_items");
+    List<Object> displayedItems = safeList(rawDisplayedItems);
+    if (impressionId == null || userId == null || displayedItems == null) {
+      throw new IllegalArgumentException(
+          "recommendation event missing impression_id/user_id/displayed_items");
+    }
+
+    long eventTimeMillis = recommendationEventTimeMillis(payload, metadata);
+    Map<String, Object> context =
+        metadata.containsKey("context")
+            ? safeMap(metadata.get("context"))
+            : safeMap(metadata.get("request_context"));
+    Object contentId = metadata.get("content_id");
+    if (contentId != null) {
+      context.putIfAbsent("content_id", contentId);
+    }
+    Object itemSnapshotScope = metadata.get("item_snapshot_scope");
+    if (itemSnapshotScope != null) {
+      context.put("item_snapshot_scope", stringValue(itemSnapshotScope));
+    }
+
+    RecommendationImpressionEvent event = new RecommendationImpressionEvent();
+    event.impressionId = impressionId;
+    event.requestId = nullableString(firstNonNull(payload.get("request_id"), metadata.get("request_id")));
+    event.userId = userId;
+    event.sessionId = nullableString(firstNonNull(metadata.get("session_id"), context.get("session_id")));
+    event.contentId = nullableString(contentId);
+    event.modelVersion = nullableString(metadata.get("model_version"));
+    event.rankingModelVersion = nullableString(metadata.get("ranking_model_version"));
+    event.context = context;
+    event.eventTimeMillis = eventTimeMillis;
+    event.itemRows = new ArrayList<>();
+
+    for (Object rawItem : displayedItems) {
+      if (!(rawItem instanceof Map)) {
+        continue;
+      }
+      Map<String, Object> item = safeMap(rawItem);
+      String productId = nullableString(item.get("product_id"));
+      if (productId == null) {
+        continue;
+      }
+      Object rawSource = firstNonNull(item.get("source"), item.get("candidate_source"));
+      String source = nullableString(rawSource);
+
+      RecommendationImpressionItemRow itemRow = new RecommendationImpressionItemRow();
+      itemRow.impressionId = impressionId;
+      itemRow.productId = productId;
+      itemRow.position = intValue(item.get("position"), 0);
+      itemRow.source = source;
+      itemRow.featureSnapshot = featureSnapshotFromItem(item);
+      itemRow.scores = scoreSnapshotFromItem(item);
+      itemRow.eventTimeMillis = eventTimeMillis;
+      event.itemRows.add(itemRow);
+    }
+
+    if (event.itemRows.isEmpty()) {
+      return null;
+    }
     return event;
   }
 
@@ -351,6 +572,17 @@ public class InteractionFeatureJob {
       out.collect(EntityEvent.from(event, "product", event.productId));
       if (!event.productCategory.isBlank()) {
         out.collect(EntityEvent.from(event, "category", event.productCategory));
+      }
+    }
+  }
+
+  static final class RecommendationImpressionItemFanout
+      implements FlatMapFunction<RecommendationImpressionEvent, RecommendationImpressionItemRow> {
+    @Override
+    public void flatMap(
+        RecommendationImpressionEvent event, Collector<RecommendationImpressionItemRow> out) {
+      for (RecommendationImpressionItemRow item : event.itemRows) {
+        out.collect(item);
       }
     }
   }
@@ -605,9 +837,87 @@ public class InteractionFeatureJob {
     }
   }
 
+  static Object firstNonNull(Object first, Object second) {
+    return first != null ? first : second;
+  }
+
+  static long recommendationEventTimeMillis(
+      Map<String, Object> payload, Map<String, Object> metadata) {
+    double timestamp = numericTimestamp(payload.get("timestamp"));
+    if (timestamp <= 0) {
+      timestamp = numericTimestamp(metadata.get("created_at"));
+    }
+    if (timestamp <= 0) {
+      timestamp = Instant.now().toEpochMilli();
+    }
+    return timestampMillis(timestamp);
+  }
+
+  static String jsonString(Object value) {
+    try {
+      return JSON.writeValueAsString(value == null ? Collections.emptyMap() : value);
+    } catch (Exception exc) {
+      throw new IllegalArgumentException("Unable to serialize JSON value", exc);
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  static List<Object> safeList(Object value) {
+    if (value instanceof List) {
+      return (List<Object>) value;
+    }
+    return null;
+  }
+
+  static Map<String, Object> safeMap(Object value) {
+    Map<String, Object> result = new HashMap<>();
+    if (!(value instanceof Map)) {
+      return result;
+    }
+    Map<?, ?> source = (Map<?, ?>) value;
+    for (Map.Entry<?, ?> entry : source.entrySet()) {
+      if (entry.getKey() != null) {
+        result.put(String.valueOf(entry.getKey()), entry.getValue());
+      }
+    }
+    return result;
+  }
+
+  static Map<String, Object> scoreSnapshotFromItem(Map<String, Object> item) {
+    Map<String, Object> scores = safeMap(item.get("scores"));
+    for (String key :
+        List.of(
+            "collaborative_score",
+            "content_similarity_score",
+            "popularity_score",
+            "combined_score",
+            "ranking_score",
+            "confidence_score")) {
+      if (item.containsKey(key) && !scores.containsKey(key)) {
+        scores.put(key, item.get(key));
+      }
+    }
+    return scores;
+  }
+
+  static Map<String, Object> featureSnapshotFromItem(Map<String, Object> item) {
+    Map<String, Object> featureSnapshot = safeMap(item.get("feature_snapshot"));
+    for (String key : List.of("price", "category", "brand")) {
+      if (item.containsKey(key) && !featureSnapshot.containsKey(key)) {
+        featureSnapshot.put(key, item.get(key));
+      }
+    }
+    Object source = firstNonNull(item.get("source"), item.get("candidate_source"));
+    if (source != null && !featureSnapshot.containsKey("candidate_source")) {
+      featureSnapshot.put("candidate_source", source);
+    }
+    return featureSnapshot;
+  }
+
   public static final class JobConfig implements Serializable {
     public String kafkaBootstrapServers;
     public String userInteractionsTopic;
+    public String recommendationEventsTopic;
     public String featureUpdatesTopic;
     public String deadLetterTopic;
     public String consumerGroupId;
@@ -635,6 +945,8 @@ public class InteractionFeatureJob {
       JobConfig config = new JobConfig();
       config.kafkaBootstrapServers = env("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092");
       config.userInteractionsTopic = env("KAFKA_USER_INTERACTIONS_TOPIC", "user-interactions");
+      config.recommendationEventsTopic =
+          env("KAFKA_RECOMMENDATION_EVENTS_TOPIC", "recommendation-events");
       config.featureUpdatesTopic = env("KAFKA_FEATURE_UPDATES_TOPIC", "feature-updates");
       config.deadLetterTopic = env("KAFKA_DEAD_LETTER_TOPIC", "dead-letter-events");
       config.consumerGroupId = env("FLINK_INTERACTION_FEATURE_CONSUMER_GROUP", "video-commerce-flink-feature-v1");
@@ -743,6 +1055,29 @@ public class InteractionFeatureJob {
     public long eventTimeMillis;
     public double occurredAtSeconds;
     public double timestampSeconds;
+  }
+
+  public static final class RecommendationImpressionEvent implements Serializable {
+    public String impressionId;
+    public String requestId;
+    public String userId;
+    public String sessionId;
+    public String contentId;
+    public String modelVersion;
+    public String rankingModelVersion;
+    public Map<String, Object> context = new HashMap<>();
+    public long eventTimeMillis;
+    public List<RecommendationImpressionItemRow> itemRows = new ArrayList<>();
+  }
+
+  public static final class RecommendationImpressionItemRow implements Serializable {
+    public String impressionId;
+    public String productId;
+    public int position;
+    public String source;
+    public Map<String, Object> featureSnapshot = new HashMap<>();
+    public Map<String, Object> scores = new HashMap<>();
+    public long eventTimeMillis;
   }
 
   public static final class UserAccumulator implements Serializable {
@@ -1016,13 +1351,22 @@ public class InteractionFeatureJob {
     public String errorType;
     public String errorMessage;
     public double occurredAt;
+    public String sourceTopic;
 
     static DlqEvent invalid(String rawValue, Exception exc) {
+      return invalid(rawValue, exc, USER_INTERACTIONS_SOURCE_TOPIC);
+    }
+
+    static DlqEvent invalid(String rawValue, Exception exc, String sourceTopic) {
       DlqEvent event = new DlqEvent();
       event.rawValue = rawValue;
       event.errorType = exc.getClass().getSimpleName();
       event.errorMessage = exc.getMessage();
       event.occurredAt = Instant.now().toEpochMilli() / 1000.0;
+      event.sourceTopic =
+          sourceTopic == null || sourceTopic.isBlank()
+              ? USER_INTERACTIONS_SOURCE_TOPIC
+              : sourceTopic;
       return event;
     }
 
@@ -1031,7 +1375,7 @@ public class InteractionFeatureJob {
       payload.put("schema_version", 1);
       payload.put("event_id", UUID.randomUUID().toString());
       payload.put("event_type", "dead_letter");
-      payload.put("source_topic", "user-interactions");
+      payload.put("source_topic", sourceTopic);
       payload.put("source_value", rawValue);
       payload.put("error_type", errorType);
       payload.put("error_message", errorMessage);

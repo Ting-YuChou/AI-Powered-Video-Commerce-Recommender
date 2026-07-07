@@ -1527,6 +1527,7 @@ class RankingModel:
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
         item_embedding_map: Optional[Dict[str, Any]] = None,
         two_tower_model_version: Optional[str] = None,
+        training_sample_source: str = "interaction_events",
     ):
         """Train the ranking model on user interaction data."""
         try:
@@ -1537,6 +1538,7 @@ class RankingModel:
                 product_metadata_map or {},
                 item_embedding_map or {},
                 two_tower_model_version,
+                training_sample_source,
             )
             if saved_model_path:
                 await self.save_model(saved_model_path)
@@ -1551,6 +1553,7 @@ class RankingModel:
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
         item_embedding_map: Optional[Dict[str, Any]] = None,
         two_tower_model_version: Optional[str] = None,
+        training_sample_source: str = "interaction_events",
     ) -> Optional[str]:
         if len(training_data) < self.config.training_min_samples:
             logger.warning("Insufficient data for ranking model training")
@@ -1585,6 +1588,7 @@ class RankingModel:
             product_metadata_map=product_metadata_map,
             item_embedding_map=item_embedding_map,
             two_tower_model_version=two_tower_model_version,
+            training_sample_source=training_sample_source,
         )
 
         if features.size(0) == 0:
@@ -1598,13 +1602,10 @@ class RankingModel:
             epoch_loss = 0.0
             num_batches = 0
 
-            for i in range(0, features.size(0), self.config.batch_size):
-                batch_features = features[i : i + self.config.batch_size]
-                batch_labels = {
-                    key: value[i : i + self.config.batch_size]
-                    for key, value in labels.items()
-                }
-
+            for batch_features, batch_labels in self._iter_training_batches(
+                features,
+                labels,
+            ):
                 self.optimizer.zero_grad()
                 predictions = self.model(batch_features)
                 loss = self._compute_loss(predictions, batch_labels)
@@ -1633,6 +1634,71 @@ class RankingModel:
         logger.info("Model training completed")
         return self.loaded_model_path
 
+    def _ltr_grouped_training_enabled(self) -> bool:
+        return bool(
+            (
+                getattr(self.config, "ltr_pairwise_enabled", False)
+                and getattr(self.config, "ltr_pairwise_weight", 0.0) > 0
+            )
+            or (
+                getattr(self.config, "ltr_listwise_enabled", False)
+                and getattr(self.config, "ltr_listwise_weight", 0.0) > 0
+            )
+        )
+
+    def _iter_training_batches(
+        self,
+        features: torch.Tensor,
+        labels: Dict[str, torch.Tensor],
+    ):
+        batch_size = max(1, int(getattr(self.config, "batch_size", 1) or 1))
+        row_count = int(features.size(0))
+        if row_count <= 0:
+            return
+
+        group_tensor = labels.get("pairwise_group")
+        if (
+            not self._ltr_grouped_training_enabled()
+            or group_tensor is None
+            or int(group_tensor.numel()) != row_count
+        ):
+            for i in range(0, row_count, batch_size):
+                yield features[i : i + batch_size], {
+                    key: value[i : i + batch_size] for key, value in labels.items()
+                }
+            return
+
+        grouped_indices: "OrderedDict[int, List[int]]" = OrderedDict()
+        for index, group_id in enumerate(group_tensor.detach().cpu().reshape(-1)):
+            grouped_indices.setdefault(int(group_id.item()), []).append(index)
+
+        pending_indices: List[int] = []
+        for indices in grouped_indices.values():
+            if pending_indices and len(pending_indices) + len(indices) > batch_size:
+                index_tensor = torch.tensor(
+                    pending_indices,
+                    dtype=torch.long,
+                    device=features.device,
+                )
+                yield features.index_select(0, index_tensor), {
+                    key: value.index_select(0, index_tensor)
+                    for key, value in labels.items()
+                }
+                pending_indices = []
+
+            pending_indices.extend(indices)
+
+        if pending_indices:
+            index_tensor = torch.tensor(
+                pending_indices,
+                dtype=torch.long,
+                device=features.device,
+            )
+            yield features.index_select(0, index_tensor), {
+                key: value.index_select(0, index_tensor)
+                for key, value in labels.items()
+            }
+
     def _prepare_training_data(
         self,
         training_data: List[Dict[str, Any]],
@@ -1641,6 +1707,7 @@ class RankingModel:
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
         item_embedding_map: Optional[Dict[str, Any]] = None,
         two_tower_model_version: Optional[str] = None,
+        training_sample_source: str = "interaction_events",
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Prepare training data from interaction logs."""
         try:
@@ -1661,7 +1728,10 @@ class RankingModel:
             gmv_labels = []
             relevance_labels = []
             group_ids = []
+            listwise_group_ids = []
+            slate_sample_flags = []
             group_mapping: Dict[str, int] = {}
+            listwise_group_mapping: Dict[str, int] = {}
 
             for sample_index, sample in enumerate(training_data):
                 product_id = sample.get("product_id")
@@ -1724,6 +1794,24 @@ class RankingModel:
                     group_mapping[group_key] = len(group_mapping)
                 group_ids.append(group_mapping[group_key])
 
+                impression_id = sample.get("impression_id") or context.get(
+                    "impression_id"
+                )
+                is_slate_sample = bool(
+                    training_sample_source == "recommendation_impressions"
+                    and impression_id
+                )
+                if is_slate_sample:
+                    listwise_group_key = f"impression:{impression_id}"
+                else:
+                    listwise_group_key = f"row:{len(listwise_group_ids)}"
+                if listwise_group_key not in listwise_group_mapping:
+                    listwise_group_mapping[listwise_group_key] = len(
+                        listwise_group_mapping
+                    )
+                listwise_group_ids.append(listwise_group_mapping[listwise_group_key])
+                slate_sample_flags.append(is_slate_sample)
+
             if not features:
                 return torch.empty(0), {}
 
@@ -1748,6 +1836,12 @@ class RankingModel:
                 "pairwise_group": torch.tensor(group_ids, dtype=torch.long).to(
                     self.device
                 ),
+                "ltr_group": torch.tensor(listwise_group_ids, dtype=torch.long).to(
+                    self.device
+                ),
+                "ltr_is_slate_sample": torch.tensor(
+                    slate_sample_flags, dtype=torch.bool
+                ).to(self.device),
             }
 
             return features_tensor, labels
@@ -1989,11 +2083,82 @@ class RankingModel:
                     * pairwise_loss
                 )
 
+            if (
+                getattr(self.config, "ltr_listwise_enabled", False)
+                and getattr(self.config, "ltr_listwise_weight", 0.0) > 0
+            ):
+                listwise_loss = self._compute_listwise_ltr_loss(
+                    predictions["ranking_score"],
+                    labels.get("ranking_relevance"),
+                    labels.get("ltr_group"),
+                    labels.get("ltr_is_slate_sample"),
+                )
+                total_loss = (
+                    total_loss
+                    + float(getattr(self.config, "ltr_listwise_weight", 0.0))
+                    * listwise_loss
+                )
+
             return total_loss
 
         except Exception as e:
             logger.error(f"Error computing loss: {e}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    def _compute_listwise_ltr_loss(
+        self,
+        ranking_scores: torch.Tensor,
+        relevance: Optional[torch.Tensor],
+        group_ids: Optional[torch.Tensor],
+        slate_sample_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute ListNet softmax cross-entropy over complete impression slates."""
+        scores = ranking_scores.reshape(-1)
+        if (
+            relevance is None
+            or group_ids is None
+            or slate_sample_mask is None
+            or scores.numel() < 2
+        ):
+            return scores.sum() * 0.0
+
+        relevance = relevance.reshape(-1)
+        group_ids = group_ids.reshape(-1)
+        slate_sample_mask = slate_sample_mask.reshape(-1).bool()
+        if (
+            relevance.numel() != scores.numel()
+            or group_ids.numel() != scores.numel()
+            or slate_sample_mask.numel() != scores.numel()
+        ):
+            return scores.sum() * 0.0
+
+        min_group_size = int(
+            max(2, getattr(self.config, "ltr_listwise_min_group_size", 2) or 2)
+        )
+        min_gap = float(max(0.0, getattr(self.config, "ltr_min_relevance_gap", 0.0)))
+        losses: List[torch.Tensor] = []
+        candidate_group_ids = torch.unique(group_ids[slate_sample_mask], sorted=True)
+        for group_id in candidate_group_ids:
+            group_mask = (group_ids == group_id) & slate_sample_mask
+            if int(group_mask.sum().item()) < min_group_size:
+                continue
+
+            group_relevance = relevance[group_mask]
+            relevance_gap = group_relevance.max() - group_relevance.min()
+            if float(relevance_gap.item()) < min_gap:
+                continue
+
+            group_scores = scores[group_mask]
+            pred_log_probs = torch.nn.functional.log_softmax(group_scores, dim=0)
+            target_probs = torch.nn.functional.softmax(
+                group_relevance,
+                dim=0,
+            ).detach()
+            losses.append(-(target_probs * pred_log_probs).sum())
+
+        if not losses:
+            return scores.sum() * 0.0
+        return torch.stack(losses).mean()
 
     def _compute_pairwise_ltr_loss(
         self,
