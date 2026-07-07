@@ -85,6 +85,15 @@ data:
   RANKING_TORCH_COMPILE_BACKEND: {{ .Values.appConfig.ranking.torchCompileBackend | quote }}
   RANKING_TORCH_COMPILE_MODE: {{ .Values.appConfig.ranking.torchCompileMode | quote }}
   RANKING_TORCH_COMPILE_DYNAMIC: {{ .Values.appConfig.ranking.torchCompileDynamic | quote }}
+  RANKING_DIRECT_CVR_WEIGHT: {{ .Values.appConfig.ranking.directCvrWeight | quote }}
+  RANKING_CTCVR_WEIGHT: {{ .Values.appConfig.ranking.ctcvrWeight | quote }}
+  RANKING_CTCVR_POS_WEIGHT: {{ .Values.appConfig.ranking.ctcvrPosWeight | quote }}
+  RANKING_BUSINESS_SCORE_ENABLED: {{ .Values.appConfig.ranking.businessScoreEnabled | quote }}
+  RANKING_VALUE_LOSS: {{ .Values.appConfig.ranking.valueLoss | quote }}
+  RANKING_VALUE_CLIP_QUANTILE: {{ .Values.appConfig.ranking.valueClipQuantile | quote }}
+  RANKING_VALUE_MIN_BUCKET_PURCHASES: {{ .Values.appConfig.ranking.valueMinBucketPurchases | quote }}
+  RANKING_VALUE_PRICE_BUCKETS: {{ .Values.appConfig.ranking.valuePriceBuckets | quote }}
+  RANKING_VALUE_LABEL_PREFERENCE: {{ .Values.appConfig.ranking.valueLabelPreference | quote }}
   RANKING_LTR_PAIRWISE_ENABLED: {{ .Values.appConfig.ranking.ltrPairwiseEnabled | quote }}
   RANKING_LTR_PAIRWISE_WEIGHT: {{ .Values.appConfig.ranking.ltrPairwiseWeight | quote }}
   RANKING_LTR_MAX_PAIRS_PER_GROUP: {{ .Values.appConfig.ranking.ltrMaxPairsPerGroup | quote }}

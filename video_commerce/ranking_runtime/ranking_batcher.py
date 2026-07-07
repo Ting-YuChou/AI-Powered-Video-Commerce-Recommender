@@ -211,7 +211,15 @@ def run_ranking_batch_payloads(
         return {"results": results, "stages": stages}
 
     inference_started = time.perf_counter()
-    predictions, inference_profile = ranking_model.run_inference_batch(feature_matrix)
+    value_bucket_ids = []
+    for item in prepared:
+        value_bucket_ids.extend(
+            ranking_model._value_bucket_ids_for_candidates(item["valid_candidates"])
+        )
+    predictions, inference_profile = ranking_model.run_inference_batch(
+        feature_matrix,
+        value_bucket_ids=value_bucket_ids,
+    )
     stages["inference_total"] = time.perf_counter() - inference_started
     stages["tensor_prep"] = float(inference_profile.get("tensor_prep_ms", 0.0)) / 1000.0
     stages["model_forward"] = (

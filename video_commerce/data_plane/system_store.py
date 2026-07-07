@@ -142,6 +142,17 @@ def _interaction_relevance(action: Any) -> float:
     return 0.0
 
 
+def _first_numeric_value(*values: Any) -> Optional[float]:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _safe_dict(value: Any) -> Dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
@@ -263,15 +274,33 @@ def build_ltr_training_samples_from_impression_records(
             for key in ("price", "category", "brand")
             if key in feature_snapshot
         }
-        value = (
-            matched_interaction.get("value")
-            if matched_interaction and "value" in matched_interaction
-            else interaction_context.get("value")
+        value = _first_numeric_value(
+            matched_interaction.get("value") if matched_interaction else None,
+            interaction_context.get("value"),
+            matched_interaction.get("gmv") if matched_interaction else None,
+            interaction_context.get("gmv"),
+            matched_interaction.get("purchase_value") if matched_interaction else None,
+            interaction_context.get("purchase_value"),
         )
-        if value is None:
-            value = interaction_context.get("gmv")
         if value is None and action == "purchase":
             value = feature_snapshot.get("price")
+        attributed_purchase = action == "purchase"
+        attributed_click = action in {"click", "add_to_cart", "purchase"}
+        business_value = _first_numeric_value(
+            matched_interaction.get("margin") if matched_interaction else None,
+            matched_interaction.get("profit") if matched_interaction else None,
+            matched_interaction.get("gross_margin") if matched_interaction else None,
+            interaction_context.get("margin"),
+            interaction_context.get("profit"),
+            interaction_context.get("gross_margin"),
+            value,
+            feature_snapshot.get("price") if attributed_purchase else None,
+        )
+        if business_value is None:
+            business_value = 0.0
+        context["attributed_click"] = attributed_click
+        context["attributed_purchase"] = attributed_purchase
+        context["business_value"] = business_value
 
         sample = {
             "event_id": (
@@ -294,7 +323,9 @@ def build_ltr_training_samples_from_impression_records(
             "source": source,
             "candidate_scores": scores,
             "product_metadata": product_metadata,
-            "value": value,
+            "value": business_value,
+            "purchase_value": value,
+            "business_value": business_value,
         }
         sample.update(scores)
         samples.append(sample)

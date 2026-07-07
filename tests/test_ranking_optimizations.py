@@ -67,7 +67,7 @@ def _recommendation(product_id: str, ranking_score: float) -> ProductRecommendat
     )
 
 
-def test_build_recommendations_constructs_only_top_k_in_score_order():
+def test_build_recommendations_constructs_only_top_k_in_business_score_order():
     ranking = RankingModel(RankingConfig())
     candidates = [
         (
@@ -84,7 +84,10 @@ def test_build_recommendations_constructs_only_top_k_in_score_order():
     predictions = {
         "ctr": np.array([0.1, 0.2, 0.3, 0.4, 0.5]),
         "cvr": np.array([0.1, 0.2, 0.3, 0.4, 0.5]),
+        "ctcvr": np.array([0.01, 0.04, 0.09, 0.16, 0.25]),
         "gmv": np.array([10, 20, 30, 40, 50]),
+        "predicted_value": np.array([10, 20, 30, 40, 50]),
+        "business_score": np.array([0.1, 0.8, 0.1, 0.9, 0.3]),
         "ranking_score": np.array([0.2, 0.9, 0.1, 0.8, 0.3]),
     }
 
@@ -94,7 +97,37 @@ def test_build_recommendations_constructs_only_top_k_in_score_order():
         k=2,
     )
 
-    assert [item.product_id for item in recommendations] == ["p1", "p3"]
+    assert [item.product_id for item in recommendations] == ["p3", "p1"]
+    assert [item.ranking_score for item in recommendations] == pytest.approx([0.9, 0.8])
+
+
+def test_build_recommendations_uses_business_score_over_raw_ranking_score():
+    ranking = RankingModel(RankingConfig())
+    candidates = [
+        (
+            CandidateProduct(product_id=f"p{i}", combined_score=0.1, source="test"),
+            {"title": f"Product {i}", "price": 10.0, "category": "cat", "brand": "brand"},
+        )
+        for i in range(3)
+    ]
+    predictions = {
+        "ctr": np.array([0.9, 0.2, 0.8]),
+        "cvr": np.array([0.9, 0.2, 0.8]),
+        "ctcvr": np.array([0.81, 0.04, 0.64]),
+        "gmv": np.array([5.0, 100.0, 20.0]),
+        "predicted_value": np.array([5.0, 100.0, 20.0]),
+        "business_score": np.array([4.05, 4.0, 12.8]),
+        "ranking_score": np.array([100.0, 200.0, 1.0]),
+    }
+
+    recommendations, _ = ranking.build_recommendations_from_predictions(
+        candidates,
+        predictions,
+        k=2,
+    )
+
+    assert [item.product_id for item in recommendations] == ["p2", "p0"]
+    assert [item.ranking_score for item in recommendations] == pytest.approx([12.8, 4.05])
 
 
 def test_mmr_diversifies_high_relevance_duplicate_cluster():
@@ -665,8 +698,14 @@ def test_prepare_training_data_does_not_use_random_vectors(monkeypatch):
     assert labels["ctr"].item() == 0.0
 
 
-def test_prepare_training_data_labels_actions_and_gmv_sources():
-    ranking = RankingModel(RankingConfig())
+def test_prepare_training_data_labels_funnel_masks_and_business_value_sources():
+    ranking = RankingModel(
+        RankingConfig(
+            value_min_bucket_purchases=1,
+            value_clip_quantile=1.0,
+            ctcvr_weight=0.0,
+        )
+    )
     samples = [
         {"user_id": "u1", "product_id": "p1", "action": "view", "context": {}},
         {"user_id": "u1", "product_id": "p2", "action": "click", "context": {}},
@@ -675,19 +714,93 @@ def test_prepare_training_data_labels_actions_and_gmv_sources():
             "user_id": "u1",
             "product_id": "p4",
             "action": "purchase",
-            "context": {"purchase_value": 99.0},
+            "context": {"purchase_value": 99.0, "profit": 35.0},
         },
         {"user_id": "u1", "product_id": "p5", "action": "purchase", "context": {}},
     ]
 
     _, labels = ranking._prepare_training_data(
         samples,
-        product_metadata_map={"p5": {"price": 25.0}},
+        product_metadata_map={
+            "p1": {"price": 25.0, "category": "cat"},
+            "p2": {"price": 75.0, "category": "cat"},
+            "p3": {"price": 250.0, "category": "cat"},
+            "p4": {"price": 99.0, "category": "cat"},
+            "p5": {"price": 25.0, "category": "cat"},
+        },
     )
 
     assert labels["ctr"].squeeze(1).tolist() == [0.0, 1.0, 1.0, 1.0, 1.0]
     assert labels["cvr"].squeeze(1).tolist() == [0.0, 0.0, 0.0, 1.0, 1.0]
-    assert labels["gmv"].squeeze(1).tolist() == [0.0, 0.0, 0.0, 99.0, 25.0]
+    assert labels["ctcvr"].squeeze(1).tolist() == [0.0, 0.0, 0.0, 1.0, 1.0]
+    assert labels["cvr_mask"].squeeze(1).tolist() == [0.0, 1.0, 1.0, 1.0, 1.0]
+    assert labels["value_mask"].squeeze(1).tolist() == [0.0, 0.0, 0.0, 1.0, 1.0]
+    assert labels["business_value"].squeeze(1).tolist() == [0.0, 0.0, 0.0, 35.0, 25.0]
+    assert set(labels["value_bucket"].detach().cpu().tolist()) == {0, 1, 2}
+    assert labels["value"].shape == labels["business_value"].shape
+
+
+def test_compute_loss_masks_unclicked_cvr_and_non_purchase_value_rows():
+    ranking = RankingModel(
+        RankingConfig(
+            value_min_bucket_purchases=1,
+            value_clip_quantile=1.0,
+            ctcvr_weight=0.0,
+        )
+    )
+    predictions = {
+        "ctr": torch.tensor([[0.5], [0.5]], dtype=torch.float32),
+        "cvr": torch.tensor([[0.99], [0.20]], dtype=torch.float32),
+        "ctcvr": torch.tensor([[0.495], [0.10]], dtype=torch.float32),
+        "gmv": torch.tensor([[999.0], [999.0]], dtype=torch.float32),
+        "ranking_score": torch.zeros((2, 1), dtype=torch.float32),
+    }
+    labels = {
+        "ctr": torch.tensor([[0.0], [1.0]], dtype=torch.float32),
+        "cvr": torch.tensor([[0.0], [0.0]], dtype=torch.float32),
+        "cvr_mask": torch.tensor([[0.0], [1.0]], dtype=torch.float32),
+        "ctcvr": torch.tensor([[0.0], [0.0]], dtype=torch.float32),
+        "value": torch.tensor([[0.0], [0.0]], dtype=torch.float32),
+        "value_mask": torch.tensor([[0.0], [0.0]], dtype=torch.float32),
+    }
+
+    masked_loss = ranking._compute_loss(predictions, labels)
+
+    predictions["cvr"][0, 0] = 0.01
+    predictions["ctcvr"][0, 0] = 0.005
+    predictions["gmv"][0, 0] = -999.0
+    predictions["gmv"][1, 0] = -999.0
+    changed_masked_out_values_loss = ranking._compute_loss(predictions, labels)
+
+    assert changed_masked_out_values_loss.item() == pytest.approx(masked_loss.item())
+
+
+@pytest.mark.asyncio
+async def test_ranking_checkpoint_persists_business_objective_metadata(tmp_path):
+    ranking = RankingModel(
+        RankingConfig(
+            hidden_dims=[8],
+            value_min_bucket_purchases=1,
+            value_clip_quantile=1.0,
+        )
+    )
+    await ranking.load_model()
+    ranking.is_trained = True
+    ranking._fit_value_transform(
+        [
+            {"business_value": 10.0, "value_bucket": 0},
+            {"business_value": 20.0, "value_bucket": 0},
+        ]
+    )
+    checkpoint_path = tmp_path / "ranking.pt"
+
+    await ranking.save_model(str(checkpoint_path))
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    assert checkpoint["config"]["ranking_objective_version"] == "business_v1"
+    assert checkpoint["config"]["value_transform_stats"]["global"]["clip"] == pytest.approx(
+        20.0
+    )
 
 
 class FakeTrainerFeatureStore:

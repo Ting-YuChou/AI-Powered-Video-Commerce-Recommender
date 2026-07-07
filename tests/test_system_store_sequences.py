@@ -471,11 +471,95 @@ def test_build_ltr_training_samples_from_impressions_adds_no_click_negatives():
     clicked = samples[0]
     skipped = samples[1]
     assert clicked["context"]["impression_id"] == "imp-1"
+    assert clicked["context"]["attributed_click"] is True
+    assert clicked["context"]["attributed_purchase"] is False
     assert clicked["context"]["recommendation_source"] == "two_tower"
     assert clicked["context"]["candidate_scores"]["ranking_score"] == 0.9
     assert clicked["product_metadata"]["price"] == 12.0
     assert skipped["event_id"] == "imp-1:p-skip:impression"
     assert skipped["context"]["recommendation_position"] == 2
+    assert skipped["context"]["attributed_click"] is False
+    assert skipped["context"]["attributed_purchase"] is False
+
+
+def test_ltr_impression_samples_mark_purchase_as_implicit_click_with_business_value():
+    created_at = datetime.fromtimestamp(1_000, tz=timezone.utc)
+    impression_items = [
+        {
+            "impression_id": "imp-1",
+            "request_id": "req-1",
+            "user_id": "u1",
+            "product_id": "p1",
+            "position": 1,
+            "source": "two_tower",
+            "context": {},
+            "feature_snapshot": {"price": 120.0, "category": "Shoes", "brand": "A"},
+            "scores": {"ranking_score": 0.9},
+            "created_at": created_at,
+        }
+    ]
+    interactions = [
+        {
+            "event_id": "evt-purchase",
+            "schema_version": 1,
+            "user_id": "u1",
+            "product_id": "p1",
+            "action": "purchase",
+            "context": {"impression_id": "imp-1", "profit": 42.0, "purchase_value": 120.0},
+            "occurred_at": datetime.fromtimestamp(1_020, tz=timezone.utc),
+        }
+    ]
+
+    samples = build_ltr_training_samples_from_impression_records(
+        impression_items,
+        interactions,
+    )
+
+    assert len(samples) == 1
+    assert samples[0]["action"] == "purchase"
+    assert samples[0]["context"]["attributed_click"] is True
+    assert samples[0]["context"]["attributed_purchase"] is True
+    assert samples[0]["business_value"] == 42.0
+    assert samples[0]["value"] == 42.0
+
+
+def test_ltr_impression_samples_use_purchase_value_before_price_fallback():
+    created_at = datetime.fromtimestamp(1_000, tz=timezone.utc)
+    impression_items = [
+        {
+            "impression_id": "imp-1",
+            "request_id": "req-1",
+            "user_id": "u1",
+            "product_id": "p1",
+            "position": 1,
+            "source": "two_tower",
+            "context": {},
+            "feature_snapshot": {"price": 25.0, "category": "Shoes", "brand": "A"},
+            "scores": {"ranking_score": 0.9},
+            "created_at": created_at,
+        }
+    ]
+    interactions = [
+        {
+            "event_id": "evt-purchase",
+            "schema_version": 1,
+            "user_id": "u1",
+            "product_id": "p1",
+            "action": "purchase",
+            "context": {"impression_id": "imp-1", "purchase_value": 120.0},
+            "occurred_at": datetime.fromtimestamp(1_020, tz=timezone.utc),
+        }
+    ]
+
+    samples = build_ltr_training_samples_from_impression_records(
+        impression_items,
+        interactions,
+    )
+
+    assert len(samples) == 1
+    assert samples[0]["business_value"] == 120.0
+    assert samples[0]["value"] == 120.0
+    assert samples[0]["purchase_value"] == 120.0
 
 
 def test_ltr_impression_matching_requires_same_user_id():

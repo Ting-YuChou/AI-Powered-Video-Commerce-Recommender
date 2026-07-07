@@ -184,6 +184,15 @@ appConfig:
     torchCompileBackend: inductor
     torchCompileMode: default
     torchCompileDynamic: true
+    directCvrWeight: 1.0
+    ctcvrWeight: 1.0
+    ctcvrPosWeight: ""
+    businessScoreEnabled: true
+    valueLoss: huber
+    valueClipQuantile: 0.99
+    valueMinBucketPurchases: 20
+    valuePriceBuckets: "[50.0,200.0]"
+    valueLabelPreference: '["margin","profit","gross_margin","value","gmv","purchase_value","price"]'
     ltrPairwiseEnabled: false
     ltrPairwiseWeight: 0.1
     ltrMaxPairsPerGroup: 2048
