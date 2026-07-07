@@ -523,5 +523,6 @@ async def test_ranking_training_with_listwise_ltr_infers():
     )
 
     assert ranking.is_trained
-    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+    assert {"ctr", "cvr", "gmv", "ranking_score"}.issubset(predictions)
+    assert {"ctcvr", "predicted_value", "business_score"}.issubset(predictions)
     assert all(values.shape == (2,) for values in predictions.values())
