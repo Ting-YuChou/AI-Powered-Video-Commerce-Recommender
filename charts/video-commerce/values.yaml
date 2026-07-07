@@ -178,6 +178,14 @@ appConfig:
     maxQueueWaitMs: 150
     productFeatureCacheSize: 50000
     realtimeWindowFeaturesEnabled: false
+    historyEmbeddingsEnabled: false
+    historyClickLastN: 20
+    historyCartLastN: 20
+    historyPurchaseLastN: 20
+    historyEmbeddingDim: 128
+    historyClickScale: 1.0
+    historyCartScale: 1.25
+    historyPurchaseScale: 1.75
     runnerPayloadV2Enabled: true
     runnerPayloadMaxBytes: "33554432"
     torchCompileEnabled: false

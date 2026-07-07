@@ -79,6 +79,14 @@ data:
   RANKING_MAX_QUEUE_WAIT_MS: {{ .Values.appConfig.ranking.maxQueueWaitMs | quote }}
   RANKING_PRODUCT_FEATURE_CACHE_SIZE: {{ .Values.appConfig.ranking.productFeatureCacheSize | quote }}
   RANKING_REALTIME_WINDOW_FEATURES_ENABLED: {{ .Values.appConfig.ranking.realtimeWindowFeaturesEnabled | quote }}
+  RANKING_HISTORY_EMBEDDINGS_ENABLED: {{ .Values.appConfig.ranking.historyEmbeddingsEnabled | quote }}
+  RANKING_HISTORY_CLICK_LAST_N: {{ .Values.appConfig.ranking.historyClickLastN | quote }}
+  RANKING_HISTORY_CART_LAST_N: {{ .Values.appConfig.ranking.historyCartLastN | quote }}
+  RANKING_HISTORY_PURCHASE_LAST_N: {{ .Values.appConfig.ranking.historyPurchaseLastN | quote }}
+  RANKING_HISTORY_EMBEDDING_DIM: {{ .Values.appConfig.ranking.historyEmbeddingDim | quote }}
+  RANKING_HISTORY_CLICK_SCALE: {{ .Values.appConfig.ranking.historyClickScale | quote }}
+  RANKING_HISTORY_CART_SCALE: {{ .Values.appConfig.ranking.historyCartScale | quote }}
+  RANKING_HISTORY_PURCHASE_SCALE: {{ .Values.appConfig.ranking.historyPurchaseScale | quote }}
   RANKING_RUNNER_PAYLOAD_V2_ENABLED: {{ .Values.appConfig.ranking.runnerPayloadV2Enabled | quote }}
   RANKING_RUNNER_PAYLOAD_MAX_BYTES: {{ .Values.appConfig.ranking.runnerPayloadMaxBytes | quote }}
   RANKING_TORCH_COMPILE_ENABLED: {{ .Values.appConfig.ranking.torchCompileEnabled | quote }}

@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,6 +27,11 @@ from video_commerce.ml.ranking import (
     RANKING_TRAINING_DATA_SOURCE,
     RankingModel,
 )
+from video_commerce.ml.ranking_history import (
+    RANKING_HISTORY_CONTEXT_KEY,
+    RankingHistoryConfig,
+    build_ranking_history_context,
+)
 from video_commerce.ml import ranking as ranking_module
 from video_commerce.services.recommendation.api import (
     _BestEffortTaskQueue,
@@ -38,6 +44,7 @@ from video_commerce.services.recommendation.api import (
     _build_impression_context_snapshot,
     _build_recommendation_cache_context,
     _catalog_serving_version_context,
+    _attach_ranking_history_embeddings,
     _count_candidate_source_tokens,
     _count_ranked_source_tokens,
     _content_feature_cache_token,
@@ -340,6 +347,139 @@ def test_realtime_window_features_are_optional_and_zero_filled():
         matrix[0, -enabled.feature_extractor.realtime_window_feature_dim :],
         np.zeros(enabled.feature_extractor.realtime_window_feature_dim, dtype=np.float32),
     )
+
+
+def test_history_builder_separates_actions_and_applies_last_n_scale_and_coverage():
+    now = 10 * 86400.0
+    sequence = [
+        {"product_id": "old_click", "action": "click", "occurred_at": now - 9 * 86400},
+        {"product_id": "missing_click", "action": "click", "occurred_at": now - 4 * 86400},
+        {"product_id": "p_click", "action": "click", "occurred_at": now - 3 * 86400},
+        {"product_id": "p_cart", "action": "add_to_cart", "occurred_at": now - 2 * 86400},
+        {"product_id": "p_purchase_1", "action": "purchase", "occurred_at": now - 2 * 86400},
+        {"product_id": "p_purchase_2", "action": "purchase", "occurred_at": now - 1 * 86400},
+    ]
+    embeddings = {
+        "old_click": np.array([9.0, 9.0], dtype=np.float32),
+        "p_click": np.array([0.0, 1.0], dtype=np.float32),
+        "p_cart": np.array([1.0, 1.0], dtype=np.float32),
+        "p_purchase_1": np.array([2.0, 0.0], dtype=np.float32),
+        "p_purchase_2": np.array([0.0, 2.0], dtype=np.float32),
+    }
+    context = build_ranking_history_context(
+        sequence,
+        embeddings,
+        config=RankingHistoryConfig(
+            embedding_dim=2,
+            click_last_n=2,
+            cart_last_n=1,
+            purchase_last_n=2,
+            purchase_scale=1.75,
+        ),
+        candidate_product_ids=["p_purchase_1"],
+        current_time=now,
+        two_tower_model_version="two-tower-test",
+    )
+
+    assert context["two_tower_model_version"] == "two-tower-test"
+    assert context["actions"]["click"]["count"] == 2
+    assert context["actions"]["click"]["covered_count"] == 1
+    assert context["actions"]["click"]["coverage_ratio"] == 0.5
+    np.testing.assert_allclose(
+        context["actions"]["click"]["vector"],
+        np.array([0.0, 1.0], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        context["actions"]["cart"]["vector"],
+        np.array([1.25, 1.25], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        context["actions"]["purchase"]["vector"],
+        np.array([1.75, 1.75], dtype=np.float32),
+    )
+    assert context["actions"]["purchase"]["recency_days_capped"] == 1.0
+    assert context["candidate_similarities"]["p_purchase_1"]["purchase"] == 3.5
+
+
+def test_history_builder_zero_fallback_when_embeddings_are_missing():
+    context = build_ranking_history_context(
+        [{"product_id": "missing", "action": "purchase", "occurred_at": 100.0}],
+        {},
+        config=RankingHistoryConfig(embedding_dim=2, purchase_last_n=1),
+        candidate_product_ids=["missing"],
+        current_time=100.0,
+    )
+
+    np.testing.assert_allclose(
+        context["actions"]["purchase"]["vector"],
+        np.zeros(2, dtype=np.float32),
+    )
+    assert context["actions"]["purchase"]["count"] == 1
+    assert context["actions"]["purchase"]["coverage_ratio"] == 0.0
+    assert context["actions"]["purchase"]["has_signal"] == 0.0
+    assert context["candidate_similarities"]["missing"]["purchase"] == 0.0
+
+
+def test_history_features_add_expected_v2_dimensions_without_realtime_shift():
+    base = RankingModel(RankingConfig())
+    history_enabled = RankingModel(RankingConfig(history_embeddings_enabled=True))
+    both_enabled = RankingModel(
+        RankingConfig(
+            history_embeddings_enabled=True,
+            realtime_window_features_enabled=True,
+        )
+    )
+
+    assert base.feature_extractor.total_feature_dim == 28
+    assert history_enabled.feature_extractor.history_embedding_feature_dim == 399
+    assert history_enabled.feature_extractor.total_feature_dim == 28 + 399
+    assert (
+        both_enabled.feature_extractor.total_feature_dim
+        == 28
+        + 399
+        + both_enabled.feature_extractor.realtime_window_feature_dim
+    )
+
+
+def test_history_feature_vector_uses_candidate_specific_similarity_by_product_id():
+    ranking = RankingModel(
+        RankingConfig(
+            history_embeddings_enabled=True,
+            history_embedding_dim=2,
+            history_click_last_n=1,
+            history_cart_last_n=0,
+            history_purchase_last_n=0,
+        )
+    )
+    context = build_ranking_history_context(
+        [{"product_id": "hist", "action": "click", "occurred_at": 10.0}],
+        {
+            "hist": np.array([1.0, 1.0], dtype=np.float32),
+            "p1": np.array([1.0, 0.0], dtype=np.float32),
+            "p2": np.array([0.0, 2.0], dtype=np.float32),
+        },
+        config=RankingHistoryConfig(
+            embedding_dim=2,
+            click_last_n=1,
+            cart_last_n=0,
+            purchase_last_n=0,
+        ),
+        candidate_product_ids=["p1", "p2"],
+        current_time=10.0,
+    )
+
+    p1_features = ranking.feature_extractor.extract_history_embedding_features(
+        {RANKING_HISTORY_CONTEXT_KEY: context},
+        CandidateProduct(product_id="p1", combined_score=0.1, source="test"),
+    )
+    p2_features = ranking.feature_extractor.extract_history_embedding_features(
+        {RANKING_HISTORY_CONTEXT_KEY: context},
+        CandidateProduct(product_id="p2", combined_score=0.1, source="test"),
+    )
+
+    click_similarity_index = ranking.config.history_embedding_dim + 4
+    assert p1_features[click_similarity_index] == 1.0
+    assert p2_features[click_similarity_index] == 2.0
 
 
 def test_realtime_window_features_populate_ranking_vector():
@@ -690,6 +830,120 @@ def test_prepare_training_data_labels_actions_and_gmv_sources():
     assert labels["gmv"].squeeze(1).tolist() == [0.0, 0.0, 0.0, 99.0, 25.0]
 
 
+def test_training_history_context_uses_only_prior_user_events():
+    ranking = RankingModel(
+        RankingConfig(
+            history_embeddings_enabled=True,
+            history_embedding_dim=2,
+            history_click_last_n=10,
+            history_cart_last_n=0,
+            history_purchase_last_n=0,
+        )
+    )
+    samples = [
+        {
+            "user_id": "u1",
+            "product_id": "p1",
+            "action": "click",
+            "occurred_at": 1.0,
+            "context": {},
+        },
+        {
+            "user_id": "u1",
+            "product_id": "p2",
+            "action": "click",
+            "occurred_at": 2.0,
+            "context": {},
+        },
+    ]
+
+    features, _ = ranking._prepare_training_data(
+        samples,
+        item_embedding_map={
+            "p1": np.array([1.0, 0.0], dtype=np.float32),
+            "p2": np.array([0.0, 1.0], dtype=np.float32),
+        },
+    )
+    history_start = (
+        ranking.feature_extractor.user_feature_dim
+        + ranking.feature_extractor.product_feature_dim
+        + ranking.feature_extractor.context_feature_dim
+        + ranking.feature_extractor.candidate_feature_dim
+    )
+
+    np.testing.assert_allclose(
+        features[0, history_start : history_start + 2].numpy(),
+        np.zeros(2, dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        features[1, history_start : history_start + 2].numpy(),
+        np.array([1.0, 0.0], dtype=np.float32),
+    )
+
+
+def test_training_history_context_excludes_same_timestamp_events():
+    ranking = RankingModel(
+        RankingConfig(
+            history_embeddings_enabled=True,
+            history_embedding_dim=2,
+            history_click_last_n=10,
+            history_cart_last_n=0,
+            history_purchase_last_n=0,
+        )
+    )
+    samples = [
+        {
+            "user_id": "u1",
+            "product_id": "p1",
+            "action": "click",
+            "occurred_at": 10.0,
+            "context": {},
+        },
+        {
+            "user_id": "u1",
+            "product_id": "p2",
+            "action": "click",
+            "occurred_at": 10.0,
+            "context": {},
+        },
+        {
+            "user_id": "u1",
+            "product_id": "p3",
+            "action": "click",
+            "occurred_at": 11.0,
+            "context": {},
+        },
+    ]
+
+    features, _ = ranking._prepare_training_data(
+        samples,
+        item_embedding_map={
+            "p1": np.array([1.0, 0.0], dtype=np.float32),
+            "p2": np.array([0.0, 1.0], dtype=np.float32),
+            "p3": np.array([1.0, 1.0], dtype=np.float32),
+        },
+    )
+    history_start = (
+        ranking.feature_extractor.user_feature_dim
+        + ranking.feature_extractor.product_feature_dim
+        + ranking.feature_extractor.context_feature_dim
+        + ranking.feature_extractor.candidate_feature_dim
+    )
+
+    np.testing.assert_allclose(
+        features[0, history_start : history_start + 2].numpy(),
+        np.zeros(2, dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        features[1, history_start : history_start + 2].numpy(),
+        np.zeros(2, dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        features[2, history_start : history_start + 2].numpy(),
+        np.array([0.5, 0.5], dtype=np.float32),
+    )
+
+
 class FakeTrainerFeatureStore:
     async def get_all_user_features_map(self):
         return {"u1": {"user_id": "u1", "total_interactions": 7}}
@@ -725,12 +979,16 @@ class FakeTrainerRankingModel:
         *,
         user_features_map=None,
         product_metadata_map=None,
+        item_embedding_map=None,
+        two_tower_model_version=None,
         training_sample_source=None,
     ):
         self.received = {
             "training_data": training_data,
             "user_features_map": user_features_map,
             "product_metadata_map": product_metadata_map,
+            "item_embedding_map": item_embedding_map,
+            "two_tower_model_version": two_tower_model_version,
             "training_sample_source": training_sample_source,
         }
 
@@ -767,6 +1025,13 @@ async def test_model_trainer_passes_real_feature_context_and_checkpoint_metadata
     service.system_store = FakeTrainerSystemStore()
     service.ranking_model = FakeTrainerRankingModel()
     service.vector_search = SimpleNamespace(product_metadata={"p1": {"price": 12.0}})
+    service.recommendation_engine = SimpleNamespace(
+        loaded_two_tower_version="two-tower-test",
+        cf_engine=SimpleNamespace(
+            trained_item_embeddings={"p1": np.array([1.0, 0.0], dtype=np.float32)},
+            synthetic_item_embeddings={"p2": np.array([0.0, 1.0], dtype=np.float32)},
+        ),
+    )
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
@@ -777,6 +1042,8 @@ async def test_model_trainer_passes_real_feature_context_and_checkpoint_metadata
         == 7
     )
     assert service.ranking_model.received["product_metadata_map"]["p1"]["price"] == 12.0
+    assert set(service.ranking_model.received["item_embedding_map"]) == {"p1", "p2"}
+    assert service.ranking_model.received["two_tower_model_version"] == "two-tower-test"
     assert (
         service.artifact_manager.payload["feature_schema_version"]
         == RANKING_FEATURE_SCHEMA_VERSION
@@ -1208,6 +1475,133 @@ def test_recommendation_cache_context_changes_when_slate_diversity_is_enabled():
 
     assert disabled != enabled
     assert enabled["slate_diversity"]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_attach_ranking_history_embeddings_adds_internal_ranker_context(monkeypatch):
+    class FakeFeatureStore:
+        def __init__(self):
+            self.limit = None
+
+        async def get_user_sequence(self, user_id, limit=200):
+            self.limit = limit
+            return [
+                {
+                    "user_id": user_id,
+                    "product_id": "hist",
+                    "action": "click",
+                    "occurred_at": 10.0,
+                }
+            ]
+
+    fake_store = FakeFeatureStore()
+    fake_engine = SimpleNamespace(
+        cf_engine=SimpleNamespace(
+            trained_item_embeddings={"hist": np.array([1.0, 0.0], dtype=np.float32)},
+            synthetic_item_embeddings={
+                "candidate": np.array([1.0, 0.0], dtype=np.float32)
+            },
+        )
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            ranking_config=RankingConfig(
+                history_embeddings_enabled=True,
+                history_embedding_dim=2,
+                history_click_last_n=1,
+                history_cart_last_n=1,
+                history_purchase_last_n=1,
+            ),
+            cache_config=SimpleNamespace(hot_path_read_timeout_ms=1000),
+        )
+    )
+    monkeypatch.setattr(recommendation_api_module, "feature_store", fake_store)
+    monkeypatch.setattr(recommendation_api_module, "recommendation_engine", fake_engine)
+
+    context, profile = await _attach_ranking_history_embeddings(
+        runtime,
+        {"surface": "home"},
+        "u1",
+        [CandidateProduct(product_id="candidate", combined_score=0.1, source="test")],
+        {"two_tower_model": "two-tower-test"},
+    )
+
+    assert fake_store.limit == 200
+    assert context["surface"] == "home"
+    history_context = context[RANKING_HISTORY_CONTEXT_KEY]
+    assert history_context["two_tower_model_version"] == "two-tower-test"
+    assert history_context["actions"]["click"]["count"] == 1
+    assert history_context["candidate_similarities"]["candidate"]["click"] == 1.0
+    assert profile["history_embeddings_status"] == "attached"
+    assert profile["history_embeddings_click_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_attach_ranking_history_embeddings_uses_lazy_embedding_lookup(monkeypatch):
+    class FakeFeatureStore:
+        async def get_user_sequence(self, user_id, limit=200):
+            return [
+                {
+                    "user_id": user_id,
+                    "product_id": "hist",
+                    "action": "click",
+                    "occurred_at": 10.0,
+                }
+            ]
+
+    class NonIterableEmbeddingMap(Mapping):
+        def __init__(self, values):
+            self.values = values
+
+        def __getitem__(self, key):
+            return self.values[key]
+
+        def __iter__(self):
+            raise AssertionError("online history lookup must not scan item embeddings")
+
+        def __len__(self):
+            return len(self.values)
+
+        def get(self, key, default=None):
+            return self.values.get(key, default)
+
+    fake_engine = SimpleNamespace(
+        cf_engine=SimpleNamespace(
+            trained_item_embeddings=NonIterableEmbeddingMap(
+                {
+                    "hist": np.array([1.0, 0.0], dtype=np.float32),
+                    "candidate": np.array([1.0, 0.0], dtype=np.float32),
+                }
+            ),
+            synthetic_item_embeddings={},
+        )
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            ranking_config=RankingConfig(
+                history_embeddings_enabled=True,
+                history_embedding_dim=2,
+                history_click_last_n=1,
+                history_cart_last_n=0,
+                history_purchase_last_n=0,
+            ),
+            cache_config=SimpleNamespace(hot_path_read_timeout_ms=1000),
+        )
+    )
+    monkeypatch.setattr(recommendation_api_module, "feature_store", FakeFeatureStore())
+    monkeypatch.setattr(recommendation_api_module, "recommendation_engine", fake_engine)
+
+    context, _ = await _attach_ranking_history_embeddings(
+        runtime,
+        {},
+        "u1",
+        [CandidateProduct(product_id="candidate", combined_score=0.1, source="test")],
+        {"two_tower_model": "two-tower-test"},
+    )
+
+    assert context[RANKING_HISTORY_CONTEXT_KEY]["candidate_similarities"]["candidate"][
+        "click"
+    ] == 1.0
 
 
 @pytest.mark.asyncio
@@ -2004,6 +2398,35 @@ def test_two_tower_user_embedding_cache_reuses_same_fresh_key():
 
     np.testing.assert_allclose(first, second)
     assert trainer.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ranking_history_embeddings_reject_old_checkpoint_schema(tmp_path):
+    old_ranking = RankingModel(RankingConfig(hidden_dims=[8]))
+    await old_ranking.load_model()
+    checkpoint_path = tmp_path / "ranking-old.pt"
+    torch.save(
+        {
+            "model_state_dict": old_ranking.model.state_dict(),
+            "config": {
+                "architecture": "dcn",
+                "hidden_dims": [8],
+                "input_dim": 28,
+                "feature_schema_version": "ranking_v1_30",
+            },
+        },
+        checkpoint_path,
+    )
+
+    history_ranking = RankingModel(
+        RankingConfig(
+            hidden_dims=[8],
+            history_embeddings_enabled=True,
+            history_embedding_dim=2,
+        )
+    )
+    with pytest.raises(RuntimeError, match="freshly trained v2 checkpoint"):
+        await history_ranking.load_model(str(checkpoint_path))
 
 
 @pytest.mark.asyncio

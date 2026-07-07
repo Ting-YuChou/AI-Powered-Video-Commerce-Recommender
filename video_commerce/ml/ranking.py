@@ -38,10 +38,17 @@ from video_commerce.ml.dcn import (
     RANKING_ARCHITECTURES,
     normalize_architecture,
 )
+from video_commerce.ml.ranking_history import (
+    RANKING_HISTORY_ACTIONS,
+    RANKING_HISTORY_CONTEXT_KEY,
+    build_training_history_contexts,
+    extract_ranking_history_feature_vector,
+    ranking_history_config_from_settings,
+)
 
 logger = logging.getLogger(__name__)
 
-RANKING_FEATURE_SCHEMA_VERSION = "ranking_v1_30"
+RANKING_FEATURE_SCHEMA_VERSION = "ranking_v2_00_history_embeddings"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
 
 
@@ -254,17 +261,29 @@ class FeatureExtractor:
     )
     WINDOW_FEATURE_ENTITIES = ("user", "product", "category")
 
-    def __init__(self, enable_realtime_window_features: bool = False):
+    def __init__(
+        self,
+        enable_realtime_window_features: bool = False,
+        enable_history_embeddings: bool = False,
+        history_embedding_dim: int = 128,
+    ):
         self.user_scaler = StandardScaler()
         self.context_scaler = StandardScaler()
         self.is_fitted = False
         self.enable_realtime_window_features = enable_realtime_window_features
+        self.enable_history_embeddings = enable_history_embeddings
+        self.history_embedding_dim = max(1, int(history_embedding_dim or 128))
 
         # Feature dimensions
         self.user_feature_dim = 10
         self.product_feature_dim = 8
         self.context_feature_dim = 6
         self.candidate_feature_dim = 4
+        self.history_embedding_feature_dim = (
+            len(RANKING_HISTORY_ACTIONS) * (self.history_embedding_dim + 5)
+            if self.enable_history_embeddings
+            else 0
+        )
         self.realtime_window_feature_dim = (
             len(self.WINDOW_FEATURE_ENTITIES)
             * len(self.WINDOW_FEATURE_NAMES)
@@ -278,6 +297,7 @@ class FeatureExtractor:
             + self.product_feature_dim
             + self.context_feature_dim
             + self.candidate_feature_dim
+            + self.history_embedding_feature_dim
             + self.realtime_window_feature_dim
         )
 
@@ -436,6 +456,21 @@ class FeatureExtractor:
                 )
         return np.nan_to_num(np.asarray(values, dtype=np.float32), 0.0)
 
+    def extract_history_embedding_features(
+        self,
+        context: Dict[str, Any],
+        candidate: Any,
+    ) -> np.ndarray:
+        """Extract optional last-N two-tower history features."""
+        if not self.enable_history_embeddings:
+            return np.zeros(0, dtype=np.float32)
+        product_id = _candidate_get(candidate, "product_id", "")
+        return extract_ranking_history_feature_vector(
+            context.get(RANKING_HISTORY_CONTEXT_KEY),
+            product_id,
+            embedding_dim=self.history_embedding_dim,
+        )
+
     def create_ranking_features(
         self,
         user_features: UserFeatures,
@@ -453,6 +488,10 @@ class FeatureExtractor:
             )
             context_feats = self.extract_context_features(context, current_time)
             candidate_feats = self.extract_candidate_features(candidate)
+            history_embedding_feats = self.extract_history_embedding_features(
+                context,
+                candidate,
+            )
             realtime_window_feats = self.extract_realtime_window_features(
                 user_features,
                 product_metadata,
@@ -467,6 +506,7 @@ class FeatureExtractor:
                     product_feats,
                     context_feats,
                     candidate_feats,
+                    history_embedding_feats,
                     realtime_window_feats,
                 ]
             )
@@ -490,7 +530,9 @@ class RankingModel:
     def __init__(self, config: RankingConfig):
         self.config = config
         self.feature_extractor = FeatureExtractor(
-            enable_realtime_window_features=config.realtime_window_features_enabled
+            enable_realtime_window_features=config.realtime_window_features_enabled,
+            enable_history_embeddings=config.history_embeddings_enabled,
+            history_embedding_dim=config.history_embedding_dim,
         )
 
         # Model components
@@ -735,6 +777,27 @@ class RankingModel:
             )
         return checkpoint, {"architecture": "mlp"}, True
 
+    def _validate_checkpoint_feature_schema(
+        self,
+        checkpoint_config: Dict[str, Any],
+        *,
+        model_path: str,
+    ) -> None:
+        if not getattr(self.config, "history_embeddings_enabled", False):
+            return
+        expected_input_dim = self.feature_extractor.total_feature_dim
+        expected_schema = self.feature_schema_version
+        checkpoint_input_dim = checkpoint_config.get("input_dim")
+        checkpoint_schema = checkpoint_config.get("feature_schema_version")
+        if checkpoint_input_dim != expected_input_dim or checkpoint_schema != expected_schema:
+            raise RuntimeError(
+                "Ranking history embeddings require a freshly trained v2 checkpoint: "
+                f"path={model_path}, checkpoint_input_dim={checkpoint_input_dim}, "
+                f"expected_input_dim={expected_input_dim}, "
+                f"checkpoint_feature_schema_version={checkpoint_schema}, "
+                f"expected_feature_schema_version={expected_schema}"
+            )
+
     async def load_model(self, model_path: str = None):
         """Load or initialize the ranking model."""
         try:
@@ -750,6 +813,10 @@ class RankingModel:
                     checkpoint_config,
                     is_legacy_raw,
                 ) = self._checkpoint_state_and_config(checkpoint)
+                self._validate_checkpoint_feature_schema(
+                    checkpoint_config,
+                    model_path=str(checkpoint_path),
+                )
                 architecture = normalize_architecture(
                     checkpoint_config.get("architecture"),
                     default="mlp"
@@ -776,6 +843,11 @@ class RankingModel:
                 self.optimizer = next_optimizer
                 self.is_trained = True
                 self.loaded_checkpoint_mtime = checkpoint_path.stat().st_mtime
+            elif getattr(self.config, "history_embeddings_enabled", False):
+                raise RuntimeError(
+                    "Ranking history embeddings require an existing freshly trained "
+                    f"v2 checkpoint at {resolved_model_path}"
+                )
             else:
                 logger.info("Initializing new model")
                 next_model, next_optimizer = self._build_model_instance(
@@ -870,12 +942,14 @@ class RankingModel:
         product_dim = self.feature_extractor.product_feature_dim
         context_dim = self.feature_extractor.context_feature_dim
         candidate_dim = self.feature_extractor.candidate_feature_dim
+        history_dim = self.feature_extractor.history_embedding_feature_dim
         realtime_dim = self.feature_extractor.realtime_window_feature_dim
         total_dim = self.feature_extractor.total_feature_dim
         product_start = user_dim
         context_start = product_start + product_dim
         candidate_start = context_start + context_dim
-        realtime_start = candidate_start + candidate_dim
+        history_start = candidate_start + candidate_dim
+        realtime_start = history_start + history_dim
         total_candidates = sum(
             len(request.get("candidates") or []) for request in requests
         )
@@ -905,6 +979,7 @@ class RankingModel:
             )
             product_rows: List[np.ndarray] = []
             candidate_rows: List[Tuple[float, float, float, float]] = []
+            history_rows: List[np.ndarray] = []
             realtime_rows: List[np.ndarray] = []
 
             for candidate in candidates:
@@ -927,6 +1002,13 @@ class RankingModel:
                             _candidate_get(candidate, "combined_score") or 0.0,
                         )
                     )
+                    if history_dim:
+                        history_rows.append(
+                            self.feature_extractor.extract_history_embedding_features(
+                                context,
+                                candidate,
+                            )
+                        )
                     if realtime_dim:
                         realtime_rows.append(
                             self.feature_extractor.extract_realtime_window_features(
@@ -959,6 +1041,11 @@ class RankingModel:
                     row_start:row_end,
                     candidate_start : candidate_start + candidate_dim,
                 ] = np.asarray(candidate_rows, dtype=np.float32)
+                if history_dim:
+                    feature_matrix[
+                        row_start:row_end,
+                        history_start : history_start + history_dim,
+                    ] = np.asarray(history_rows, dtype=np.float32)
                 if realtime_dim:
                     feature_matrix[
                         row_start:row_end,
@@ -1438,6 +1525,8 @@ class RankingModel:
         *,
         user_features_map: Optional[Dict[str, Any]] = None,
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        item_embedding_map: Optional[Dict[str, Any]] = None,
+        two_tower_model_version: Optional[str] = None,
         training_sample_source: str = "interaction_events",
     ):
         """Train the ranking model on user interaction data."""
@@ -1447,6 +1536,8 @@ class RankingModel:
                 training_data,
                 user_features_map or {},
                 product_metadata_map or {},
+                item_embedding_map or {},
+                two_tower_model_version,
                 training_sample_source,
             )
             if saved_model_path:
@@ -1460,6 +1551,8 @@ class RankingModel:
         training_data: List[Dict[str, Any]],
         user_features_map: Optional[Dict[str, Any]] = None,
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        item_embedding_map: Optional[Dict[str, Any]] = None,
+        two_tower_model_version: Optional[str] = None,
         training_sample_source: str = "interaction_events",
     ) -> Optional[str]:
         if len(training_data) < self.config.training_min_samples:
@@ -1493,6 +1586,8 @@ class RankingModel:
             training_data,
             user_features_map=user_features_map,
             product_metadata_map=product_metadata_map,
+            item_embedding_map=item_embedding_map,
+            two_tower_model_version=two_tower_model_version,
             training_sample_source=training_sample_source,
         )
 
@@ -1610,12 +1705,23 @@ class RankingModel:
         *,
         user_features_map: Optional[Dict[str, Any]] = None,
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        item_embedding_map: Optional[Dict[str, Any]] = None,
+        two_tower_model_version: Optional[str] = None,
         training_sample_source: str = "interaction_events",
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Prepare training data from interaction logs."""
         try:
             user_features_map = user_features_map or {}
             product_metadata_map = product_metadata_map or {}
+            item_embedding_map = item_embedding_map or {}
+            history_contexts: Dict[int, Dict[str, Any]] = {}
+            if getattr(self.config, "history_embeddings_enabled", False):
+                history_contexts = build_training_history_contexts(
+                    training_data,
+                    item_embedding_map,
+                    config=ranking_history_config_from_settings(self.config),
+                    two_tower_model_version=two_tower_model_version,
+                )
             features = []
             ctr_labels = []
             cvr_labels = []
@@ -1627,7 +1733,7 @@ class RankingModel:
             group_mapping: Dict[str, int] = {}
             listwise_group_mapping: Dict[str, int] = {}
 
-            for sample in training_data:
+            for sample_index, sample in enumerate(training_data):
                 product_id = sample.get("product_id")
                 if not product_id:
                     continue
@@ -1637,6 +1743,9 @@ class RankingModel:
                     sample, product_metadata_map
                 )
                 context = dict(sample.get("context") or {})
+                history_context = history_contexts.get(sample_index)
+                if history_context is not None:
+                    context[RANKING_HISTORY_CONTEXT_KEY] = history_context
                 candidate = self._training_candidate(sample)
                 feature_vector = self.feature_extractor.create_ranking_features(
                     user_features,

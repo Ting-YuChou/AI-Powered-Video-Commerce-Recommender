@@ -65,6 +65,7 @@ class FeatureStore:
         "product_metadata",
         "trending_products",
         "category_pool",
+        "cluster_pool",
     }
 
     def __init__(self, redis_config: RedisConfig, cache_config: CacheConfig = None):
@@ -90,6 +91,7 @@ class FeatureStore:
             "system_metrics": "sm:",
             "trending_products": "tp:",
             "category_pool": "cp:",
+            "cluster_pool": "clp:",
             "product_embeddings": "pe:",
             "analytics": "analytics:",
             "health": "health:",
@@ -102,6 +104,7 @@ class FeatureStore:
         self._content_feature_snapshot_max_items: int = 100000
         self._trending_pool_memory_cache: Dict[str, List[CandidateProduct]] = {}
         self._category_pool_memory_cache: Dict[str, List[CandidateProduct]] = {}
+        self._cluster_pool_memory_cache: Dict[str, List[CandidateProduct]] = {}
         self._known_user_ids: Set[str] = set()
         self._known_user_snapshot_loaded_at: float = 0.0
         self._known_user_snapshot_enabled_flag: bool = True
@@ -1547,6 +1550,89 @@ class FeatureStore:
         except (Exception, CacheDecodeError) as e:
             logger.error(f"Error getting category pool {category}: {e}")
             return []
+
+    async def store_cluster_pools(
+        self,
+        pools: Dict[Union[str, int], List[CandidateProduct]],
+        pool_version: Optional[str] = None,
+    ):
+        """Store precomputed content-cluster pools in memory and Redis."""
+        try:
+            if not pools:
+                return
+
+            pipeline = self._client_for_key_type("cluster_pool").pipeline(
+                transaction=False
+            )
+            for cluster_id, candidates in pools.items():
+                cluster_key = self._cluster_pool_cache_name(
+                    cluster_id,
+                    pool_version,
+                )
+                payload = [candidate.dict() for candidate in candidates]
+                self._cluster_pool_memory_cache[cluster_key] = [
+                    CandidateProduct(**item) for item in payload
+                ]
+                key = self._cluster_pool_redis_key(cluster_id, pool_version)
+                pipeline.setex(
+                    key,
+                    self.cache_config.serving_pool_ttl,
+                    pack_cache_payload("cluster_pool", payload),
+                )
+            await pipeline.execute()
+        except Exception as e:
+            logger.error(f"Error storing cluster pools: {e}")
+
+    async def get_cluster_pool(
+        self,
+        cluster_id: Union[str, int],
+        limit: int,
+        exclude_items: Optional[set] = None,
+        pool_version: Optional[str] = None,
+    ) -> List[CandidateProduct]:
+        """Get a precomputed content-cluster pool, filtered for excluded items."""
+        try:
+            if limit <= 0:
+                return []
+            exclude_items = exclude_items or set()
+            cluster_key = self._cluster_pool_cache_name(
+                cluster_id,
+                pool_version,
+            )
+            cached = self._cluster_pool_memory_cache.get(cluster_key)
+            if cached is None:
+                key = self._cluster_pool_redis_key(cluster_id, pool_version)
+                raw = await self._client_for_key_type("cluster_pool").get(key)
+                if raw:
+                    payload = unpack_cache_payload(raw, "cluster_pool")
+                    cached = [CandidateProduct(**item) for item in payload]
+                    self._cluster_pool_memory_cache[cluster_key] = cached
+                else:
+                    return []
+
+            return [
+                CandidateProduct(**candidate.dict())
+                for candidate in cached
+                if candidate.product_id not in exclude_items
+            ][:limit]
+        except (Exception, CacheDecodeError) as e:
+            logger.error(f"Error getting cluster pool {cluster_id}: {e}")
+            return []
+
+    @staticmethod
+    def _cluster_pool_cache_name(
+        cluster_id: Union[str, int],
+        pool_version: Optional[str],
+    ) -> str:
+        cluster_key = str(cluster_id)
+        return f"{pool_version}:{cluster_key}" if pool_version else cluster_key
+
+    def _cluster_pool_redis_key(
+        self,
+        cluster_id: Union[str, int],
+        pool_version: Optional[str],
+    ) -> str:
+        return f"{self.prefixes['cluster_pool']}{self._cluster_pool_cache_name(cluster_id, pool_version)}"
 
     async def get_cached_recommendations(
         self, user_id: str, context_hash: str
