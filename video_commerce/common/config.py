@@ -732,7 +732,7 @@ class RankingConfig(BaseSettings):
         description="Minimum relevance-label gap required to form a pairwise LTR pair",
     )
     ltr_listwise_enabled: bool = Field(
-        False,
+        True,
         description=(
             "Enable ListNet-style listwise learning-to-rank loss during offline "
             "ranking training"

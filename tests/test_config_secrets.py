@@ -238,7 +238,7 @@ def test_config_reads_ranking_ltr_env(monkeypatch):
     assert config.ranking_config.ltr_pairwise_weight == 0.1
     assert config.ranking_config.ltr_max_pairs_per_group == 2048
     assert config.ranking_config.ltr_min_relevance_gap == 0.5
-    assert config.ranking_config.ltr_listwise_enabled is False
+    assert config.ranking_config.ltr_listwise_enabled is True
     assert config.ranking_config.ltr_listwise_weight == 0.1
     assert config.ranking_config.ltr_listwise_min_group_size == 2
 

@@ -188,7 +188,7 @@ appConfig:
     ltrPairwiseWeight: 0.1
     ltrMaxPairsPerGroup: 2048
     ltrMinRelevanceGap: 0.5
-    ltrListwiseEnabled: false
+    ltrListwiseEnabled: true
     ltrListwiseWeight: 0.1
     ltrListwiseMinGroupSize: 2
   cache:
