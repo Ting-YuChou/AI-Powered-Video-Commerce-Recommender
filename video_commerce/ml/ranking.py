@@ -15,7 +15,7 @@ import asyncio
 import hashlib
 import logging
 from collections import OrderedDict
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Sequence, Tuple
 import json
 import time
 from pathlib import Path
@@ -50,6 +50,8 @@ logger = logging.getLogger(__name__)
 
 RANKING_FEATURE_SCHEMA_VERSION = "ranking_v2_00_history_embeddings"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
+RANKING_OBJECTIVE_VERSION = "business_v1"
+LEGACY_RANKING_OBJECTIVE_VERSION = "legacy_multi_objective"
 
 
 def _stable_hash_bucket(value: Any, buckets: int = 100) -> int:
@@ -225,9 +227,8 @@ class MultiObjectiveRankingModel(nn.Module):
         cvr_pred = torch.sigmoid(
             self._collapse_scalar_head(self.cvr_tower(shared_features))
         )
-        gmv_pred = torch.relu(
-            self._collapse_scalar_head(self.gmv_tower(shared_features))
-        )
+        ctcvr_pred = ctr_pred * cvr_pred
+        gmv_pred = self._collapse_scalar_head(self.gmv_tower(shared_features))
 
         # Combine for final ranking
         combined_features = torch.cat(
@@ -240,6 +241,7 @@ class MultiObjectiveRankingModel(nn.Module):
         return {
             "ctr": ctr_pred,
             "cvr": cvr_pred,
+            "ctcvr": ctcvr_pred,
             "gmv": gmv_pred,
             "ranking_score": ranking_score,
         }
@@ -546,6 +548,9 @@ class RankingModel:
         self.last_training_time = 0
         self.feature_schema_version = RANKING_FEATURE_SCHEMA_VERSION
         self.training_data_source = RANKING_TRAINING_DATA_SOURCE
+        self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
+        self.value_transform_stats: Dict[str, Any] = self._default_value_transform_stats()
+        self.value_bucket_mapping: Dict[str, int] = {}
 
         # Performance tracking
         self.training_history = []
@@ -578,6 +583,17 @@ class RankingModel:
         self._product_feature_cache_lock = threading.RLock()
 
         logger.info(f"RankingModel initialized on device: {self.device}")
+
+    def _default_value_transform_stats(self) -> Dict[str, Any]:
+        return {
+            "global": {
+                "count": 0,
+                "clip": None,
+                "mean": 0.0,
+                "std": 1.0,
+            },
+            "buckets": {},
+        }
 
     def _initialize_model(
         self,
@@ -842,6 +858,19 @@ class RankingModel:
                 self.model = next_model
                 self.optimizer = next_optimizer
                 self.is_trained = True
+                self.ranking_objective_version = str(
+                    checkpoint_config.get(
+                        "ranking_objective_version",
+                        LEGACY_RANKING_OBJECTIVE_VERSION,
+                    )
+                )
+                self.value_transform_stats = dict(
+                    checkpoint_config.get("value_transform_stats")
+                    or self._default_value_transform_stats()
+                )
+                self.value_bucket_mapping = dict(
+                    checkpoint_config.get("value_bucket_mapping") or {}
+                )
                 self.loaded_checkpoint_mtime = checkpoint_path.stat().st_mtime
             elif getattr(self.config, "history_embeddings_enabled", False):
                 raise RuntimeError(
@@ -857,6 +886,9 @@ class RankingModel:
                 self.model = next_model
                 self.optimizer = next_optimizer
                 self.is_trained = False
+                self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
+                self.value_transform_stats = self._default_value_transform_stats()
+                self.value_bucket_mapping = {}
                 self.loaded_checkpoint_mtime = 0.0
 
             # Set to evaluation mode initially
@@ -1082,6 +1114,7 @@ class RankingModel:
     def run_inference_batch(
         self,
         feature_matrix: np.ndarray,
+        value_bucket_ids: Optional[Sequence[Optional[int]]] = None,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         """Run one Torch forward pass for a feature matrix."""
         model = self.model
@@ -1129,11 +1162,63 @@ class RankingModel:
             key: value.detach().cpu().numpy().reshape(-1)
             for key, value in predictions.items()
         }
+        self._add_business_predictions(
+            prediction_arrays,
+            value_bucket_ids=value_bucket_ids,
+        )
         return prediction_arrays, {
             "tensor_prep_ms": tensor_prep_ms,
             "model_forward_ms": model_forward_ms,
             "inference_path": inference_path,
         }
+
+    def _add_business_predictions(
+        self,
+        predictions: Dict[str, np.ndarray],
+        value_bucket_ids: Optional[Sequence[Optional[int]]] = None,
+    ) -> None:
+        if not getattr(self.config, "business_score_enabled", True):
+            return
+        raw_values = np.asarray(predictions.get("gmv", []), dtype=np.float64).reshape(-1)
+        if raw_values.size == 0:
+            return
+        bucket_ids: List[Optional[int]]
+        if value_bucket_ids is None:
+            bucket_ids = [None] * int(raw_values.size)
+        else:
+            bucket_ids = [
+                None if bucket_id is None else int(bucket_id)
+                for bucket_id in value_bucket_ids
+            ]
+            if len(bucket_ids) != raw_values.size:
+                logger.warning(
+                    "ranking_value_bucket_id_count_mismatch",
+                    extra={
+                        "bucket_id_count": len(bucket_ids),
+                        "prediction_count": int(raw_values.size),
+                    },
+                )
+                bucket_ids = [None] * int(raw_values.size)
+        predicted_values = np.asarray(
+            [
+                self._inverse_transform_business_value(value, bucket_id)
+                for value, bucket_id in zip(raw_values, bucket_ids)
+            ],
+            dtype=np.float32,
+        )
+        predictions["predicted_value"] = predicted_values
+        predictions["gmv"] = predicted_values
+        ctr = np.asarray(predictions.get("ctr", np.zeros_like(predicted_values))).reshape(
+            -1
+        )
+        cvr = np.asarray(predictions.get("cvr", np.zeros_like(predicted_values))).reshape(
+            -1
+        )
+        ctcvr = np.asarray(predictions.get("ctcvr", ctr * cvr)).reshape(-1)
+        predictions["ctcvr"] = np.clip(ctcvr, 0.0, 1.0).astype(np.float32)
+        predictions["business_score"] = (
+            predictions["ctcvr"] * predicted_values
+        ).astype(np.float32)
 
     def build_recommendations_from_predictions(
         self,
@@ -1147,7 +1232,13 @@ class RankingModel:
         if not valid_candidates or k <= 0:
             return [], round((time.perf_counter() - response_stage_started) * 1000, 2)
 
-        ranking_scores = np.asarray(predictions["ranking_score"]).reshape(-1)
+        score_key = (
+            "business_score"
+            if getattr(self.config, "business_score_enabled", True)
+            and "business_score" in predictions
+            else "ranking_score"
+        )
+        ranking_scores = np.asarray(predictions[score_key]).reshape(-1)
         top_count = min(k, len(valid_candidates), ranking_scores.shape[0])
         if top_count <= 0:
             return [], round((time.perf_counter() - response_stage_started) * 1000, 2)
@@ -1162,10 +1253,13 @@ class RankingModel:
             candidate, metadata = valid_candidates[int(i)]
             ctr_score = float(predictions["ctr"][i])
             cvr_score = float(predictions["cvr"][i])
-            gmv_score = float(predictions["gmv"][i])
+            gmv_source = predictions.get("predicted_value", predictions.get("gmv"))
+            gmv_score = float(gmv_source[i])
             ranking_score = float(ranking_scores[i])
 
-            if self.config.enable_multi_objective:
+            if getattr(self.config, "business_score_enabled", True):
+                confidence_score = max(0.0, min(ctr_score * cvr_score, 1.0))
+            elif self.config.enable_multi_objective:
                 confidence_score = (
                     ctr_score * self.config.ctr_weight
                     + cvr_score * self.config.cvr_weight
@@ -1394,7 +1488,10 @@ class RankingModel:
                     return [], profile
                 return []
 
-            predictions, inference_profile = self.run_inference_batch(feature_matrix)
+            predictions, inference_profile = self.run_inference_batch(
+                feature_matrix,
+                value_bucket_ids=self._value_bucket_ids_for_candidates(valid_candidates),
+            )
             profile["tensor_prep_ms"] = inference_profile["tensor_prep_ms"]
             profile["model_forward_ms"] = inference_profile["model_forward_ms"]
             profile["inference_path"] = inference_profile["inference_path"]
@@ -1628,6 +1725,7 @@ class RankingModel:
         self.model.eval()
         self.is_trained = True
         self.last_training_time = time.time()
+        self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
         self.model_version = f"ranking-{int(self.last_training_time)}"
         self._compile_model_for_inference()
 
@@ -1725,7 +1823,13 @@ class RankingModel:
             features = []
             ctr_labels = []
             cvr_labels = []
-            gmv_labels = []
+            ctcvr_labels = []
+            cvr_masks = []
+            value_labels = []
+            business_value_labels = []
+            value_masks = []
+            value_bucket_ids = []
+            value_records: List[Dict[str, Any]] = []
             relevance_labels = []
             group_ids = []
             listwise_group_ids = []
@@ -1766,21 +1870,40 @@ class RankingModel:
                 features.append(feature_vector)
 
                 # Create labels based on interaction type
-                action = sample.get("action", "view")
+                action = str(sample.get("action", "view") or "view").lower()
+                context = dict(sample.get("context") or {})
+                is_clicked = self._training_clicked_label(sample, action)
+                is_purchase = action == "purchase" or bool(
+                    context.get("attributed_purchase")
+                )
 
                 # CTR label (clicked or not)
-                ctr_label = (
-                    1.0 if action in ["click", "purchase", "add_to_cart"] else 0.0
-                )
+                ctr_label = 1.0 if is_clicked else 0.0
                 ctr_labels.append(ctr_label)
 
-                # CVR label (converted or not)
-                cvr_label = 1.0 if action == "purchase" else 0.0
+                # CVR is conditional on click; unclicked rows are masked out.
+                cvr_label = 1.0 if is_purchase else 0.0
                 cvr_labels.append(cvr_label)
+                ctcvr_labels.append(1.0 if is_purchase else 0.0)
+                cvr_masks.append(1.0 if is_clicked else 0.0)
 
-                # GMV label (purchase value)
-                gmv_value = self._training_gmv_label(sample, product_metadata, action)
-                gmv_labels.append(gmv_value)
+                # Business value is purchase-conditional; non-purchase rows are masked out.
+                business_value = self._training_business_value_label(
+                    sample,
+                    product_metadata,
+                    action,
+                )
+                value_bucket = self._value_bucket_id(product_metadata)
+                business_value_labels.append(business_value)
+                value_masks.append(1.0 if is_purchase else 0.0)
+                value_bucket_ids.append(value_bucket)
+                if is_purchase:
+                    value_records.append(
+                        {
+                            "business_value": business_value,
+                            "value_bucket": value_bucket,
+                        }
+                    )
 
                 relevance_labels.append(
                     self._training_relevance_label(
@@ -1815,6 +1938,18 @@ class RankingModel:
             if not features:
                 return torch.empty(0), {}
 
+            self._fit_value_transform(value_records)
+            value_labels = [
+                self._transform_business_value(value, bucket_id)
+                if mask > 0.0
+                else 0.0
+                for value, bucket_id, mask in zip(
+                    business_value_labels,
+                    value_bucket_ids,
+                    value_masks,
+                )
+            ]
+
             features_tensor = torch.tensor(np.vstack(features), dtype=torch.float32).to(
                 self.device
             )
@@ -1825,9 +1960,24 @@ class RankingModel:
                 "cvr": torch.tensor(cvr_labels, dtype=torch.float32)
                 .to(self.device)
                 .unsqueeze(1),
-                "gmv": torch.tensor(gmv_labels, dtype=torch.float32)
+                "ctcvr": torch.tensor(ctcvr_labels, dtype=torch.float32)
                 .to(self.device)
                 .unsqueeze(1),
+                "cvr_mask": torch.tensor(cvr_masks, dtype=torch.float32)
+                .to(self.device)
+                .unsqueeze(1),
+                "value": torch.tensor(value_labels, dtype=torch.float32)
+                .to(self.device)
+                .unsqueeze(1),
+                "business_value": torch.tensor(business_value_labels, dtype=torch.float32)
+                .to(self.device)
+                .unsqueeze(1),
+                "value_mask": torch.tensor(value_masks, dtype=torch.float32)
+                .to(self.device)
+                .unsqueeze(1),
+                "value_bucket": torch.tensor(value_bucket_ids, dtype=torch.long).to(
+                    self.device
+                ),
                 "ranking_relevance": torch.tensor(
                     relevance_labels, dtype=torch.float32
                 )
@@ -1843,6 +1993,7 @@ class RankingModel:
                     slate_sample_flags, dtype=torch.bool
                 ).to(self.device),
             }
+            labels["gmv"] = labels["value"]
 
             return features_tensor, labels
 
@@ -1963,22 +2114,161 @@ class RankingModel:
         product_metadata: Dict[str, Any],
         action: str,
     ) -> float:
-        if action != "purchase":
-            return 0.0
+        return self._training_business_value_label(sample, product_metadata, action)
+
+    def _training_clicked_label(self, sample: Dict[str, Any], action: str) -> bool:
         context = sample.get("context") or {}
-        return max(
-            0.0,
-            self._first_float(
-                sample.get("value"),
-                sample.get("gmv"),
-                sample.get("purchase_value"),
-                context.get("value"),
-                context.get("gmv"),
-                context.get("purchase_value"),
-                product_metadata.get("price"),
-                default=0.0,
-            ),
+        if bool(context.get("attributed_click")) or bool(
+            context.get("attributed_purchase")
+        ):
+            return True
+        return str(action or "").lower() in {"click", "add_to_cart", "purchase"}
+
+    def _training_business_value_label(
+        self,
+        sample: Dict[str, Any],
+        product_metadata: Dict[str, Any],
+        action: str,
+    ) -> float:
+        context = sample.get("context") or {}
+        if action != "purchase" and not bool(context.get("attributed_purchase")):
+            return 0.0
+
+        label_keys = list(
+            getattr(
+                self.config,
+                "value_label_preference",
+                ["margin", "profit", "gross_margin", "value", "gmv", "purchase_value", "price"],
+            )
+            or []
         )
+        for key in label_keys:
+            value = self._optional_float(
+                sample.get(key),
+                context.get(key),
+                product_metadata.get(key),
+            )
+            if value is not None:
+                return max(0.0, float(value))
+        return 0.0
+
+    def _value_bucket_ids_for_candidates(
+        self,
+        valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]],
+    ) -> List[Optional[int]]:
+        return [
+            self._value_bucket_id(product_metadata, create=False)
+            for _, product_metadata in valid_candidates
+        ]
+
+    def _value_bucket_id(
+        self,
+        product_metadata: Dict[str, Any],
+        *,
+        create: bool = True,
+    ) -> Optional[int]:
+        key = self._value_bucket_key(product_metadata)
+        bucket_id = self.value_bucket_mapping.get(key)
+        if bucket_id is None and create:
+            bucket_id = len(self.value_bucket_mapping)
+            self.value_bucket_mapping[key] = bucket_id
+        return bucket_id
+
+    def _value_bucket_key(self, product_metadata: Dict[str, Any]) -> str:
+        category = str(product_metadata.get("category") or "General").strip().lower()
+        price = self._first_float(product_metadata.get("price"), default=0.0)
+        thresholds = sorted(
+            float(value)
+            for value in getattr(self.config, "value_price_buckets", [50.0, 200.0])
+        )
+        price_bucket = 0
+        for threshold in thresholds:
+            if price >= threshold:
+                price_bucket += 1
+        return f"{category}:{price_bucket}"
+
+    def _fit_value_transform(self, records: List[Dict[str, Any]]) -> None:
+        if not records:
+            self.value_transform_stats = self._default_value_transform_stats()
+            return
+
+        by_bucket: Dict[int, List[float]] = {}
+        all_values: List[float] = []
+        for record in records:
+            value = max(0.0, self._first_float(record.get("business_value"), default=0.0))
+            bucket_id = int(record.get("value_bucket", -1))
+            all_values.append(value)
+            by_bucket.setdefault(bucket_id, []).append(value)
+
+        stats = {
+            "global": self._compute_value_stats(all_values),
+            "buckets": {},
+        }
+        min_bucket_purchases = max(
+            1,
+            int(getattr(self.config, "value_min_bucket_purchases", 20) or 20),
+        )
+        for bucket_id, values in by_bucket.items():
+            if len(values) >= min_bucket_purchases:
+                stats["buckets"][str(bucket_id)] = self._compute_value_stats(values)
+        self.value_transform_stats = stats
+
+    def _compute_value_stats(self, values: List[float]) -> Dict[str, Any]:
+        if not values:
+            return self._default_value_transform_stats()["global"]
+        raw = np.asarray([max(0.0, float(value)) for value in values], dtype=np.float64)
+        quantile = float(getattr(self.config, "value_clip_quantile", 0.99) or 0.99)
+        clip = float(np.quantile(raw, quantile)) if raw.size else 0.0
+        if not np.isfinite(clip) or clip <= 0.0:
+            clip = float(np.max(raw)) if raw.size else 0.0
+        clipped = np.minimum(raw, clip)
+        logged = np.log1p(clipped)
+        mean = float(np.mean(logged)) if logged.size else 0.0
+        std = float(np.std(logged)) if logged.size else 1.0
+        if not np.isfinite(std) or std < 1e-6:
+            std = 1.0
+        return {
+            "count": int(raw.size),
+            "clip": clip,
+            "mean": mean,
+            "std": std,
+        }
+
+    def _stats_for_value_bucket(self, bucket_id: Optional[int] = None) -> Dict[str, Any]:
+        stats = self.value_transform_stats or self._default_value_transform_stats()
+        if bucket_id is not None:
+            bucket_stats = (stats.get("buckets") or {}).get(str(int(bucket_id)))
+            if bucket_stats:
+                return bucket_stats
+        return stats.get("global") or self._default_value_transform_stats()["global"]
+
+    def _transform_business_value(self, value: float, bucket_id: Optional[int]) -> float:
+        stats = self._stats_for_value_bucket(bucket_id)
+        clip = stats.get("clip")
+        raw = max(0.0, float(value))
+        if clip is not None:
+            raw = min(raw, max(0.0, float(clip)))
+        logged = float(np.log1p(raw))
+        return (logged - float(stats.get("mean", 0.0))) / float(
+            stats.get("std", 1.0) or 1.0
+        )
+
+    def _inverse_transform_business_value(
+        self,
+        normalized_value: float,
+        bucket_id: Optional[int] = None,
+    ) -> float:
+        stats = self._stats_for_value_bucket(bucket_id)
+        if int(stats.get("count", 0) or 0) <= 0:
+            return max(0.0, float(normalized_value))
+        logged = float(normalized_value) * float(stats.get("std", 1.0) or 1.0) + float(
+            stats.get("mean", 0.0)
+        )
+        value = max(0.0, float(np.expm1(logged)))
+        clip = stats.get("clip")
+        if clip is not None:
+            value = min(value, max(0.0, float(clip)))
+        return value
 
     def _training_relevance_label(
         self,
@@ -2055,16 +2345,36 @@ class RankingModel:
             # CTR loss (binary cross-entropy)
             ctr_loss = nn.BCELoss()(predictions["ctr"], labels["ctr"])
 
-            # CVR loss (binary cross-entropy)
-            cvr_loss = nn.BCELoss()(predictions["cvr"], labels["cvr"])
+            # CVR loss is conditional on click; unclicked rows do not contribute.
+            cvr_loss = self._masked_binary_cross_entropy(
+                predictions["cvr"],
+                labels["cvr"],
+                labels.get("cvr_mask"),
+            )
+            ctcvr_predictions = predictions.get(
+                "ctcvr",
+                predictions["ctr"] * predictions["cvr"],
+            )
+            ctcvr_targets = labels.get("ctcvr", labels["cvr"])
+            ctcvr_loss = self._binary_cross_entropy_with_pos_weight(
+                ctcvr_predictions,
+                ctcvr_targets,
+                getattr(self.config, "ctcvr_pos_weight", None),
+            )
 
-            # GMV loss (MSE)
-            gmv_loss = nn.MSELoss()(predictions["gmv"], labels["gmv"])
+            # Value loss is purchase-conditional on normalized business value.
+            gmv_loss = self._masked_value_loss(
+                predictions["gmv"],
+                labels.get("value", labels.get("gmv")),
+                labels.get("value_mask"),
+            )
 
             # Combined loss with weights
             total_loss = (
                 self.config.ctr_weight * ctr_loss
-                + self.config.cvr_weight * cvr_loss
+                + float(getattr(self.config, "direct_cvr_weight", self.config.cvr_weight))
+                * cvr_loss
+                + float(getattr(self.config, "ctcvr_weight", 0.0)) * ctcvr_loss
                 + self.config.gmv_weight * gmv_loss
             )
 
@@ -2104,6 +2414,74 @@ class RankingModel:
         except Exception as e:
             logger.error(f"Error computing loss: {e}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    def _binary_cross_entropy_with_pos_weight(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        pos_weight: Optional[float],
+    ) -> torch.Tensor:
+        losses = torch.nn.functional.binary_cross_entropy(
+            predictions,
+            targets,
+            reduction="none",
+        )
+        if pos_weight is not None:
+            weight = torch.where(
+                targets > 0.0,
+                torch.as_tensor(float(pos_weight), device=losses.device, dtype=losses.dtype),
+                torch.ones((), device=losses.device, dtype=losses.dtype),
+            )
+            losses = losses * weight
+        return losses.mean()
+
+    def _masked_binary_cross_entropy(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        losses = torch.nn.functional.binary_cross_entropy(
+            predictions,
+            targets,
+            reduction="none",
+        )
+        if mask is None:
+            return losses.mean()
+        mask = mask.to(device=losses.device, dtype=losses.dtype)
+        denominator = mask.sum()
+        if float(denominator.detach().cpu().item()) <= 0.0:
+            return losses.sum() * 0.0
+        return (losses * mask).sum() / denominator
+
+    def _masked_value_loss(
+        self,
+        predictions: torch.Tensor,
+        targets: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if targets is None:
+            return predictions.sum() * 0.0
+        value_loss = str(getattr(self.config, "value_loss", "huber") or "huber").lower()
+        if value_loss == "mse":
+            losses = torch.nn.functional.mse_loss(
+                predictions,
+                targets,
+                reduction="none",
+            )
+        else:
+            losses = torch.nn.functional.smooth_l1_loss(
+                predictions,
+                targets,
+                reduction="none",
+            )
+        if mask is None:
+            return losses.mean()
+        mask = mask.to(device=losses.device, dtype=losses.dtype)
+        denominator = mask.sum()
+        if float(denominator.detach().cpu().item()) <= 0.0:
+            return losses.sum() * 0.0
+        return (losses * mask).sum() / denominator
 
     def _compute_listwise_ltr_loss(
         self,
@@ -2259,6 +2637,9 @@ class RankingModel:
                         "hidden_dims": self.model.hidden_dims,
                         "input_dim": self.feature_extractor.total_feature_dim,
                         "feature_schema_version": self.feature_schema_version,
+                        "ranking_objective_version": self.ranking_objective_version,
+                        "value_transform_stats": self.value_transform_stats,
+                        "value_bucket_mapping": self.value_bucket_mapping,
                     },
                 }
                 torch.save(checkpoint, model_path)

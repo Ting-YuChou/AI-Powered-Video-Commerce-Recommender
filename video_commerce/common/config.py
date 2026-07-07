@@ -782,7 +782,49 @@ class RankingConfig(BaseSettings):
     )
     ctr_weight: float = Field(1.0, description="Click-through rate weight")
     cvr_weight: float = Field(2.0, description="Conversion rate weight")
+    direct_cvr_weight: float = Field(
+        1.0,
+        description="Auxiliary clicked-row CVR loss weight for pCVR_given_click",
+    )
+    ctcvr_weight: float = Field(
+        1.0,
+        description="ESMM-style all-impression CTCVR loss weight",
+    )
+    ctcvr_pos_weight: Optional[float] = Field(
+        None,
+        description="Optional positive-class multiplier for sparse CTCVR labels",
+    )
     gmv_weight: float = Field(3.0, description="GMV optimization weight")
+    business_score_enabled: bool = Field(
+        True,
+        description=(
+            "Rank with pCTR * pCVR_given_click * predicted business value instead "
+            "of the free-form ranking tower score"
+        ),
+    )
+    value_loss: str = Field(
+        "huber",
+        description="Loss for purchase-conditional value prediction: huber or mse",
+    )
+    value_clip_quantile: float = Field(
+        0.99,
+        description="Quantile used to winsorize purchase business-value labels",
+    )
+    value_min_bucket_purchases: int = Field(
+        20,
+        description=(
+            "Minimum purchase labels required before category/price-bucket value "
+            "normalization uses bucket-specific statistics"
+        ),
+    )
+    value_price_buckets: List[float] = Field(
+        [50.0, 200.0],
+        description="Price thresholds used for business-value normalization buckets",
+    )
+    value_label_preference: List[str] = Field(
+        ["margin", "profit", "gross_margin", "value", "gmv", "purchase_value", "price"],
+        description="Ordered fields used to choose the purchase business-value label",
+    )
     ltr_pairwise_enabled: bool = Field(
         False,
         description=(
@@ -844,6 +886,28 @@ class RankingConfig(BaseSettings):
         if normalized not in {"dcn", "dcn_v2_low_rank", "mlp"}:
             raise ValueError("architecture must be one of: dcn, dcn_v2_low_rank, mlp")
         return normalized
+
+    @validator("value_loss")
+    def validate_value_loss(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"huber", "mse"}:
+            raise ValueError("value_loss must be one of: huber, mse")
+        return normalized
+
+    @validator("ctcvr_pos_weight", pre=True)
+    def validate_ctcvr_pos_weight(cls, value: Optional[float]) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        parsed = float(value)
+        if parsed <= 0:
+            raise ValueError("ctcvr_pos_weight must be greater than 0 when set")
+        return parsed
+
+    @validator("value_clip_quantile")
+    def validate_value_clip_quantile(cls, value: float) -> float:
+        if not 0.0 < float(value) <= 1.0:
+            raise ValueError("value_clip_quantile must be in (0, 1]")
+        return float(value)
 
     @validator("cross_layers")
     def validate_cross_layers(cls, value: int) -> int:
