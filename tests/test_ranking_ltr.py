@@ -284,6 +284,108 @@ def test_pairwise_ltr_loss_is_zero_when_no_valid_pairs():
     assert torch.all(scores.grad == 0)
 
 
+def test_listwise_ltr_loss_prefers_higher_scores_for_higher_relevance():
+    ranking = RankingModel(
+        RankingConfig(
+            ltr_min_relevance_gap=0.5,
+            ltr_listwise_min_group_size=2,
+        )
+    )
+    relevance = torch.tensor([[3.0], [1.0]])
+    group_ids = torch.tensor([0, 0])
+    slate_mask = torch.tensor([True, True])
+
+    good_scores = torch.tensor([[2.0], [0.0]], requires_grad=True)
+    bad_scores = torch.tensor([[0.0], [2.0]], requires_grad=True)
+
+    good_loss = ranking._compute_listwise_ltr_loss(
+        good_scores,
+        relevance,
+        group_ids,
+        slate_mask,
+    )
+    bad_loss = ranking._compute_listwise_ltr_loss(
+        bad_scores,
+        relevance,
+        group_ids,
+        slate_mask,
+    )
+
+    assert good_loss < bad_loss
+
+
+def test_listwise_ltr_loss_is_zero_when_no_valid_slate_group():
+    ranking = RankingModel(
+        RankingConfig(
+            ltr_min_relevance_gap=0.5,
+            ltr_listwise_min_group_size=2,
+        )
+    )
+    scores = torch.tensor([[0.5], [0.2]], requires_grad=True)
+    relevance = torch.tensor([[3.0], [1.0]])
+    group_ids = torch.tensor([0, 0])
+    slate_mask = torch.tensor([False, False])
+
+    loss = ranking._compute_listwise_ltr_loss(
+        scores,
+        relevance,
+        group_ids,
+        slate_mask,
+    )
+    loss.backward()
+
+    assert loss.item() == pytest.approx(0.0)
+    assert scores.grad is not None
+    assert torch.all(scores.grad == 0)
+
+
+def test_ltr_training_batches_keep_impression_group_together():
+    ranking = RankingModel(
+        RankingConfig(
+            batch_size=2,
+            ltr_listwise_enabled=True,
+            ltr_listwise_weight=0.25,
+        )
+    )
+    features = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    labels = {
+        "pairwise_group": torch.tensor([0, 0, 0, 1]),
+        "ltr_group": torch.tensor([0, 0, 0, 1]),
+        "ltr_is_slate_sample": torch.tensor([True, True, True, True]),
+    }
+
+    batches = list(ranking._iter_training_batches(features, labels))
+
+    assert [batch_features.size(0) for batch_features, _ in batches] == [3, 1]
+    assert torch.equal(batches[0][1]["ltr_group"], torch.tensor([0, 0, 0]))
+
+
+def test_event_level_impression_context_is_not_marked_as_listwise_slate():
+    ranking = RankingModel(RankingConfig())
+    samples = [
+        {
+            "user_id": "u1",
+            "product_id": "p1",
+            "action": "click",
+            "context": {"impression_id": "imp-1"},
+        },
+        {
+            "user_id": "u1",
+            "product_id": "p2",
+            "action": "view",
+            "context": {"impression_id": "imp-1"},
+        },
+    ]
+
+    _, labels = ranking._prepare_training_data(
+        samples,
+        training_sample_source="interaction_events",
+    )
+
+    assert labels["ltr_is_slate_sample"].tolist() == [False, False]
+    assert labels["ltr_group"].tolist() == [0, 1]
+
+
 @pytest.mark.parametrize("pairwise_enabled", [False, True])
 @pytest.mark.asyncio
 async def test_ranking_training_with_and_without_pairwise_ltr_infers(pairwise_enabled):
@@ -364,4 +466,62 @@ async def test_ranking_training_with_and_without_pairwise_ltr_infers(pairwise_en
         "business_score",
         "ranking_score",
     }
+    assert all(values.shape == (2,) for values in predictions.values())
+
+
+@pytest.mark.asyncio
+async def test_ranking_training_with_listwise_ltr_infers():
+    ranking = RankingModel(
+        RankingConfig(
+            architecture="dcn",
+            hidden_dims=[16, 8],
+            training_min_samples=1,
+            epochs=1,
+            batch_size=1,
+            ltr_pairwise_enabled=False,
+            ltr_listwise_enabled=True,
+            ltr_listwise_weight=0.25,
+            ltr_listwise_min_group_size=2,
+        )
+    )
+    await ranking.load_model()
+
+    samples = [
+        {
+            "request_id": "req-1",
+            "user_id": "u1",
+            "product_id": "p1",
+            "action": "purchase",
+            "value": 40.0,
+            "timestamp": 1_700_000_000.0,
+            "context": {"impression_id": "imp-1", "session_position": 1},
+            "combined_score": 0.7,
+        },
+        {
+            "request_id": "req-1",
+            "user_id": "u1",
+            "product_id": "p2",
+            "action": "view",
+            "timestamp": 1_700_000_001.0,
+            "context": {"impression_id": "imp-1", "session_position": 2},
+            "combined_score": 0.2,
+        },
+    ]
+    product_metadata_map = {
+        "p1": {"price": 40.0, "in_stock": True},
+        "p2": {"price": 20.0, "in_stock": True},
+    }
+
+    ranking._train_model_sync(
+        samples,
+        user_features_map={"u1": {"user_id": "u1", "total_interactions": 10}},
+        product_metadata_map=product_metadata_map,
+        training_sample_source="recommendation_impressions",
+    )
+    predictions, _ = ranking.run_inference_batch(
+        np.zeros((2, ranking.feature_extractor.total_feature_dim), dtype=np.float32)
+    )
+
+    assert ranking.is_trained
+    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
     assert all(values.shape == (2,) for values in predictions.values())

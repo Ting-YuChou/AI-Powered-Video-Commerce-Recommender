@@ -6,6 +6,7 @@ import pytest
 
 from video_commerce.common.cache_codec import json_dumps, json_loads
 from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
+from video_commerce.ml.ranking_history import RANKING_HISTORY_CONTEXT_KEY
 from video_commerce.ranking_runtime.ranking_batcher import (
     RankingBatcher,
     RankingQueueTimeoutError,
@@ -645,7 +646,12 @@ def test_ranking_runner_payload_v2_round_trip_and_v1_fallback():
                 ],
                 "product_ids": ["p1"],
                 "user_features": {"user_id": "u1"},
-                "context": {},
+                "context": {
+                    RANKING_HISTORY_CONTEXT_KEY: {
+                        "schema_version": "ranking_history_embeddings_v1",
+                        "actions": {"click": {"count": 1}},
+                    }
+                },
                 "k": 1,
                 "batch_wait_ms": 0.0,
             }
@@ -653,6 +659,9 @@ def test_ranking_runner_payload_v2_round_trip_and_v1_fallback():
     }
     normalized = normalize_ranking_batch_payloads(v2_payload)
     assert normalized[0]["product_metadata_map"]["p1"]["title"] == "V2 title"
+    assert normalized[0]["context"][RANKING_HISTORY_CONTEXT_KEY]["actions"]["click"][
+        "count"
+    ] == 1
 
     result = run_ranking_batch_payloads(FakeRankingModel(), v2_payload)
     assert result["results"][0][1][0]["title"] == "V2 title"
