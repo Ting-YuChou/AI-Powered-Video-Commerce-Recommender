@@ -158,10 +158,12 @@ class FakeFeatureStore:
         self.cache_config = CacheConfig(hot_path_read_timeout_ms=50)
         self.interactions = interactions or []
         self.interaction_reads = 0
+        self.interaction_limits = []
 
     async def get_user_interactions(self, user_id, limit=100):
         self.interaction_reads += 1
-        return list(self.interactions)
+        self.interaction_limits.append(limit)
+        return list(self.interactions[:limit])
 
     async def get_user_features(self, user_id, cache_default=False):
         return UserFeatures(user_id=user_id)
@@ -350,6 +352,29 @@ class FailingSASRec(FakeSASRec):
         raise RuntimeError("boom")
 
 
+class FakeSwingItemCF:
+    def __init__(self):
+        self.is_trained = True
+        self.model_version = "swing-test"
+        self.calls = []
+
+    def get_candidates(self, user_interactions, *, k, exclude_items, current_time=None):
+        self.calls.append(
+            {
+                "user_interactions": list(user_interactions),
+                "exclude_items": set(exclude_items),
+            }
+        )
+        return [
+            CandidateProduct(
+                product_id="swing",
+                collaborative_score=0.7,
+                combined_score=0.7,
+                source="swing_itemcf",
+            )
+        ][:k]
+
+
 @pytest.mark.asyncio
 async def test_generate_candidates_skips_sasrec_when_disabled():
     feature_store = FakeFeatureStore(interactions=[_event("seen")])
@@ -369,6 +394,68 @@ async def test_generate_candidates_skips_sasrec_when_disabled():
     assert [candidate.source for candidate in candidates] == ["trending_pool"]
     assert profile["source_counts"]["sasrec"] == 0
     assert feature_store.interaction_reads == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_merges_swing_itemcf_when_enabled():
+    feature_store = FakeFeatureStore(interactions=[_event("seed", action="click")])
+    engine = RecommendationEngine(
+        feature_store,
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_swing_itemcf=True,
+            enable_sasrec=False,
+            candidates_per_source=2,
+            max_total_candidates=10,
+            serving_recent_interaction_limit=0,
+            swing_itemcf_serving_interaction_limit=25,
+        ),
+    )
+    engine.swing_itemcf_engine = FakeSwingItemCF()
+
+    candidates, profile = await engine.generate_candidates("u1", include_profile=True)
+
+    assert "swing_itemcf" in {candidate.source for candidate in candidates}
+    assert profile["source_counts"]["swing_itemcf"] == 1
+    assert feature_store.interaction_reads == 1
+    assert feature_store.interaction_limits == [25]
+    assert engine.swing_itemcf_engine.calls[0]["exclude_items"] == {"seed"}
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_reads_larger_swing_window_before_seed_dedupe():
+    interactions = [
+        _event("duplicate", action="view", timestamp=10),
+        _event("duplicate", action="click", timestamp=9),
+        _event("noise", action="report", timestamp=8),
+        _event("older-positive", action="purchase", timestamp=7),
+    ]
+    feature_store = FakeFeatureStore(interactions=interactions)
+    engine = RecommendationEngine(
+        feature_store,
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_swing_itemcf=True,
+            enable_sasrec=False,
+            candidates_per_source=2,
+            max_total_candidates=10,
+            serving_recent_interaction_limit=0,
+            swing_itemcf_max_seed_items=1,
+            swing_itemcf_serving_interaction_limit=4,
+        ),
+    )
+    engine.swing_itemcf_engine = FakeSwingItemCF()
+
+    await engine.generate_candidates("u1", include_profile=True)
+
+    assert feature_store.interaction_limits == [4]
+    observed = engine.swing_itemcf_engine.calls[0]["user_interactions"]
+    assert [event["product_id"] for event in observed] == [
+        "duplicate",
+        "duplicate",
+        "noise",
+        "older-positive",
+    ]
 
 
 @pytest.mark.asyncio

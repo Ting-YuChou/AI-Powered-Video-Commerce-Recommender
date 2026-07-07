@@ -32,6 +32,7 @@ class ModelArtifactManager:
     RANKING_MODEL_NAME = "ranking_model"
     TWO_TOWER_MODEL_NAME = "two_tower_retrieval"
     SASREC_MODEL_NAME = "sasrec_retrieval"
+    SWING_ITEMCF_MODEL_NAME = "swing_itemcf_recall"
 
     def __init__(
         self,
@@ -86,6 +87,12 @@ class ModelArtifactManager:
     def sasrec_local_metadata_path(self) -> str:
         return self.recommendation_config.sasrec_metadata_path or str(
             Path(self.model_config.cache_dir) / "sasrec_metadata.json"
+        )
+
+    @property
+    def swing_itemcf_local_index_path(self) -> str:
+        return self.recommendation_config.swing_itemcf_index_path or str(
+            Path(self.model_config.cache_dir) / "swing_itemcf.json.gz"
         )
 
     async def get_latest_model_checkpoint(
@@ -235,6 +242,35 @@ class ModelArtifactManager:
             ),
         ]
         await self._sync_paths_to_local_atomically(artifact_specs)
+        return record
+
+    async def sync_latest_swing_itemcf_artifact(self) -> Optional[ModelArtifactRecord]:
+        record = await self.get_latest_model_checkpoint(self.SWING_ITEMCF_MODEL_NAME)
+        if not record:
+            return None
+
+        payload = record.payload
+        index_path = payload.get("index_path") or record.checkpoint_path
+        if not index_path:
+            logger.warning(
+                "Swing ItemCF artifact record is incomplete; skipping sync",
+                extra={"model_version": record.model_version},
+            )
+            return None
+
+        await self._sync_paths_to_local_atomically(
+            [
+                (
+                    index_path,
+                    self.swing_itemcf_local_index_path,
+                    self._extract_artifact_sha256(
+                        payload,
+                        "index",
+                        legacy_key="index_sha256",
+                    ),
+                )
+            ]
+        )
         return record
 
     async def persist_ranking_checkpoint(
@@ -483,6 +519,51 @@ class ModelArtifactManager:
             model_name=self.SASREC_MODEL_NAME,
             model_version=model_version,
             checkpoint_path=persisted_checkpoint,
+            payload=record_payload,
+        )
+
+    async def persist_swing_itemcf_artifact(
+        self,
+        *,
+        index_path: str,
+        model_version: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ModelArtifactRecord]:
+        if not self.system_store:
+            return None
+
+        index_sha256 = ObjectStorage.calculate_sha256(index_path)
+        persisted_index = await self._persist_artifact(
+            local_path=index_path,
+            model_name=self.SWING_ITEMCF_MODEL_NAME,
+            model_version=model_version,
+            content_type="application/gzip",
+        )
+        record_payload = dict(payload or {})
+        record_payload.update(
+            {
+                "index_path": persisted_index,
+                "index_sha256": index_sha256,
+                "local_cache_index_path": self.swing_itemcf_local_index_path,
+                "artifact_manifest": {
+                    "index": {
+                        "path": persisted_index,
+                        "sha256": index_sha256,
+                        "local_cache_path": self.swing_itemcf_local_index_path,
+                    }
+                },
+            }
+        )
+        await self.system_store.record_model_checkpoint(
+            model_name=self.SWING_ITEMCF_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_index,
+            payload=record_payload,
+        )
+        return ModelArtifactRecord(
+            model_name=self.SWING_ITEMCF_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_index,
             payload=record_payload,
         )
 

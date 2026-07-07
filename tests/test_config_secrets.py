@@ -21,6 +21,7 @@ def test_config_reads_secret_file_env(monkeypatch, tmp_path):
 def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     monkeypatch.delenv("VECTOR_INDEX_PATH", raising=False)
     monkeypatch.delenv("RECOMMENDATION_CF_INDEX_PATH", raising=False)
+    monkeypatch.delenv("RECOMMENDATION_SWING_ITEMCF_INDEX_PATH", raising=False)
     monkeypatch.delenv("ENVIRONMENT", raising=False)
     for env_name in (
         "REDIS_CACHE_HOST",
@@ -47,6 +48,9 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     assert config.recommendation_config.cf_index_path == str(
         tmp_path / "models" / "cf_vector_index.faiss"
     )
+    assert config.recommendation_config.swing_itemcf_index_path == str(
+        tmp_path / "models" / "swing_itemcf.json.gz"
+    )
     assert config.cache_config.hot_path_read_timeout_ms == 150.0
     assert config.cache_config.candidate_cache_race_timeout_ms == 5.0
     assert config.cache_config.recommendation_cache_race_timeout_ms == 5.0
@@ -54,6 +58,8 @@ def test_config_defaults_index_paths_under_model_cache(monkeypatch, tmp_path):
     assert config.recommendation_config.known_user_snapshot_enabled is True
     assert config.recommendation_config.content_features_snapshot_enabled is True
     assert config.recommendation_config.speech_category_candidates_enabled is False
+    assert config.recommendation_config.enable_swing_itemcf is False
+    assert config.recommendation_config.swing_itemcf_serving_interaction_limit == 200
     assert config.model_config.speech_to_text_enabled is False
     assert config.model_config.speech_to_text_model == "Qwen/Qwen3-ASR-0.6B"
     assert config.kafka_config.consumer_max_poll_interval_ms == 600000

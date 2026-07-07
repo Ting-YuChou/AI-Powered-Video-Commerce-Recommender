@@ -41,6 +41,7 @@ data:
   MODEL_CACHE_DIR: {{ .Values.appConfig.modelCacheDir | quote }}
   VECTOR_INDEX_PATH: {{ .Values.appConfig.vectorIndexPath | quote }}
   RECOMMENDATION_CF_INDEX_PATH: {{ .Values.appConfig.recommendationCfIndexPath | quote }}
+  RECOMMENDATION_SWING_ITEMCF_INDEX_PATH: {{ .Values.appConfig.recommendationSwingItemcfIndexPath | quote }}
   DATA_UPLOAD_DIR: {{ .Values.appConfig.dataUploadDir | quote }}
   DATA_LOAD_SAMPLE_DATA: "false"
   DATA_MAX_FILE_SIZE: {{ .Values.appConfig.dataMaxFileSize | quote }}
@@ -104,6 +105,17 @@ data:
   RECOMMENDATION_RETRIEVAL_EXECUTOR_WORKERS: {{ .Values.appConfig.recommendation.retrievalExecutorWorkers | quote }}
   RECOMMENDATION_SERVING_RECENT_INTERACTION_LIMIT: {{ .Values.appConfig.recommendation.servingRecentInteractionLimit | quote }}
   RECOMMENDATION_SPEECH_CATEGORY_CANDIDATES_ENABLED: {{ .Values.appConfig.recommendation.speechCategoryCandidatesEnabled | quote }}
+  RECOMMENDATION_MAX_LIVE_SWING_ITEMCF_CANDIDATES: {{ .Values.appConfig.recommendation.maxLiveSwingItemcfCandidates | quote }}
+  RECOMMENDATION_ENABLE_SWING_ITEMCF: {{ .Values.appConfig.recommendation.enableSwingItemcf | quote }}
+  RECOMMENDATION_SWING_ITEMCF_ALPHA: {{ .Values.appConfig.recommendation.swingItemcfAlpha | quote }}
+  RECOMMENDATION_SWING_ITEMCF_MAX_NEIGHBORS_PER_ITEM: {{ .Values.appConfig.recommendation.swingItemcfMaxNeighborsPerItem | quote }}
+  RECOMMENDATION_SWING_ITEMCF_MAX_SEED_ITEMS: {{ .Values.appConfig.recommendation.swingItemcfMaxSeedItems | quote }}
+  RECOMMENDATION_SWING_ITEMCF_SERVING_INTERACTION_LIMIT: {{ .Values.appConfig.recommendation.swingItemcfServingInteractionLimit | quote }}
+  RECOMMENDATION_SWING_ITEMCF_TRAINING_MAX_USERS: {{ .Values.appConfig.recommendation.swingItemcfTrainingMaxUsers | quote }}
+  RECOMMENDATION_SWING_ITEMCF_TRAINING_MAX_EVENTS_PER_USER: {{ .Values.appConfig.recommendation.swingItemcfTrainingMaxEventsPerUser | quote }}
+  RECOMMENDATION_SWING_ITEMCF_MAX_ITEMS_PER_USER: {{ .Values.appConfig.recommendation.swingItemcfMaxItemsPerUser | quote }}
+  RECOMMENDATION_SWING_ITEMCF_MAX_USERS_PER_ITEM: {{ .Values.appConfig.recommendation.swingItemcfMaxUsersPerItem | quote }}
+  RECOMMENDATION_SWING_ITEMCF_SCORE_WEIGHT: {{ .Values.appConfig.recommendation.swingItemcfScoreWeight | quote }}
   RECOMMENDATION_IMPRESSION_LOGGING_ENABLED: {{ .Values.appConfig.recommendation.impressionLoggingEnabled | quote }}
   RECOMMENDATION_IMPRESSION_MAX_ITEMS: {{ .Values.appConfig.recommendation.impressionMaxItems | quote }}
   MONITORING_LOG_LEVEL: {{ .Values.appConfig.monitoring.logLevel | quote }}

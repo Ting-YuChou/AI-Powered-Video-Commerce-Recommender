@@ -1111,6 +1111,11 @@ async def test_recommendation_path_expands_ranker_pool_and_caches_post_mmr(monke
         async def get_cached_candidate_products(self, user_id, cache_key):
             return None
 
+        async def cache_candidate_products(
+            self, user_id, cache_key, candidates, user_features=None
+        ):
+            return None
+
         def generate_context_hash(self, context):
             return hashlib.md5(json.dumps(context, sort_keys=True).encode()).hexdigest()
 
@@ -1297,6 +1302,178 @@ async def test_recommendation_path_expands_ranker_pool_and_caches_post_mmr(monke
     assert profile["slate_diversity_pool_size"] == 4
     assert profile["slate_diversity_selected_count"] == 2
     assert profile["slate_diversity_ms"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_recommendation_path_does_not_force_empty_interactions_when_swing_needs_them(
+    monkeypatch,
+):
+    recommendation_api_module._recommendation_singleflight.clear()
+    scheduled_tasks = []
+
+    class FakeFeatureStore:
+        async def get_user_serving_context(
+            self, user_id, sequence_limit=200, cache_default=False
+        ):
+            return UserFeatures(user_id=user_id), _default_user_sequence_token()
+
+        async def get_cached_recommendations(self, user_id, cache_key):
+            return None
+
+        async def get_cached_candidate_products(self, user_id, cache_key):
+            return None
+
+        async def cache_candidate_products(
+            self, user_id, cache_key, candidates, user_features=None
+        ):
+            return None
+
+        def generate_context_hash(self, context):
+            return hashlib.md5(json.dumps(context, sort_keys=True).encode()).hexdigest()
+
+        async def get_product_metadata_batch(self, product_ids):
+            return {
+                product_id: {
+                    "title": f"Product {product_id}",
+                    "price": 10.0,
+                    "active": True,
+                    "in_stock": True,
+                }
+                for product_id in product_ids
+            }
+
+        def prime_product_metadata_memory_cache(self, metadata):
+            return None
+
+        async def store_product_metadata_batch(self, metadata):
+            return None
+
+        async def cache_recommendations(
+            self, user_id, cache_key, recommendations, user_features=None
+        ):
+            return None
+
+        async def log_recommendation_request(self, user_id, count, response_time):
+            return None
+
+    class CapturingRecommendationEngine:
+        loaded_two_tower_version = "two-tower-test"
+        loaded_sasrec_version = None
+        cf_engine = SimpleNamespace(model_version="two-tower-test")
+        config = RecommendationConfig(enable_swing_itemcf=True)
+        swing_itemcf_engine = SimpleNamespace(is_trained=True)
+        sasrec_engine = SimpleNamespace(is_trained=False)
+
+        def __init__(self):
+            self.seen_user_interactions = "unset"
+
+        async def generate_candidates(
+            self,
+            user_id,
+            content_features=None,
+            context=None,
+            k_per_source=100,
+            include_profile=False,
+            user_features=None,
+            user_interactions=None,
+        ):
+            self.seen_user_interactions = user_interactions
+            return [
+                CandidateProduct(
+                    product_id="p1",
+                    combined_score=1.0,
+                    source="swing_itemcf",
+                )
+            ], {"path": "fake", "candidate_count": 1}
+
+        async def get_trending_recommendations(self, k):
+            return []
+
+    class FakeVectorSearch:
+        def get_catalog_version_context(self):
+            return {"catalog_version": 1, "last_updated": 1, "product_count": 1}
+
+        async def get_product_metadata_batch(self, product_ids):
+            return {}
+
+    class FakeRankingBatcher:
+        async def rank_candidates(
+            self,
+            candidates,
+            user_features,
+            context,
+            k,
+            product_metadata_map=None,
+            include_profile=False,
+            deadline_unix_seconds=None,
+        ):
+            return [_recommendation(candidates[0].product_id, 1.0)], {"path": "fake"}
+
+    class FakeObservability:
+        def record_recommendation(self, **kwargs):
+            return None
+
+    def schedule_task(task_name, awaitable, timeout_seconds=0.25):
+        scheduled_tasks.append(asyncio.create_task(awaitable))
+
+    engine = CapturingRecommendationEngine()
+    runtime = SimpleNamespace(
+        service_name="recommendation-service",
+        active_requests=0,
+        handled_requests=0,
+        max_active_requests=0,
+        observability=FakeObservability(),
+        config=SimpleNamespace(
+            recommendation_config=RecommendationConfig(),
+            cache_config=SimpleNamespace(
+                hot_path_read_timeout_ms=1000,
+                background_write_timeout_ms=1000,
+            ),
+            monitoring_config=SimpleNamespace(
+                enable_profiling_logs=True,
+                profiling_log_min_duration_ms=999999,
+            ),
+            model_config=SimpleNamespace(ranking_model_path=None),
+            vector_config=SimpleNamespace(index_path=None),
+        ),
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            worker_process_id=123,
+            worker_active_requests_at_entry=1,
+            worker_handled_requests=7,
+            request_started_at=time.perf_counter(),
+        )
+    )
+
+    monkeypatch.setattr(
+        recommendation_api_module.app.state, "runtime", runtime, raising=False
+    )
+    monkeypatch.setattr(recommendation_api_module, "feature_store", FakeFeatureStore())
+    monkeypatch.setattr(recommendation_api_module, "recommendation_engine", engine)
+    monkeypatch.setattr(recommendation_api_module, "vector_search", FakeVectorSearch())
+    monkeypatch.setattr(recommendation_api_module, "ranking_batcher", FakeRankingBatcher())
+    monkeypatch.setattr(
+        recommendation_api_module,
+        "ranking_model",
+        SimpleNamespace(model_version="ranking-test"),
+    )
+    monkeypatch.setattr(recommendation_api_module, "kafka_manager", None)
+    monkeypatch.setattr(
+        recommendation_api_module, "_schedule_best_effort_task", schedule_task
+    )
+
+    result = await recommendation_api_module.get_recommendations(
+        request,
+        Response(),
+        RecommendationRequest(user_id="u1", k=1),
+    )
+    if scheduled_tasks:
+        await asyncio.gather(*scheduled_tasks)
+    payload = json.loads(result.body)
+
+    assert engine.seen_user_interactions is None
+    assert payload["recommendations"][0]["product_id"] == "p1"
 
 
 @pytest.mark.asyncio
@@ -1718,8 +1895,10 @@ def test_catalog_version_context_uses_vector_search_catalog_token(monkeypatch):
 def test_serving_version_context_includes_sasrec_versions(monkeypatch, tmp_path):
     checkpoint = tmp_path / "sasrec.pt"
     vocab = tmp_path / "sasrec_vocab.json"
+    swing_index = tmp_path / "swing_itemcf.json.gz"
     checkpoint.write_bytes(b"checkpoint")
     vocab.write_text("{}", encoding="utf-8")
+    swing_index.write_bytes(b"swing")
 
     runtime = SimpleNamespace(
         config=SimpleNamespace(
@@ -1730,6 +1909,7 @@ def test_serving_version_context_includes_sasrec_versions(monkeypatch, tmp_path)
             recommendation_config=SimpleNamespace(
                 sasrec_checkpoint_path=str(checkpoint),
                 sasrec_vocab_path=str(vocab),
+                swing_itemcf_index_path=str(swing_index),
             ),
         )
     )
@@ -1740,7 +1920,9 @@ def test_serving_version_context_includes_sasrec_versions(monkeypatch, tmp_path)
         SimpleNamespace(
             loaded_two_tower_version="two-tower-1",
             loaded_sasrec_version="sasrec-1",
+            loaded_swing_itemcf_version="swing-1",
             cf_engine=SimpleNamespace(model_version="two-tower-1"),
+            swing_itemcf_engine=SimpleNamespace(model_version="swing-1"),
         ),
     )
     monkeypatch.setattr(
@@ -1765,6 +1947,8 @@ def test_serving_version_context_includes_sasrec_versions(monkeypatch, tmp_path)
     assert context["sasrec_model"] == "sasrec-1"
     assert context["sasrec_checkpoint_mtime"] is not None
     assert context["sasrec_vocab_mtime"] is not None
+    assert context["swing_itemcf_model"] == "swing-1"
+    assert context["swing_itemcf_index_mtime"] is not None
 
 
 def test_serving_version_context_reuses_cached_file_mtimes(monkeypatch, tmp_path):
@@ -1772,6 +1956,7 @@ def test_serving_version_context_reuses_cached_file_mtimes(monkeypatch, tmp_path
     vector_path = tmp_path / "vector.faiss"
     sasrec_path = tmp_path / "sasrec.pt"
     vocab_path = tmp_path / "sasrec_vocab.json"
+    swing_index_path = tmp_path / "swing_itemcf.json.gz"
     runtime = SimpleNamespace(
         config=SimpleNamespace(
             model_config=SimpleNamespace(ranking_model_path=str(ranking_path)),
@@ -1779,6 +1964,7 @@ def test_serving_version_context_reuses_cached_file_mtimes(monkeypatch, tmp_path
             recommendation_config=SimpleNamespace(
                 sasrec_checkpoint_path=str(sasrec_path),
                 sasrec_vocab_path=str(vocab_path),
+                swing_itemcf_index_path=str(swing_index_path),
             ),
         )
     )
@@ -1798,7 +1984,7 @@ def test_serving_version_context_reuses_cached_file_mtimes(monkeypatch, tmp_path
     second = _serving_version_context(runtime)
 
     assert first == second
-    assert calls["count"] == 4
+    assert calls["count"] == 5
 
 
 @pytest.mark.asyncio

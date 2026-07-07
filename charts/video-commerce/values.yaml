@@ -122,6 +122,7 @@ appConfig:
   modelCacheDir: /app/models
   vectorIndexPath: /app/models/vector_index.faiss
   recommendationCfIndexPath: /app/models/cf_vector_index.faiss
+  recommendationSwingItemcfIndexPath: /app/models/swing_itemcf.json.gz
   dataUploadDir: /app/uploads
   objectStorageDownloadDir: /tmp/object-storage
   dataMaxFileSize: "104857600"
@@ -162,6 +163,17 @@ appConfig:
     retrievalExecutorWorkers: 2
     servingRecentInteractionLimit: 0
     speechCategoryCandidatesEnabled: false
+    maxLiveSwingItemcfCandidates: 40
+    enableSwingItemcf: false
+    swingItemcfAlpha: 5.0
+    swingItemcfMaxNeighborsPerItem: 100
+    swingItemcfMaxSeedItems: 20
+    swingItemcfServingInteractionLimit: 200
+    swingItemcfTrainingMaxUsers: 10000
+    swingItemcfTrainingMaxEventsPerUser: 100
+    swingItemcfMaxItemsPerUser: 100
+    swingItemcfMaxUsersPerItem: 500
+    swingItemcfScoreWeight: 1.0
     impressionLoggingEnabled: true
     impressionMaxItems: 100
   ranking:
