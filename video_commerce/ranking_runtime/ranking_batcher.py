@@ -5,6 +5,7 @@ Micro-batching queue for recommendation ranking inference.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -211,7 +212,19 @@ def run_ranking_batch_payloads(
         return {"results": results, "stages": stages}
 
     inference_started = time.perf_counter()
-    predictions, inference_profile = ranking_model.run_inference_batch(feature_matrix)
+    value_bucket_ids: List[Optional[int]] = []
+    for item in prepared:
+        value_bucket_ids.extend(
+            _value_bucket_ids_for_candidates(
+                ranking_model,
+                item["valid_candidates"],
+            )
+        )
+    predictions, inference_profile = _run_inference_batch(
+        ranking_model,
+        feature_matrix,
+        value_bucket_ids=value_bucket_ids,
+    )
     stages["inference_total"] = time.perf_counter() - inference_started
     stages["tensor_prep"] = float(inference_profile.get("tensor_prep_ms", 0.0)) / 1000.0
     stages["model_forward"] = (
@@ -285,6 +298,32 @@ def run_ranking_batch_payloads(
     stages["response_build"] = time.perf_counter() - response_build_started
     stages["total_execution"] = time.perf_counter() - batch_execution_started
     return {"results": results, "stages": stages}
+
+
+def _value_bucket_ids_for_candidates(
+    ranking_model: RankingModel,
+    valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]],
+) -> List[Optional[int]]:
+    helper = getattr(ranking_model, "_value_bucket_ids_for_candidates", None)
+    if callable(helper):
+        return list(helper(valid_candidates))
+    return [None] * len(valid_candidates)
+
+
+def _run_inference_batch(
+    ranking_model: RankingModel,
+    feature_matrix: Any,
+    *,
+    value_bucket_ids: Optional[List[Optional[int]]] = None,
+):
+    run_inference = ranking_model.run_inference_batch
+    try:
+        signature = inspect.signature(run_inference)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None and "value_bucket_ids" in signature.parameters:
+        return run_inference(feature_matrix, value_bucket_ids=value_bucket_ids)
+    return run_inference(feature_matrix)
 
 
 def _run_ranking_process_batch(batch_payloads: Any) -> Dict[str, Any]:

@@ -15,7 +15,7 @@ import asyncio
 import hashlib
 import logging
 from collections import OrderedDict
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Sequence, Tuple
 import json
 import time
 from pathlib import Path
@@ -38,11 +38,20 @@ from video_commerce.ml.dcn import (
     RANKING_ARCHITECTURES,
     normalize_architecture,
 )
+from video_commerce.ml.ranking_history import (
+    RANKING_HISTORY_ACTIONS,
+    RANKING_HISTORY_CONTEXT_KEY,
+    build_training_history_contexts,
+    extract_ranking_history_feature_vector,
+    ranking_history_config_from_settings,
+)
 
 logger = logging.getLogger(__name__)
 
-RANKING_FEATURE_SCHEMA_VERSION = "ranking_v1_30"
+RANKING_FEATURE_SCHEMA_VERSION = "ranking_v2_00_history_embeddings"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
+RANKING_OBJECTIVE_VERSION = "business_v1"
+LEGACY_RANKING_OBJECTIVE_VERSION = "legacy_multi_objective"
 
 
 def _stable_hash_bucket(value: Any, buckets: int = 100) -> int:
@@ -218,9 +227,8 @@ class MultiObjectiveRankingModel(nn.Module):
         cvr_pred = torch.sigmoid(
             self._collapse_scalar_head(self.cvr_tower(shared_features))
         )
-        gmv_pred = torch.relu(
-            self._collapse_scalar_head(self.gmv_tower(shared_features))
-        )
+        ctcvr_pred = ctr_pred * cvr_pred
+        gmv_pred = self._collapse_scalar_head(self.gmv_tower(shared_features))
 
         # Combine for final ranking
         combined_features = torch.cat(
@@ -233,6 +241,7 @@ class MultiObjectiveRankingModel(nn.Module):
         return {
             "ctr": ctr_pred,
             "cvr": cvr_pred,
+            "ctcvr": ctcvr_pred,
             "gmv": gmv_pred,
             "ranking_score": ranking_score,
         }
@@ -254,17 +263,29 @@ class FeatureExtractor:
     )
     WINDOW_FEATURE_ENTITIES = ("user", "product", "category")
 
-    def __init__(self, enable_realtime_window_features: bool = False):
+    def __init__(
+        self,
+        enable_realtime_window_features: bool = False,
+        enable_history_embeddings: bool = False,
+        history_embedding_dim: int = 128,
+    ):
         self.user_scaler = StandardScaler()
         self.context_scaler = StandardScaler()
         self.is_fitted = False
         self.enable_realtime_window_features = enable_realtime_window_features
+        self.enable_history_embeddings = enable_history_embeddings
+        self.history_embedding_dim = max(1, int(history_embedding_dim or 128))
 
         # Feature dimensions
         self.user_feature_dim = 10
         self.product_feature_dim = 8
         self.context_feature_dim = 6
         self.candidate_feature_dim = 4
+        self.history_embedding_feature_dim = (
+            len(RANKING_HISTORY_ACTIONS) * (self.history_embedding_dim + 5)
+            if self.enable_history_embeddings
+            else 0
+        )
         self.realtime_window_feature_dim = (
             len(self.WINDOW_FEATURE_ENTITIES)
             * len(self.WINDOW_FEATURE_NAMES)
@@ -278,6 +299,7 @@ class FeatureExtractor:
             + self.product_feature_dim
             + self.context_feature_dim
             + self.candidate_feature_dim
+            + self.history_embedding_feature_dim
             + self.realtime_window_feature_dim
         )
 
@@ -436,6 +458,21 @@ class FeatureExtractor:
                 )
         return np.nan_to_num(np.asarray(values, dtype=np.float32), 0.0)
 
+    def extract_history_embedding_features(
+        self,
+        context: Dict[str, Any],
+        candidate: Any,
+    ) -> np.ndarray:
+        """Extract optional last-N two-tower history features."""
+        if not self.enable_history_embeddings:
+            return np.zeros(0, dtype=np.float32)
+        product_id = _candidate_get(candidate, "product_id", "")
+        return extract_ranking_history_feature_vector(
+            context.get(RANKING_HISTORY_CONTEXT_KEY),
+            product_id,
+            embedding_dim=self.history_embedding_dim,
+        )
+
     def create_ranking_features(
         self,
         user_features: UserFeatures,
@@ -453,6 +490,10 @@ class FeatureExtractor:
             )
             context_feats = self.extract_context_features(context, current_time)
             candidate_feats = self.extract_candidate_features(candidate)
+            history_embedding_feats = self.extract_history_embedding_features(
+                context,
+                candidate,
+            )
             realtime_window_feats = self.extract_realtime_window_features(
                 user_features,
                 product_metadata,
@@ -467,6 +508,7 @@ class FeatureExtractor:
                     product_feats,
                     context_feats,
                     candidate_feats,
+                    history_embedding_feats,
                     realtime_window_feats,
                 ]
             )
@@ -490,7 +532,9 @@ class RankingModel:
     def __init__(self, config: RankingConfig):
         self.config = config
         self.feature_extractor = FeatureExtractor(
-            enable_realtime_window_features=config.realtime_window_features_enabled
+            enable_realtime_window_features=config.realtime_window_features_enabled,
+            enable_history_embeddings=config.history_embeddings_enabled,
+            history_embedding_dim=config.history_embedding_dim,
         )
 
         # Model components
@@ -504,6 +548,9 @@ class RankingModel:
         self.last_training_time = 0
         self.feature_schema_version = RANKING_FEATURE_SCHEMA_VERSION
         self.training_data_source = RANKING_TRAINING_DATA_SOURCE
+        self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
+        self.value_transform_stats: Dict[str, Any] = self._default_value_transform_stats()
+        self.value_bucket_mapping: Dict[str, int] = {}
 
         # Performance tracking
         self.training_history = []
@@ -536,6 +583,17 @@ class RankingModel:
         self._product_feature_cache_lock = threading.RLock()
 
         logger.info(f"RankingModel initialized on device: {self.device}")
+
+    def _default_value_transform_stats(self) -> Dict[str, Any]:
+        return {
+            "global": {
+                "count": 0,
+                "clip": None,
+                "mean": 0.0,
+                "std": 1.0,
+            },
+            "buckets": {},
+        }
 
     def _initialize_model(
         self,
@@ -735,6 +793,27 @@ class RankingModel:
             )
         return checkpoint, {"architecture": "mlp"}, True
 
+    def _validate_checkpoint_feature_schema(
+        self,
+        checkpoint_config: Dict[str, Any],
+        *,
+        model_path: str,
+    ) -> None:
+        if not getattr(self.config, "history_embeddings_enabled", False):
+            return
+        expected_input_dim = self.feature_extractor.total_feature_dim
+        expected_schema = self.feature_schema_version
+        checkpoint_input_dim = checkpoint_config.get("input_dim")
+        checkpoint_schema = checkpoint_config.get("feature_schema_version")
+        if checkpoint_input_dim != expected_input_dim or checkpoint_schema != expected_schema:
+            raise RuntimeError(
+                "Ranking history embeddings require a freshly trained v2 checkpoint: "
+                f"path={model_path}, checkpoint_input_dim={checkpoint_input_dim}, "
+                f"expected_input_dim={expected_input_dim}, "
+                f"checkpoint_feature_schema_version={checkpoint_schema}, "
+                f"expected_feature_schema_version={expected_schema}"
+            )
+
     async def load_model(self, model_path: str = None):
         """Load or initialize the ranking model."""
         try:
@@ -750,6 +829,10 @@ class RankingModel:
                     checkpoint_config,
                     is_legacy_raw,
                 ) = self._checkpoint_state_and_config(checkpoint)
+                self._validate_checkpoint_feature_schema(
+                    checkpoint_config,
+                    model_path=str(checkpoint_path),
+                )
                 architecture = normalize_architecture(
                     checkpoint_config.get("architecture"),
                     default="mlp"
@@ -775,7 +858,25 @@ class RankingModel:
                 self.model = next_model
                 self.optimizer = next_optimizer
                 self.is_trained = True
+                self.ranking_objective_version = str(
+                    checkpoint_config.get(
+                        "ranking_objective_version",
+                        LEGACY_RANKING_OBJECTIVE_VERSION,
+                    )
+                )
+                self.value_transform_stats = dict(
+                    checkpoint_config.get("value_transform_stats")
+                    or self._default_value_transform_stats()
+                )
+                self.value_bucket_mapping = dict(
+                    checkpoint_config.get("value_bucket_mapping") or {}
+                )
                 self.loaded_checkpoint_mtime = checkpoint_path.stat().st_mtime
+            elif getattr(self.config, "history_embeddings_enabled", False):
+                raise RuntimeError(
+                    "Ranking history embeddings require an existing freshly trained "
+                    f"v2 checkpoint at {resolved_model_path}"
+                )
             else:
                 logger.info("Initializing new model")
                 next_model, next_optimizer = self._build_model_instance(
@@ -785,6 +886,9 @@ class RankingModel:
                 self.model = next_model
                 self.optimizer = next_optimizer
                 self.is_trained = False
+                self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
+                self.value_transform_stats = self._default_value_transform_stats()
+                self.value_bucket_mapping = {}
                 self.loaded_checkpoint_mtime = 0.0
 
             # Set to evaluation mode initially
@@ -870,12 +974,14 @@ class RankingModel:
         product_dim = self.feature_extractor.product_feature_dim
         context_dim = self.feature_extractor.context_feature_dim
         candidate_dim = self.feature_extractor.candidate_feature_dim
+        history_dim = self.feature_extractor.history_embedding_feature_dim
         realtime_dim = self.feature_extractor.realtime_window_feature_dim
         total_dim = self.feature_extractor.total_feature_dim
         product_start = user_dim
         context_start = product_start + product_dim
         candidate_start = context_start + context_dim
-        realtime_start = candidate_start + candidate_dim
+        history_start = candidate_start + candidate_dim
+        realtime_start = history_start + history_dim
         total_candidates = sum(
             len(request.get("candidates") or []) for request in requests
         )
@@ -905,6 +1011,7 @@ class RankingModel:
             )
             product_rows: List[np.ndarray] = []
             candidate_rows: List[Tuple[float, float, float, float]] = []
+            history_rows: List[np.ndarray] = []
             realtime_rows: List[np.ndarray] = []
 
             for candidate in candidates:
@@ -927,6 +1034,13 @@ class RankingModel:
                             _candidate_get(candidate, "combined_score") or 0.0,
                         )
                     )
+                    if history_dim:
+                        history_rows.append(
+                            self.feature_extractor.extract_history_embedding_features(
+                                context,
+                                candidate,
+                            )
+                        )
                     if realtime_dim:
                         realtime_rows.append(
                             self.feature_extractor.extract_realtime_window_features(
@@ -959,6 +1073,11 @@ class RankingModel:
                     row_start:row_end,
                     candidate_start : candidate_start + candidate_dim,
                 ] = np.asarray(candidate_rows, dtype=np.float32)
+                if history_dim:
+                    feature_matrix[
+                        row_start:row_end,
+                        history_start : history_start + history_dim,
+                    ] = np.asarray(history_rows, dtype=np.float32)
                 if realtime_dim:
                     feature_matrix[
                         row_start:row_end,
@@ -995,6 +1114,7 @@ class RankingModel:
     def run_inference_batch(
         self,
         feature_matrix: np.ndarray,
+        value_bucket_ids: Optional[Sequence[Optional[int]]] = None,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         """Run one Torch forward pass for a feature matrix."""
         model = self.model
@@ -1042,11 +1162,63 @@ class RankingModel:
             key: value.detach().cpu().numpy().reshape(-1)
             for key, value in predictions.items()
         }
+        self._add_business_predictions(
+            prediction_arrays,
+            value_bucket_ids=value_bucket_ids,
+        )
         return prediction_arrays, {
             "tensor_prep_ms": tensor_prep_ms,
             "model_forward_ms": model_forward_ms,
             "inference_path": inference_path,
         }
+
+    def _add_business_predictions(
+        self,
+        predictions: Dict[str, np.ndarray],
+        value_bucket_ids: Optional[Sequence[Optional[int]]] = None,
+    ) -> None:
+        if not getattr(self.config, "business_score_enabled", True):
+            return
+        raw_values = np.asarray(predictions.get("gmv", []), dtype=np.float64).reshape(-1)
+        if raw_values.size == 0:
+            return
+        bucket_ids: List[Optional[int]]
+        if value_bucket_ids is None:
+            bucket_ids = [None] * int(raw_values.size)
+        else:
+            bucket_ids = [
+                None if bucket_id is None else int(bucket_id)
+                for bucket_id in value_bucket_ids
+            ]
+            if len(bucket_ids) != raw_values.size:
+                logger.warning(
+                    "ranking_value_bucket_id_count_mismatch",
+                    extra={
+                        "bucket_id_count": len(bucket_ids),
+                        "prediction_count": int(raw_values.size),
+                    },
+                )
+                bucket_ids = [None] * int(raw_values.size)
+        predicted_values = np.asarray(
+            [
+                self._inverse_transform_business_value(value, bucket_id)
+                for value, bucket_id in zip(raw_values, bucket_ids)
+            ],
+            dtype=np.float32,
+        )
+        predictions["predicted_value"] = predicted_values
+        predictions["gmv"] = predicted_values
+        ctr = np.asarray(predictions.get("ctr", np.zeros_like(predicted_values))).reshape(
+            -1
+        )
+        cvr = np.asarray(predictions.get("cvr", np.zeros_like(predicted_values))).reshape(
+            -1
+        )
+        ctcvr = np.asarray(predictions.get("ctcvr", ctr * cvr)).reshape(-1)
+        predictions["ctcvr"] = np.clip(ctcvr, 0.0, 1.0).astype(np.float32)
+        predictions["business_score"] = (
+            predictions["ctcvr"] * predicted_values
+        ).astype(np.float32)
 
     def build_recommendations_from_predictions(
         self,
@@ -1060,7 +1232,13 @@ class RankingModel:
         if not valid_candidates or k <= 0:
             return [], round((time.perf_counter() - response_stage_started) * 1000, 2)
 
-        ranking_scores = np.asarray(predictions["ranking_score"]).reshape(-1)
+        score_key = (
+            "business_score"
+            if getattr(self.config, "business_score_enabled", True)
+            and "business_score" in predictions
+            else "ranking_score"
+        )
+        ranking_scores = np.asarray(predictions[score_key]).reshape(-1)
         top_count = min(k, len(valid_candidates), ranking_scores.shape[0])
         if top_count <= 0:
             return [], round((time.perf_counter() - response_stage_started) * 1000, 2)
@@ -1075,10 +1253,13 @@ class RankingModel:
             candidate, metadata = valid_candidates[int(i)]
             ctr_score = float(predictions["ctr"][i])
             cvr_score = float(predictions["cvr"][i])
-            gmv_score = float(predictions["gmv"][i])
+            gmv_source = predictions.get("predicted_value", predictions.get("gmv"))
+            gmv_score = float(gmv_source[i])
             ranking_score = float(ranking_scores[i])
 
-            if self.config.enable_multi_objective:
+            if getattr(self.config, "business_score_enabled", True):
+                confidence_score = max(0.0, min(ctr_score * cvr_score, 1.0))
+            elif self.config.enable_multi_objective:
                 confidence_score = (
                     ctr_score * self.config.ctr_weight
                     + cvr_score * self.config.cvr_weight
@@ -1307,7 +1488,10 @@ class RankingModel:
                     return [], profile
                 return []
 
-            predictions, inference_profile = self.run_inference_batch(feature_matrix)
+            predictions, inference_profile = self.run_inference_batch(
+                feature_matrix,
+                value_bucket_ids=self._value_bucket_ids_for_candidates(valid_candidates),
+            )
             profile["tensor_prep_ms"] = inference_profile["tensor_prep_ms"]
             profile["model_forward_ms"] = inference_profile["model_forward_ms"]
             profile["inference_path"] = inference_profile["inference_path"]
@@ -1438,6 +1622,9 @@ class RankingModel:
         *,
         user_features_map: Optional[Dict[str, Any]] = None,
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        item_embedding_map: Optional[Dict[str, Any]] = None,
+        two_tower_model_version: Optional[str] = None,
+        training_sample_source: str = "interaction_events",
     ):
         """Train the ranking model on user interaction data."""
         try:
@@ -1446,6 +1633,9 @@ class RankingModel:
                 training_data,
                 user_features_map or {},
                 product_metadata_map or {},
+                item_embedding_map or {},
+                two_tower_model_version,
+                training_sample_source,
             )
             if saved_model_path:
                 await self.save_model(saved_model_path)
@@ -1458,6 +1648,9 @@ class RankingModel:
         training_data: List[Dict[str, Any]],
         user_features_map: Optional[Dict[str, Any]] = None,
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        item_embedding_map: Optional[Dict[str, Any]] = None,
+        two_tower_model_version: Optional[str] = None,
+        training_sample_source: str = "interaction_events",
     ) -> Optional[str]:
         if len(training_data) < self.config.training_min_samples:
             logger.warning("Insufficient data for ranking model training")
@@ -1490,6 +1683,9 @@ class RankingModel:
             training_data,
             user_features_map=user_features_map,
             product_metadata_map=product_metadata_map,
+            item_embedding_map=item_embedding_map,
+            two_tower_model_version=two_tower_model_version,
+            training_sample_source=training_sample_source,
         )
 
         if features.size(0) == 0:
@@ -1503,13 +1699,10 @@ class RankingModel:
             epoch_loss = 0.0
             num_batches = 0
 
-            for i in range(0, features.size(0), self.config.batch_size):
-                batch_features = features[i : i + self.config.batch_size]
-                batch_labels = {
-                    key: value[i : i + self.config.batch_size]
-                    for key, value in labels.items()
-                }
-
+            for batch_features, batch_labels in self._iter_training_batches(
+                features,
+                labels,
+            ):
                 self.optimizer.zero_grad()
                 predictions = self.model(batch_features)
                 loss = self._compute_loss(predictions, batch_labels)
@@ -1532,11 +1725,77 @@ class RankingModel:
         self.model.eval()
         self.is_trained = True
         self.last_training_time = time.time()
+        self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
         self.model_version = f"ranking-{int(self.last_training_time)}"
         self._compile_model_for_inference()
 
         logger.info("Model training completed")
         return self.loaded_model_path
+
+    def _ltr_grouped_training_enabled(self) -> bool:
+        return bool(
+            (
+                getattr(self.config, "ltr_pairwise_enabled", False)
+                and getattr(self.config, "ltr_pairwise_weight", 0.0) > 0
+            )
+            or (
+                getattr(self.config, "ltr_listwise_enabled", False)
+                and getattr(self.config, "ltr_listwise_weight", 0.0) > 0
+            )
+        )
+
+    def _iter_training_batches(
+        self,
+        features: torch.Tensor,
+        labels: Dict[str, torch.Tensor],
+    ):
+        batch_size = max(1, int(getattr(self.config, "batch_size", 1) or 1))
+        row_count = int(features.size(0))
+        if row_count <= 0:
+            return
+
+        group_tensor = labels.get("pairwise_group")
+        if (
+            not self._ltr_grouped_training_enabled()
+            or group_tensor is None
+            or int(group_tensor.numel()) != row_count
+        ):
+            for i in range(0, row_count, batch_size):
+                yield features[i : i + batch_size], {
+                    key: value[i : i + batch_size] for key, value in labels.items()
+                }
+            return
+
+        grouped_indices: "OrderedDict[int, List[int]]" = OrderedDict()
+        for index, group_id in enumerate(group_tensor.detach().cpu().reshape(-1)):
+            grouped_indices.setdefault(int(group_id.item()), []).append(index)
+
+        pending_indices: List[int] = []
+        for indices in grouped_indices.values():
+            if pending_indices and len(pending_indices) + len(indices) > batch_size:
+                index_tensor = torch.tensor(
+                    pending_indices,
+                    dtype=torch.long,
+                    device=features.device,
+                )
+                yield features.index_select(0, index_tensor), {
+                    key: value.index_select(0, index_tensor)
+                    for key, value in labels.items()
+                }
+                pending_indices = []
+
+            pending_indices.extend(indices)
+
+        if pending_indices:
+            index_tensor = torch.tensor(
+                pending_indices,
+                dtype=torch.long,
+                device=features.device,
+            )
+            yield features.index_select(0, index_tensor), {
+                key: value.index_select(0, index_tensor)
+                for key, value in labels.items()
+            }
 
     def _prepare_training_data(
         self,
@@ -1544,20 +1803,41 @@ class RankingModel:
         *,
         user_features_map: Optional[Dict[str, Any]] = None,
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        item_embedding_map: Optional[Dict[str, Any]] = None,
+        two_tower_model_version: Optional[str] = None,
+        training_sample_source: str = "interaction_events",
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Prepare training data from interaction logs."""
         try:
             user_features_map = user_features_map or {}
             product_metadata_map = product_metadata_map or {}
+            item_embedding_map = item_embedding_map or {}
+            history_contexts: Dict[int, Dict[str, Any]] = {}
+            if getattr(self.config, "history_embeddings_enabled", False):
+                history_contexts = build_training_history_contexts(
+                    training_data,
+                    item_embedding_map,
+                    config=ranking_history_config_from_settings(self.config),
+                    two_tower_model_version=two_tower_model_version,
+                )
             features = []
             ctr_labels = []
             cvr_labels = []
-            gmv_labels = []
+            ctcvr_labels = []
+            cvr_masks = []
+            value_labels = []
+            business_value_labels = []
+            value_masks = []
+            value_bucket_ids = []
+            value_records: List[Dict[str, Any]] = []
             relevance_labels = []
             group_ids = []
+            listwise_group_ids = []
+            slate_sample_flags = []
             group_mapping: Dict[str, int] = {}
+            listwise_group_mapping: Dict[str, int] = {}
 
-            for sample in training_data:
+            for sample_index, sample in enumerate(training_data):
                 product_id = sample.get("product_id")
                 if not product_id:
                     continue
@@ -1567,6 +1847,9 @@ class RankingModel:
                     sample, product_metadata_map
                 )
                 context = dict(sample.get("context") or {})
+                history_context = history_contexts.get(sample_index)
+                if history_context is not None:
+                    context[RANKING_HISTORY_CONTEXT_KEY] = history_context
                 candidate = self._training_candidate(sample)
                 feature_vector = self.feature_extractor.create_ranking_features(
                     user_features,
@@ -1587,21 +1870,40 @@ class RankingModel:
                 features.append(feature_vector)
 
                 # Create labels based on interaction type
-                action = sample.get("action", "view")
+                action = str(sample.get("action", "view") or "view").lower()
+                context = dict(sample.get("context") or {})
+                is_clicked = self._training_clicked_label(sample, action)
+                is_purchase = action == "purchase" or bool(
+                    context.get("attributed_purchase")
+                )
 
                 # CTR label (clicked or not)
-                ctr_label = (
-                    1.0 if action in ["click", "purchase", "add_to_cart"] else 0.0
-                )
+                ctr_label = 1.0 if is_clicked else 0.0
                 ctr_labels.append(ctr_label)
 
-                # CVR label (converted or not)
-                cvr_label = 1.0 if action == "purchase" else 0.0
+                # CVR is conditional on click; unclicked rows are masked out.
+                cvr_label = 1.0 if is_purchase else 0.0
                 cvr_labels.append(cvr_label)
+                ctcvr_labels.append(1.0 if is_purchase else 0.0)
+                cvr_masks.append(1.0 if is_clicked else 0.0)
 
-                # GMV label (purchase value)
-                gmv_value = self._training_gmv_label(sample, product_metadata, action)
-                gmv_labels.append(gmv_value)
+                # Business value is purchase-conditional; non-purchase rows are masked out.
+                business_value = self._training_business_value_label(
+                    sample,
+                    product_metadata,
+                    action,
+                )
+                value_bucket = self._value_bucket_id(product_metadata)
+                business_value_labels.append(business_value)
+                value_masks.append(1.0 if is_purchase else 0.0)
+                value_bucket_ids.append(value_bucket)
+                if is_purchase:
+                    value_records.append(
+                        {
+                            "business_value": business_value,
+                            "value_bucket": value_bucket,
+                        }
+                    )
 
                 relevance_labels.append(
                     self._training_relevance_label(
@@ -1615,8 +1917,38 @@ class RankingModel:
                     group_mapping[group_key] = len(group_mapping)
                 group_ids.append(group_mapping[group_key])
 
+                impression_id = sample.get("impression_id") or context.get(
+                    "impression_id"
+                )
+                is_slate_sample = bool(
+                    training_sample_source == "recommendation_impressions"
+                    and impression_id
+                )
+                if is_slate_sample:
+                    listwise_group_key = f"impression:{impression_id}"
+                else:
+                    listwise_group_key = f"row:{len(listwise_group_ids)}"
+                if listwise_group_key not in listwise_group_mapping:
+                    listwise_group_mapping[listwise_group_key] = len(
+                        listwise_group_mapping
+                    )
+                listwise_group_ids.append(listwise_group_mapping[listwise_group_key])
+                slate_sample_flags.append(is_slate_sample)
+
             if not features:
                 return torch.empty(0), {}
+
+            self._fit_value_transform(value_records)
+            value_labels = [
+                self._transform_business_value(value, bucket_id)
+                if mask > 0.0
+                else 0.0
+                for value, bucket_id, mask in zip(
+                    business_value_labels,
+                    value_bucket_ids,
+                    value_masks,
+                )
+            ]
 
             features_tensor = torch.tensor(np.vstack(features), dtype=torch.float32).to(
                 self.device
@@ -1628,9 +1960,24 @@ class RankingModel:
                 "cvr": torch.tensor(cvr_labels, dtype=torch.float32)
                 .to(self.device)
                 .unsqueeze(1),
-                "gmv": torch.tensor(gmv_labels, dtype=torch.float32)
+                "ctcvr": torch.tensor(ctcvr_labels, dtype=torch.float32)
                 .to(self.device)
                 .unsqueeze(1),
+                "cvr_mask": torch.tensor(cvr_masks, dtype=torch.float32)
+                .to(self.device)
+                .unsqueeze(1),
+                "value": torch.tensor(value_labels, dtype=torch.float32)
+                .to(self.device)
+                .unsqueeze(1),
+                "business_value": torch.tensor(business_value_labels, dtype=torch.float32)
+                .to(self.device)
+                .unsqueeze(1),
+                "value_mask": torch.tensor(value_masks, dtype=torch.float32)
+                .to(self.device)
+                .unsqueeze(1),
+                "value_bucket": torch.tensor(value_bucket_ids, dtype=torch.long).to(
+                    self.device
+                ),
                 "ranking_relevance": torch.tensor(
                     relevance_labels, dtype=torch.float32
                 )
@@ -1639,7 +1986,14 @@ class RankingModel:
                 "pairwise_group": torch.tensor(group_ids, dtype=torch.long).to(
                     self.device
                 ),
+                "ltr_group": torch.tensor(listwise_group_ids, dtype=torch.long).to(
+                    self.device
+                ),
+                "ltr_is_slate_sample": torch.tensor(
+                    slate_sample_flags, dtype=torch.bool
+                ).to(self.device),
             }
+            labels["gmv"] = labels["value"]
 
             return features_tensor, labels
 
@@ -1760,22 +2114,161 @@ class RankingModel:
         product_metadata: Dict[str, Any],
         action: str,
     ) -> float:
-        if action != "purchase":
-            return 0.0
+        return self._training_business_value_label(sample, product_metadata, action)
+
+    def _training_clicked_label(self, sample: Dict[str, Any], action: str) -> bool:
         context = sample.get("context") or {}
-        return max(
-            0.0,
-            self._first_float(
-                sample.get("value"),
-                sample.get("gmv"),
-                sample.get("purchase_value"),
-                context.get("value"),
-                context.get("gmv"),
-                context.get("purchase_value"),
-                product_metadata.get("price"),
-                default=0.0,
-            ),
+        if bool(context.get("attributed_click")) or bool(
+            context.get("attributed_purchase")
+        ):
+            return True
+        return str(action or "").lower() in {"click", "add_to_cart", "purchase"}
+
+    def _training_business_value_label(
+        self,
+        sample: Dict[str, Any],
+        product_metadata: Dict[str, Any],
+        action: str,
+    ) -> float:
+        context = sample.get("context") or {}
+        if action != "purchase" and not bool(context.get("attributed_purchase")):
+            return 0.0
+
+        label_keys = list(
+            getattr(
+                self.config,
+                "value_label_preference",
+                ["margin", "profit", "gross_margin", "value", "gmv", "purchase_value", "price"],
+            )
+            or []
         )
+        for key in label_keys:
+            value = self._optional_float(
+                sample.get(key),
+                context.get(key),
+                product_metadata.get(key),
+            )
+            if value is not None:
+                return max(0.0, float(value))
+        return 0.0
+
+    def _value_bucket_ids_for_candidates(
+        self,
+        valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]],
+    ) -> List[Optional[int]]:
+        return [
+            self._value_bucket_id(product_metadata, create=False)
+            for _, product_metadata in valid_candidates
+        ]
+
+    def _value_bucket_id(
+        self,
+        product_metadata: Dict[str, Any],
+        *,
+        create: bool = True,
+    ) -> Optional[int]:
+        key = self._value_bucket_key(product_metadata)
+        bucket_id = self.value_bucket_mapping.get(key)
+        if bucket_id is None and create:
+            bucket_id = len(self.value_bucket_mapping)
+            self.value_bucket_mapping[key] = bucket_id
+        return bucket_id
+
+    def _value_bucket_key(self, product_metadata: Dict[str, Any]) -> str:
+        category = str(product_metadata.get("category") or "General").strip().lower()
+        price = self._first_float(product_metadata.get("price"), default=0.0)
+        thresholds = sorted(
+            float(value)
+            for value in getattr(self.config, "value_price_buckets", [50.0, 200.0])
+        )
+        price_bucket = 0
+        for threshold in thresholds:
+            if price >= threshold:
+                price_bucket += 1
+        return f"{category}:{price_bucket}"
+
+    def _fit_value_transform(self, records: List[Dict[str, Any]]) -> None:
+        if not records:
+            self.value_transform_stats = self._default_value_transform_stats()
+            return
+
+        by_bucket: Dict[int, List[float]] = {}
+        all_values: List[float] = []
+        for record in records:
+            value = max(0.0, self._first_float(record.get("business_value"), default=0.0))
+            bucket_id = int(record.get("value_bucket", -1))
+            all_values.append(value)
+            by_bucket.setdefault(bucket_id, []).append(value)
+
+        stats = {
+            "global": self._compute_value_stats(all_values),
+            "buckets": {},
+        }
+        min_bucket_purchases = max(
+            1,
+            int(getattr(self.config, "value_min_bucket_purchases", 20) or 20),
+        )
+        for bucket_id, values in by_bucket.items():
+            if len(values) >= min_bucket_purchases:
+                stats["buckets"][str(bucket_id)] = self._compute_value_stats(values)
+        self.value_transform_stats = stats
+
+    def _compute_value_stats(self, values: List[float]) -> Dict[str, Any]:
+        if not values:
+            return self._default_value_transform_stats()["global"]
+        raw = np.asarray([max(0.0, float(value)) for value in values], dtype=np.float64)
+        quantile = float(getattr(self.config, "value_clip_quantile", 0.99) or 0.99)
+        clip = float(np.quantile(raw, quantile)) if raw.size else 0.0
+        if not np.isfinite(clip) or clip <= 0.0:
+            clip = float(np.max(raw)) if raw.size else 0.0
+        clipped = np.minimum(raw, clip)
+        logged = np.log1p(clipped)
+        mean = float(np.mean(logged)) if logged.size else 0.0
+        std = float(np.std(logged)) if logged.size else 1.0
+        if not np.isfinite(std) or std < 1e-6:
+            std = 1.0
+        return {
+            "count": int(raw.size),
+            "clip": clip,
+            "mean": mean,
+            "std": std,
+        }
+
+    def _stats_for_value_bucket(self, bucket_id: Optional[int] = None) -> Dict[str, Any]:
+        stats = self.value_transform_stats or self._default_value_transform_stats()
+        if bucket_id is not None:
+            bucket_stats = (stats.get("buckets") or {}).get(str(int(bucket_id)))
+            if bucket_stats:
+                return bucket_stats
+        return stats.get("global") or self._default_value_transform_stats()["global"]
+
+    def _transform_business_value(self, value: float, bucket_id: Optional[int]) -> float:
+        stats = self._stats_for_value_bucket(bucket_id)
+        clip = stats.get("clip")
+        raw = max(0.0, float(value))
+        if clip is not None:
+            raw = min(raw, max(0.0, float(clip)))
+        logged = float(np.log1p(raw))
+        return (logged - float(stats.get("mean", 0.0))) / float(
+            stats.get("std", 1.0) or 1.0
+        )
+
+    def _inverse_transform_business_value(
+        self,
+        normalized_value: float,
+        bucket_id: Optional[int] = None,
+    ) -> float:
+        stats = self._stats_for_value_bucket(bucket_id)
+        if int(stats.get("count", 0) or 0) <= 0:
+            return max(0.0, float(normalized_value))
+        logged = float(normalized_value) * float(stats.get("std", 1.0) or 1.0) + float(
+            stats.get("mean", 0.0)
+        )
+        value = max(0.0, float(np.expm1(logged)))
+        clip = stats.get("clip")
+        if clip is not None:
+            value = min(value, max(0.0, float(clip)))
+        return value
 
     def _training_relevance_label(
         self,
@@ -1852,16 +2345,36 @@ class RankingModel:
             # CTR loss (binary cross-entropy)
             ctr_loss = nn.BCELoss()(predictions["ctr"], labels["ctr"])
 
-            # CVR loss (binary cross-entropy)
-            cvr_loss = nn.BCELoss()(predictions["cvr"], labels["cvr"])
+            # CVR loss is conditional on click; unclicked rows do not contribute.
+            cvr_loss = self._masked_binary_cross_entropy(
+                predictions["cvr"],
+                labels["cvr"],
+                labels.get("cvr_mask"),
+            )
+            ctcvr_predictions = predictions.get(
+                "ctcvr",
+                predictions["ctr"] * predictions["cvr"],
+            )
+            ctcvr_targets = labels.get("ctcvr", labels["cvr"])
+            ctcvr_loss = self._binary_cross_entropy_with_pos_weight(
+                ctcvr_predictions,
+                ctcvr_targets,
+                getattr(self.config, "ctcvr_pos_weight", None),
+            )
 
-            # GMV loss (MSE)
-            gmv_loss = nn.MSELoss()(predictions["gmv"], labels["gmv"])
+            # Value loss is purchase-conditional on normalized business value.
+            gmv_loss = self._masked_value_loss(
+                predictions["gmv"],
+                labels.get("value", labels.get("gmv")),
+                labels.get("value_mask"),
+            )
 
             # Combined loss with weights
             total_loss = (
                 self.config.ctr_weight * ctr_loss
-                + self.config.cvr_weight * cvr_loss
+                + float(getattr(self.config, "direct_cvr_weight", self.config.cvr_weight))
+                * cvr_loss
+                + float(getattr(self.config, "ctcvr_weight", 0.0)) * ctcvr_loss
                 + self.config.gmv_weight * gmv_loss
             )
 
@@ -1880,11 +2393,150 @@ class RankingModel:
                     * pairwise_loss
                 )
 
+            if (
+                getattr(self.config, "ltr_listwise_enabled", False)
+                and getattr(self.config, "ltr_listwise_weight", 0.0) > 0
+            ):
+                listwise_loss = self._compute_listwise_ltr_loss(
+                    predictions["ranking_score"],
+                    labels.get("ranking_relevance"),
+                    labels.get("ltr_group"),
+                    labels.get("ltr_is_slate_sample"),
+                )
+                total_loss = (
+                    total_loss
+                    + float(getattr(self.config, "ltr_listwise_weight", 0.0))
+                    * listwise_loss
+                )
+
             return total_loss
 
         except Exception as e:
             logger.error(f"Error computing loss: {e}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    def _binary_cross_entropy_with_pos_weight(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        pos_weight: Optional[float],
+    ) -> torch.Tensor:
+        losses = torch.nn.functional.binary_cross_entropy(
+            predictions,
+            targets,
+            reduction="none",
+        )
+        if pos_weight is not None:
+            weight = torch.where(
+                targets > 0.0,
+                torch.as_tensor(float(pos_weight), device=losses.device, dtype=losses.dtype),
+                torch.ones((), device=losses.device, dtype=losses.dtype),
+            )
+            losses = losses * weight
+        return losses.mean()
+
+    def _masked_binary_cross_entropy(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        losses = torch.nn.functional.binary_cross_entropy(
+            predictions,
+            targets,
+            reduction="none",
+        )
+        if mask is None:
+            return losses.mean()
+        mask = mask.to(device=losses.device, dtype=losses.dtype)
+        denominator = mask.sum()
+        if float(denominator.detach().cpu().item()) <= 0.0:
+            return losses.sum() * 0.0
+        return (losses * mask).sum() / denominator
+
+    def _masked_value_loss(
+        self,
+        predictions: torch.Tensor,
+        targets: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if targets is None:
+            return predictions.sum() * 0.0
+        value_loss = str(getattr(self.config, "value_loss", "huber") or "huber").lower()
+        if value_loss == "mse":
+            losses = torch.nn.functional.mse_loss(
+                predictions,
+                targets,
+                reduction="none",
+            )
+        else:
+            losses = torch.nn.functional.smooth_l1_loss(
+                predictions,
+                targets,
+                reduction="none",
+            )
+        if mask is None:
+            return losses.mean()
+        mask = mask.to(device=losses.device, dtype=losses.dtype)
+        denominator = mask.sum()
+        if float(denominator.detach().cpu().item()) <= 0.0:
+            return losses.sum() * 0.0
+        return (losses * mask).sum() / denominator
+
+    def _compute_listwise_ltr_loss(
+        self,
+        ranking_scores: torch.Tensor,
+        relevance: Optional[torch.Tensor],
+        group_ids: Optional[torch.Tensor],
+        slate_sample_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute ListNet softmax cross-entropy over complete impression slates."""
+        scores = ranking_scores.reshape(-1)
+        if (
+            relevance is None
+            or group_ids is None
+            or slate_sample_mask is None
+            or scores.numel() < 2
+        ):
+            return scores.sum() * 0.0
+
+        relevance = relevance.reshape(-1)
+        group_ids = group_ids.reshape(-1)
+        slate_sample_mask = slate_sample_mask.reshape(-1).bool()
+        if (
+            relevance.numel() != scores.numel()
+            or group_ids.numel() != scores.numel()
+            or slate_sample_mask.numel() != scores.numel()
+        ):
+            return scores.sum() * 0.0
+
+        min_group_size = int(
+            max(2, getattr(self.config, "ltr_listwise_min_group_size", 2) or 2)
+        )
+        min_gap = float(max(0.0, getattr(self.config, "ltr_min_relevance_gap", 0.0)))
+        losses: List[torch.Tensor] = []
+        candidate_group_ids = torch.unique(group_ids[slate_sample_mask], sorted=True)
+        for group_id in candidate_group_ids:
+            group_mask = (group_ids == group_id) & slate_sample_mask
+            if int(group_mask.sum().item()) < min_group_size:
+                continue
+
+            group_relevance = relevance[group_mask]
+            relevance_gap = group_relevance.max() - group_relevance.min()
+            if float(relevance_gap.item()) < min_gap:
+                continue
+
+            group_scores = scores[group_mask]
+            pred_log_probs = torch.nn.functional.log_softmax(group_scores, dim=0)
+            target_probs = torch.nn.functional.softmax(
+                group_relevance,
+                dim=0,
+            ).detach()
+            losses.append(-(target_probs * pred_log_probs).sum())
+
+        if not losses:
+            return scores.sum() * 0.0
+        return torch.stack(losses).mean()
 
     def _compute_pairwise_ltr_loss(
         self,
@@ -1985,6 +2637,9 @@ class RankingModel:
                         "hidden_dims": self.model.hidden_dims,
                         "input_dim": self.feature_extractor.total_feature_dim,
                         "feature_schema_version": self.feature_schema_version,
+                        "ranking_objective_version": self.ranking_objective_version,
+                        "value_transform_stats": self.value_transform_stats,
+                        "value_bucket_mapping": self.value_bucket_mapping,
                     },
                 }
                 torch.save(checkpoint, model_path)

@@ -7,11 +7,21 @@ import pytest
 import torch
 
 from video_commerce.common.config import RankingConfig
-from video_commerce.ml.dcn import DeepAndCrossNetwork, LowRankCrossLayer
 from video_commerce.common.models import CandidateProduct, UserFeatures
+from video_commerce.ml.dcn import DeepAndCrossNetwork, LowRankCrossLayer
 from video_commerce.ml.ranking import MultiObjectiveRankingModel, RankingModel
-from video_commerce.ranking_runtime.ranking_batcher import RankingBatcher
 from video_commerce.ml.two_tower import ItemFeatureEncoder, TwoTowerModel, TwoTowerTrainer
+from video_commerce.ranking_runtime.ranking_batcher import RankingBatcher
+
+RANKING_PREDICTION_KEYS = {
+    "ctr",
+    "cvr",
+    "ctcvr",
+    "gmv",
+    "ranking_score",
+    "predicted_value",
+    "business_score",
+}
 
 
 def test_deep_and_cross_network_outputs_finite_expected_shape():
@@ -377,7 +387,7 @@ async def test_ranking_dcn_direct_and_microbatch_inference_outputs_shapes():
 
     predictions, _ = ranking.run_inference_batch(feature_matrix)
 
-    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+    assert set(predictions) == RANKING_PREDICTION_KEYS
     assert all(values.shape == (4,) for values in predictions.values())
 
     user_features = UserFeatures(user_id="u1")
@@ -464,7 +474,7 @@ async def test_ranking_torch_compile_disabled_uses_eager_inference(monkeypatch):
     assert status["torch_compile_last_fallback_error"] is None
     assert status["torch_compile_last_inference_path"] == "eager"
     assert profile["inference_path"] == "eager"
-    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+    assert set(predictions) == RANKING_PREDICTION_KEYS
 
 
 @pytest.mark.asyncio
@@ -529,7 +539,7 @@ async def test_ranking_torch_compile_enabled_uses_compiled_wrapper(monkeypatch):
     assert health["torch_compile_warmup_ms"] == stats["torch_compile_warmup_ms"]
     assert health["torch_compile_fallback_count"] == 0
     assert profile["inference_path"] == "compiled"
-    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+    assert set(predictions) == RANKING_PREDICTION_KEYS
 
 
 @pytest.mark.asyncio
@@ -561,7 +571,7 @@ async def test_ranking_torch_compile_failure_falls_back_to_eager(monkeypatch):
     assert status["torch_compile_last_fallback_error"] is None
     assert status["torch_compile_last_inference_path"] == "eager"
     assert profile["inference_path"] == "eager"
-    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+    assert set(predictions) == RANKING_PREDICTION_KEYS
 
 
 @pytest.mark.asyncio
@@ -607,7 +617,7 @@ async def test_ranking_torch_compile_inference_failure_records_fallback(monkeypa
     assert "compiled inference failed" in status["torch_compile_error"]
     assert "compiled inference failed" in status["torch_compile_last_fallback_error"]
     assert status["torch_compile_last_inference_path"] == "eager"
-    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+    assert set(predictions) == RANKING_PREDICTION_KEYS
 
 
 @pytest.mark.asyncio
@@ -718,7 +728,7 @@ async def test_ranking_dcn_v2_low_rank_trains_and_infers_with_batch_size_one():
     assert ranking.is_trained
     assert ranking.model is not None
     assert ranking.model.architecture == "dcn_v2_low_rank"
-    assert set(predictions) == {"ctr", "cvr", "gmv", "ranking_score"}
+    assert set(predictions) == RANKING_PREDICTION_KEYS
     assert all(values.shape == (4,) for values in predictions.values())
 
     user_features = UserFeatures(

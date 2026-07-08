@@ -198,9 +198,25 @@ class RecommendationConfig(BaseSettings):
         150,
         description="Number of products to precompute per category pool",
     )
+    enable_content_cluster_pools: bool = Field(
+        False,
+        description="Enable content-embedding cluster candidate pools",
+    )
+    content_cluster_count: int = Field(
+        128,
+        description="Number of product content clusters to build offline",
+    )
+    serving_cluster_pool_size: int = Field(
+        150,
+        description="Number of products to precompute per content cluster pool",
+    )
     preferred_category_pool_count: int = Field(
         2,
         description="Maximum preferred categories to pull from serving pools per request",
+    )
+    preferred_cluster_pool_count: int = Field(
+        2,
+        description="Maximum content clusters to pull from serving pools per request",
     )
     max_live_cf_candidates: int = Field(
         40,
@@ -229,6 +245,10 @@ class RecommendationConfig(BaseSettings):
     max_pool_category_candidates: int = Field(
         30,
         description="Maximum precomputed category-pool candidates to merge per request",
+    )
+    max_pool_cluster_candidates: int = Field(
+        30,
+        description="Maximum precomputed content-cluster candidates to merge per request",
     )
     max_random_candidates: int = Field(
         10,
@@ -467,6 +487,12 @@ class RecommendationConfig(BaseSettings):
     cf_index_path: str = Field(
         "/tmp/cf_vector_index.faiss", description="CF FAISS index file path"
     )
+    content_cluster_metadata_path: Optional[str] = Field(
+        None, description="Content cluster metadata JSON local path"
+    )
+    content_cluster_centroids_path: Optional[str] = Field(
+        None, description="Content cluster centroid NPZ local path"
+    )
 
     # SASRec sequential retrieval
     enable_sasrec: bool = Field(
@@ -546,6 +572,16 @@ class RecommendationConfig(BaseSettings):
         return normalized
 
     @validator(
+        "content_cluster_count",
+        "serving_cluster_pool_size",
+        "preferred_cluster_pool_count",
+    )
+    def validate_content_cluster_positive_ints(cls, value: int, field) -> int:
+        if value <= 0:
+            raise ValueError(f"{field.name} must be > 0")
+        return value
+
+    @validator(
         "cf_cold_start_neighbors",
         "cf_cold_start_min_valid_neighbors",
         "cf_cold_start_max_items",
@@ -560,6 +596,12 @@ class RecommendationConfig(BaseSettings):
     def validate_max_new_item_candidates(cls, value: int) -> int:
         if value < 0:
             raise ValueError("max_new_item_candidates must be >= 0")
+        return value
+
+    @validator("max_pool_cluster_candidates")
+    def validate_max_pool_cluster_candidates(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_pool_cluster_candidates must be >= 0")
         return value
 
     @validator("serving_recent_interaction_limit")
@@ -741,6 +783,38 @@ class RankingConfig(BaseSettings):
         False,
         description="Include Flink realtime window features in ranking feature vectors",
     )
+    history_embeddings_enabled: bool = Field(
+        False,
+        description="Include separate click/cart/purchase last-N two-tower history embeddings in ranking features",
+    )
+    history_click_last_n: int = Field(
+        20,
+        description="Number of recent click item embeddings averaged for ranking history features",
+    )
+    history_cart_last_n: int = Field(
+        20,
+        description="Number of recent add-to-cart item embeddings averaged for ranking history features",
+    )
+    history_purchase_last_n: int = Field(
+        20,
+        description="Number of recent purchase item embeddings averaged for ranking history features",
+    )
+    history_embedding_dim: int = Field(
+        128,
+        description="Two-tower item embedding dimension used by ranking history features",
+    )
+    history_click_scale: float = Field(
+        1.0,
+        description="Scale applied to click last-N ranking history vectors",
+    )
+    history_cart_scale: float = Field(
+        1.25,
+        description="Scale applied to cart last-N ranking history vectors",
+    )
+    history_purchase_scale: float = Field(
+        1.75,
+        description="Scale applied to purchase last-N ranking history vectors",
+    )
     max_queue_wait_ms: float = Field(
         150.0,
         description="Maximum time a ranking request may wait in the queue before failing fast",
@@ -776,7 +850,49 @@ class RankingConfig(BaseSettings):
     )
     ctr_weight: float = Field(1.0, description="Click-through rate weight")
     cvr_weight: float = Field(2.0, description="Conversion rate weight")
+    direct_cvr_weight: float = Field(
+        1.0,
+        description="Auxiliary clicked-row CVR loss weight for pCVR_given_click",
+    )
+    ctcvr_weight: float = Field(
+        1.0,
+        description="ESMM-style all-impression CTCVR loss weight",
+    )
+    ctcvr_pos_weight: Optional[float] = Field(
+        None,
+        description="Optional positive-class multiplier for sparse CTCVR labels",
+    )
     gmv_weight: float = Field(3.0, description="GMV optimization weight")
+    business_score_enabled: bool = Field(
+        True,
+        description=(
+            "Rank with pCTR * pCVR_given_click * predicted business value instead "
+            "of the free-form ranking tower score"
+        ),
+    )
+    value_loss: str = Field(
+        "huber",
+        description="Loss for purchase-conditional value prediction: huber or mse",
+    )
+    value_clip_quantile: float = Field(
+        0.99,
+        description="Quantile used to winsorize purchase business-value labels",
+    )
+    value_min_bucket_purchases: int = Field(
+        20,
+        description=(
+            "Minimum purchase labels required before category/price-bucket value "
+            "normalization uses bucket-specific statistics"
+        ),
+    )
+    value_price_buckets: List[float] = Field(
+        [50.0, 200.0],
+        description="Price thresholds used for business-value normalization buckets",
+    )
+    value_label_preference: List[str] = Field(
+        ["margin", "profit", "gross_margin", "value", "gmv", "purchase_value", "price"],
+        description="Ordered fields used to choose the purchase business-value label",
+    )
     ltr_pairwise_enabled: bool = Field(
         False,
         description=(
@@ -798,6 +914,21 @@ class RankingConfig(BaseSettings):
     ltr_min_relevance_gap: float = Field(
         0.5,
         description="Minimum relevance-label gap required to form a pairwise LTR pair",
+    )
+    ltr_listwise_enabled: bool = Field(
+        True,
+        description=(
+            "Enable ListNet-style listwise learning-to-rank loss during offline "
+            "ranking training"
+        ),
+    )
+    ltr_listwise_weight: float = Field(
+        0.1,
+        description="Weight applied to listwise LTR loss when enabled",
+    )
+    ltr_listwise_min_group_size: int = Field(
+        2,
+        description="Minimum impression slate size required for listwise LTR loss",
     )
 
     # Training settings
@@ -824,6 +955,28 @@ class RankingConfig(BaseSettings):
             raise ValueError("architecture must be one of: dcn, dcn_v2_low_rank, mlp")
         return normalized
 
+    @validator("value_loss")
+    def validate_value_loss(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"huber", "mse"}:
+            raise ValueError("value_loss must be one of: huber, mse")
+        return normalized
+
+    @validator("ctcvr_pos_weight", pre=True)
+    def validate_ctcvr_pos_weight(cls, value: Optional[float]) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        parsed = float(value)
+        if parsed <= 0:
+            raise ValueError("ctcvr_pos_weight must be greater than 0 when set")
+        return parsed
+
+    @validator("value_clip_quantile")
+    def validate_value_clip_quantile(cls, value: float) -> float:
+        if not 0.0 < float(value) <= 1.0:
+            raise ValueError("value_clip_quantile must be in (0, 1]")
+        return float(value)
+
     @validator("cross_layers")
     def validate_cross_layers(cls, value: int) -> int:
         if value < 0:
@@ -836,7 +989,7 @@ class RankingConfig(BaseSettings):
             raise ValueError("low_rank_dim must be >= 1")
         return value
 
-    @validator("ltr_pairwise_weight", "ltr_min_relevance_gap")
+    @validator("ltr_pairwise_weight", "ltr_min_relevance_gap", "ltr_listwise_weight")
     def validate_ltr_non_negative_float(cls, value: float) -> float:
         if value < 0:
             raise ValueError("LTR float settings must be >= 0")
@@ -846,6 +999,38 @@ class RankingConfig(BaseSettings):
     def validate_ltr_max_pairs_per_group(cls, value: int) -> int:
         if value < 0:
             raise ValueError("ltr_max_pairs_per_group must be >= 0")
+        return value
+
+    @validator("ltr_listwise_min_group_size")
+    def validate_ltr_listwise_min_group_size(cls, value: int) -> int:
+        if value < 2:
+            raise ValueError("ltr_listwise_min_group_size must be >= 2")
+        return value
+
+    @validator(
+        "history_click_last_n",
+        "history_cart_last_n",
+        "history_purchase_last_n",
+    )
+    def validate_history_last_n(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("ranking history last-N settings must be >= 0")
+        return value
+
+    @validator("history_embedding_dim")
+    def validate_history_embedding_dim(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("history_embedding_dim must be >= 1")
+        return value
+
+    @validator(
+        "history_click_scale",
+        "history_cart_scale",
+        "history_purchase_scale",
+    )
+    def validate_history_scales(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("ranking history scales must be >= 0")
         return value
 
     @validator("runner_payload_max_bytes")

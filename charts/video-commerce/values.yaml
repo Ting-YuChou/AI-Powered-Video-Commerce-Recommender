@@ -190,16 +190,36 @@ appConfig:
     maxQueueWaitMs: 150
     productFeatureCacheSize: 50000
     realtimeWindowFeaturesEnabled: false
+    historyEmbeddingsEnabled: false
+    historyClickLastN: 20
+    historyCartLastN: 20
+    historyPurchaseLastN: 20
+    historyEmbeddingDim: 128
+    historyClickScale: 1.0
+    historyCartScale: 1.25
+    historyPurchaseScale: 1.75
     runnerPayloadV2Enabled: true
     runnerPayloadMaxBytes: "33554432"
     torchCompileEnabled: false
     torchCompileBackend: inductor
     torchCompileMode: default
     torchCompileDynamic: true
+    directCvrWeight: 1.0
+    ctcvrWeight: 1.0
+    ctcvrPosWeight: ""
+    businessScoreEnabled: true
+    valueLoss: huber
+    valueClipQuantile: 0.99
+    valueMinBucketPurchases: 20
+    valuePriceBuckets: "[50.0,200.0]"
+    valueLabelPreference: '["margin","profit","gross_margin","value","gmv","purchase_value","price"]'
     ltrPairwiseEnabled: false
     ltrPairwiseWeight: 0.1
     ltrMaxPairsPerGroup: 2048
     ltrMinRelevanceGap: 0.5
+    ltrListwiseEnabled: true
+    ltrListwiseWeight: 0.1
+    ltrListwiseMinGroupSize: 2
   cache:
     candidateCacheRaceTimeoutMs: 5
     recommendationCacheRaceTimeoutMs: 5

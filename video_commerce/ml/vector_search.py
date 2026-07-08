@@ -22,6 +22,11 @@ import threading
 # Local imports
 from video_commerce.common.models import ProductData, CandidateProduct
 from video_commerce.common.config import VectorConfig
+from video_commerce.ml.content_clusters import (
+    ContentClusterArtifact,
+    assign_embedding_to_clusters,
+    load_content_cluster_artifact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +52,10 @@ class VectorSearchEngine:
         self.product_index_map: Dict[int, str] = {}  # FAISS index -> product_id
         self.product_embeddings: Dict[str, np.ndarray] = {}  # product_id -> embedding
         self.product_metadata: Dict[str, Dict[str, Any]] = {}  # product_id -> metadata
+        self.content_cluster_model_version: Optional[str] = None
+        self.content_cluster_assignments: Dict[str, int] = {}
+        self.content_cluster_centroids: Optional[np.ndarray] = None
+        self.content_cluster_metadata: Dict[str, Any] = {}
         
         # Index management
         self.index_lock = threading.RLock()
@@ -421,6 +430,121 @@ class VectorSearchEngine:
             "last_updated": int(self.last_updated or 0),
             "product_count": len(self.product_metadata),
         }
+
+    def load_content_cluster_artifact(
+        self,
+        *,
+        metadata_path: str,
+        centroids_path: Optional[str] = None,
+    ) -> bool:
+        """Load a product content-cluster artifact for candidate-pool serving."""
+        try:
+            artifact = load_content_cluster_artifact(
+                metadata_path=metadata_path,
+                centroids_path=centroids_path,
+            )
+            self.apply_content_cluster_artifact(artifact)
+            logger.info(
+                "Loaded content cluster artifact %s with %s assignments",
+                artifact.cluster_model_version,
+                len(artifact.product_cluster_map),
+            )
+            return True
+        except FileNotFoundError:
+            logger.info("Content cluster artifact not found at %s", metadata_path)
+            self.clear_content_cluster_artifact()
+            return False
+        except Exception as exc:
+            logger.warning("Failed to load content cluster artifact: %s", exc)
+            self.clear_content_cluster_artifact()
+            return False
+
+    def apply_content_cluster_artifact(
+        self,
+        artifact: ContentClusterArtifact,
+    ) -> None:
+        """Apply loaded content-cluster assignments to the local product catalog."""
+        self.clear_content_cluster_artifact()
+        assignments: Dict[str, int] = {}
+        for product_id, cluster_id in artifact.product_cluster_map.items():
+            if product_id not in self.product_metadata:
+                continue
+            cluster_value = int(cluster_id)
+            assignments[product_id] = cluster_value
+            self.product_metadata.setdefault(product_id, {})[
+                "content_cluster_id"
+            ] = cluster_value
+
+        self.content_cluster_model_version = artifact.cluster_model_version
+        self.content_cluster_assignments = assignments
+        self.content_cluster_centroids = self._normalize_cluster_centroids(
+            artifact.centroids
+        )
+        self.content_cluster_metadata = {
+            "num_clusters": int(artifact.num_clusters),
+            "product_count": int(artifact.product_count),
+            "assignment_count": len(assignments),
+            "embedding_dim": int(artifact.embedding_dim),
+            "created_at": float(artifact.created_at),
+            "source_catalog_context": dict(artifact.source_catalog_context or {}),
+            **dict(artifact.metadata or {}),
+        }
+
+    def clear_content_cluster_artifact(self) -> None:
+        """Clear loaded cluster assignments without changing the vector index."""
+        for product_id in self.content_cluster_assignments:
+            metadata = self.product_metadata.get(product_id)
+            if metadata is not None:
+                metadata.pop("content_cluster_id", None)
+        self.content_cluster_model_version = None
+        self.content_cluster_assignments = {}
+        self.content_cluster_centroids = None
+        self.content_cluster_metadata = {}
+
+    def get_product_cluster_id(self, product_id: str) -> Optional[int]:
+        """Return the loaded content cluster ID for a product, if available."""
+        cluster_id = self.content_cluster_assignments.get(product_id)
+        if cluster_id is not None:
+            return int(cluster_id)
+        return None
+
+    def assign_content_embedding_clusters(
+        self,
+        embedding: Any,
+        *,
+        limit: int = 1,
+    ) -> List[int]:
+        """Resolve nearest loaded content clusters for a request embedding."""
+        if self.content_cluster_centroids is None:
+            return []
+        return assign_embedding_to_clusters(
+            embedding,
+            self.content_cluster_centroids,
+            limit=limit,
+            centroids_normalized=True,
+        )
+
+    def get_content_cluster_version_context(self) -> Dict[str, Any]:
+        """Return the cluster artifact token used by recommendation cache keys."""
+        return {
+            "cluster_model_version": self.content_cluster_model_version,
+            "num_clusters": self.content_cluster_metadata.get("num_clusters", 0),
+            "assignment_count": len(self.content_cluster_assignments),
+            "product_count": self.content_cluster_metadata.get("product_count", 0),
+            "created_at": round(
+                float(self.content_cluster_metadata.get("created_at", 0.0) or 0.0),
+                6,
+            ),
+        }
+
+    @staticmethod
+    def _normalize_cluster_centroids(centroids: Any) -> np.ndarray:
+        values = np.asarray(centroids, dtype=np.float32)
+        if values.ndim != 2:
+            return values
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        norms = np.where((norms > 0.0) & np.isfinite(norms), norms, 1.0)
+        return (values / norms).astype(np.float32)
     
     async def update_product_metadata(self, product_id: str, metadata: Dict[str, Any]):
         """Update product metadata."""
@@ -724,7 +848,9 @@ class VectorSearchEngine:
             'last_updated': self.last_updated,
             'is_loaded': self.is_loaded,
             'search_stats': self.search_stats.copy(),
-            'index_type': self.config.index_type
+            'index_type': self.config.index_type,
+            'content_cluster_model_version': self.content_cluster_model_version,
+            'content_cluster_assignments': len(self.content_cluster_assignments),
         }
     
     def health_check(self) -> Dict[str, Any]:

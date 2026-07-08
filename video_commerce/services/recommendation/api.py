@@ -12,8 +12,9 @@ import random
 import time
 import traceback
 import uuid
+from collections import ChainMap
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import httpx
 from fastapi import Body, HTTPException, Request, Response
@@ -41,6 +42,12 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
     RankingCoordinatorError,
 )
 from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.ranking_history import (
+    RANKING_HISTORY_CONTEXT_KEY,
+    build_ranking_history_context,
+    history_context_profile,
+    ranking_history_config_from_settings,
+)
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.common.service_common import (
     build_health_response,
@@ -292,6 +299,55 @@ def _is_realtime_window_features_enabled(runtime: Any) -> bool:
     return bool(getattr(ranking_config, "realtime_window_features_enabled", False))
 
 
+def _is_ranking_history_embeddings_enabled(runtime: Any) -> bool:
+    config = getattr(runtime, "config", None)
+    ranking_config = getattr(config, "ranking_config", None)
+    return bool(getattr(ranking_config, "history_embeddings_enabled", False))
+
+
+def _ranking_history_item_embedding_map() -> Mapping[str, Any]:
+    if recommendation_engine is None:
+        return {}
+    cf_engine = getattr(recommendation_engine, "cf_engine", None)
+    if cf_engine is None:
+        return {}
+    trained_embeddings = getattr(cf_engine, "trained_item_embeddings", None)
+    synthetic_embeddings = getattr(cf_engine, "synthetic_item_embeddings", None)
+    maps = [
+        item_map
+        for item_map in (synthetic_embeddings, trained_embeddings)
+        if isinstance(item_map, Mapping)
+    ]
+    if not maps:
+        return {}
+    return ChainMap(*maps)
+
+
+def _ranking_history_serving_context(runtime: Any) -> Dict[str, Any]:
+    ranking_config = getattr(getattr(runtime, "config", None), "ranking_config", None)
+    if ranking_config is None or not getattr(
+        ranking_config,
+        "history_embeddings_enabled",
+        False,
+    ):
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "click_last_n": int(getattr(ranking_config, "history_click_last_n", 20)),
+        "cart_last_n": int(getattr(ranking_config, "history_cart_last_n", 20)),
+        "purchase_last_n": int(
+            getattr(ranking_config, "history_purchase_last_n", 20)
+        ),
+        "embedding_dim": int(getattr(ranking_config, "history_embedding_dim", 128)),
+        "click_scale": round(float(getattr(ranking_config, "history_click_scale", 1.0)), 6),
+        "cart_scale": round(float(getattr(ranking_config, "history_cart_scale", 1.25)), 6),
+        "purchase_scale": round(
+            float(getattr(ranking_config, "history_purchase_scale", 1.75)),
+            6,
+        ),
+    }
+
+
 def _should_initialize_local_ranker(runtime) -> bool:
     topology = runtime.config.service_topology_config
     has_remote_ranker = bool(ranking_coordinator_client_pool or ranking_client_pool)
@@ -413,33 +469,41 @@ def _refresh_serving_version_context(runtime) -> Dict[str, Any]:
 
 def _serving_version_paths(
     runtime,
-) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+) -> Tuple[
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    cluster_metadata_path, cluster_centroids_path = _content_cluster_artifact_paths(
+        runtime
+    )
     return (
         runtime.config.model_config.ranking_model_path,
         runtime.config.vector_config.index_path,
-        getattr(runtime.config.recommendation_config, "sasrec_checkpoint_path", None),
-        getattr(runtime.config.recommendation_config, "sasrec_vocab_path", None),
+        runtime.config.recommendation_config.sasrec_checkpoint_path,
+        runtime.config.recommendation_config.sasrec_vocab_path,
         getattr(runtime.config.recommendation_config, "swing_itemcf_index_path", None),
+        cluster_metadata_path,
+        cluster_centroids_path,
     )
 
 
 def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
     ranking_path = runtime.config.model_config.ranking_model_path
     vector_path = runtime.config.vector_config.index_path
-    sasrec_checkpoint_path = getattr(
-        runtime.config.recommendation_config,
-        "sasrec_checkpoint_path",
-        None,
-    )
-    sasrec_vocab_path = getattr(
-        runtime.config.recommendation_config,
-        "sasrec_vocab_path",
-        None,
-    )
     swing_itemcf_index_path = getattr(
         runtime.config.recommendation_config,
         "swing_itemcf_index_path",
         None,
+    )
+    sasrec_checkpoint_path = runtime.config.recommendation_config.sasrec_checkpoint_path
+    sasrec_vocab_path = runtime.config.recommendation_config.sasrec_vocab_path
+    cluster_metadata_path, cluster_centroids_path = _content_cluster_artifact_paths(
+        runtime
     )
     return {
         "ranking_model": ranking_model.model_version if ranking_model else None,
@@ -477,8 +541,73 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
             else None
         ),
         "swing_itemcf_index_mtime": _safe_file_mtime(swing_itemcf_index_path),
+        "content_cluster_model": (
+            getattr(recommendation_engine, "loaded_content_cluster_version", None)
+            if recommendation_engine
+            else None
+        ),
+        "content_cluster_metadata_mtime": (
+            _safe_file_mtime(cluster_metadata_path)
+            if cluster_metadata_path
+            else None
+        ),
+        "content_cluster_centroids_mtime": (
+            _safe_file_mtime(cluster_centroids_path)
+            if cluster_centroids_path
+            else None
+        ),
+        "content_cluster": _content_cluster_serving_version_context(),
         "vector_index_mtime": _safe_file_mtime(vector_path),
         "catalog": _catalog_serving_version_context(),
+        "ranking_history_embeddings": _ranking_history_serving_context(runtime),
+    }
+
+
+def _content_cluster_artifact_paths(runtime) -> Tuple[Optional[str], Optional[str]]:
+    recommendation_config = runtime.config.recommendation_config
+    metadata_path = getattr(
+        recommendation_config,
+        "content_cluster_metadata_path",
+        None,
+    )
+    centroids_path = getattr(
+        recommendation_config,
+        "content_cluster_centroids_path",
+        None,
+    )
+    if metadata_path and centroids_path:
+        return metadata_path, centroids_path
+    cf_index_path = getattr(recommendation_config, "cf_index_path", None)
+    if not cf_index_path:
+        return metadata_path, centroids_path
+    base_dir = Path(cf_index_path).parent
+    return (
+        metadata_path or str(base_dir / "content_clusters.metadata.json"),
+        centroids_path or str(base_dir / "content_clusters.centroids.npz"),
+    )
+
+
+def _content_cluster_serving_version_context() -> Dict[str, Any]:
+    if vector_search is None:
+        return {
+            "cluster_model_version": None,
+            "num_clusters": 0,
+            "assignment_count": 0,
+            "product_count": 0,
+            "created_at": 0,
+        }
+    if hasattr(vector_search, "get_content_cluster_version_context"):
+        return vector_search.get_content_cluster_version_context()
+    return {
+        "cluster_model_version": getattr(
+            vector_search, "content_cluster_model_version", None
+        ),
+        "num_clusters": 0,
+        "assignment_count": len(
+            getattr(vector_search, "content_cluster_assignments", {}) or {}
+        ),
+        "product_count": 0,
+        "created_at": 0,
     }
 
 
@@ -1156,6 +1285,10 @@ async def get_recommendations(
         "candidate_cache_write_ms": 0.0,
         "metadata_lookup_ms": 0.0,
         "ranking_ms": 0.0,
+        "history_embeddings_ms": 0.0,
+        "history_embeddings_status": (
+            "enabled" if _is_ranking_history_embeddings_enabled(runtime) else "disabled"
+        ),
         "slate_diversity_enabled": _is_mmr_slate_diversity_enabled(
             runtime.config.recommendation_config
         ),
@@ -1685,7 +1818,7 @@ async def get_recommendations(
         if _is_realtime_window_features_enabled(runtime):
             stage_started = time.perf_counter()
             ranking_context = await _attach_realtime_window_features(
-                payload.context,
+                ranking_context,
                 payload.user_id,
                 candidates,
                 product_metadata_map,
@@ -1694,6 +1827,20 @@ async def get_recommendations(
                 (time.perf_counter() - stage_started) * 1000,
                 2,
             )
+        if _is_ranking_history_embeddings_enabled(runtime):
+            stage_started = time.perf_counter()
+            ranking_context, history_profile = await _attach_ranking_history_embeddings(
+                runtime,
+                ranking_context,
+                payload.user_id,
+                candidates,
+                serving_versions,
+            )
+            profile["history_embeddings_ms"] = round(
+                (time.perf_counter() - stage_started) * 1000,
+                2,
+            )
+            profile.update(history_profile)
 
         stage_started = time.perf_counter()
         ranked_recommendations, ranking_profile = await _rank_candidates_for_request(
@@ -2096,6 +2243,49 @@ async def _attach_realtime_window_features(
     return {
         **(context or {}),
         "_realtime_window_features": serialized,
+    }
+
+
+async def _attach_ranking_history_embeddings(
+    runtime: Any,
+    context: Optional[Dict[str, Any]],
+    user_id: str,
+    candidates: List[CandidateProduct],
+    serving_versions: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Attach compact last-N history embedding context for the ranker."""
+    base_context = dict(context or {})
+    if feature_store is None:
+        return base_context, {"history_embeddings_status": "feature_store_unavailable"}
+
+    history_config = ranking_history_config_from_settings(runtime.config.ranking_config)
+    sequence_limit = max(
+        200,
+        history_config.click_last_n
+        + history_config.cart_last_n
+        + history_config.purchase_last_n,
+    )
+    sequence = await _bounded_hot_path_read(
+        runtime,
+        "ranking_history_sequence",
+        feature_store.get_user_sequence(user_id, limit=sequence_limit),
+        [],
+    )
+    candidate_ids = [str(candidate.product_id) for candidate in candidates]
+    history_context = build_ranking_history_context(
+        sequence or [],
+        _ranking_history_item_embedding_map(),
+        config=history_config,
+        candidate_product_ids=candidate_ids,
+        current_time=time.time(),
+        two_tower_model_version=serving_versions.get("two_tower_model"),
+    )
+    return {
+        **base_context,
+        RANKING_HISTORY_CONTEXT_KEY: history_context,
+    }, {
+        "history_embeddings_status": "attached",
+        **history_context_profile(history_context),
     }
 
 
