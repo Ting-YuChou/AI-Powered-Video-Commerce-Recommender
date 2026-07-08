@@ -30,6 +30,10 @@ from video_commerce.ml.vector_search import VectorSearchEngine
 from video_commerce.common.config import RecommendationConfig
 from video_commerce.ml.two_tower import TwoTowerTrainer
 from video_commerce.ml.sasrec import SASRecCandidateEngine
+from video_commerce.ml.swing_itemcf import (
+    SwingItemCFCandidateEngine,
+    SwingItemCFTrainer,
+)
 from video_commerce.ml.cf_cold_start import (
     ContentToCFAdapter,
     build_content_feature,
@@ -1345,6 +1349,10 @@ class RecommendationEngine:
         # Recommendation engines
         self.cf_engine = TwoTowerRetrievalEngine(config, vector_search)
         self.sasrec_engine = SASRecCandidateEngine(config)
+        self.swing_itemcf_engine = SwingItemCFCandidateEngine(
+            max_seed_items=config.swing_itemcf_max_seed_items,
+            score_weight=config.swing_itemcf_score_weight,
+        )
         self.trending_engine = TrendingEngine(config)
 
         # Model state
@@ -1352,9 +1360,10 @@ class RecommendationEngine:
         self.last_model_update = 0
         self.loaded_two_tower_version: Optional[str] = None
         self.loaded_sasrec_version: Optional[str] = None
+        self.loaded_swing_itemcf_version: Optional[str] = None
         self.loaded_content_cluster_version: Optional[str] = None
 
-        logger.info("Recommendation engine initialized (Two-Tower + SASRec retrieval)")
+        logger.info("Recommendation engine initialized (Two-Tower + SASRec + Swing retrieval)")
 
     def close(self) -> None:
         self.cf_engine.close()
@@ -1388,6 +1397,7 @@ class RecommendationEngine:
             logger.info("Loading recommendation serving state")
             await self._try_load_cf_index()
             await self._try_load_sasrec_artifacts()
+            await self._try_load_swing_itemcf_artifact()
             await self._try_load_content_cluster_artifacts()
             await self.refresh_serving_pools()
             await self._prime_hot_serving_caches()
@@ -1399,6 +1409,13 @@ class RecommendationEngine:
             if self.config.enable_sasrec and not self.sasrec_engine.is_trained:
                 logger.warning(
                     "SASRec artifacts not available; serving will skip sequential candidates"
+                )
+            if (
+                self.config.enable_swing_itemcf
+                and not self.swing_itemcf_engine.is_trained
+            ):
+                logger.warning(
+                    "Swing ItemCF artifact not available; serving will skip Swing candidates"
                 )
             logger.info("Recommendation serving state ready")
         except Exception as e:
@@ -1501,6 +1518,34 @@ class RecommendationEngine:
                 return True
         except Exception as e:
             logger.warning(f"Could not load SASRec artifacts: {e}")
+        return False
+
+    async def _try_load_swing_itemcf_artifact(self) -> bool:
+        """Load Swing ItemCF serving artifact if the source is enabled."""
+        if not self.config.enable_swing_itemcf:
+            return False
+        try:
+            checkpoint_record = None
+            if self.artifact_manager:
+                checkpoint_record = (
+                    await self.artifact_manager.sync_latest_swing_itemcf_artifact()
+                )
+
+            artifact_path = self._swing_itemcf_artifact_path()
+            loaded_engine = SwingItemCFCandidateEngine(
+                max_seed_items=self.config.swing_itemcf_max_seed_items,
+                score_weight=self.config.swing_itemcf_score_weight,
+            )
+            loaded = await asyncio.to_thread(loaded_engine.load_artifact, artifact_path)
+            if loaded:
+                if checkpoint_record:
+                    loaded_engine.model_version = checkpoint_record.model_version
+                self.swing_itemcf_engine = loaded_engine
+                self.loaded_swing_itemcf_version = loaded_engine.model_version
+                logger.info("Loaded Swing ItemCF serving artifact")
+                return True
+        except Exception as e:
+            logger.warning(f"Could not load Swing ItemCF artifact: {e}")
         return False
 
     async def _try_load_content_cluster_artifacts(self) -> bool:
@@ -1630,6 +1675,7 @@ class RecommendationEngine:
                     )
 
                 await self._update_sasrec_from_sequences()
+                await self._update_swing_itemcf_from_sequences()
                 await self._update_content_cluster_artifacts()
 
                 # Update trending scores (use last 1K for recency)
@@ -1724,6 +1770,85 @@ class RecommendationEngine:
             self.config.sasrec_metadata_path or str(base_dir / "sasrec_metadata.json"),
         )
 
+    async def _update_swing_itemcf_from_sequences(self) -> None:
+        if not self.config.enable_swing_itemcf:
+            return
+        if not self.artifact_manager or not self.artifact_manager.system_store:
+            logger.warning(
+                "Skipping Swing ItemCF training because Postgres system store is unavailable"
+            )
+            return
+
+        try:
+            lookback_days = max(0, int(self.training_sequence_lookback_days or 0))
+            since = time.time() - (lookback_days * 86400) if lookback_days > 0 else None
+            sequences = (
+                await self.artifact_manager.system_store.get_user_training_sequences(
+                    max_users=self.config.swing_itemcf_training_max_users,
+                    max_events_per_user=self.config.swing_itemcf_training_max_events_per_user,
+                    min_sequence_length=2,
+                    since=since,
+                    actions=POSITIVE_SEQUENCE_ACTIONS,
+                )
+            )
+            if not sequences:
+                logger.info(
+                    "Skipping Swing ItemCF training because no positive user sequences are available"
+                )
+                return
+
+            trainer = SwingItemCFTrainer(
+                alpha=self.config.swing_itemcf_alpha,
+                max_neighbors_per_item=self.config.swing_itemcf_max_neighbors_per_item,
+                max_items_per_user=self.config.swing_itemcf_max_items_per_user,
+                max_users_per_item=self.config.swing_itemcf_max_users_per_item,
+            )
+            model_version = f"swing-itemcf-{int(time.time())}"
+            index = await asyncio.to_thread(
+                trainer.fit,
+                sequences,
+                model_version=model_version,
+            )
+            if not index.is_trained:
+                logger.info("Skipping Swing ItemCF artifact persistence; index is empty")
+                return
+
+            artifact_path = self._swing_itemcf_artifact_path()
+            await asyncio.to_thread(index.save, artifact_path)
+            artifact_record = await self.artifact_manager.persist_swing_itemcf_artifact(
+                index_path=artifact_path,
+                model_version=index.model_version or model_version,
+                payload={
+                    "sequence_count": len(sequences),
+                    **dict(index.metadata),
+                },
+            )
+            if artifact_record:
+                index.model_version = artifact_record.model_version
+            self.swing_itemcf_engine = SwingItemCFCandidateEngine(
+                index,
+                max_seed_items=self.config.swing_itemcf_max_seed_items,
+                score_weight=self.config.swing_itemcf_score_weight,
+            )
+            self.loaded_swing_itemcf_version = (
+                artifact_record.model_version
+                if artifact_record
+                else self.swing_itemcf_engine.model_version
+            )
+        except Exception as exc:
+            logger.warning(
+                "Swing ItemCF training update failed; continuing without new Swing artifacts: %s",
+                exc,
+            )
+
+    def _swing_itemcf_artifact_path(self) -> str:
+        if self.artifact_manager:
+            return self.artifact_manager.swing_itemcf_local_index_path
+        base_dir = Path(self.config.cf_index_path).parent
+        return self.config.swing_itemcf_index_path or str(
+            base_dir / "swing_itemcf.json.gz"
+        )
+
     def _content_cluster_artifact_paths(self) -> Tuple[str, str]:
         base_dir = Path(self.config.cf_index_path).parent
         return (
@@ -1772,6 +1897,20 @@ class RecommendationEngine:
                 await self._try_load_sasrec_artifacts()
                 updated = (
                     updated or self.loaded_sasrec_version == latest_sasrec.model_version
+                )
+
+        if self.config.enable_swing_itemcf:
+            latest_swing = await self.artifact_manager.get_latest_model_checkpoint(
+                ModelArtifactManager.SWING_ITEMCF_MODEL_NAME
+            )
+            if (
+                latest_swing
+                and latest_swing.model_version != self.loaded_swing_itemcf_version
+            ):
+                await self._try_load_swing_itemcf_artifact()
+                updated = (
+                    updated
+                    or self.loaded_swing_itemcf_version == latest_swing.model_version
                 )
 
         if self.cf_engine.should_refresh_new_item_candidates() and not pools_refreshed:
@@ -2080,6 +2219,7 @@ class RecommendationEngine:
                 "user_features_ms": 0.0,
                 "cf_candidates_ms": 0.0,
                 "sasrec_candidates_ms": 0.0,
+                "swing_itemcf_candidates_ms": 0.0,
                 "content_candidates_ms": 0.0,
                 "trending_candidates_ms": 0.0,
                 "category_pool_ms": 0.0,
@@ -2095,6 +2235,7 @@ class RecommendationEngine:
                 "source_overlap_counts": {},
                 "merged_source_counts": {},
                 "sasrec_sequence_length": 0,
+                "swing_itemcf_seed_count": 0,
                 "has_transcript": False,
                 "speech_category_candidates_used": False,
             }
@@ -2130,18 +2271,39 @@ class RecommendationEngine:
                 bool(self.config.enable_sasrec)
                 and bool(getattr(self.sasrec_engine, "is_trained", False))
             )
+            swing_needs_interactions = (
+                bool(self.config.enable_swing_itemcf)
+                and bool(getattr(self.swing_itemcf_engine, "is_trained", False))
+            )
             serving_recent_limit = int(
                 getattr(self.config, "serving_recent_interaction_limit", 0) or 0
             )
             interaction_limit = 0
             if user_interactions is None:
+                requested_limits: List[int] = []
                 if sasrec_needs_interactions:
-                    interaction_limit = max(
-                        serving_recent_limit,
-                        int(getattr(self.config, "sasrec_max_sequence_length", 0) or 0),
+                    requested_limits.append(
+                        int(getattr(self.config, "sasrec_max_sequence_length", 0) or 0)
                     )
-                elif serving_recent_limit > 0:
-                    interaction_limit = serving_recent_limit
+                if swing_needs_interactions:
+                    swing_read_limit = int(
+                        getattr(
+                            self.config,
+                            "swing_itemcf_serving_interaction_limit",
+                            0,
+                        )
+                        or 0
+                    )
+                    swing_seed_limit = int(
+                        getattr(self.config, "swing_itemcf_max_seed_items", 0) or 0
+                    )
+                    requested_limits.append(
+                        max(swing_read_limit, swing_seed_limit)
+                    )
+                if serving_recent_limit > 0:
+                    requested_limits.append(serving_recent_limit)
+                if requested_limits:
+                    interaction_limit = max(requested_limits)
             if user_interactions is None and interaction_limit > 0:
                 interaction_task = asyncio.create_task(
                     timed_stage(
@@ -2183,6 +2345,14 @@ class RecommendationEngine:
                 resolved_user_interactions
             )
             profile["sasrec_sequence_length"] = len(sasrec_sequence)
+            profile["swing_itemcf_seed_count"] = len(
+                {
+                    interaction.get("product_id")
+                    for interaction in resolved_user_interactions
+                    if interaction.get("product_id")
+                    and interaction.get("action") in POSITIVE_SEQUENCE_ACTIONS
+                }
+            )
             user_features_dict = user_features_obj.dict() if user_features_obj else {}
             preferred_categories = self._resolve_preferred_categories(
                 user_features_obj, context, content_features
@@ -2229,6 +2399,19 @@ class RecommendationEngine:
                     k=min(target_candidates, self.config.max_live_sasrec_candidates),
                     exclude_items=exclude_items,
                     catalog_product_ids=self.vector_search.product_metadata.keys(),
+                )
+
+            async def fetch_swing_itemcf_candidates() -> List[CandidateProduct]:
+                if (
+                    not self.config.enable_swing_itemcf
+                    or not self.swing_itemcf_engine.is_trained
+                ):
+                    return []
+                return self.swing_itemcf_engine.get_candidates(
+                    resolved_user_interactions,
+                    k=min(target_candidates, self.config.max_live_swing_itemcf_candidates),
+                    exclude_items=exclude_items,
+                    current_time=time.time(),
                 )
 
             async def fetch_content_candidates() -> List[CandidateProduct]:
@@ -2351,6 +2534,15 @@ class RecommendationEngine:
                 ),
                 name="candidate-source-sasrec",
             )
+            swing_itemcf_task = asyncio.create_task(
+                timed_stage(
+                    "swing_itemcf_candidates_ms",
+                    fetch_swing_itemcf_candidates(),
+                    [],
+                    source_timeout_ms,
+                ),
+                name="candidate-source-swing-itemcf",
+            )
             content_task = asyncio.create_task(
                 timed_stage(
                     "content_candidates_ms",
@@ -2400,6 +2592,7 @@ class RecommendationEngine:
             (
                 cf_candidates,
                 sasrec_candidates,
+                swing_itemcf_candidates,
                 content_candidates,
                 trending_candidates,
                 category_candidates,
@@ -2408,6 +2601,7 @@ class RecommendationEngine:
             ) = await asyncio.gather(
                 cf_task,
                 sasrec_task,
+                swing_itemcf_task,
                 content_task,
                 trending_task,
                 category_task,
@@ -2427,6 +2621,7 @@ class RecommendationEngine:
 
             merge_source("cf", cf_candidates)
             merge_source("sasrec", sasrec_candidates)
+            merge_source("swing_itemcf", swing_itemcf_candidates)
             merge_source("content", content_candidates)
             merge_source("trending_pool", trending_candidates)
             merge_source("category_pool", category_candidates)
@@ -2533,6 +2728,7 @@ class RecommendationEngine:
                     "user_features_ms": 0.0,
                     "cf_candidates_ms": 0.0,
                     "sasrec_candidates_ms": 0.0,
+                    "swing_itemcf_candidates_ms": 0.0,
                     "content_candidates_ms": 0.0,
                     "trending_candidates_ms": 0.0,
                     "category_pool_ms": 0.0,
@@ -2548,6 +2744,7 @@ class RecommendationEngine:
                     "source_overlap_counts": {},
                     "merged_source_counts": {},
                     "sasrec_sequence_length": 0,
+                    "swing_itemcf_seed_count": 0,
                     "has_transcript": False,
                     "speech_category_candidates_used": False,
                     "error": str(e),

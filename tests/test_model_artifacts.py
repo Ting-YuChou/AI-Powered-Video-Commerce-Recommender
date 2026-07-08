@@ -320,3 +320,109 @@ def test_sync_latest_sasrec_artifacts_rejects_checksum_mismatch(tmp_path):
         raise AssertionError("expected checksum mismatch")
 
     assert not (tmp_path / "cache" / "sasrec_model.pt").exists()
+
+
+def test_persist_swing_itemcf_artifact_records_manifest(tmp_path):
+    fake_store = FakeSystemStore()
+    index = tmp_path / "models" / "swing_itemcf.json.gz"
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_bytes(b"swing-index")
+
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(
+            swing_itemcf_index_path=str(tmp_path / "cache" / "swing_itemcf.json.gz")
+        ),
+    )
+
+    record = asyncio.run(
+        manager.persist_swing_itemcf_artifact(
+            index_path=str(index),
+            model_version="swing-123",
+            payload={"training_user_count": 2},
+        )
+    )
+
+    assert record is not None
+    assert fake_store.recorded[-1]["model_name"] == ModelArtifactManager.SWING_ITEMCF_MODEL_NAME
+    manifest = fake_store.recorded[-1]["payload"]["artifact_manifest"]
+    assert manifest["index"]["sha256"] == hashlib.sha256(b"swing-index").hexdigest()
+    assert manifest["index"]["local_cache_path"].endswith("swing_itemcf.json.gz")
+    assert fake_store.recorded[-1]["payload"]["training_user_count"] == 2
+
+
+def test_sync_latest_swing_itemcf_artifact_copies_to_local_cache(tmp_path):
+    fake_store = FakeSystemStore()
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    index = remote_dir / "swing_itemcf.json.gz"
+    index.write_bytes(b"swing-index")
+
+    fake_store.latest[ModelArtifactManager.SWING_ITEMCF_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.SWING_ITEMCF_MODEL_NAME,
+        "model_version": "swing-123",
+        "checkpoint_path": str(index),
+        "payload": {"index_path": str(index)},
+        "created_at": 1.0,
+    }
+
+    local_index = tmp_path / "cache" / "swing_itemcf.json.gz"
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(
+            swing_itemcf_index_path=str(local_index)
+        ),
+    )
+
+    record = asyncio.run(manager.sync_latest_swing_itemcf_artifact())
+
+    assert record is not None
+    assert local_index.read_bytes() == b"swing-index"
+
+
+def test_sync_latest_swing_itemcf_artifact_rejects_checksum_mismatch(tmp_path):
+    fake_store = FakeSystemStore()
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    index = remote_dir / "swing_itemcf.json.gz"
+    index.write_bytes(b"swing-index")
+
+    fake_store.latest[ModelArtifactManager.SWING_ITEMCF_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.SWING_ITEMCF_MODEL_NAME,
+        "model_version": "swing-123",
+        "checkpoint_path": str(index),
+        "payload": {
+            "index_path": str(index),
+            "artifact_manifest": {"index": {"sha256": "bad"}},
+        },
+        "created_at": 1.0,
+    }
+
+    local_index = tmp_path / "cache" / "swing_itemcf.json.gz"
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(
+            swing_itemcf_index_path=str(local_index)
+        ),
+    )
+
+    try:
+        asyncio.run(manager.sync_latest_swing_itemcf_artifact())
+    except ValueError as exc:
+        assert "checksum mismatch" in str(exc)
+    else:
+        raise AssertionError("expected checksum mismatch")
+
+    assert not local_index.exists()

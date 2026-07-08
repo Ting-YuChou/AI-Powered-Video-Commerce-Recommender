@@ -230,6 +230,10 @@ class RecommendationConfig(BaseSettings):
         20,
         description="Maximum content-similar candidates to fetch live per request",
     )
+    max_live_swing_itemcf_candidates: int = Field(
+        40,
+        description="Maximum Swing ItemCF candidates to fetch live per request",
+    )
     speech_category_candidates_enabled: bool = Field(
         False,
         description="Use content categories inferred from transcribed speech in candidate pools",
@@ -324,6 +328,43 @@ class RecommendationConfig(BaseSettings):
     candidate_source_timeout_ms: float = Field(
         250.0,
         description="Maximum time to spend on one live candidate source on the serving path",
+    )
+    enable_swing_itemcf: bool = Field(
+        False, description="Enable Swing ItemCF candidate source"
+    )
+    swing_itemcf_index_path: Optional[str] = Field(
+        None, description="Swing ItemCF compressed JSON index path"
+    )
+    swing_itemcf_alpha: float = Field(
+        5.0, description="Swing denominator smoothing alpha"
+    )
+    swing_itemcf_max_neighbors_per_item: int = Field(
+        100, description="Maximum Swing neighbors stored per source item"
+    )
+    swing_itemcf_max_seed_items: int = Field(
+        20, description="Maximum recent positive seed items used for Swing serving"
+    )
+    swing_itemcf_serving_interaction_limit: int = Field(
+        200,
+        description=(
+            "Raw recent interactions to read for Swing serving before positive "
+            "dedupe and seed capping"
+        ),
+    )
+    swing_itemcf_training_max_users: int = Field(
+        10000, description="Maximum users used for Swing offline training"
+    )
+    swing_itemcf_training_max_events_per_user: int = Field(
+        100, description="Maximum positive events per user used for Swing training"
+    )
+    swing_itemcf_max_items_per_user: int = Field(
+        100, description="Maximum deduplicated positive items per user in Swing training"
+    )
+    swing_itemcf_max_users_per_item: int = Field(
+        500, description="Maximum users retained per item when building Swing pairs"
+    )
+    swing_itemcf_score_weight: float = Field(
+        1.0, description="Score multiplier for Swing ItemCF candidates"
     )
     known_user_snapshot_enabled: bool = Field(
         True,
@@ -567,6 +608,33 @@ class RecommendationConfig(BaseSettings):
     def validate_serving_recent_interaction_limit(cls, value: int) -> int:
         if value < 0:
             raise ValueError("serving_recent_interaction_limit must be >= 0")
+        return value
+
+    @validator(
+        "max_live_swing_itemcf_candidates",
+        "swing_itemcf_max_neighbors_per_item",
+        "swing_itemcf_max_seed_items",
+        "swing_itemcf_serving_interaction_limit",
+        "swing_itemcf_training_max_users",
+        "swing_itemcf_training_max_events_per_user",
+        "swing_itemcf_max_items_per_user",
+        "swing_itemcf_max_users_per_item",
+    )
+    def validate_swing_itemcf_positive_ints(cls, value: int, field) -> int:
+        if value <= 0:
+            raise ValueError(f"{field.name} must be > 0")
+        return value
+
+    @validator("swing_itemcf_alpha")
+    def validate_swing_itemcf_alpha(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("swing_itemcf_alpha must be > 0")
+        return value
+
+    @validator("swing_itemcf_score_weight")
+    def validate_swing_itemcf_score_weight(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("swing_itemcf_score_weight must be >= 0")
         return value
 
     @validator("impression_max_items")
@@ -1812,6 +1880,10 @@ class Config:
         if not self.recommendation_config.sasrec_metadata_path:
             self.recommendation_config.sasrec_metadata_path = str(
                 Path(self.model_config.cache_dir) / "sasrec_metadata.json"
+            )
+        if not self.recommendation_config.swing_itemcf_index_path:
+            self.recommendation_config.swing_itemcf_index_path = str(
+                Path(self.model_config.cache_dir) / "swing_itemcf.json.gz"
             )
 
         # Set embedding dimension consistency

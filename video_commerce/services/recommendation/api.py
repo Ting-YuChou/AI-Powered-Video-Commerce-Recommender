@@ -476,6 +476,7 @@ def _serving_version_paths(
     Optional[str],
     Optional[str],
     Optional[str],
+    Optional[str],
 ]:
     cluster_metadata_path, cluster_centroids_path = _content_cluster_artifact_paths(
         runtime
@@ -485,6 +486,7 @@ def _serving_version_paths(
         runtime.config.vector_config.index_path,
         runtime.config.recommendation_config.sasrec_checkpoint_path,
         runtime.config.recommendation_config.sasrec_vocab_path,
+        getattr(runtime.config.recommendation_config, "swing_itemcf_index_path", None),
         cluster_metadata_path,
         cluster_centroids_path,
     )
@@ -493,6 +495,11 @@ def _serving_version_paths(
 def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
     ranking_path = runtime.config.model_config.ranking_model_path
     vector_path = runtime.config.vector_config.index_path
+    swing_itemcf_index_path = getattr(
+        runtime.config.recommendation_config,
+        "swing_itemcf_index_path",
+        None,
+    )
     sasrec_checkpoint_path = runtime.config.recommendation_config.sasrec_checkpoint_path
     sasrec_vocab_path = runtime.config.recommendation_config.sasrec_vocab_path
     cluster_metadata_path, cluster_centroids_path = _content_cluster_artifact_paths(
@@ -522,12 +529,18 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
             else None
         ),
         "sasrec_model": (
-            recommendation_engine.loaded_sasrec_version
+            getattr(recommendation_engine, "loaded_sasrec_version", None)
             if recommendation_engine
             else None
         ),
         "sasrec_checkpoint_mtime": _safe_file_mtime(sasrec_checkpoint_path),
         "sasrec_vocab_mtime": _safe_file_mtime(sasrec_vocab_path),
+        "swing_itemcf_model": (
+            getattr(recommendation_engine, "loaded_swing_itemcf_version", None)
+            if recommendation_engine
+            else None
+        ),
+        "swing_itemcf_index_mtime": _safe_file_mtime(swing_itemcf_index_path),
         "content_cluster_model": (
             getattr(recommendation_engine, "loaded_content_cluster_version", None)
             if recommendation_engine
@@ -596,6 +609,31 @@ def _content_cluster_serving_version_context() -> Dict[str, Any]:
         "product_count": 0,
         "created_at": 0,
     }
+
+
+def _candidate_generation_interaction_hint(
+    engine: Any,
+    user_features: UserFeatures,
+    user_sequence_token: Dict[str, Any],
+) -> Optional[List[Dict[str, Any]]]:
+    if int((user_sequence_token or {}).get("length", 0) or 0) != 0:
+        return None
+
+    config = getattr(engine, "config", None)
+    sasrec_requires_interactions = bool(
+        getattr(config, "enable_sasrec", False)
+        and getattr(getattr(engine, "sasrec_engine", None), "is_trained", False)
+    )
+    swing_requires_interactions = bool(
+        getattr(config, "enable_swing_itemcf", False)
+        and getattr(getattr(engine, "swing_itemcf_engine", None), "is_trained", False)
+    )
+    if sasrec_requires_interactions or swing_requires_interactions:
+        return None
+
+    if int(getattr(user_features, "total_interactions", 0) or 0) <= 0:
+        return []
+    return None
 
 
 def _catalog_serving_version_context() -> Dict[str, Any]:
@@ -1614,9 +1652,11 @@ async def get_recommendations(
                 k_per_source=k_per_source,
                 include_profile=True,
                 user_features=user_features,
-                user_interactions=[]
-                if user_sequence_token.get("length", 0) == 0
-                else None,
+                user_interactions=_candidate_generation_interaction_hint(
+                    recommendation_engine,
+                    user_features,
+                    user_sequence_token,
+                ),
             )
             profile["candidate_generation_ms"] = round(
                 (time.perf_counter() - stage_started) * 1000, 2
