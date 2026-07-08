@@ -42,6 +42,7 @@ from video_commerce.services.recommendation.api import (
     _build_candidate_cache_context,
     _build_displayed_item_snapshots,
     _build_impression_context_snapshot,
+    _build_rejected_candidate_snapshots,
     _build_recommendation_cache_context,
     _catalog_serving_version_context,
     _attach_ranking_history_embeddings,
@@ -56,7 +57,7 @@ from video_commerce.services.recommendation.api import (
     _refresh_serving_version_context,
     _user_feature_cache_token,
 )
-from video_commerce.ml.recommender import TwoTowerRetrievalEngine
+from video_commerce.ml.recommender import RecommendationEngine, TwoTowerRetrievalEngine
 from video_commerce.ml.slate_diversity import select_mmr_recommendations
 
 
@@ -755,6 +756,121 @@ def test_source_count_helpers_track_ranked_sasrec_coverage():
         ranked,
         {candidate.product_id: candidate.source for candidate in candidates},
     ) == {"cf": 1, "sasrec": 1}
+
+
+def test_rejected_candidate_snapshots_are_capped_and_exclude_returned_top_k():
+    candidates = [
+        CandidateProduct(product_id="shown", source="two_tower", combined_score=0.9),
+        CandidateProduct(product_id="reject-1", source="content", combined_score=0.7),
+        CandidateProduct(product_id="reject-2", source="popular", combined_score=0.5),
+    ]
+    recommendations = [
+        ProductRecommendation(
+            product_id="shown",
+            title="Shown",
+            price=10.0,
+            confidence_score=0.9,
+            ranking_score=0.8,
+        )
+    ]
+    metadata = {
+        "reject-1": {"price": 12.0, "category": "Shoes", "brand": "A"},
+        "reject-2": {"price": 13.0, "category": "Bags", "brand": "B"},
+    }
+
+    snapshots = _build_rejected_candidate_snapshots(
+        candidates,
+        recommendations,
+        product_metadata_map=metadata,
+        max_items=1,
+    )
+
+    assert len(snapshots) == 1
+    assert snapshots[0]["product_id"] == "reject-1"
+    assert snapshots[0]["candidate_source"] == "content"
+    assert snapshots[0]["position"] == 2
+    assert snapshots[0]["scores"]["combined_score"] == 0.7
+    assert snapshots[0]["feature_snapshot"]["price"] == 12.0
+
+
+@pytest.mark.asyncio
+async def test_two_tower_model_update_passes_external_training_negatives():
+    class Store:
+        async def get_training_interactions(self, limit=50000):
+            return [
+                {"user_id": "u1", "product_id": "p1", "action": "click"},
+                {"user_id": "u1", "product_id": "p2", "action": "click"},
+            ]
+
+        async def get_two_tower_training_impression_negatives(self, limit=50000):
+            return [
+                {
+                    "user_id": "u1",
+                    "product_id": "p3",
+                    "source": "impression_no_click",
+                    "weight": 0.25,
+                    "exposed": True,
+                    "rank_position": 3,
+                }
+            ]
+
+    class FeatureStore:
+        async def get_all_user_features_map(self):
+            return {"u1": {"total_interactions": 2}}
+
+    class CFEngine:
+        is_trained = False
+        model_version = None
+        last_training_time = 0
+
+        def __init__(self):
+            self.received = None
+
+        async def train_model(
+            self,
+            interactions,
+            *,
+            user_features_map=None,
+            external_negatives=None,
+        ):
+            self.received = {
+                "interactions": interactions,
+                "user_features_map": user_features_map,
+                "external_negatives": external_negatives,
+            }
+
+    class Trending:
+        async def update_trending_scores(self, interactions):
+            return None
+
+    engine = object.__new__(RecommendationEngine)
+    engine.config = RecommendationConfig(enable_sasrec=False)
+    engine.artifact_manager = SimpleNamespace(system_store=Store())
+    engine.feature_store = FeatureStore()
+    engine.cf_engine = CFEngine()
+    engine.trending_engine = Trending()
+    engine.last_model_update = 0
+
+    async def noop():
+        return None
+
+    engine._update_sasrec_from_sequences = noop
+    engine._update_swing_itemcf_from_sequences = noop
+    engine._update_content_cluster_artifacts = noop
+    engine.refresh_serving_pools = noop
+
+    await engine._update_models_from_interactions()
+
+    assert engine.cf_engine.received["external_negatives"] == [
+        {
+            "user_id": "u1",
+            "product_id": "p3",
+            "source": "impression_no_click",
+            "weight": 0.25,
+            "exposed": True,
+            "rank_position": 3,
+        }
+    ]
 
 
 def test_prepare_training_data_uses_online_equivalent_feature_extractor(monkeypatch):

@@ -904,6 +904,52 @@ def _build_displayed_item_snapshots(
     return displayed_items
 
 
+def _build_rejected_candidate_snapshots(
+    candidates: List[CandidateProduct],
+    recommendations: List[Any],
+    *,
+    product_metadata_map: Dict[str, Dict[str, Any]],
+    max_items: int,
+) -> List[Dict[str, Any]]:
+    """Build bounded ranker-rejected snapshots for weak retrieval negatives."""
+    if max_items <= 0:
+        return []
+
+    returned_product_ids = {
+        str(product_id)
+        for product_id in (
+            _recommendation_field(recommendation, "product_id")
+            for recommendation in recommendations
+        )
+        if product_id
+    }
+    rejected_items: List[Dict[str, Any]] = []
+    for position, candidate in enumerate(candidates, start=1):
+        if len(rejected_items) >= max_items:
+            break
+        product_id = str(candidate.product_id or "")
+        if not product_id or product_id in returned_product_ids:
+            continue
+        metadata = product_metadata_map.get(product_id, {})
+        scores = _candidate_score_snapshot(candidate)
+        rejected_items.append(
+            {
+                "product_id": product_id,
+                "position": position,
+                "candidate_source": candidate.source,
+                "source": candidate.source,
+                "feature_snapshot": {
+                    "price": metadata.get("price"),
+                    "category": metadata.get("category"),
+                    "brand": metadata.get("brand"),
+                    "candidate_source": candidate.source,
+                },
+                "scores": scores,
+            }
+        )
+    return rejected_items
+
+
 def _attach_displayed_item_snapshot_metadata(
     recommendation_payloads: List[Dict[str, Any]],
     displayed_items: List[Dict[str, Any]],
@@ -1881,6 +1927,7 @@ async def get_recommendations(
         ]
         impression_id = None
         displayed_items: List[Dict[str, Any]] = []
+        rejected_candidate_items: List[Dict[str, Any]] = []
         if runtime.config.recommendation_config.impression_logging_enabled:
             impression_id = uuid.uuid4().hex
             displayed_items = _build_displayed_item_snapshots(
@@ -1894,6 +1941,14 @@ async def get_recommendations(
             ranked_recommendation_payloads = _attach_displayed_item_snapshot_metadata(
                 ranked_recommendation_payloads,
                 displayed_items,
+            )
+            rejected_candidate_items = _build_rejected_candidate_snapshots(
+                candidates,
+                ranked_recommendations,
+                product_metadata_map=product_metadata_map,
+                max_items=int(
+                    runtime.config.recommendation_config.ranker_rejected_logging_max_items
+                ),
             )
 
         stage_started = time.perf_counter()
@@ -1959,6 +2014,7 @@ async def get_recommendations(
                         "ranked_source_counts": profile.get("ranked_source_counts", {}),
                         "item_snapshot_scope": "returned_top_k",
                         "displayed_items": displayed_items,
+                        "rejected_candidate_items": rejected_candidate_items,
                     },
                 ),
                 timeout_seconds=runtime.config.cache_config.background_write_timeout_ms

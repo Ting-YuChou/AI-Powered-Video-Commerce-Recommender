@@ -242,11 +242,17 @@ class NonTrainingCFEngine:
     def __init__(self):
         self.calls = []
 
-    async def train_model(self, interactions, user_features_map=None):
+    async def train_model(
+        self,
+        interactions,
+        user_features_map=None,
+        external_negatives=None,
+    ):
         self.calls.append(
             {
                 "interactions": list(interactions),
                 "user_features_map": dict(user_features_map or {}),
+                "external_negatives": list(external_negatives or []),
             }
         )
 

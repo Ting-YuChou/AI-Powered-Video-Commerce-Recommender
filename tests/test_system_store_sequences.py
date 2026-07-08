@@ -3,12 +3,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 from sqlalchemy.dialects import postgresql
 
 from video_commerce.common.config import DatabaseConfig
 from video_commerce.data_plane.system_store import (
     SystemStore,
+    TWO_TOWER_POSITIVE_ACTIONS,
     _impression_context_snapshot,
+    build_two_tower_training_negatives_from_impression_records,
     build_chronological_user_sequences,
     build_ltr_training_samples_from_impression_records,
 )
@@ -480,6 +483,168 @@ def test_build_ltr_training_samples_from_impressions_adds_no_click_negatives():
     assert skipped["context"]["recommendation_position"] == 2
     assert skipped["context"]["attributed_click"] is False
     assert skipped["context"]["attributed_purchase"] is False
+
+
+def test_build_two_tower_training_negatives_uses_only_weak_no_click_items():
+    created_at = datetime.fromtimestamp(1_000, tz=timezone.utc)
+    impression_items = [
+        {
+            "impression_id": "imp-1",
+            "user_id": "u1",
+            "product_id": "p-click",
+            "position": 1,
+            "source": "two_tower",
+            "feature_snapshot": {"candidate_source": "two_tower"},
+            "scores": {"ranking_score": 0.9},
+            "created_at": created_at,
+        },
+        {
+            "impression_id": "imp-1",
+            "user_id": "u1",
+            "product_id": "p-view-only",
+            "position": 2,
+            "source": "popular",
+            "feature_snapshot": {"candidate_source": "popular"},
+            "scores": {"ranking_score": 0.4},
+            "created_at": created_at,
+        },
+        {
+            "impression_id": "imp-1",
+            "user_id": "u1",
+            "product_id": "p-skip",
+            "position": 3,
+            "source": "content",
+            "feature_snapshot": {"candidate_source": "content"},
+            "scores": {"ranking_score": 0.3},
+            "created_at": created_at,
+        },
+    ]
+    interactions = [
+        {
+            "event_id": "evt-click",
+            "user_id": "u1",
+            "product_id": "p-click",
+            "action": "click",
+            "context": {"impression_id": "imp-1"},
+            "occurred_at": datetime.fromtimestamp(1_010, tz=timezone.utc),
+        },
+        {
+            "event_id": "evt-view",
+            "user_id": "u1",
+            "product_id": "p-view-only",
+            "action": "view",
+            "context": {"impression_id": "imp-1"},
+            "occurred_at": datetime.fromtimestamp(1_011, tz=timezone.utc),
+        },
+    ]
+
+    negatives = build_two_tower_training_negatives_from_impression_records(
+        impression_items,
+        interactions,
+    )
+
+    assert [negative["product_id"] for negative in negatives] == [
+        "p-view-only",
+        "p-skip",
+    ]
+    assert {negative["source"] for negative in negatives} == {"impression_no_click"}
+    assert all(negative["exposed"] is True for negative in negatives)
+    assert all(negative["weight"] == 0.25 for negative in negatives)
+    assert negatives[0]["rank_position"] == 2
+
+
+@pytest.mark.parametrize("positive_action", sorted(TWO_TOWER_POSITIVE_ACTIONS))
+def test_build_two_tower_training_negatives_excludes_all_positive_actions(
+    positive_action,
+):
+    created_at = datetime.fromtimestamp(1_000, tz=timezone.utc)
+    impression_items = [
+        {
+            "impression_id": "imp-1",
+            "user_id": "u1",
+            "product_id": "p-positive",
+            "position": 1,
+            "source": "two_tower",
+            "created_at": created_at,
+        },
+        {
+            "impression_id": "imp-1",
+            "user_id": "u1",
+            "product_id": "p-skip",
+            "position": 2,
+            "source": "popular",
+            "created_at": created_at,
+        },
+    ]
+    interactions = [
+        {
+            "event_id": f"evt-{positive_action}",
+            "user_id": "u1",
+            "product_id": "p-positive",
+            "action": positive_action,
+            "context": {"impression_id": "imp-1"},
+            "occurred_at": datetime.fromtimestamp(1_010, tz=timezone.utc),
+        }
+    ]
+
+    negatives = build_two_tower_training_negatives_from_impression_records(
+        impression_items,
+        interactions,
+    )
+
+    assert [negative["product_id"] for negative in negatives] == ["p-skip"]
+
+
+def test_build_two_tower_training_negatives_includes_ranker_rejected_context_items():
+    created_at = datetime.fromtimestamp(1_000, tz=timezone.utc)
+    impression_items = [
+        {
+            "impression_id": "imp-1",
+            "user_id": "u1",
+            "product_id": "p-click",
+            "position": 1,
+            "source": "two_tower",
+            "feature_snapshot": {"candidate_source": "two_tower"},
+            "scores": {"ranking_score": 0.9},
+            "created_at": created_at,
+            "context": {
+                "rejected_candidate_items": [
+                    {
+                        "product_id": "p-rejected",
+                        "candidate_source": "two_tower",
+                        "position": 12,
+                        "scores": {"ranking_score": 0.2},
+                    },
+                    {
+                        "product_id": "p-click",
+                        "candidate_source": "two_tower",
+                        "position": 13,
+                    },
+                ]
+            },
+        }
+    ]
+    interactions = [
+        {
+            "event_id": "evt-click",
+            "user_id": "u1",
+            "product_id": "p-click",
+            "action": "purchase",
+            "context": {"impression_id": "imp-1"},
+            "occurred_at": datetime.fromtimestamp(1_010, tz=timezone.utc),
+        }
+    ]
+
+    negatives = build_two_tower_training_negatives_from_impression_records(
+        impression_items,
+        interactions,
+    )
+
+    assert [negative["product_id"] for negative in negatives] == ["p-rejected"]
+    assert negatives[0]["source"] == "ranker_rejected"
+    assert negatives[0]["exposed"] is False
+    assert negatives[0]["weight"] == 0.15
+    assert negatives[0]["rank_position"] == 12
 
 
 def test_ltr_impression_samples_mark_purchase_as_implicit_click_with_business_value():

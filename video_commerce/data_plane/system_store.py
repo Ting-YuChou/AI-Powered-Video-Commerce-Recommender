@@ -11,7 +11,7 @@ import logging
 import time
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from sqlalchemy import (
     DateTime,
@@ -36,6 +36,7 @@ from video_commerce.common.config import DatabaseConfig
 logger = logging.getLogger(__name__)
 
 POSITIVE_SEQUENCE_ACTIONS = ("view", "click", "add_to_cart", "purchase")
+MAX_REJECTED_CANDIDATE_ITEMS = 50
 IMPRESSION_CONTEXT_KEYS = {
     "session_id",
     "surface",
@@ -331,6 +332,102 @@ def build_ltr_training_samples_from_impression_records(
         samples.append(sample)
 
     return samples
+
+
+TWO_TOWER_POSITIVE_ACTIONS = {"click", "add_to_cart", "purchase", "favorite", "share"}
+
+
+def build_two_tower_training_negatives_from_impression_records(
+    impression_items: Iterable[Mapping[str, Any]],
+    interactions: Iterable[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Build weak retrieval negatives from returned no-click and rejected candidates."""
+    positive_keys: Set[tuple[str, str, str]] = set()
+    for interaction in interactions:
+        action = str(interaction.get("action") or "").lower()
+        if action not in TWO_TOWER_POSITIVE_ACTIONS:
+            continue
+        context = _safe_dict(interaction.get("context"))
+        impression_id = str(context.get("impression_id") or "").strip()
+        product_id = str(interaction.get("product_id") or "").strip()
+        user_id = str(interaction.get("user_id") or "").strip()
+        if impression_id and product_id and user_id:
+            positive_keys.add((impression_id, product_id, user_id))
+
+    negatives: List[Dict[str, Any]] = []
+    emitted: Set[tuple[str, str, str, str]] = set()
+    rejected_contexts: Dict[tuple[str, str], List[Mapping[str, Any]]] = {}
+
+    for item in impression_items:
+        impression_id = str(item.get("impression_id") or "").strip()
+        product_id = str(item.get("product_id") or "").strip()
+        user_id = str(item.get("user_id") or "").strip()
+        if not impression_id or not product_id or not user_id:
+            continue
+
+        context = _safe_dict(item.get("context"))
+        rejected_items = context.get("rejected_candidate_items")
+        if isinstance(rejected_items, list):
+            rejected_contexts.setdefault((impression_id, user_id), [])
+            for rejected in rejected_items:
+                if isinstance(rejected, Mapping):
+                    rejected_contexts[(impression_id, user_id)].append(rejected)
+
+        if (impression_id, product_id, user_id) in positive_keys:
+            continue
+        key = (impression_id, product_id, user_id, "impression_no_click")
+        if key in emitted:
+            continue
+        emitted.add(key)
+        negatives.append(
+            {
+                "user_id": user_id,
+                "product_id": product_id,
+                "source": "impression_no_click",
+                "weight": 0.25,
+                "exposed": True,
+                "sample_prob": 1.0,
+                "rank_position": item.get("position"),
+                "context": {
+                    "impression_id": impression_id,
+                    "recommendation_source": item.get("source")
+                    or _safe_dict(item.get("feature_snapshot")).get("candidate_source"),
+                    "candidate_scores": _score_snapshot_from_item(item),
+                },
+            }
+        )
+
+    for (impression_id, user_id), rejected_items in rejected_contexts.items():
+        for rejected in rejected_items:
+            product_id = str(rejected.get("product_id") or "").strip()
+            if not product_id:
+                continue
+            if (impression_id, product_id, user_id) in positive_keys:
+                continue
+            key = (impression_id, product_id, user_id, "ranker_rejected")
+            if key in emitted:
+                continue
+            emitted.add(key)
+            negatives.append(
+                {
+                    "user_id": user_id,
+                    "product_id": product_id,
+                    "source": "ranker_rejected",
+                    "weight": 0.15,
+                    "exposed": False,
+                    "sample_prob": 1.0,
+                    "rank_position": rejected.get("position")
+                    or rejected.get("rank_position"),
+                    "context": {
+                        "impression_id": impression_id,
+                        "recommendation_source": rejected.get("source")
+                        or rejected.get("candidate_source"),
+                        "candidate_scores": _safe_dict(rejected.get("scores")),
+                    },
+                }
+            )
+
+    return negatives
 
 
 class Base(DeclarativeBase):
@@ -895,6 +992,32 @@ class SystemStore:
             context.setdefault("content_id", metadata.get("content_id"))
         if metadata.get("item_snapshot_scope") is not None:
             context["item_snapshot_scope"] = str(metadata.get("item_snapshot_scope"))[:64]
+        rejected_candidate_items = metadata.get("rejected_candidate_items")
+        if isinstance(rejected_candidate_items, list):
+            bounded_rejected_items = []
+            for raw_item in rejected_candidate_items[:MAX_REJECTED_CANDIDATE_ITEMS]:
+                if not isinstance(raw_item, Mapping):
+                    continue
+                product_id = str(raw_item.get("product_id") or "").strip()
+                if not product_id:
+                    continue
+                bounded_rejected_items.append(
+                    {
+                        "product_id": product_id,
+                        "position": raw_item.get("position")
+                        or raw_item.get("rank_position"),
+                        "source": raw_item.get("source")
+                        or raw_item.get("candidate_source"),
+                        "candidate_source": raw_item.get("candidate_source")
+                        or raw_item.get("source"),
+                        "feature_snapshot": _safe_dict(
+                            raw_item.get("feature_snapshot")
+                        ),
+                        "scores": _safe_dict(raw_item.get("scores")),
+                    }
+                )
+            if bounded_rejected_items:
+                context["rejected_candidate_items"] = bounded_rejected_items
 
         impression_row = {
             "impression_id": impression_id,
@@ -1086,6 +1209,125 @@ class SystemStore:
             for row in interaction_rows
         ]
         return build_ltr_training_samples_from_impression_records(
+            flattened_items,
+            interactions,
+        )
+
+    async def get_two_tower_training_impression_negatives(
+        self,
+        *,
+        limit: int = 50000,
+        lookback_days: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read weak retrieval negatives from returned no-click and rejected candidates."""
+        if not self.enabled:
+            return []
+        limit = max(0, int(limit))
+        if limit <= 0:
+            return []
+
+        if lookback_days is None:
+            lookback_days = int(self.config.ltr_impression_lookback_days)
+        cutoff = None
+        if int(lookback_days or 0) > 0:
+            cutoff = _utc_now() - timedelta(days=int(lookback_days or 0))
+
+        stmt = (
+            select(RecommendationImpression)
+            .order_by(RecommendationImpression.created_at.desc())
+            .limit(limit)
+        )
+        if cutoff is not None:
+            stmt = stmt.where(RecommendationImpression.created_at >= cutoff)
+
+        async with self.session_factory() as session:
+            result = await session.execute(stmt)
+            impression_rows = result.scalars().all()
+
+            impression_ids = {impression.impression_id for impression in impression_rows}
+            item_rows = []
+            interaction_rows = []
+            if impression_ids:
+                item_stmt = (
+                    select(RecommendationImpressionItem)
+                    .where(
+                        RecommendationImpressionItem.impression_id.in_(
+                            sorted(impression_ids)
+                        )
+                    )
+                    .order_by(
+                        RecommendationImpressionItem.impression_id.asc(),
+                        RecommendationImpressionItem.position.asc(),
+                    )
+                )
+                item_result = await session.execute(item_stmt)
+                item_rows = item_result.scalars().all()
+
+                user_ids = sorted(
+                    {
+                        impression.user_id
+                        for impression in impression_rows
+                        if impression.user_id
+                    }
+                )
+                interaction_stmt = select(InteractionEvent).where(
+                    InteractionEvent.context["impression_id"].as_string().in_(
+                        sorted(impression_ids)
+                    )
+                )
+                if user_ids:
+                    interaction_stmt = interaction_stmt.where(
+                        InteractionEvent.user_id.in_(user_ids)
+                    )
+                if cutoff is not None:
+                    interaction_stmt = interaction_stmt.where(
+                        InteractionEvent.occurred_at >= cutoff
+                    )
+                interaction_result = await session.execute(interaction_stmt)
+                interaction_rows = interaction_result.scalars().all()
+
+        self._update_pool_metrics()
+
+        impressions_by_id = {
+            impression.impression_id: impression for impression in impression_rows
+        }
+        flattened_items: List[Dict[str, Any]] = []
+        for item in item_rows:
+            impression = impressions_by_id.get(item.impression_id)
+            if impression is None:
+                continue
+            flattened_items.append(
+                {
+                    "impression_id": impression.impression_id,
+                    "request_id": impression.request_id,
+                    "user_id": impression.user_id,
+                    "session_id": impression.session_id,
+                    "content_id": impression.content_id,
+                    "model_version": impression.model_version,
+                    "ranking_model_version": impression.ranking_model_version,
+                    "context": impression.context or {},
+                    "created_at": impression.created_at,
+                    "product_id": item.product_id,
+                    "position": item.position,
+                    "source": item.source,
+                    "feature_snapshot": item.feature_snapshot or {},
+                    "scores": item.scores or {},
+                }
+            )
+        interactions = [
+            {
+                "event_id": row.event_id,
+                "schema_version": row.schema_version,
+                "request_id": row.request_id,
+                "user_id": row.user_id,
+                "product_id": row.product_id,
+                "action": row.action,
+                "context": row.context or {},
+                "occurred_at": row.occurred_at,
+            }
+            for row in interaction_rows
+        ]
+        return build_two_tower_training_negatives_from_impression_records(
             flattened_items,
             interactions,
         )
