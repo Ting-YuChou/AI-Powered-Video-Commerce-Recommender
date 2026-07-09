@@ -16,12 +16,13 @@ Architecture:
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 import hashlib
 import json
 import logging
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import faiss
 import numpy as np
@@ -36,6 +37,33 @@ logger = logging.getLogger(__name__)
 
 NUM_CATEGORY_BUCKETS = 64
 NUM_BRAND_BUCKETS = 128
+
+NEGATIVE_SOURCE_RANDOM = "random"
+NEGATIVE_SOURCE_ANN_HARD = "ann_hard"
+NEGATIVE_SOURCE_IMPRESSION_NO_CLICK = "impression_no_click"
+NEGATIVE_SOURCE_RANKER_REJECTED = "ranker_rejected"
+
+
+@dataclass(frozen=True)
+class ExternalNegativeCandidate:
+    user_id: str
+    product_id: str
+    source: str = NEGATIVE_SOURCE_IMPRESSION_NO_CLICK
+    weight: float = 0.25
+    exposed: bool = True
+    sample_prob: float = 1.0
+    rank_position: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class NegativeSample:
+    item_idx: int
+    product_id: Optional[str] = None
+    source: str = NEGATIVE_SOURCE_RANDOM
+    weight: float = 1.0
+    exposed: bool = False
+    sample_prob: float = 1.0
+    rank_position: Optional[int] = None
 
 
 def _hash_bucket(value: str, num_buckets: int) -> int:
@@ -321,6 +349,10 @@ class TwoTowerModel(nn.Module):
         neg_item_ids: torch.Tensor,
         neg_clip_embs: torch.Tensor,
         neg_item_feats: torch.Tensor,
+        neg_weights: Optional[torch.Tensor] = None,
+        sample_weights: Optional[torch.Tensor] = None,
+        in_batch_exclude_mask: Optional[torch.Tensor] = None,
+        in_batch_loss_weight: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         batch_size = user_ids.size(0)
         num_neg = neg_item_ids.size(1)
@@ -328,25 +360,65 @@ class TwoTowerModel(nn.Module):
         user_emb = self.encode_users(user_ids, user_features)
         pos_emb = self.encode_items(pos_item_ids, pos_clip_embs, pos_item_feats)
 
-        neg_ids_flat = neg_item_ids.reshape(-1)
-        neg_clip_flat = neg_clip_embs.reshape(-1, neg_clip_embs.size(-1))
-        neg_feat_flat = neg_item_feats.reshape(-1, neg_item_feats.size(-1))
-        neg_emb_flat = self.encode_items(neg_ids_flat, neg_clip_flat, neg_feat_flat)
-        neg_emb = neg_emb_flat.reshape(batch_size, num_neg, -1)
-
         pos_scores = torch.sum(user_emb * pos_emb, dim=-1, keepdim=True) / self.temperature
-        neg_scores = torch.bmm(neg_emb, user_emb.unsqueeze(-1)).squeeze(-1) / self.temperature
 
-        logits = torch.cat([pos_scores, neg_scores], dim=-1)
-        labels = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
-        loss = F.cross_entropy(logits, labels)
-        accuracy = (logits.argmax(dim=-1) == 0).float().mean()
+        if num_neg > 0:
+            neg_ids_flat = neg_item_ids.reshape(-1)
+            neg_clip_flat = neg_clip_embs.reshape(-1, neg_clip_embs.size(-1))
+            neg_feat_flat = neg_item_feats.reshape(-1, neg_item_feats.size(-1))
+            neg_emb_flat = self.encode_items(neg_ids_flat, neg_clip_flat, neg_feat_flat)
+            neg_emb = neg_emb_flat.reshape(batch_size, num_neg, -1)
+            neg_scores = torch.bmm(neg_emb, user_emb.unsqueeze(-1)).squeeze(-1) / self.temperature
+
+            if neg_weights is None:
+                neg_weights_t = torch.ones_like(neg_scores)
+            else:
+                neg_weights_t = neg_weights.to(device=neg_scores.device, dtype=neg_scores.dtype)
+            neg_weights_t = torch.clamp(neg_weights_t, min=1e-8)
+            weighted_neg_scores = neg_scores + torch.log(neg_weights_t)
+            denominator = torch.logsumexp(
+                torch.cat([pos_scores, weighted_neg_scores], dim=-1),
+                dim=-1,
+            )
+            row_loss = denominator - pos_scores.squeeze(-1)
+            logits_for_accuracy = torch.cat([pos_scores, neg_scores], dim=-1)
+            accuracy = (logits_for_accuracy.argmax(dim=-1) == 0).float().mean()
+        else:
+            row_loss = torch.zeros(batch_size, dtype=pos_scores.dtype, device=pos_scores.device)
+            accuracy = torch.ones((), dtype=pos_scores.dtype, device=pos_scores.device)
+
+        if sample_weights is not None:
+            sample_weights_t = sample_weights.to(device=row_loss.device, dtype=row_loss.dtype)
+            sample_weights_t = torch.clamp(sample_weights_t, min=0.0)
+            mean_weight = torch.clamp(sample_weights_t.mean(), min=1e-8)
+            row_loss = row_loss * (sample_weights_t / mean_weight)
+
+        loss = row_loss.mean()
+
+        if in_batch_loss_weight > 0.0 and batch_size > 1:
+            in_batch_logits = torch.matmul(user_emb, pos_emb.t()) / self.temperature
+            if in_batch_exclude_mask is not None:
+                mask = in_batch_exclude_mask.to(
+                    device=in_batch_logits.device,
+                    dtype=torch.bool,
+                )
+                diag = torch.eye(batch_size, dtype=torch.bool, device=in_batch_logits.device)
+                in_batch_logits = in_batch_logits.masked_fill(mask & ~diag, -1e9)
+            labels = torch.arange(batch_size, dtype=torch.long, device=in_batch_logits.device)
+            in_batch_row_loss = F.cross_entropy(
+                in_batch_logits,
+                labels,
+                reduction="none",
+            )
+            if sample_weights is not None:
+                in_batch_row_loss = in_batch_row_loss * (sample_weights_t / mean_weight)
+            loss = loss + float(in_batch_loss_weight) * in_batch_row_loss.mean()
 
         return {"loss": loss, "accuracy": accuracy}
 
 
 class NegativeSampler:
-    """Mixed hard/random negative sampler using a FAISS index for hard mining."""
+    """Source-aware negative sampler using weak external, hard, and random sources."""
 
     def __init__(
         self,
@@ -355,12 +427,28 @@ class NegativeSampler:
         num_random: int = 10,
         hard_ratio_start: float = 0.1,
         hard_ratio_end: float = 0.5,
+        hard_ratio_cap: float = 0.2,
+        impression_negative_ratio: float = 0.2,
+        ranker_rejected_negative_ratio: float = 0.1,
+        hard_negative_weight: float = 0.35,
+        impression_negative_weight: float = 0.25,
+        ranker_rejected_negative_weight: float = 0.15,
+        random_negative_weight: float = 1.0,
     ):
         self.num_items = num_items
         self.num_hard = num_hard
         self.num_random = num_random
         self.hard_ratio_start = hard_ratio_start
         self.hard_ratio_end = hard_ratio_end
+        self.hard_ratio_cap = max(0.0, min(float(hard_ratio_cap), 1.0))
+        self.impression_negative_ratio = max(0.0, min(float(impression_negative_ratio), 1.0))
+        self.ranker_rejected_negative_ratio = max(
+            0.0, min(float(ranker_rejected_negative_ratio), 1.0)
+        )
+        self.hard_negative_weight = max(float(hard_negative_weight), 0.0)
+        self.impression_negative_weight = max(float(impression_negative_weight), 0.0)
+        self.ranker_rejected_negative_weight = max(float(ranker_rejected_negative_weight), 0.0)
+        self.random_negative_weight = max(float(random_negative_weight), 0.0)
         self.item_index: Optional[faiss.Index] = None
         self.item_index_map: Dict[int, int] = {}
 
@@ -382,14 +470,61 @@ class NegativeSampler:
         self,
         user_embedding: Optional[np.ndarray],
         positive_items: Set[int],
+        external_negatives: Optional[Sequence[NegativeSample]] = None,
         epoch: int = 0,
         total_epochs: int = 1,
-    ) -> List[int]:
+    ) -> List[NegativeSample]:
         total_neg = self.total_negatives
-        hard_ratio = self.get_hard_ratio(epoch, total_epochs)
-        num_hard_actual = int(total_neg * hard_ratio)
+        if total_neg <= 0:
+            return []
 
-        negatives: List[int] = []
+        hard_ratio = min(self.get_hard_ratio(epoch, total_epochs), self.hard_ratio_cap)
+        num_hard_actual = min(total_neg, int(total_neg * hard_ratio))
+        num_impression = int(total_neg * self.impression_negative_ratio)
+        num_ranker_rejected = int(total_neg * self.ranker_rejected_negative_ratio)
+
+        negatives: List[NegativeSample] = []
+        selected: Set[int] = set()
+
+        def add_sample(sample: NegativeSample, *, weight: Optional[float] = None) -> bool:
+            if sample.item_idx <= 0:
+                return False
+            if sample.item_idx in positive_items or sample.item_idx in selected:
+                return False
+            selected.add(sample.item_idx)
+            negatives.append(
+                NegativeSample(
+                    item_idx=sample.item_idx,
+                    product_id=sample.product_id,
+                    source=sample.source,
+                    weight=sample.weight if weight is None else weight,
+                    exposed=sample.exposed,
+                    sample_prob=sample.sample_prob,
+                    rank_position=sample.rank_position,
+                )
+            )
+            return True
+
+        external_by_source: Dict[str, List[NegativeSample]] = defaultdict(list)
+        for sample in external_negatives or []:
+            external_by_source[sample.source].append(sample)
+
+        for sample in external_by_source.get(NEGATIVE_SOURCE_IMPRESSION_NO_CLICK, []):
+            impression_count = sum(
+                1 for neg in negatives if neg.source == NEGATIVE_SOURCE_IMPRESSION_NO_CLICK
+            )
+            if impression_count >= num_impression:
+                break
+            add_sample(sample, weight=self.impression_negative_weight)
+
+        for sample in external_by_source.get(NEGATIVE_SOURCE_RANKER_REJECTED, []):
+            ranker_rejected_count = sum(
+                1 for neg in negatives if neg.source == NEGATIVE_SOURCE_RANKER_REJECTED
+            )
+            if ranker_rejected_count >= num_ranker_rejected:
+                break
+            add_sample(sample, weight=self.ranker_rejected_negative_weight)
+
         if (
             num_hard_actual > 0
             and self.item_index is not None
@@ -400,24 +535,62 @@ class NegativeSampler:
             search_k = min(num_hard_actual * 5, self.item_index.ntotal)
             _, indices = self.item_index.search(query, search_k)
             for idx in indices[0]:
-                if len(negatives) >= num_hard_actual:
+                hard_count = sum(
+                    1 for neg in negatives if neg.source == NEGATIVE_SOURCE_ANN_HARD
+                )
+                if hard_count >= num_hard_actual:
                     break
                 if idx == -1:
                     continue
                 item_idx = self.item_index_map.get(int(idx))
-                if item_idx is not None and item_idx not in positive_items:
-                    negatives.append(item_idx)
+                if item_idx is not None:
+                    add_sample(
+                        NegativeSample(
+                            item_idx=item_idx,
+                            source=NEGATIVE_SOURCE_ANN_HARD,
+                            weight=self.hard_negative_weight,
+                        ),
+                        weight=self.hard_negative_weight,
+                    )
 
         attempts = 0
         max_attempts = total_neg * 10
         while len(negatives) < total_neg and attempts < max_attempts:
             rand_idx = np.random.randint(1, self.num_items + 1)
-            if rand_idx not in positive_items and rand_idx not in negatives:
-                negatives.append(rand_idx)
+            add_sample(
+                NegativeSample(
+                    item_idx=rand_idx,
+                    source=NEGATIVE_SOURCE_RANDOM,
+                    weight=self.random_negative_weight,
+                    sample_prob=1.0 / max(float(self.num_items), 1.0),
+                ),
+                weight=self.random_negative_weight,
+            )
             attempts += 1
 
+        if len(negatives) < total_neg:
+            for item_idx in range(1, self.num_items + 1):
+                if len(negatives) >= total_neg:
+                    break
+                add_sample(
+                    NegativeSample(
+                        item_idx=item_idx,
+                        source=NEGATIVE_SOURCE_RANDOM,
+                        weight=self.random_negative_weight,
+                        sample_prob=1.0 / max(float(self.num_items), 1.0),
+                    ),
+                    weight=self.random_negative_weight,
+                )
+
         while len(negatives) < total_neg:
-            negatives.append(np.random.randint(1, max(self.num_items, 2)))
+            negatives.append(
+                NegativeSample(
+                    item_idx=0,
+                    source=NEGATIVE_SOURCE_RANDOM,
+                    weight=0.0,
+                    sample_prob=0.0,
+                )
+            )
 
         return negatives[:total_neg]
 
@@ -447,6 +620,15 @@ class TwoTowerTrainer:
         num_random_negatives: int = 10,
         hard_ratio_start: float = 0.1,
         hard_ratio_end: float = 0.5,
+        hard_ratio_cap: float = 0.2,
+        impression_negative_ratio: float = 0.2,
+        ranker_rejected_negative_ratio: float = 0.1,
+        hard_negative_weight: float = 0.35,
+        impression_negative_weight: float = 0.25,
+        ranker_rejected_negative_weight: float = 0.15,
+        random_negative_weight: float = 1.0,
+        enable_in_batch_negatives: bool = True,
+        in_batch_loss_weight: float = 0.25,
         user_hidden_dims: Optional[List[int]] = None,
         item_hidden_dims: Optional[List[int]] = None,
         architecture: str = "dcn",
@@ -472,11 +654,21 @@ class TwoTowerTrainer:
         self.num_random_negatives = num_random_negatives
         self.hard_ratio_start = hard_ratio_start
         self.hard_ratio_end = hard_ratio_end
+        self.hard_ratio_cap = hard_ratio_cap
+        self.impression_negative_ratio = impression_negative_ratio
+        self.ranker_rejected_negative_ratio = ranker_rejected_negative_ratio
+        self.hard_negative_weight = hard_negative_weight
+        self.impression_negative_weight = impression_negative_weight
+        self.ranker_rejected_negative_weight = ranker_rejected_negative_weight
+        self.random_negative_weight = random_negative_weight
+        self.enable_in_batch_negatives = enable_in_batch_negatives
+        self.in_batch_loss_weight = in_batch_loss_weight
 
         self.user_mapping: Dict[str, int] = {}
         self.item_mapping: Dict[str, int] = {}
         self.reverse_item_mapping: Dict[int, str] = {}
         self.user_positives: Dict[int, Set[int]] = defaultdict(set)
+        self._external_negatives_by_user: Dict[int, List[NegativeSample]] = defaultdict(list)
 
         self._item_clip_embs: Optional[np.ndarray] = None
         self._item_side_feats: Optional[np.ndarray] = None
@@ -490,6 +682,9 @@ class TwoTowerTrainer:
         product_metadata: Dict[str, Dict[str, Any]],
         product_clip_embeddings: Dict[str, np.ndarray],
         user_features_map: Dict[str, Dict[str, Any]],
+        external_negatives: Optional[
+            Sequence[Mapping[str, Any] | ExternalNegativeCandidate]
+        ] = None,
     ):
         logger.info(f"Preparing training data from {len(interactions)} interactions")
 
@@ -498,6 +693,17 @@ class TwoTowerTrainer:
         for interaction in interactions:
             uid = interaction.get("user_id")
             pid = interaction.get("product_id")
+            if uid and pid:
+                users.add(uid)
+                items.add(pid)
+
+        for candidate in external_negatives or []:
+            if isinstance(candidate, ExternalNegativeCandidate):
+                uid = candidate.user_id
+                pid = candidate.product_id
+            else:
+                uid = str(candidate.get("user_id") or "")
+                pid = str(candidate.get("product_id") or "")
             if uid and pid:
                 users.add(uid)
                 items.add(pid)
@@ -513,8 +719,14 @@ class TwoTowerTrainer:
         num_items = len(self.item_mapping)
         logger.info(f"Mapped {num_users} users, {num_items} items")
 
-        self._item_clip_embs = np.zeros((num_items + 1, self.clip_dim), dtype=np.float32)
-        self._item_side_feats = np.zeros((num_items + 1, ItemFeatureEncoder.FEATURE_DIM), dtype=np.float32)
+        self._item_clip_embs = np.zeros(
+            (num_items + 1, self.clip_dim),
+            dtype=np.float32,
+        )
+        self._item_side_feats = np.zeros(
+            (num_items + 1, ItemFeatureEncoder.FEATURE_DIM),
+            dtype=np.float32,
+        )
 
         for product_id, idx in self.item_mapping.items():
             clip_emb = product_clip_embeddings.get(product_id)
@@ -532,6 +744,7 @@ class TwoTowerTrainer:
 
         self._train_samples = []
         self.user_positives = defaultdict(set)
+        self._external_negatives_by_user = defaultdict(list)
         for interaction in interactions:
             uid = interaction.get("user_id")
             pid = interaction.get("product_id")
@@ -543,6 +756,52 @@ class TwoTowerTrainer:
             weight = INTERACTION_WEIGHTS.get(action, 1.0)
             self._train_samples.append((u_idx, p_idx, weight))
             self.user_positives[u_idx].add(p_idx)
+
+        for candidate in external_negatives or []:
+            if isinstance(candidate, ExternalNegativeCandidate):
+                raw_candidate = {
+                    "user_id": candidate.user_id,
+                    "product_id": candidate.product_id,
+                    "source": candidate.source,
+                    "weight": candidate.weight,
+                    "exposed": candidate.exposed,
+                    "sample_prob": candidate.sample_prob,
+                    "rank_position": candidate.rank_position,
+                }
+            else:
+                raw_candidate = dict(candidate)
+            uid = str(raw_candidate.get("user_id") or "")
+            pid = str(raw_candidate.get("product_id") or "")
+            if uid not in self.user_mapping or pid not in self.item_mapping:
+                continue
+            source = str(
+                raw_candidate.get("source") or NEGATIVE_SOURCE_IMPRESSION_NO_CLICK
+            )
+            default_weight = (
+                self.ranker_rejected_negative_weight
+                if source == NEGATIVE_SOURCE_RANKER_REJECTED
+                else self.impression_negative_weight
+            )
+            self._external_negatives_by_user[self.user_mapping[uid]].append(
+                NegativeSample(
+                    item_idx=self.item_mapping[pid],
+                    product_id=pid,
+                    source=source,
+                    weight=float(raw_candidate.get("weight", default_weight)),
+                    exposed=bool(
+                        raw_candidate.get(
+                            "exposed",
+                            source == NEGATIVE_SOURCE_IMPRESSION_NO_CLICK,
+                        )
+                    ),
+                    sample_prob=float(raw_candidate.get("sample_prob", 1.0)),
+                    rank_position=(
+                        int(raw_candidate["rank_position"])
+                        if raw_candidate.get("rank_position") is not None
+                        else None
+                    ),
+                )
+            )
 
         logger.info(f"Prepared {len(self._train_samples)} training samples")
 
@@ -564,6 +823,13 @@ class TwoTowerTrainer:
             num_random=self.num_random_negatives,
             hard_ratio_start=self.hard_ratio_start,
             hard_ratio_end=self.hard_ratio_end,
+            hard_ratio_cap=self.hard_ratio_cap,
+            impression_negative_ratio=self.impression_negative_ratio,
+            ranker_rejected_negative_ratio=self.ranker_rejected_negative_ratio,
+            hard_negative_weight=self.hard_negative_weight,
+            impression_negative_weight=self.impression_negative_weight,
+            ranker_rejected_negative_weight=self.ranker_rejected_negative_weight,
+            random_negative_weight=self.random_negative_weight,
         )
 
     def train(self, existing_cf_index: Optional[faiss.Index] = None) -> Dict[str, Any]:
@@ -584,7 +850,11 @@ class TwoTowerTrainer:
                 f"index_items={existing_cf_index.ntotal}, current_items={len(self.item_mapping)}"
             )
 
-        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=1e-5,
+        )
         self.model.train()
 
         num_samples = len(self._train_samples)
@@ -603,18 +873,31 @@ class TwoTowerTrainer:
                 actual_bs = len(batch_indices)
 
                 user_ids_np = np.zeros(actual_bs, dtype=np.int64)
-                user_feats_np = np.zeros((actual_bs, UserFeatureEncoder.FEATURE_DIM), dtype=np.float32)
+                user_feats_np = np.zeros(
+                    (actual_bs, UserFeatureEncoder.FEATURE_DIM),
+                    dtype=np.float32,
+                )
                 pos_item_ids_np = np.zeros(actual_bs, dtype=np.int64)
                 pos_clip_np = np.zeros((actual_bs, self.clip_dim), dtype=np.float32)
-                pos_feat_np = np.zeros((actual_bs, ItemFeatureEncoder.FEATURE_DIM), dtype=np.float32)
+                pos_feat_np = np.zeros(
+                    (actual_bs, ItemFeatureEncoder.FEATURE_DIM),
+                    dtype=np.float32,
+                )
                 neg_item_ids_np = np.zeros((actual_bs, total_neg), dtype=np.int64)
                 neg_clip_np = np.zeros((actual_bs, total_neg, self.clip_dim), dtype=np.float32)
-                neg_feat_np = np.zeros((actual_bs, total_neg, ItemFeatureEncoder.FEATURE_DIM), dtype=np.float32)
+                neg_feat_np = np.zeros(
+                    (actual_bs, total_neg, ItemFeatureEncoder.FEATURE_DIM),
+                    dtype=np.float32,
+                )
+                neg_weights_np = np.ones((actual_bs, total_neg), dtype=np.float32)
+                sample_weights_np = np.ones(actual_bs, dtype=np.float32)
+                in_batch_exclude_mask_np = np.zeros((actual_bs, actual_bs), dtype=bool)
 
                 for i, sample_idx in enumerate(batch_indices):
-                    u_idx, p_idx, _ = self._train_samples[sample_idx]
+                    u_idx, p_idx, sample_weight = self._train_samples[sample_idx]
 
                     user_ids_np[i] = u_idx
+                    sample_weights_np[i] = float(sample_weight)
                     user_feats_np[i] = self._user_side_feats.get(
                         u_idx,
                         np.zeros(UserFeatureEncoder.FEATURE_DIM, dtype=np.float32),
@@ -624,10 +907,24 @@ class TwoTowerTrainer:
                     pos_clip_np[i] = self._item_clip_embs[p_idx]
                     pos_feat_np[i] = self._item_side_feats[p_idx]
 
+                if self.enable_in_batch_negatives and actual_bs > 1:
+                    for i in range(actual_bs):
+                        user_positive_items = self.user_positives.get(int(user_ids_np[i]), set())
+                        for j in range(actual_bs):
+                            if i == j:
+                                continue
+                            if (
+                                int(pos_item_ids_np[j]) in user_positive_items
+                                or int(pos_item_ids_np[j]) == int(pos_item_ids_np[i])
+                            ):
+                                in_batch_exclude_mask_np[i, j] = True
+
                 user_embeddings_np: Optional[np.ndarray] = None
-                hard_count = int(
-                    total_neg * self.negative_sampler.get_hard_ratio(epoch, self.epochs)
+                hard_ratio = min(
+                    self.negative_sampler.get_hard_ratio(epoch, self.epochs),
+                    self.negative_sampler.hard_ratio_cap,
                 )
+                hard_count = min(total_neg, int(total_neg * hard_ratio))
                 if (
                     hard_count > 0
                     and self.negative_sampler.item_index is not None
@@ -654,10 +951,17 @@ class TwoTowerTrainer:
                             else None
                         ),
                         positive_items=self.user_positives.get(u_idx, set()),
+                        external_negatives=self._external_negatives_by_user.get(u_idx, []),
                         epoch=epoch,
                         total_epochs=self.epochs,
                     )
-                    for j, neg_idx in enumerate(neg_indices):
+                    for j, neg_sample in enumerate(neg_indices):
+                        if isinstance(neg_sample, NegativeSample):
+                            neg_idx = neg_sample.item_idx
+                            neg_weights_np[i, j] = float(neg_sample.weight)
+                        else:
+                            neg_idx = int(neg_sample)
+                            neg_weights_np[i, j] = 1.0
                         neg_item_ids_np[i, j] = neg_idx
                         if neg_idx < len(self._item_clip_embs):
                             neg_clip_np[i, j] = self._item_clip_embs[neg_idx]
@@ -671,6 +975,9 @@ class TwoTowerTrainer:
                 neg_ids_t = torch.tensor(neg_item_ids_np, device=self.device)
                 neg_clip_t = torch.tensor(neg_clip_np, device=self.device)
                 neg_feat_t = torch.tensor(neg_feat_np, device=self.device)
+                neg_weights_t = torch.tensor(neg_weights_np, device=self.device)
+                sample_weights_t = torch.tensor(sample_weights_np, device=self.device)
+                in_batch_mask_t = torch.tensor(in_batch_exclude_mask_np, device=self.device)
 
                 optimizer.zero_grad()
                 outputs = self.model(
@@ -682,6 +989,14 @@ class TwoTowerTrainer:
                     neg_ids_t,
                     neg_clip_t,
                     neg_feat_t,
+                    neg_weights=neg_weights_t,
+                    sample_weights=sample_weights_t,
+                    in_batch_exclude_mask=in_batch_mask_t,
+                    in_batch_loss_weight=(
+                        self.in_batch_loss_weight
+                        if self.enable_in_batch_negatives
+                        else 0.0
+                    ),
                 )
                 loss = outputs["loss"]
                 loss.backward()

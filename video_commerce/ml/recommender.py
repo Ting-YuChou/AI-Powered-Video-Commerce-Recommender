@@ -87,6 +87,15 @@ class TwoTowerRetrievalEngine:
             num_random_negatives=config.tt_num_random_negatives,
             hard_ratio_start=config.tt_hard_negative_ratio_start,
             hard_ratio_end=config.tt_hard_negative_ratio_end,
+            hard_ratio_cap=config.tt_hard_negative_ratio_cap,
+            impression_negative_ratio=config.tt_impression_negative_ratio,
+            ranker_rejected_negative_ratio=config.tt_ranker_rejected_negative_ratio,
+            hard_negative_weight=config.tt_hard_negative_weight,
+            impression_negative_weight=config.tt_impression_negative_weight,
+            ranker_rejected_negative_weight=config.tt_ranker_rejected_negative_weight,
+            random_negative_weight=config.tt_random_negative_weight,
+            enable_in_batch_negatives=config.tt_enable_in_batch_negatives,
+            in_batch_loss_weight=config.tt_in_batch_loss_weight,
             user_hidden_dims=config.tt_user_hidden_dims,
             item_hidden_dims=config.tt_item_hidden_dims,
             architecture=config.tt_architecture,
@@ -182,6 +191,7 @@ class TwoTowerRetrievalEngine:
         self,
         interactions: List[Dict[str, Any]],
         user_features_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        external_negatives: Optional[List[Dict[str, Any]]] = None,
     ):
         """Train the Two-Tower model on user interaction data.
 
@@ -224,6 +234,7 @@ class TwoTowerRetrievalEngine:
                 product_metadata=product_metadata,
                 product_clip_embeddings=product_clip_embeddings,
                 user_features_map=user_features_map,
+                external_negatives=external_negatives or [],
             )
 
             # Try to load existing checkpoint for warm-start
@@ -1638,6 +1649,14 @@ class RecommendationEngine:
                     limit=50000
                 )
             )
+            external_negatives: List[Dict[str, Any]] = []
+            get_two_tower_negatives = getattr(
+                self.artifact_manager.system_store,
+                "get_two_tower_training_impression_negatives",
+                None,
+            )
+            if callable(get_two_tower_negatives):
+                external_negatives = await get_two_tower_negatives(limit=50000)
 
             if interactions:
                 # Gather user features for the trainer
@@ -1645,7 +1664,9 @@ class RecommendationEngine:
 
                 # Train Two-Tower model
                 await self.cf_engine.train_model(
-                    interactions, user_features_map=user_features_map
+                    interactions,
+                    user_features_map=user_features_map,
+                    external_negatives=external_negatives,
                 )
                 if self.cf_engine.is_trained:
                     checkpoint_path = (
@@ -1665,6 +1686,7 @@ class RecommendationEngine:
                         adapter_path=self.artifact_manager.two_tower_local_adapter_path,
                         payload={
                             "sample_count": len(interactions),
+                            "external_negative_count": len(external_negatives),
                             "last_training_time": self.cf_engine.last_training_time,
                         },
                     )

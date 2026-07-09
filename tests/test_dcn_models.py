@@ -10,6 +10,7 @@ from video_commerce.common.config import RankingConfig
 from video_commerce.common.models import CandidateProduct, UserFeatures
 from video_commerce.ml.dcn import DeepAndCrossNetwork, LowRankCrossLayer
 from video_commerce.ml.ranking import MultiObjectiveRankingModel, RankingModel
+from video_commerce.ml import two_tower as two_tower_module
 from video_commerce.ml.two_tower import ItemFeatureEncoder, TwoTowerModel, TwoTowerTrainer
 from video_commerce.ranking_runtime.ranking_batcher import RankingBatcher
 
@@ -210,6 +211,7 @@ def test_two_tower_training_passes_user_embedding_to_hard_negative_sampler():
         num_random_negatives=0,
         hard_ratio_start=1.0,
         hard_ratio_end=1.0,
+        hard_ratio_cap=1.0,
         user_hidden_dims=[8],
         item_hidden_dims=[8],
         architecture="dcn",
@@ -244,7 +246,13 @@ def test_two_tower_training_passes_user_embedding_to_hard_negative_sampler():
     )
     saw_user_embedding = []
 
-    def sample_with_probe(user_embedding, positive_items, epoch=0, total_epochs=1):
+    def sample_with_probe(
+        user_embedding,
+        positive_items,
+        external_negatives=None,
+        epoch=0,
+        total_epochs=1,
+    ):
         saw_user_embedding.append(user_embedding is not None)
         for item_idx in range(1, len(trainer.item_mapping) + 1):
             if item_idx not in positive_items:
@@ -256,6 +264,191 @@ def test_two_tower_training_passes_user_embedding_to_hard_negative_sampler():
     trainer.train(existing_cf_index=index)
 
     assert any(saw_user_embedding)
+
+
+def test_source_aware_negative_sampler_caps_hard_and_fills_source_quotas():
+    sampler = two_tower_module.NegativeSampler(
+        num_items=13,
+        num_hard=6,
+        num_random=5,
+        hard_ratio_start=1.0,
+        hard_ratio_end=1.0,
+        hard_ratio_cap=0.2,
+        impression_negative_ratio=0.2,
+        ranker_rejected_negative_ratio=0.1,
+        hard_negative_weight=0.35,
+        impression_negative_weight=0.25,
+        ranker_rejected_negative_weight=0.15,
+        random_negative_weight=1.0,
+    )
+    index = faiss.IndexFlatIP(2)
+    index.add(
+        np.array(
+            [
+                [1.0, 0.0],
+                [0.9, 0.1],
+                [0.8, 0.2],
+                [0.7, 0.3],
+                [0.6, 0.4],
+                [0.5, 0.5],
+            ],
+            dtype=np.float32,
+        )
+    )
+    sampler.set_index(index, {idx: idx + 1 for idx in range(index.ntotal)})
+    external_negatives = [
+        two_tower_module.NegativeSample(
+            item_idx=3,
+            product_id="p3",
+            source="impression_no_click",
+            weight=0.25,
+            exposed=True,
+            rank_position=2,
+        ),
+        two_tower_module.NegativeSample(
+            item_idx=4,
+            product_id="p4",
+            source="impression_no_click",
+            weight=0.25,
+            exposed=True,
+            rank_position=3,
+        ),
+        two_tower_module.NegativeSample(
+            item_idx=5,
+            product_id="p5",
+            source="ranker_rejected",
+            weight=0.15,
+            exposed=False,
+            rank_position=11,
+        ),
+    ]
+
+    samples = sampler.sample(
+        user_embedding=np.array([1.0, 0.0], dtype=np.float32),
+        positive_items={1, 2},
+        external_negatives=external_negatives,
+        epoch=0,
+        total_epochs=1,
+    )
+
+    assert len(samples) == 11
+    assert all(sample.item_idx not in {1, 2} for sample in samples)
+    counts = {}
+    for sample in samples:
+        counts[sample.source] = counts.get(sample.source, 0) + 1
+    assert counts["impression_no_click"] == 2
+    assert counts["ranker_rejected"] == 1
+    assert counts["ann_hard"] <= 2
+    assert counts["random"] >= 6
+    assert {sample.weight for sample in samples if sample.source == "ann_hard"} == {0.35}
+
+
+def test_two_tower_weighted_loss_downweights_weak_negatives():
+    model = TwoTowerModel(num_users=1, num_items=3, clip_dim=1, output_dim=2)
+
+    model.encode_users = lambda user_ids, user_features: torch.tensor(
+        [[1.0, 0.0]], device=user_ids.device
+    )
+
+    def encode_items(item_ids, clip_embeddings, item_features):
+        embeddings = {
+            1: torch.tensor([1.0, 0.0], device=item_ids.device),
+            2: torch.tensor([0.95, 0.05], device=item_ids.device),
+            3: torch.tensor([0.95, 0.05], device=item_ids.device),
+        }
+        return torch.stack([embeddings[int(item_id)] for item_id in item_ids.tolist()])
+
+    model.encode_items = encode_items
+    common_kwargs = {
+        "user_ids": torch.tensor([1]),
+        "user_features": torch.zeros((1, 10)),
+        "pos_item_ids": torch.tensor([1]),
+        "pos_clip_embs": torch.zeros((1, 1)),
+        "pos_item_feats": torch.zeros((1, 8)),
+        "neg_item_ids": torch.tensor([[2, 3]]),
+        "neg_clip_embs": torch.zeros((1, 2, 1)),
+        "neg_item_feats": torch.zeros((1, 2, 8)),
+    }
+
+    full_weight = model(**common_kwargs, neg_weights=torch.tensor([[1.0, 1.0]]))["loss"]
+    weak_weight = model(**common_kwargs, neg_weights=torch.tensor([[0.1, 1.0]]))["loss"]
+
+    assert weak_weight < full_weight
+
+
+def test_two_tower_sample_weights_affect_row_loss():
+    model = TwoTowerModel(num_users=2, num_items=3, clip_dim=1, output_dim=2)
+
+    model.encode_users = lambda user_ids, user_features: torch.tensor(
+        [[1.0, 0.0], [1.0, 0.0]], device=user_ids.device
+    )
+
+    def encode_items(item_ids, clip_embeddings, item_features):
+        embeddings = {
+            1: torch.tensor([0.0, 1.0], device=item_ids.device),
+            2: torch.tensor([1.0, 0.0], device=item_ids.device),
+            3: torch.tensor([1.0, 0.0], device=item_ids.device),
+        }
+        return torch.stack([embeddings[int(item_id)] for item_id in item_ids.tolist()])
+
+    model.encode_items = encode_items
+    common_kwargs = {
+        "user_ids": torch.tensor([1, 2]),
+        "user_features": torch.zeros((2, 10)),
+        "pos_item_ids": torch.tensor([1, 2]),
+        "pos_clip_embs": torch.zeros((2, 1)),
+        "pos_item_feats": torch.zeros((2, 8)),
+        "neg_item_ids": torch.tensor([[3], [3]]),
+        "neg_clip_embs": torch.zeros((2, 1, 1)),
+        "neg_item_feats": torch.zeros((2, 1, 8)),
+        "neg_weights": torch.ones((2, 1)),
+    }
+
+    high_loss_first = model(**common_kwargs, sample_weights=torch.tensor([5.0, 1.0]))["loss"]
+    high_loss_second = model(**common_kwargs, sample_weights=torch.tensor([1.0, 5.0]))["loss"]
+
+    assert high_loss_first > high_loss_second
+
+
+def test_two_tower_in_batch_mask_excludes_false_negatives():
+    model = TwoTowerModel(num_users=2, num_items=3, clip_dim=1, output_dim=2)
+
+    model.encode_users = lambda user_ids, user_features: torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0]], device=user_ids.device
+    )
+
+    def encode_items(item_ids, clip_embeddings, item_features):
+        embeddings = {
+            1: torch.tensor([0.0, 1.0], device=item_ids.device),
+            2: torch.tensor([1.0, 0.0], device=item_ids.device),
+            3: torch.tensor([0.0, 1.0], device=item_ids.device),
+        }
+        return torch.stack([embeddings[int(item_id)] for item_id in item_ids.tolist()])
+
+    model.encode_items = encode_items
+    common_kwargs = {
+        "user_ids": torch.tensor([1, 2]),
+        "user_features": torch.zeros((2, 10)),
+        "pos_item_ids": torch.tensor([1, 2]),
+        "pos_clip_embs": torch.zeros((2, 1)),
+        "pos_item_feats": torch.zeros((2, 8)),
+        "neg_item_ids": torch.tensor([[3], [3]]),
+        "neg_clip_embs": torch.zeros((2, 1, 1)),
+        "neg_item_feats": torch.zeros((2, 1, 8)),
+        "neg_weights": torch.ones((2, 1)),
+        "in_batch_loss_weight": 1.0,
+    }
+
+    unmasked = model(**common_kwargs)["loss"]
+    masked = model(
+        **common_kwargs,
+        in_batch_exclude_mask=torch.tensor(
+            [[False, True], [False, False]],
+            dtype=torch.bool,
+        ),
+    )["loss"]
+
+    assert masked < unmasked
 
 
 def test_two_tower_warm_start_keeps_configured_dcn_architecture(tmp_path):

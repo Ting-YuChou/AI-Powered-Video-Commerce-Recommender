@@ -482,6 +482,37 @@ class RecommendationConfig(BaseSettings):
     tt_hard_negative_ratio_end: float = Field(
         0.5, description="Final hard negative ratio (curriculum)"
     )
+    tt_hard_negative_ratio_cap: float = Field(
+        0.2, description="Maximum explicit negative share mined from ANN hard negatives"
+    )
+    tt_impression_negative_ratio: float = Field(
+        0.2, description="Explicit negative share sourced from no-click impressions"
+    )
+    tt_ranker_rejected_negative_ratio: float = Field(
+        0.1, description="Explicit negative share sourced from ranker-rejected candidates"
+    )
+    tt_hard_negative_weight: float = Field(
+        0.35, description="Loss denominator weight for ANN hard negatives"
+    )
+    tt_impression_negative_weight: float = Field(
+        0.25, description="Loss denominator weight for no-click impression negatives"
+    )
+    tt_ranker_rejected_negative_weight: float = Field(
+        0.15, description="Loss denominator weight for ranker-rejected weak negatives"
+    )
+    tt_random_negative_weight: float = Field(
+        1.0, description="Loss denominator weight for random sampled negatives"
+    )
+    tt_enable_in_batch_negatives: bool = Field(
+        True, description="Enable masked in-batch negatives during Two-Tower training"
+    )
+    tt_in_batch_loss_weight: float = Field(
+        0.25, description="Loss weight for masked in-batch Two-Tower contrastive loss"
+    )
+    ranker_rejected_logging_max_items: int = Field(
+        50,
+        description="Maximum ranker-rejected candidates to include in impression metadata",
+    )
 
     # CF FAISS index path
     cf_index_path: str = Field(
