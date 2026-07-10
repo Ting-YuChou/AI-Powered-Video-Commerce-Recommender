@@ -898,6 +898,7 @@ def test_prepare_training_data_uses_online_equivalent_feature_extractor(monkeypa
         "user_id": "u1",
         "product_id": "p1",
         "action": "click",
+        "event_time": fixed_now,
         "context": {"device": "mobile", "session_position": 2, "time_on_page": 30},
         "collaborative_score": 0.2,
         "content_similarity_score": 0.3,
@@ -1337,6 +1338,59 @@ async def test_model_trainer_prefers_impression_backed_ltr_samples():
     assert (
         service.artifact_manager.payload["training_sample_source"]
         == "recommendation_impressions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_uses_pit_dataset_without_current_online_feature_maps():
+    class PitReader:
+        async def read(self, dataset_uri):
+            assert dataset_uri == "s3://feature-lake/ranking-pit.jsonl"
+            return SimpleNamespace(
+                dataset_version="iceberg-snapshot-42",
+                rows=[
+                    {
+                        "user_id": "u1",
+                        "product_id": "p1",
+                        "action": "click",
+                        "as_of_ts": 100.0,
+                        "user_features": {"total_interactions": 3},
+                        "product_metadata": {"price": 9.0},
+                        "context": {},
+                    }
+                ],
+            )
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/ranking-pit.jsonl",
+        ),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = SimpleNamespace()
+    service.system_store = None
+    service.pit_dataset_reader = PitReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.vector_search = None
+    service.recommendation_engine = None
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="test")
+
+    assert service.ranking_model.received["training_data"][0]["as_of_ts"] == 100.0
+    assert service.ranking_model.received["user_features_map"] == {}
+    assert service.ranking_model.received["product_metadata_map"] == {}
+    assert service.ranking_model.received["training_sample_source"] == "feature_lake_pit"
+    assert (
+        service.artifact_manager.payload["feature_lake_dataset_version"]
+        == "iceberg-snapshot-42"
     )
 
 

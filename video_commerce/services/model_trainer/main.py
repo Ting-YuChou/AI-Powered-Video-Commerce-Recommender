@@ -16,6 +16,7 @@ from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.ml.ranking import RankingModel
 from video_commerce.ml.ranking_history import merge_item_embedding_maps
+from video_commerce.ml.pit_training_dataset import PitTrainingDatasetReader
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.ml.vector_search import VectorSearchEngine
@@ -37,6 +38,7 @@ class ModelTrainerService:
         self.system_store: SystemStore | None = None
         self.object_storage: ObjectStorage | None = None
         self.artifact_manager: ModelArtifactManager | None = None
+        self.pit_dataset_reader: PitTrainingDatasetReader | None = None
         self.observability = ObservabilityManager()
         self.running = False
         self._heartbeat_task: asyncio.Task | None = None
@@ -71,6 +73,14 @@ class ModelTrainerService:
 
         self.object_storage = ObjectStorage(self.config.object_storage_config)
         await self.object_storage.initialize()
+        feature_lake_config = getattr(self.config, "feature_lake_config", None)
+        if getattr(feature_lake_config, "training_source", "legacy") == "pit":
+            self.pit_dataset_reader = PitTrainingDatasetReader(
+                self.object_storage,
+                expected_feature_definition_version=(
+                    feature_lake_config.feature_definition_version
+                ),
+            )
         self.artifact_manager = ModelArtifactManager(
             system_store=self.system_store,
             object_storage=self.object_storage,
@@ -167,13 +177,28 @@ class ModelTrainerService:
             return
         if not self.feature_store or not self.ranking_model:
             return
-        if not self.system_store:
+        feature_lake_config = getattr(self.config, "feature_lake_config", None)
+        use_pit_dataset = (
+            getattr(feature_lake_config, "training_source", "legacy") == "pit"
+        )
+        if not use_pit_dataset and not self.system_store:
             logger.warning("Skipping ranking retrain because Postgres system store is unavailable")
             return
 
         training_sample_source = "interaction_events"
         interactions = []
-        if (
+        pit_dataset = None
+        if use_pit_dataset:
+            if not self.pit_dataset_reader:
+                raise RuntimeError(
+                    "PIT ranking training is configured but the dataset reader is unavailable"
+                )
+            pit_dataset = await self.pit_dataset_reader.read(
+                feature_lake_config.ranking_pit_dataset_uri
+            )
+            interactions = pit_dataset.rows
+            training_sample_source = "feature_lake_pit"
+        elif (
             (
                 getattr(self.config.ranking_config, "ltr_pairwise_enabled", False)
                 or getattr(self.config.ranking_config, "ltr_listwise_enabled", False)
@@ -201,7 +226,7 @@ class ModelTrainerService:
                     },
                 )
 
-        if not interactions:
+        if not interactions and not use_pit_dataset:
             interactions = await self.system_store.get_training_interactions(limit=50000)
         if len(interactions) < self.config.ranking_config.training_min_samples:
             self.observability.record_training_run(
@@ -231,27 +256,32 @@ class ModelTrainerService:
         )
         status = "success"
         try:
-            user_features_map = await self.feature_store.get_all_user_features_map()
-            product_metadata_map = (
-                dict(self.vector_search.product_metadata)
-                if self.vector_search and self.vector_search.product_metadata
-                else {}
-            )
+            user_features_map = {}
+            product_metadata_map = {}
             recommendation_engine = getattr(self, "recommendation_engine", None)
-            cf_engine = (
-                getattr(recommendation_engine, "cf_engine", None)
-                if recommendation_engine
-                else None
-            )
-            item_embedding_map = merge_item_embedding_maps(
-                getattr(cf_engine, "trained_item_embeddings", None),
-                getattr(cf_engine, "synthetic_item_embeddings", None),
-            )
-            two_tower_model_version = (
-                getattr(recommendation_engine, "loaded_two_tower_version", None)
-                if recommendation_engine
-                else None
-            )
+            item_embedding_map = {}
+            two_tower_model_version = None
+            if not use_pit_dataset:
+                user_features_map = await self.feature_store.get_all_user_features_map()
+                product_metadata_map = (
+                    dict(self.vector_search.product_metadata)
+                    if self.vector_search and self.vector_search.product_metadata
+                    else {}
+                )
+                cf_engine = (
+                    getattr(recommendation_engine, "cf_engine", None)
+                    if recommendation_engine
+                    else None
+                )
+                item_embedding_map = merge_item_embedding_maps(
+                    getattr(cf_engine, "trained_item_embeddings", None),
+                    getattr(cf_engine, "synthetic_item_embeddings", None),
+                )
+                two_tower_model_version = (
+                    getattr(recommendation_engine, "loaded_two_tower_version", None)
+                    if recommendation_engine
+                    else None
+                )
             await self.ranking_model.train_model(
                 interactions,
                 user_features_map=user_features_map,
@@ -271,6 +301,14 @@ class ModelTrainerService:
                         "feature_schema_version": self.ranking_model.feature_schema_version,
                         "training_data_source": self.ranking_model.training_data_source,
                         "training_sample_source": training_sample_source,
+                        "feature_lake_dataset_version": (
+                            pit_dataset.dataset_version if pit_dataset else None
+                        ),
+                        "feature_definition_version": (
+                            getattr(pit_dataset, "feature_definition_version", None)
+                            if pit_dataset
+                            else None
+                        ),
                     },
                 )
                 if record:

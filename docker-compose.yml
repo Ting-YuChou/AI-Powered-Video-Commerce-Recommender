@@ -214,6 +214,15 @@ x-common-service: &common-service
     OBJECT_STORAGE_MAX_ATTEMPTS: ${OBJECT_STORAGE_MAX_ATTEMPTS:-3}
     OBJECT_STORAGE_CHECKSUM_ALGORITHM: ${OBJECT_STORAGE_CHECKSUM_ALGORITHM:-}
     OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION: ${OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION:-}
+    FEATURE_LAKE_ENABLED: ${FEATURE_LAKE_ENABLED:-false}
+    FEATURE_LAKE_CATALOG_NAME: ${FEATURE_LAKE_CATALOG_NAME:-feature_catalog}
+    FEATURE_LAKE_CATALOG_URI: ${FEATURE_LAKE_CATALOG_URI:-}
+    FEATURE_LAKE_WAREHOUSE_URI: ${FEATURE_LAKE_WAREHOUSE_URI:-}
+    FEATURE_LAKE_NAMESPACE: ${FEATURE_LAKE_NAMESPACE:-video_commerce}
+    FEATURE_LAKE_TRAINING_SOURCE: ${FEATURE_LAKE_TRAINING_SOURCE:-legacy}
+    FEATURE_LAKE_RANKING_PIT_DATASET_URI: ${FEATURE_LAKE_RANKING_PIT_DATASET_URI:-}
+    FEATURE_LAKE_FEATURE_DEFINITION_VERSION: ${FEATURE_LAKE_FEATURE_DEFINITION_VERSION:-ranking_ltr_v1}
+    FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS: ${FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS:-168}
   volumes:
     - models_data:/app/models
     - upload_data:/app/uploads
@@ -691,13 +700,14 @@ services:
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic video-processing-tasks --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic recommendation-events --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-updates --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic catalog-feature-events --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic dead-letter-events --partitions 3 --replication-factor 1
     networks:
       - video-commerce-network
     restart: "no"
 
   flink-volume-init:
-    image: flink:1.19.1-scala_2.12-java11
+    image: flink:1.20.1-scala_2.12-java11
     profiles: ["flink"]
     user: "0:0"
     entrypoint: ["sh", "-lc"]
@@ -710,7 +720,7 @@ services:
       - flink_savepoints:/flink/savepoints
 
   flink-jobmanager:
-    image: flink:1.19.1-scala_2.12-java11
+    image: flink:1.20.1-scala_2.12-java11
     profiles: ["flink"]
     command: jobmanager
     environment:
@@ -741,7 +751,7 @@ services:
     restart: unless-stopped
 
   flink-taskmanager:
-    image: flink:1.19.1-scala_2.12-java11
+    image: flink:1.20.1-scala_2.12-java11
     profiles: ["flink"]
     command: taskmanager
     environment:

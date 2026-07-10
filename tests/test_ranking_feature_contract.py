@@ -1,7 +1,9 @@
 import numpy as np
+import pytest
 
+from video_commerce.common.config import RankingConfig
 from video_commerce.common.models import CandidateProduct, UserFeatures
-from video_commerce.ml.ranking import FeatureExtractor
+from video_commerce.ml.ranking import FeatureExtractor, RankingModel
 from video_commerce.ml.ranking_features import FeatureBundle, RankingFeatureAssembler
 
 
@@ -61,3 +63,40 @@ def test_feature_assembler_matches_feature_extractor_for_a_fixed_observation_tim
     actual = RankingFeatureAssembler(extractor).build(bundle, as_of_ts=as_of_ts)
 
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_ranking_training_uses_pit_bundle_and_observation_timestamp(monkeypatch):
+    ranking = RankingModel(RankingConfig())
+    captured = {}
+
+    def capture_features(user_features, product_metadata, context, candidate, *, as_of_ts=None):
+        captured["user_features"] = user_features
+        captured["product_metadata"] = product_metadata
+        captured["as_of_ts"] = as_of_ts
+        return np.zeros(ranking.feature_extractor.total_feature_dim, dtype=np.float32)
+
+    monkeypatch.setattr(
+        ranking.feature_extractor, "create_ranking_features", capture_features
+    )
+
+    features, _ = ranking._prepare_training_data(
+        [
+            {
+                "user_id": "user-1",
+                "product_id": "product-1",
+                "action": "click",
+                "event_time": 1_700_000_000.0,
+                "as_of_ts": 1_700_000_123.0,
+                "user_features": {"total_interactions": 3},
+                "product_metadata": {"price": 9.0, "category": "shoes"},
+                "context": {},
+            }
+        ],
+        user_features_map={"user-1": {"total_interactions": 999}},
+        product_metadata_map={"product-1": {"price": 999.0}},
+    )
+
+    assert features.shape[0] == 1
+    assert captured["user_features"].total_interactions == 3
+    assert captured["product_metadata"]["price"] == 9.0
+    assert captured["as_of_ts"] == pytest.approx(1_700_000_123.0)

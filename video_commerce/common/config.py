@@ -1371,6 +1371,57 @@ class FeaturePipelineConfig(BaseSettings):
         env_prefix = "FEATURE_PIPELINE_"
 
 
+class FeatureLakeConfig(BaseSettings):
+    """Offline historical feature store and point-in-time training settings."""
+
+    enabled: bool = Field(
+        False,
+        description="Enable the Iceberg-backed offline feature store integration",
+    )
+    catalog_name: str = Field("feature_catalog", description="Iceberg catalog name")
+    catalog_uri: Optional[str] = Field(
+        None,
+        description="Iceberg REST catalog URI",
+    )
+    warehouse_uri: Optional[str] = Field(
+        None,
+        description="S3 warehouse URI used by the Iceberg catalog",
+    )
+    namespace: str = Field("video_commerce", description="Iceberg namespace")
+    training_source: str = Field(
+        "legacy",
+        description="Ranking trainer source: legacy or pit",
+    )
+    ranking_pit_dataset_uri: Optional[str] = Field(
+        None,
+        description="Versioned PIT training dataset export URI consumed by model-trainer",
+    )
+    feature_definition_version: str = Field(
+        "ranking_ltr_v1",
+        description="Shared online/offline ranking feature definition version",
+    )
+    attribution_window_hours: int = Field(
+        168,
+        description="Maximum feedback attribution window after a ranking impression",
+    )
+
+    @validator("training_source")
+    def validate_training_source(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"legacy", "pit"}:
+            raise ValueError("training_source must be one of: legacy, pit")
+        return normalized
+
+    @validator("attribution_window_hours")
+    def validate_attribution_window_hours(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("attribution_window_hours must be positive")
+        return value
+
+    class Config:
+        env_prefix = "FEATURE_LAKE_"
+
+
 class SecurityConfig(BaseSettings):
     """Internal service authentication configuration."""
 
@@ -1840,6 +1891,7 @@ class Config:
         self.object_storage_config = ObjectStorageConfig()
         self.kafka_config = KafkaConfig()
         self.feature_pipeline_config = FeaturePipelineConfig()
+        self.feature_lake_config = FeatureLakeConfig()
         self.security_config = SecurityConfig()
         self.service_topology_config = ServiceTopologyConfig()
         self.database_config = DatabaseConfig()
@@ -2016,6 +2068,24 @@ class Config:
             errors.append(
                 "DATABASE_URL or DATABASE_URL_FILE is required when DATABASE_ENABLE=true"
             )
+        if self.feature_lake_config.enabled:
+            if not self.feature_lake_config.catalog_uri:
+                errors.append(
+                    "FEATURE_LAKE_CATALOG_URI is required when FEATURE_LAKE_ENABLED=true"
+                )
+            if not self.feature_lake_config.warehouse_uri:
+                errors.append(
+                    "FEATURE_LAKE_WAREHOUSE_URI is required when FEATURE_LAKE_ENABLED=true"
+                )
+        if self.feature_lake_config.training_source == "pit":
+            if not self.feature_lake_config.enabled:
+                errors.append(
+                    "FEATURE_LAKE_ENABLED=true is required when FEATURE_LAKE_TRAINING_SOURCE=pit"
+                )
+            if not self.feature_lake_config.ranking_pit_dataset_uri:
+                errors.append(
+                    "FEATURE_LAKE_RANKING_PIT_DATASET_URI is required when FEATURE_LAKE_TRAINING_SOURCE=pit"
+                )
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":
             if self.security_config.auth_mode == "disabled":

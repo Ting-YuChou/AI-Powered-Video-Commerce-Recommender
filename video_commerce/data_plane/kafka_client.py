@@ -44,7 +44,7 @@ def _build_event_payload(
     occurred_at: Optional[float] = None,
     **payload: Any,
 ) -> Dict[str, Any]:
-    event_time = occurred_at or time.time()
+    event_time = time.time() if occurred_at is None else float(occurred_at)
     return {
         "schema_version": EVENT_SCHEMA_VERSION,
         "event_id": str(uuid.uuid4()),
@@ -648,6 +648,8 @@ class KafkaManager:
         action: str,
         context: Optional[Dict[str, Any]] = None,
         timestamp: Optional[float] = None,
+        event_time: Optional[float] = None,
+        server_received_at: Optional[float] = None,
         request_id: Optional[str] = None,
     ) -> bool:
         """
@@ -662,15 +664,23 @@ class KafkaManager:
         Returns:
             True if sent successfully
         """
+        resolved_event_time = (
+            float(event_time)
+            if event_time is not None
+            else (float(timestamp) if timestamp is not None else time.time())
+        )
+        received_at = time.time() if server_received_at is None else float(server_received_at)
         event = _build_event_payload(
             "user_interaction",
             request_id=request_id,
-            occurred_at=timestamp,
+            occurred_at=resolved_event_time,
             user_id=user_id,
             product_id=product_id,
             action=action,
             context=context or {},
-            timestamp=timestamp or time.time(),
+            event_time=resolved_event_time,
+            timestamp=resolved_event_time,
+            server_received_at=received_at,
         )
         
         return await self.producer.send(
@@ -687,18 +697,28 @@ class KafkaManager:
         action: str,
         context: Optional[Dict[str, Any]] = None,
         timestamp: Optional[float] = None,
+        event_time: Optional[float] = None,
+        server_received_at: Optional[float] = None,
         request_id: Optional[str] = None,
     ) -> bool:
         """Enqueue a user interaction event without waiting for broker ack."""
+        resolved_event_time = (
+            float(event_time)
+            if event_time is not None
+            else (float(timestamp) if timestamp is not None else time.time())
+        )
+        received_at = time.time() if server_received_at is None else float(server_received_at)
         event = _build_event_payload(
             "user_interaction",
             request_id=request_id,
-            occurred_at=timestamp,
+            occurred_at=resolved_event_time,
             user_id=user_id,
             product_id=product_id,
             action=action,
             context=context or {},
-            timestamp=timestamp or time.time(),
+            event_time=resolved_event_time,
+            timestamp=resolved_event_time,
+            server_received_at=received_at,
         )
 
         return await self.producer.send_nowait(

@@ -147,6 +147,29 @@ def test_feature_pipeline_defaults_to_official_flink(monkeypatch):
     reset_config()
 
 
+def test_config_reads_feature_lake_pit_training_env(monkeypatch):
+    monkeypatch.setenv("FEATURE_LAKE_ENABLED", "true")
+    monkeypatch.setenv("FEATURE_LAKE_CATALOG_URI", "http://iceberg-rest:8181")
+    monkeypatch.setenv("FEATURE_LAKE_WAREHOUSE_URI", "s3://video-commerce-features/warehouse")
+    monkeypatch.setenv("FEATURE_LAKE_TRAINING_SOURCE", "pit")
+    monkeypatch.setenv(
+        "FEATURE_LAKE_RANKING_PIT_DATASET_URI",
+        "s3://video-commerce-features/training/ranking-pit.jsonl",
+    )
+    monkeypatch.setenv("FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS", "168")
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    reset_config()
+    config = Config()
+
+    assert config.feature_lake_config.enabled is True
+    assert config.feature_lake_config.catalog_uri == "http://iceberg-rest:8181"
+    assert config.feature_lake_config.training_source == "pit"
+    assert config.feature_lake_config.attribution_window_hours == 168
+
+    reset_config()
+
+
 def test_config_reads_flink_feature_pipeline_env(monkeypatch):
     monkeypatch.setenv("FEATURE_PIPELINE_MODE", "flink_shadow")
     monkeypatch.setenv("FLINK_FEATURE_OUTPUT_NAMESPACE", "shadow")

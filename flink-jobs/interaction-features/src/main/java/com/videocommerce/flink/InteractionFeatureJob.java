@@ -409,7 +409,10 @@ public class InteractionFeatureJob {
             : new HashMap<>();
     String contextJson = JSON.writeValueAsString(eventContext);
 
-    double occurredAt = numericTimestamp(payload.get("occurred_at"));
+    double occurredAt = numericTimestamp(payload.get("event_time"));
+    if (occurredAt <= 0) {
+      occurredAt = numericTimestamp(payload.get("occurred_at"));
+    }
     if (occurredAt <= 0) {
       occurredAt = numericTimestamp(payload.get("timestamp"));
     }
@@ -429,7 +432,10 @@ public class InteractionFeatureJob {
     event.contextJson = contextJson;
     event.eventTimeMillis = eventTimeMillis;
     event.occurredAtSeconds = eventTimeMillis / 1000.0;
-    event.timestampSeconds = numericTimestamp(payload.get("timestamp"));
+    event.timestampSeconds = numericTimestamp(payload.get("event_time"));
+    if (event.timestampSeconds <= 0) {
+      event.timestampSeconds = numericTimestamp(payload.get("timestamp"));
+    }
     if (event.timestampSeconds <= 0) {
       event.timestampSeconds = event.occurredAtSeconds;
     }

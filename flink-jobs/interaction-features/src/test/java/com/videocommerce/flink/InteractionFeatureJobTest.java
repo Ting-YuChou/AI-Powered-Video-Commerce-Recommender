@@ -10,7 +10,7 @@ import org.junit.jupiter.api.Test;
 
 class InteractionFeatureJobTest {
   @Test
-  void parserUsesOccurredAtAndContextCategory() throws Exception {
+  void parserPrefersEventTimeAndContextCategory() throws Exception {
     String raw =
         "{"
             + "\"event_id\":\"e1\","
@@ -19,6 +19,7 @@ class InteractionFeatureJobTest {
             + "\"user_id\":\"u1\","
             + "\"product_id\":\"p1\","
             + "\"action\":\"click\","
+            + "\"event_time\":1.5,"
             + "\"occurred_at\":2.5,"
             + "\"timestamp\":3.0,"
             + "\"context\":{\"product_category\":\"shoes\",\"session_length\":12.5}"
@@ -32,7 +33,7 @@ class InteractionFeatureJobTest {
     assertEquals("p1", event.productId);
     assertEquals("click", event.action);
     assertEquals("shoes", event.productCategory);
-    assertEquals(2500L, event.eventTimeMillis);
+    assertEquals(1500L, event.eventTimeMillis);
     assertEquals(12.5, event.sessionLengthSeconds);
   }
 
@@ -216,6 +217,19 @@ class InteractionFeatureJobTest {
 
     assertEquals("recommendation-events", payload.get("source_topic"));
     assertEquals("IllegalArgumentException", payload.get("error_type"));
+  }
+
+  @Test
+  void pointInTimeJoinSqlEnforcesEventAndAvailabilityCutsAndSevenDayAttribution() {
+    String sql = PointInTimeFeatureJoinJob.buildPointInTimeInsertSql(
+        "video_commerce", "ranking_ltr_v1", 168);
+
+    assertEquals(true, sql.contains("u.event_time <= o.event_time"));
+    assertEquals(true, sql.contains("u.available_at <= o.event_time"));
+    assertEquals(true, sql.contains("i.event_time <= o.event_time"));
+    assertEquals(true, sql.contains("i.available_at <= o.event_time"));
+    assertEquals(true, sql.contains("INTERVAL '168' HOUR"));
+    assertEquals(true, sql.contains("ranking_ltr_v1"));
   }
 
   @Test

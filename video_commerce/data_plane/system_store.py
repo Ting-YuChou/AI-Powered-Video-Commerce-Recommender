@@ -82,7 +82,11 @@ def _event_value(event: Any, key: str, default: Any = None) -> Any:
 
 
 def _event_to_sequence_dict(event: Any) -> Dict[str, Any]:
-    occurred_at = _coerce_datetime(_event_value(event, "occurred_at")) or _utc_now()
+    occurred_at = (
+        _coerce_datetime(_event_value(event, "event_time"))
+        or _coerce_datetime(_event_value(event, "occurred_at"))
+        or _utc_now()
+    )
     return {
         "event_id": _event_value(event, "event_id"),
         "schema_version": int(_event_value(event, "schema_version", 1) or 1),
@@ -91,6 +95,7 @@ def _event_to_sequence_dict(event: Any) -> Dict[str, Any]:
         "product_id": _event_value(event, "product_id"),
         "action": _event_value(event, "action"),
         "context": _event_value(event, "context", {}) or {},
+        "event_time": occurred_at.timestamp(),
         "timestamp": occurred_at.timestamp(),
         "occurred_at": occurred_at.timestamp(),
     }

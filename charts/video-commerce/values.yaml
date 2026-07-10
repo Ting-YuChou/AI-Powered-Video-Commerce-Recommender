@@ -575,7 +575,9 @@ backend:
         enabled: true
         path: /metrics
     featureWorker:
-      enabled: true
+      # Flink is the production-authoritative writer for official feature keys.
+      # Enable this only for the explicit Python pipeline fallback.
+      enabled: false
       name: feature-worker
       replicaCount: 2
       command: ["python", "-m", "video_commerce.services.feature_worker.feature_updater"]

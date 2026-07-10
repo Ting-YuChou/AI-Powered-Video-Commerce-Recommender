@@ -1858,6 +1858,7 @@ class RankingModel:
                     product_metadata,
                     context,
                     candidate,
+                    as_of_ts=self._training_as_of_timestamp(sample),
                 )
                 feature_vector = np.asarray(feature_vector, dtype=np.float32)
                 if feature_vector.shape != (self.feature_extractor.total_feature_dim,):
@@ -2009,7 +2010,11 @@ class RankingModel:
         user_features_map: Dict[str, Any],
     ) -> UserFeatures:
         user_id = str(sample.get("user_id") or "unknown")
-        raw_features = user_features_map.get(user_id)
+        raw_features = sample.get("user_features")
+        if raw_features is None:
+            raw_features = (sample.get("context") or {}).get("user_features")
+        if raw_features is None:
+            raw_features = user_features_map.get(user_id)
         if isinstance(raw_features, UserFeatures):
             return raw_features
         if isinstance(raw_features, dict):
@@ -2019,7 +2024,27 @@ class RankingModel:
                 return UserFeatures(**payload)
             except Exception as exc:
                 logger.warning("Invalid user features for ranking training: %s", exc)
-        return UserFeatures(user_id=user_id)
+        return UserFeatures(
+            user_id=user_id,
+            last_active=self._training_as_of_timestamp(sample),
+        )
+
+    @staticmethod
+    def _training_as_of_timestamp(sample: Dict[str, Any]) -> float:
+        """Resolve a deterministic feature cutoff for one training row."""
+        for key in ("as_of_ts", "event_time", "occurred_at", "timestamp"):
+            value = sample.get(key)
+            if value is None:
+                continue
+            if hasattr(value, "timestamp"):
+                return float(value.timestamp())
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        # Missing timestamps must remain deterministic rather than leak wall-clock
+        # time into a training vector. Ingest contracts should make this fallback rare.
+        return 0.0
 
     def _training_product_metadata(
         self,
@@ -2050,7 +2075,7 @@ class RankingModel:
         metadata.setdefault("in_stock", True)
         metadata.setdefault(
             "created_at",
-            sample.get("occurred_at") or sample.get("timestamp") or time.time(),
+            self._training_as_of_timestamp(sample),
         )
         metadata.setdefault("tags", [])
         metadata.setdefault("brand", context.get("brand", "Unknown"))
