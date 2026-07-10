@@ -309,7 +309,7 @@ class FeatureExtractor:
         current_time: Optional[float] = None,
     ) -> np.ndarray:
         """Extract numerical features from user profile."""
-        current_time = current_time or time.time()
+        current_time = time.time() if current_time is None else float(current_time)
         features = np.array(
             [
                 user_features.total_interactions / 1000,  # Normalize
@@ -336,7 +336,7 @@ class FeatureExtractor:
         current_time: Optional[float] = None,
     ) -> np.ndarray:
         """Extract features from product metadata."""
-        current_time = current_time or time.time()
+        current_time = time.time() if current_time is None else float(current_time)
         features = np.array(
             [
                 np.log1p(product_metadata.get("price", 1.0)),  # Log price
@@ -383,7 +383,7 @@ class FeatureExtractor:
         current_time: Optional[float] = None,
     ) -> np.ndarray:
         """Extract features from request context."""
-        current_time = current_time or time.time()
+        current_time = time.time() if current_time is None else float(current_time)
         dt = time.localtime(current_time)
 
         features = np.array(
@@ -479,11 +479,13 @@ class FeatureExtractor:
         product_metadata: Dict[str, Any],
         context: Dict[str, Any],
         candidate: CandidateProduct,
+        *,
+        as_of_ts: Optional[float] = None,
     ) -> np.ndarray:
         """Create complete feature vector for ranking."""
         try:
             # Extract individual feature groups
-            current_time = time.time()
+            current_time = time.time() if as_of_ts is None else float(as_of_ts)
             user_feats = self.extract_user_features(user_features, current_time)
             product_feats = self.extract_product_features(
                 product_metadata, current_time
