@@ -258,6 +258,10 @@ load_dataset.py
 
 # Generated reports and load test outputs
 # ---------------------------------------
+
+# Local linked worktrees
+# ----------------------
+.worktrees/
 output/
 loadtest/results/
 loadtest/k6/*.json
