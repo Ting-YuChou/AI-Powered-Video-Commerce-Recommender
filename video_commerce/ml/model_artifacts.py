@@ -30,6 +30,7 @@ class ModelArtifactManager:
     """Coordinate Postgres metadata with local/object-storage model artifacts."""
 
     RANKING_MODEL_NAME = "ranking_model"
+    RANKING_SHADOW_MODEL_NAME = "ranking_model_pit_shadow"
     TWO_TOWER_MODEL_NAME = "two_tower_retrieval"
     SASREC_MODEL_NAME = "sasrec_retrieval"
     SWING_ITEMCF_MODEL_NAME = "swing_itemcf_recall"
@@ -329,6 +330,50 @@ class ModelArtifactManager:
         )
         return ModelArtifactRecord(
             model_name=self.RANKING_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_path,
+            payload=record_payload,
+        )
+
+    async def persist_ranking_shadow_checkpoint(
+        self,
+        *,
+        local_path: str,
+        model_version: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ModelArtifactRecord]:
+        """Persist a PIT shadow artifact under a namespace serving never syncs."""
+        if not self.system_store:
+            return None
+        artifact_sha256 = ObjectStorage.calculate_sha256(local_path)
+        persisted_path = await self._persist_artifact(
+            local_path=local_path,
+            model_name=self.RANKING_SHADOW_MODEL_NAME,
+            model_version=model_version,
+        )
+        record_payload = dict(payload or {})
+        record_payload.update(
+            {
+                "shadow": True,
+                "activation_allowed": False,
+                "artifact_sha256": artifact_sha256,
+                "artifact_manifest": {
+                    "checkpoint": {
+                        "path": persisted_path,
+                        "sha256": artifact_sha256,
+                        "local_cache_path": local_path,
+                    }
+                },
+            }
+        )
+        await self.system_store.record_model_checkpoint(
+            model_name=self.RANKING_SHADOW_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_path,
+            payload=record_payload,
+        )
+        return ModelArtifactRecord(
+            model_name=self.RANKING_SHADOW_MODEL_NAME,
             model_version=model_version,
             checkpoint_path=persisted_path,
             payload=record_payload,

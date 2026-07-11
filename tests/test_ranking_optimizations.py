@@ -21,6 +21,7 @@ from video_commerce.common.models import (
     UserFeatures,
 )
 from video_commerce.services.model_trainer.main import ModelTrainerService
+from video_commerce.services.model_trainer import main as model_trainer_module
 from video_commerce.services.recommendation import api as recommendation_api_module
 from video_commerce.ml.ranking import (
     RANKING_FEATURE_SCHEMA_VERSION,
@@ -32,6 +33,8 @@ from video_commerce.ml.ranking_history import (
     RankingHistoryConfig,
     build_ranking_history_context,
 )
+from video_commerce.ml.ranking_features import FeatureBundle
+from video_commerce.ml.ranking_training import AttributionFacts, RankingTrainingExample
 from video_commerce.ml import ranking as ranking_module
 from video_commerce.services.recommendation.api import (
     _BestEffortTaskQueue,
@@ -1163,6 +1166,12 @@ async def test_ranking_checkpoint_persists_business_objective_metadata(tmp_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     assert checkpoint["config"]["ranking_objective_version"] == "business_v1"
+    assert checkpoint["config"]["feature_definition_version"] == "ranking_ltr_v1"
+    assert checkpoint["config"]["label_definition_version"] == "ranking_labels_v1"
+    assert (
+        checkpoint["config"]["feature_assembler_version"]
+        == "ranking_feature_assembler_v1"
+    )
     assert checkpoint["config"]["value_transform_stats"]["global"][
         "clip"
     ] == pytest.approx(20.0)
@@ -1295,7 +1304,15 @@ class FakeTrainerSystemStore:
     async def get_training_interactions(self, limit=50000):
         if self.event_samples is not None:
             return self.event_samples
-        return [{"user_id": "u1", "product_id": "p1", "action": "click", "context": {}}]
+        return [
+            {
+                "user_id": "u1",
+                "product_id": "p1",
+                "action": "click",
+                "as_of_ts": 100.0,
+                "context": {},
+            }
+        ]
 
     async def get_ltr_training_impressions(self, *, limit=50000, lookback_days=30):
         return self.impression_samples or []
@@ -1315,20 +1332,47 @@ class FakeTrainerRankingModel:
         self,
         training_data,
         *,
-        user_features_map=None,
-        product_metadata_map=None,
-        item_embedding_map=None,
-        two_tower_model_version=None,
         training_sample_source=None,
     ):
         self.received = {
             "training_data": training_data,
-            "user_features_map": user_features_map,
-            "product_metadata_map": product_metadata_map,
-            "item_embedding_map": item_embedding_map,
-            "two_tower_model_version": two_tower_model_version,
             "training_sample_source": training_sample_source,
         }
+
+
+class FakeTrainerLegacyAdapter:
+    async def build(self, rows, *, training_sample_source):
+        examples = []
+        for index, row in enumerate(rows):
+            context = dict(row.get("context") or {})
+            impression_id = context.get("impression_id") or f"legacy-{index}"
+            examples.append(
+                RankingTrainingExample(
+                    observation_id=f"legacy:{index}",
+                    impression_id=impression_id,
+                    bundle=FeatureBundle(
+                        as_of_ts=float(row.get("as_of_ts") or 100.0),
+                        feature_definition_version="ranking_ltr_v1",
+                        user_features=UserFeatures(
+                            user_id=row.get("user_id", "u1"), total_interactions=7
+                        ),
+                        product_metadata={"price": 12.0},
+                        context=context,
+                        candidate=CandidateProduct(
+                            product_id=row["product_id"],
+                            combined_score=0.0,
+                            source="legacy_test",
+                        ),
+                    ),
+                    attribution=AttributionFacts(
+                        "click" if row.get("action") == "click" else "view",
+                        row.get("action") == "click",
+                        False,
+                    ),
+                    is_slate_sample=bool(context.get("impression_id")),
+                )
+            )
+        return examples
 
 
 class FakeTrainerArtifactManager:
@@ -1339,6 +1383,12 @@ class FakeTrainerArtifactManager:
         self, *, local_path, model_version, payload=None
     ):
         self.payload = payload
+        return SimpleNamespace(model_version=model_version)
+
+    async def persist_ranking_shadow_checkpoint(
+        self, *, local_path, model_version, payload=None
+    ):
+        self.shadow_payload = payload
         return SimpleNamespace(model_version=model_version)
 
 
@@ -1362,6 +1412,7 @@ async def test_model_trainer_passes_real_feature_context_and_checkpoint_metadata
     service.feature_store = FakeTrainerFeatureStore()
     service.system_store = FakeTrainerSystemStore()
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={"p1": {"price": 12.0}})
     service.recommendation_engine = SimpleNamespace(
         loaded_two_tower_version="two-tower-test",
@@ -1375,13 +1426,10 @@ async def test_model_trainer_passes_real_feature_context_and_checkpoint_metadata
 
     await service._train_ranking_model(trigger="test")
 
-    assert (
-        service.ranking_model.received["user_features_map"]["u1"]["total_interactions"]
-        == 7
-    )
-    assert service.ranking_model.received["product_metadata_map"]["p1"]["price"] == 12.0
-    assert set(service.ranking_model.received["item_embedding_map"]) == {"p1", "p2"}
-    assert service.ranking_model.received["two_tower_model_version"] == "two-tower-test"
+    example = service.ranking_model.received["training_data"][0]
+    assert isinstance(example, RankingTrainingExample)
+    assert example.bundle.user_features.total_interactions == 7
+    assert example.bundle.product_metadata["price"] == 12.0
     assert (
         service.artifact_manager.payload["feature_schema_version"]
         == RANKING_FEATURE_SCHEMA_VERSION
@@ -1400,12 +1448,14 @@ async def test_model_trainer_prefers_impression_backed_ltr_samples():
             "user_id": "u1",
             "product_id": "p1",
             "action": "click",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-1"},
         },
         {
             "user_id": "u1",
             "product_id": "p2",
             "action": "view",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-1"},
         },
     ]
@@ -1427,18 +1477,24 @@ async def test_model_trainer_prefers_impression_backed_ltr_samples():
                 "user_id": "u2",
                 "product_id": "p9",
                 "action": "purchase",
+                "as_of_ts": 100.0,
                 "context": {},
             }
         ],
     )
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={})
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"] == impression_samples
+    assert all(
+        isinstance(example, RankingTrainingExample)
+        for example in service.ranking_model.received["training_data"]
+    )
+    assert len(service.ranking_model.received["training_data"]) == 2
     assert (
         service.ranking_model.received["training_sample_source"]
         == "recommendation_impressions"
@@ -1457,16 +1513,31 @@ async def test_model_trainer_uses_pit_dataset_without_current_online_feature_map
             return SimpleNamespace(
                 dataset_version="iceberg-snapshot-42",
                 materialization_run_id="run-42",
-                rows=[
-                    {
-                        "user_id": "u1",
-                        "product_id": "p1",
-                        "action": "click",
-                        "as_of_ts": 100.0,
-                        "user_features": {"total_interactions": 3},
-                        "product_metadata": {"price": 9.0},
-                        "context": {},
-                    }
+                feature_definition_version="ranking_ltr_v1",
+                label_definition_version="ranking_labels_v1",
+                manifest_uri="s3://feature-lake/run-42/manifest.json",
+                iceberg_snapshot_id="42",
+                schema_hash="a" * 64,
+                examples=[
+                    RankingTrainingExample(
+                        observation_id="imp-1:p1",
+                        impression_id="imp-1",
+                        bundle=FeatureBundle(
+                            as_of_ts=100.0,
+                            feature_definition_version="ranking_ltr_v1",
+                            user_features=UserFeatures(
+                                user_id="u1", total_interactions=3
+                            ),
+                            product_metadata={"price": 9.0},
+                            context={},
+                            candidate=CandidateProduct(
+                                product_id="p1",
+                                combined_score=0.5,
+                                source="pit_test",
+                            ),
+                        ),
+                        attribution=AttributionFacts("click", True, False),
+                    )
                 ],
             )
 
@@ -1482,7 +1553,7 @@ async def test_model_trainer_uses_pit_dataset_without_current_online_feature_map
         ),
         model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
     )
-    service.feature_store = SimpleNamespace()
+    service.feature_store = None
     service.system_store = None
     service.pit_dataset_reader = PitReader()
     service.ranking_model = FakeTrainerRankingModel()
@@ -1493,9 +1564,7 @@ async def test_model_trainer_uses_pit_dataset_without_current_online_feature_map
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"][0]["as_of_ts"] == 100.0
-    assert service.ranking_model.received["user_features_map"] == {}
-    assert service.ranking_model.received["product_metadata_map"] == {}
+    assert service.ranking_model.received["training_data"][0].bundle.as_of_ts == 100.0
     assert (
         service.ranking_model.received["training_sample_source"] == "feature_lake_pit"
     )
@@ -1507,6 +1576,76 @@ async def test_model_trainer_uses_pit_dataset_without_current_online_feature_map
         service.artifact_manager.payload["feature_lake_materialization_run_id"]
         == "run-42"
     )
+    assert (
+        service.artifact_manager.payload["label_definition_version"]
+        == "ranking_labels_v1"
+    )
+    assert service.artifact_manager.payload["feature_lake_iceberg_snapshot_id"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch):
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=FeatureBundle(
+            as_of_ts=100.0,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={"price": 9.0},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1", combined_score=0.5, source="pit_test"
+            ),
+        ),
+        attribution=AttributionFacts("click", True, False),
+    )
+    dataset = SimpleNamespace(
+        examples=[example],
+        dataset_version="iceberg-snapshot-42",
+        materialization_run_id="run-42",
+        manifest_uri="s3://features/run-42/manifest.json",
+        iceberg_snapshot_id="42",
+        schema_hash="a" * 64,
+        feature_definition_version="ranking_ltr_v1",
+        label_definition_version="ranking_labels_v1",
+    )
+
+    class Reader:
+        async def read(self, _uri):
+            return dataset
+
+    class ShadowModel:
+        def __init__(self, _config):
+            self.loaded_model_path = None
+            self.model_version = "shadow-1"
+            self.feature_assembler = SimpleNamespace(
+                version="ranking_feature_assembler_v1"
+            )
+
+        async def train_model(self, examples, *, training_sample_source):
+            assert examples == [example]
+            assert training_sample_source == "feature_lake_pit_shadow"
+
+    monkeypatch.setattr(model_trainer_module, "RankingModel", ShadowModel)
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        feature_lake_config=SimpleNamespace(ranking_pit_dataset_uri="s3://latest"),
+        ranking_config=SimpleNamespace(training_min_samples=1),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.pit_dataset_reader = Reader()
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_pit_shadow_model(trigger="scheduled")
+
+    assert service.artifact_manager.shadow_payload["activation_allowed"] is False
+    assert (
+        service.artifact_manager.shadow_payload["label_definition_version"]
+        == "ranking_labels_v1"
+    )
+    assert service.observability.runs[-1][1] == "success"
 
 
 @pytest.mark.asyncio
@@ -1516,12 +1655,14 @@ async def test_model_trainer_prefers_impression_samples_for_listwise_ltr():
             "user_id": "u1",
             "product_id": "p1",
             "action": "click",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-1"},
         },
         {
             "user_id": "u1",
             "product_id": "p2",
             "action": "view",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-1"},
         },
     ]
@@ -1544,18 +1685,24 @@ async def test_model_trainer_prefers_impression_samples_for_listwise_ltr():
                 "user_id": "u2",
                 "product_id": "p9",
                 "action": "purchase",
+                "as_of_ts": 100.0,
                 "context": {},
             }
         ],
     )
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={})
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"] == impression_samples
+    assert all(
+        isinstance(example, RankingTrainingExample)
+        for example in service.ranking_model.received["training_data"]
+    )
+    assert len(service.ranking_model.received["training_data"]) == 2
     assert (
         service.ranking_model.received["training_sample_source"]
         == "recommendation_impressions"
@@ -1569,8 +1716,20 @@ async def test_model_trainer_prefers_impression_samples_for_listwise_ltr():
 @pytest.mark.asyncio
 async def test_model_trainer_falls_back_when_impression_samples_are_insufficient():
     event_samples = [
-        {"user_id": "u2", "product_id": "p9", "action": "click", "context": {}},
-        {"user_id": "u2", "product_id": "p10", "action": "view", "context": {}},
+        {
+            "user_id": "u2",
+            "product_id": "p9",
+            "action": "click",
+            "as_of_ts": 100.0,
+            "context": {},
+        },
+        {
+            "user_id": "u2",
+            "product_id": "p10",
+            "action": "view",
+            "as_of_ts": 100.0,
+            "context": {},
+        },
     ]
     service = object.__new__(ModelTrainerService)
     service.config = SimpleNamespace(
@@ -1595,13 +1754,18 @@ async def test_model_trainer_falls_back_when_impression_samples_are_insufficient
         event_samples=event_samples,
     )
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={})
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"] == event_samples
+    assert len(service.ranking_model.received["training_data"]) == 2
+    assert all(
+        isinstance(row, RankingTrainingExample)
+        for row in service.ranking_model.received["training_data"]
+    )
     assert (
         service.ranking_model.received["training_sample_source"] == "interaction_events"
     )
@@ -1618,12 +1782,14 @@ async def test_model_trainer_listwise_fallback_keeps_event_source():
             "user_id": "u2",
             "product_id": "p9",
             "action": "click",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-fallback"},
         },
         {
             "user_id": "u2",
             "product_id": "p10",
             "action": "view",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-fallback"},
         },
     ]
@@ -1651,13 +1817,18 @@ async def test_model_trainer_listwise_fallback_keeps_event_source():
         event_samples=event_samples,
     )
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={})
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"] == event_samples
+    assert len(service.ranking_model.received["training_data"]) == 2
+    assert all(
+        isinstance(row, RankingTrainingExample)
+        for row in service.ranking_model.received["training_data"]
+    )
     assert (
         service.ranking_model.received["training_sample_source"] == "interaction_events"
     )

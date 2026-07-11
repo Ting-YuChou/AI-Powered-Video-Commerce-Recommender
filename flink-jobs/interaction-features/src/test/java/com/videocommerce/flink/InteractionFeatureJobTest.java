@@ -1,6 +1,7 @@
 package com.videocommerce.flink;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -272,13 +273,53 @@ class InteractionFeatureJobTest {
     assertEquals(true, sql.contains("i.available_at_epoch<=CAST(1700000000.000 AS DOUBLE)"));
     assertEquals(true, sql.contains("ranking_ltr_v1"));
     assertEquals(true, sql.startsWith("INSERT INTO"));
+    assertFalse(sql.contains("(materialization_run_id,observation_id,"));
     assertEquals(false, sql.contains("INSERT OVERWRITE"));
     assertEquals(true, sql.contains("pit_feature_bundle_hash"));
     assertEquals(true, sql.contains("o.feature_bundle_hash"));
+    assertTrue(sql.contains("'ranking_labels_v1'"));
+    assertTrue(sql.contains("attributed_action"));
+    assertTrue(sql.contains("attributed_value"));
+    assertTrue(sql.contains("attributed_value_source"));
+    assertTrue(sql.contains("JSON_VALUE(context_json,'$.purchase_value')"));
+    assertTrue(sql.contains("\nWITH eligible_observations"));
     assertEquals(
         true,
         PointInTimeFeatureJoinJob.buildExistingRunSql("video_commerce", "run-1")
             .contains("ranking_training_pit_quarantine"));
+  }
+
+  @Test
+  void pitSchemaEvolutionAddsTypedLabelColumnsAdditively() {
+    String sql = PointInTimeFeatureJoinJob.buildAddColumnSql(
+        "video_commerce", "attributed_value", "DOUBLE");
+
+    assertEquals(
+        "ALTER TABLE `video_commerce`.`ranking_training_pit` ADD `attributed_value` DOUBLE",
+        sql);
+    assertTrue(PointInTimeFeatureJoinJob.buildTrainingTableSql("video_commerce")
+        .contains("label_definition_version STRING"));
+    assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql("s3://bucket/pit", "run-1")
+        .contains("attributed_action STRING"));
+  }
+
+  @Test
+  void pitInsertAdaptsSelectOrderToExistingPhaseTwoSchema() {
+    List<String> phaseTwoThenAddedColumns = List.of(
+        "materialization_run_id", "observation_id", "impression_id", "user_id", "product_id",
+        "action", "as_of_ts", "user_features_json", "product_metadata_json", "context_json",
+        "candidate_features_json", "online_feature_bundle_hash", "feature_bundle_hash",
+        "attributed_click", "attributed_purchase", "feature_definition_version",
+        "materialized_at", "materialization_date", "attributed_action", "attributed_value",
+        "attributed_value_source", "label_definition_version");
+
+    String sql = PointInTimeFeatureJoinJob.buildPointInTimeInsertSql(
+        "video_commerce", "ranking_ltr_v1", 168, 1, 1_700_000_000.0, "run-1",
+        phaseTwoThenAddedColumns);
+
+    assertTrue(sql.contains(
+        "COALESCE(f.attributed_purchase,0),'ranking_ltr_v1',CURRENT_TIMESTAMP,CURRENT_DATE,"
+            + "f.attributed_action,f.attributed_value,f.attributed_value_source,'ranking_labels_v1'"));
   }
 
   @Test

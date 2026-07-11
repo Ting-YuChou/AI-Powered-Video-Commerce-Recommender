@@ -152,6 +152,7 @@ def test_config_reads_feature_lake_pit_training_env(monkeypatch):
     monkeypatch.setenv("FEATURE_LAKE_CATALOG_URI", "http://iceberg-rest:8181")
     monkeypatch.setenv("FEATURE_LAKE_WAREHOUSE_URI", "s3://video-commerce-features/warehouse")
     monkeypatch.setenv("FEATURE_LAKE_TRAINING_SOURCE", "pit")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_SHADOW_ENABLED", "true")
     monkeypatch.setenv(
         "FEATURE_LAKE_RANKING_PIT_DATASET_URI",
         "s3://video-commerce-features/training/ranking-pit.jsonl",
@@ -165,6 +166,7 @@ def test_config_reads_feature_lake_pit_training_env(monkeypatch):
     assert config.feature_lake_config.enabled is True
     assert config.feature_lake_config.catalog_uri == "http://iceberg-rest:8181"
     assert config.feature_lake_config.training_source == "pit"
+    assert config.feature_lake_config.pit_shadow_enabled is True
     assert config.feature_lake_config.attribution_window_hours == 168
 
     reset_config()

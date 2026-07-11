@@ -118,6 +118,7 @@ external:
     warehouseUri: ""
     namespace: video_commerce
     trainingSource: legacy
+    pitShadowEnabled: false
     rankingPitDatasetUri: ""
     featureDefinitionVersion: ranking_ltr_v1
     attributionWindowHours: 168

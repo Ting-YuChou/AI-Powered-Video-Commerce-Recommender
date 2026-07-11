@@ -123,6 +123,34 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
     )
 
 
+def test_persist_ranking_shadow_checkpoint_uses_non_activating_model_namespace(tmp_path):
+    fake_store = FakeSystemStore()
+    shadow_path = tmp_path / "ranking.pit-shadow.pt"
+    shadow_path.write_bytes(b"shadow")
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+        ),
+        model_config=ModelConfig(ranking_model_path=str(tmp_path / "ranking.pt")),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    record = asyncio.run(
+        manager.persist_ranking_shadow_checkpoint(
+            local_path=str(shadow_path),
+            model_version="ranking-shadow-1",
+            payload={"shadow": True},
+        )
+    )
+
+    assert record.model_name == ModelArtifactManager.RANKING_SHADOW_MODEL_NAME
+    assert fake_store.recorded[-1]["model_name"] == "ranking_model_pit_shadow"
+    assert fake_store.latest.get(ModelArtifactManager.RANKING_MODEL_NAME) is None
+
+
 def test_sync_latest_two_tower_artifacts_copies_to_local_cache(tmp_path):
     fake_store = FakeSystemStore()
     remote_dir = tmp_path / "remote"

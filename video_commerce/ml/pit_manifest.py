@@ -17,6 +17,7 @@ from video_commerce.ml.pit_training_dataset import (
     PitTrainingDatasetError,
     arrow_schema_sha256,
 )
+from video_commerce.ml.ranking_training import RANKING_LABEL_DEFINITION_VERSION
 
 
 class PitManifestPublisher:
@@ -32,7 +33,9 @@ class PitManifestPublisher:
         iceberg_table_id: str,
         iceberg_snapshot_id: str,
         feature_definition_version: str,
+        label_definition_version: str,
         attribution_cutoff: float,
+        quarantine_row_count: int = 0,
         expected_iceberg_row_count: int | None = None,
     ) -> str:
         run_id = str(materialization_run_id or "").strip()
@@ -67,6 +70,27 @@ class PitManifestPublisher:
                     raise PitTrainingDatasetError(
                         "PIT Parquet shard is missing feature_definition_version"
                     )
+                if "label_definition_version" not in table.column_names:
+                    raise PitTrainingDatasetError(
+                        "PIT Parquet shard is missing label_definition_version"
+                    )
+                for required_column in (
+                    "observation_id",
+                    "impression_id",
+                    "user_features_json",
+                    "product_metadata_json",
+                    "context_json",
+                    "candidate_features_json",
+                    "attributed_action",
+                    "attributed_click",
+                    "attributed_purchase",
+                    "attributed_value",
+                    "attributed_value_source",
+                ):
+                    if required_column not in table.column_names:
+                        raise PitTrainingDatasetError(
+                            f"PIT Parquet shard is missing {required_column}"
+                        )
                 for required_hash in (
                     "online_feature_bundle_hash",
                     "feature_bundle_hash",
@@ -87,6 +111,13 @@ class PitManifestPublisher:
                 if versions != {feature_definition_version}:
                     raise PitTrainingDatasetError(
                         "PIT Parquet shard feature definition version mismatch"
+                    )
+                label_versions = set(
+                    table.column("label_definition_version").to_pylist()
+                )
+                if label_versions != {label_definition_version}:
+                    raise PitTrainingDatasetError(
+                        "PIT Parquet shard label definition version mismatch"
                     )
                 as_of_values = [
                     float(value)
@@ -133,9 +164,11 @@ class PitManifestPublisher:
             "iceberg_table_id": iceberg_table_id,
             "iceberg_snapshot_id": str(iceberg_snapshot_id),
             "feature_definition_version": feature_definition_version,
+            "label_definition_version": label_definition_version,
             "schema_hash": schema_hash,
             "attribution_cutoff": float(attribution_cutoff),
             "row_count": row_count,
+            "quarantine_row_count": max(0, int(quarantine_row_count)),
             "online_offline_parity_ratio": parity_matches / row_count,
             "min_as_of_ts": min_as_of,
             "max_as_of_ts": max_as_of,
@@ -253,7 +286,7 @@ async def _main() -> None:
     shard_prefix = f"{export_prefix.rstrip('/')}/runs/{run_id}/shards"
     shard_objects = await storage.list_storage_uris(shard_prefix)
     shards = [uri for uri in shard_objects if _is_parquet_shard_uri(uri)]
-    snapshot_id, iceberg_row_count = await asyncio.to_thread(
+    snapshot_id, iceberg_row_count, quarantine_row_count = await asyncio.to_thread(
         _load_pinned_iceberg_run,
         catalog_uri=feature_lake.catalog_uri,
         warehouse_uri=feature_lake.warehouse_uri,
@@ -272,14 +305,16 @@ async def _main() -> None:
         iceberg_table_id=f"{feature_lake.namespace}.ranking_training_pit",
         iceberg_snapshot_id=snapshot_id,
         feature_definition_version=feature_lake.feature_definition_version,
+        label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
         attribution_cutoff=float(cutoff),
+        quarantine_row_count=quarantine_row_count,
         expected_iceberg_row_count=iceberg_row_count,
     )
 
 
 def _load_pinned_iceberg_run(
     *, catalog_uri: str, warehouse_uri: str, namespace: str, storage: Any, run_id: str
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     from pyiceberg.catalog import load_catalog
     from pyiceberg.expressions import EqualTo
 
@@ -310,7 +345,20 @@ def _load_pinned_iceberg_run(
         raise PitTrainingDatasetError(
             "committed PIT snapshot contains no rows for run ID"
         )
-    return str(snapshot.snapshot_id), rows.num_rows
+    quarantine = catalog.load_table(f"{namespace}.ranking_training_pit_quarantine")
+    quarantine_snapshot = quarantine.current_snapshot()
+    quarantine_rows = 0
+    if quarantine_snapshot is not None:
+        quarantine_rows = (
+            quarantine.scan(
+                row_filter=EqualTo("materialization_run_id", run_id),
+                selected_fields=("observation_id",),
+                snapshot_id=quarantine_snapshot.snapshot_id,
+            )
+            .to_arrow()
+            .num_rows
+        )
+    return str(snapshot.snapshot_id), rows.num_rows, quarantine_rows
 
 
 if __name__ == "__main__":

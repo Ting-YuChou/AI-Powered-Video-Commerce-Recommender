@@ -29,6 +29,25 @@ def _daily_failures(report: Mapping[str, Any]) -> Tuple[str, ...]:
             report.get("online_offline_parity_ratio", -1)
         )
         >= 0.999,
+        "assembler_vector_parity_ratio": float(
+            report.get("assembler_vector_parity_ratio", -1)
+        )
+        == 1.0,
+        "label_reconciliation_ratio": float(
+            report.get("label_reconciliation_ratio", -1)
+        )
+        == 1.0,
+        "pit_current_state_calls": int(report.get("pit_current_state_calls", -1)) == 0,
+        "invalid_feature_or_label_rows": int(
+            report.get("invalid_feature_or_label_rows", -1)
+        )
+        == 0,
+        "serving_p95_regression_ratio": float(
+            report.get("serving_p95_regression_ratio", float("inf"))
+        )
+        <= 0.05,
+        "serving_throughput_ratio": float(report.get("serving_throughput_ratio", -1))
+        >= 0.95,
         "raw_materialization_lag_p99_seconds": float(
             report.get("raw_materialization_lag_p99_seconds", float("inf"))
         )

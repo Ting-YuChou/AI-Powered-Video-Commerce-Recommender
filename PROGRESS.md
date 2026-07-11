@@ -63,3 +63,40 @@
   seven-day shadow gates pass. Remaining rollout work is operational scheduling,
   real p99 lag/parity evidence, schema-evolution rehearsal for existing Iceberg
   tables, and catalog activation cutover before training switches to PIT.
+
+## 2026-07-10 — Offline Feature Store phase 3 typed PIT training
+
+- Replaced PIT dictionary heuristics with typed `FeatureBundle`,
+  `AttributionFacts`, `RankingTrainingExample`, and `TrainingLabels` contracts.
+  The manifest reader now pins Iceberg table/snapshot IDs, validates all typed
+  row fields and versions, and returns examples rather than raw dictionaries.
+- Unified online batching and offline tensor construction behind the versioned
+  `RankingFeatureAssembler`; PIT features use bundle `as_of_ts` only and reject
+  unsupported versions, shape mismatches, and non-finite values. Added the
+  `ranking_labels_v1` builder with attribution-only CTR/CVR/CTCVR, masks,
+  relevance, and actual-feedback purchase value semantics.
+- Isolated current Redis/catalog access in `LegacyTrainingDatasetAdapter`.
+  Primary PIT trainer initialization no longer loads Redis features, vector
+  catalog state, or recommendation models. Added non-activating
+  `ranking_model_pit_shadow` artifacts, typed rollout metrics/alerts, and
+  feature/label/assembler/manifest lineage in checkpoints and artifact metadata.
+- Added explicit Iceberg additive schema evolution and runtime-resolved insert
+  column ordering so an existing Phase 2 table can safely append Phase 3 label
+  columns. Existing v6 table schema evolved from schema ID 0 (18 columns) to
+  schema ID 4 (22 columns); run `smoke-pit-20260710-phase3c` committed one typed
+  row with zero quarantine rows at snapshot `5595377083784054562`.
+- Key files: `video_commerce/ml/ranking_features.py`,
+  `video_commerce/ml/ranking_training.py`,
+  `video_commerce/ml/pit_training_dataset.py`,
+  `video_commerce/ml/legacy_training_adapter.py`,
+  `video_commerce/services/model_trainer/main.py`, and
+  `flink-jobs/interaction-features/src/main/java/com/videocommerce/flink/PointInTimeFeatureJoinJob.java`.
+- Verification: Docker backend `396 passed, 5 skipped`; Flink Maven 23 tests
+  passed; Compose config, Helm lint, strict kubeconform (33 resources),
+  Prometheus rules, Grafana JSON, Python compile/diff checks, and Black checks
+  passed. Existing Iceberg table migration, PIT export, completed manifest,
+  typed reader, shared assembler/labels/trainer, and checkpoint smoke passed.
+- Follow-up: keep `FEATURE_LAKE_TRAINING_SOURCE=legacy` and enable PIT shadow
+  only. A real seven-day shadow window, online load p95/throughput comparison,
+  and production parity/coverage/lag evidence remain rollout gates rather than
+  one-time local test claims.

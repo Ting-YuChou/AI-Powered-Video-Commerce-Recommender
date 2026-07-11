@@ -39,6 +39,13 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     manager.record_best_effort_task("cache_recommendations", "dropped_queue_full")
     manager.set_best_effort_queue_depth(3)
     manager.record_interaction_ingest("click", "accepted")
+    manager.update_typed_pit_training_metrics(
+        assembler_parity_ratio=1.0,
+        label_reconciliation_ratio=1.0,
+        current_state_calls=0,
+        invalid_rows=0,
+        value_mask_coverage=0.8,
+    )
 
     payload = manager.prometheus_payload().decode("utf-8")
 
@@ -62,3 +69,8 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "video_commerce_best_effort_tasks_total" in payload
     assert "video_commerce_best_effort_queue_depth" in payload
     assert "video_commerce_interactions_ingested_total" in payload
+    assert "pit_assembler_vector_parity_ratio" in payload
+    assert "pit_label_reconciliation_ratio" in payload
+    assert "pit_current_state_calls" in payload
+    assert "pit_invalid_feature_or_label_rows" in payload
+    assert "pit_value_mask_coverage_ratio" in payload

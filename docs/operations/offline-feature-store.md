@@ -82,12 +82,47 @@ SHA-256 before writing `manifest.json`; `latest.json` is written last. The
 trainer resolves `latest.json` once per training run and fails closed on any
 manifest, shard, schema, hash, or feature-definition mismatch.
 
+New Phase 3 manifests must also declare `label_definition_version` as
+`ranking_labels_v1`. Their shards contain finalized attribution facts rather
+than precomputed model targets. The typed reader validates every observation,
+impression, user/item snapshot, candidate score, version, and hash before it
+constructs a `RankingTrainingExample`. Actual purchase value comes only from
+feedback inside the attribution window; missing value remains null and produces
+`value_mask=0`.
+
+The PIT trainer path is deliberately isolated from current Redis features and
+the current catalog. It executes the same versioned feature assembler used by
+online ranking, then the versioned label builder. A malformed row, unsupported
+feature/label version, non-finalized attribution, or NaN/Inf fails the entire
+PIT training run instead of falling back to legacy data.
+
+## Typed PIT shadow training
+
+To train a non-activating PIT artifact while legacy remains primary:
+
+```text
+FEATURE_LAKE_ENABLED=true
+FEATURE_LAKE_TRAINING_SOURCE=legacy
+FEATURE_LAKE_PIT_SHADOW_ENABLED=true
+FEATURE_LAKE_RANKING_PIT_DATASET_URI=s3://video-commerce-features/training/ranking-pit/latest.json
+```
+
+Shadow checkpoints are persisted under the separate
+`ranking_model_pit_shadow` artifact name with `activation_allowed=false`.
+Serving never watches that namespace. The trainer records the pinned manifest,
+materialization run, Iceberg snapshot, schema hash, feature/label/assembler
+versions, input and quarantine counts, and value-mask coverage in artifact
+metadata.
+
 ## Seven-day cutover and rollback
 
 Keep `FEATURE_LAKE_TRAINING_SOURCE=legacy` until seven consecutive UTC daily
 reports pass all gates: zero leakage and duplicates, complete reconciliation,
 99.9% bundle parity at `1e-6`, lag/outbox thresholds, coverage within 0.1
-percentage point, and 100% shadow training/artifact persistence.
+percentage point, and 100% shadow training/artifact persistence. Phase 3 also
+requires exact typed assembler parity, exact label reconciliation, zero PIT
+current-state reads, zero invalid numeric rows, serving p95 regression no more
+than 5%, and throughput at least 95% of baseline.
 
 Then set:
 

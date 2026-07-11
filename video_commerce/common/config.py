@@ -1413,6 +1413,10 @@ class FeatureLakeConfig(BaseSettings):
         "legacy",
         description="Ranking trainer source: legacy or pit",
     )
+    pit_shadow_enabled: bool = Field(
+        False,
+        description="Train a non-activating typed PIT shadow artifact beside legacy",
+    )
     ranking_pit_dataset_uri: Optional[str] = Field(
         None,
         description="Versioned PIT training dataset export URI consumed by model-trainer",
@@ -2129,6 +2133,15 @@ class Config:
             if not self.feature_lake_config.ranking_pit_dataset_uri:
                 errors.append(
                     "FEATURE_LAKE_RANKING_PIT_DATASET_URI is required when FEATURE_LAKE_TRAINING_SOURCE=pit"
+                )
+        if self.feature_lake_config.pit_shadow_enabled:
+            if not self.feature_lake_config.enabled:
+                errors.append(
+                    "FEATURE_LAKE_ENABLED=true is required when FEATURE_LAKE_PIT_SHADOW_ENABLED=true"
+                )
+            if not self.feature_lake_config.ranking_pit_dataset_uri:
+                errors.append(
+                    "FEATURE_LAKE_RANKING_PIT_DATASET_URI is required when FEATURE_LAKE_PIT_SHADOW_ENABLED=true"
                 )
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":

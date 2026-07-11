@@ -34,6 +34,18 @@
         {"expr": "rate(feature_lake_dlq_total[5m])", "legendFormat": "DLQ/s"},
         {"expr": "increase(pit_manifest_validation_failures_total[10m])", "legendFormat": "manifest failures"}
       ]
+    },
+    {
+      "id": 5,
+      "title": "Typed PIT training contract",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "pit_assembler_vector_parity_ratio", "legendFormat": "assembler parity"},
+        {"expr": "pit_label_reconciliation_ratio", "legendFormat": "label reconciliation"},
+        {"expr": "pit_value_mask_coverage_ratio", "legendFormat": "actual value coverage"},
+        {"expr": "pit_current_state_calls", "legendFormat": "forbidden current-state calls"},
+        {"expr": "pit_invalid_feature_or_label_rows", "legendFormat": "invalid tensor rows"}
+      ]
     }
   ],
   "schemaVersion": 39,

@@ -36,6 +36,7 @@ data:
   FEATURE_LAKE_WAREHOUSE_URI: {{ .Values.external.featureLake.warehouseUri | quote }}
   FEATURE_LAKE_NAMESPACE: {{ .Values.external.featureLake.namespace | quote }}
   FEATURE_LAKE_TRAINING_SOURCE: {{ .Values.external.featureLake.trainingSource | quote }}
+  FEATURE_LAKE_PIT_SHADOW_ENABLED: {{ .Values.external.featureLake.pitShadowEnabled | quote }}
   FEATURE_LAKE_RANKING_PIT_DATASET_URI: {{ .Values.external.featureLake.rankingPitDatasetUri | quote }}
   FEATURE_LAKE_FEATURE_DEFINITION_VERSION: {{ .Values.external.featureLake.featureDefinitionVersion | quote }}
   FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS: {{ .Values.external.featureLake.attributionWindowHours | quote }}

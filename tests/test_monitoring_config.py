@@ -69,6 +69,10 @@ def test_prometheus_rules_cover_service_worker_kafka_db_and_redis():
         "FeatureLakeDlqTraffic",
         "PitManifestValidationFailure",
         "PitOnlineOfflineParityLow",
+        "PitAssemblerParityLow",
+        "PitLabelReconciliationLow",
+        "PitCurrentStateDependencyDetected",
+        "PitInvalidTrainingTensorDetected",
     ):
         assert f"alert: {alert_name}" in rules
 
@@ -87,5 +91,10 @@ def test_feature_lake_dashboard_and_metrics_are_declared():
         "pit_manifest_validation_failures_total",
         "pit_online_offline_parity_ratio",
         "pit_leakage_rows",
+        "pit_assembler_vector_parity_ratio",
+        "pit_label_reconciliation_ratio",
+        "pit_current_state_calls",
+        "pit_invalid_feature_or_label_rows",
+        "pit_value_mask_coverage_ratio",
     ):
         assert metric in observability

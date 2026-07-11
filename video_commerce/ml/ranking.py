@@ -20,7 +20,6 @@ import json
 import time
 from pathlib import Path
 import pickle
-import threading
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import ndcg_score, roc_auc_score
 
@@ -44,6 +43,15 @@ from video_commerce.ml.ranking_history import (
     build_training_history_contexts,
     extract_ranking_history_feature_vector,
     ranking_history_config_from_settings,
+)
+from video_commerce.common.feature_history_contracts import (
+    RANKING_LTR_FEATURE_DEFINITION_VERSION,
+)
+from video_commerce.ml.ranking_features import FeatureBundle, RankingFeatureAssembler
+from video_commerce.ml.ranking_training import (
+    RANKING_LABEL_DEFINITION_VERSION,
+    RankingTrainingExample,
+    TrainingTensorBuilder,
 )
 
 logger = logging.getLogger(__name__)
@@ -538,6 +546,12 @@ class RankingModel:
             enable_history_embeddings=config.history_embeddings_enabled,
             history_embedding_dim=config.history_embedding_dim,
         )
+        self.feature_assembler = RankingFeatureAssembler(
+            self.feature_extractor,
+            product_feature_cache_size=getattr(
+                config, "product_feature_cache_size", 50000
+            ),
+        )
 
         # Model components
         self.model: Optional[MultiObjectiveRankingModel] = None
@@ -580,11 +594,17 @@ class RankingModel:
             0,
             getattr(config, "product_feature_cache_size", 50000),
         )
-        self._product_feature_cache: OrderedDict[
-            Tuple[str, Tuple[Any, ...]],
-            Tuple[np.ndarray, float],
-        ] = OrderedDict()
-        self._product_feature_cache_lock = threading.RLock()
+        self._product_feature_cache = self.feature_assembler._product_feature_cache
+        self._product_feature_cache_lock = (
+            self.feature_assembler._product_feature_cache_lock
+        )
+        self.training_tensor_builder = TrainingTensorBuilder(
+            self.feature_assembler,
+            device=self.device,
+            value_bucket_id=lambda metadata: self._value_bucket_id(metadata),
+            fit_value_transform=self._fit_value_transform,
+            transform_value=self._transform_business_value,
+        )
 
         logger.info(f"RankingModel initialized on device: {self.device}")
 
@@ -977,18 +997,7 @@ class RankingModel:
     ) -> Tuple[Optional[np.ndarray], List[Dict[str, Any]], float]:
         """Prepare one feature matrix for multiple ranking requests."""
         feature_stage_started = time.perf_counter()
-        user_dim = self.feature_extractor.user_feature_dim
-        product_dim = self.feature_extractor.product_feature_dim
-        context_dim = self.feature_extractor.context_feature_dim
-        candidate_dim = self.feature_extractor.candidate_feature_dim
-        history_dim = self.feature_extractor.history_embedding_feature_dim
-        realtime_dim = self.feature_extractor.realtime_window_feature_dim
         total_dim = self.feature_extractor.total_feature_dim
-        product_start = user_dim
-        context_start = product_start + product_dim
-        candidate_start = context_start + context_dim
-        history_start = candidate_start + candidate_dim
-        realtime_start = history_start + history_dim
         total_candidates = sum(
             len(request.get("candidates") or []) for request in requests
         )
@@ -1008,18 +1017,7 @@ class RankingModel:
             product_metadata_map = request.get("product_metadata_map") or {}
             valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]] = []
             row_start = row_count
-            user_feats = self.feature_extractor.extract_user_features(
-                user_features,
-                current_time,
-            )
-            context_feats = self.feature_extractor.extract_context_features(
-                context,
-                current_time,
-            )
-            product_rows: List[np.ndarray] = []
-            candidate_rows: List[Tuple[float, float, float, float]] = []
-            history_rows: List[np.ndarray] = []
-            realtime_rows: List[np.ndarray] = []
+            bundles: List[FeatureBundle] = []
 
             for candidate in candidates:
                 try:
@@ -1027,37 +1025,18 @@ class RankingModel:
                     product_metadata = product_metadata_map.get(
                         product_id
                     ) or self._build_product_metadata(candidate, current_time)
-                    product_feats = self._get_product_feature_vector(
-                        product_id,
-                        product_metadata,
-                        current_time,
-                    )
-                    candidate_rows.append(
-                        (
-                            _candidate_get(candidate, "collaborative_score") or 0.0,
-                            _candidate_get(candidate, "content_similarity_score")
-                            or 0.0,
-                            _candidate_get(candidate, "popularity_score") or 0.0,
-                            _candidate_get(candidate, "combined_score") or 0.0,
+                    bundles.append(
+                        FeatureBundle(
+                            as_of_ts=current_time,
+                            feature_definition_version=(
+                                RANKING_LTR_FEATURE_DEFINITION_VERSION
+                            ),
+                            user_features=user_features,
+                            product_metadata=product_metadata,
+                            context=context,
+                            candidate=candidate,
                         )
                     )
-                    if history_dim:
-                        history_rows.append(
-                            self.feature_extractor.extract_history_embedding_features(
-                                context,
-                                candidate,
-                            )
-                        )
-                    if realtime_dim:
-                        realtime_rows.append(
-                            self.feature_extractor.extract_realtime_window_features(
-                                user_features,
-                                product_metadata,
-                                context,
-                                candidate,
-                            )
-                        )
-                    product_rows.append(product_feats)
                     valid_candidates.append((candidate, product_metadata))
                     row_count += 1
                 except Exception as e:
@@ -1069,27 +1048,9 @@ class RankingModel:
 
             row_end = row_count
             if row_end > row_start:
-                feature_matrix[row_start:row_end, :user_dim] = user_feats
-                feature_matrix[
-                    row_start:row_end, product_start:context_start
-                ] = np.asarray(product_rows, dtype=np.float32)
-                feature_matrix[
-                    row_start:row_end, context_start:candidate_start
-                ] = context_feats
-                feature_matrix[
-                    row_start:row_end,
-                    candidate_start : candidate_start + candidate_dim,
-                ] = np.asarray(candidate_rows, dtype=np.float32)
-                if history_dim:
-                    feature_matrix[
-                        row_start:row_end,
-                        history_start : history_start + history_dim,
-                    ] = np.asarray(history_rows, dtype=np.float32)
-                if realtime_dim:
-                    feature_matrix[
-                        row_start:row_end,
-                        realtime_start : realtime_start + realtime_dim,
-                    ] = np.asarray(realtime_rows, dtype=np.float32)
+                feature_matrix[row_start:row_end] = self.feature_assembler.build_many(
+                    bundles
+                )
 
             prepared_requests.append(
                 {
@@ -1330,25 +1291,7 @@ class RankingModel:
     def _product_metadata_fingerprint(
         product_metadata: Dict[str, Any]
     ) -> Tuple[Any, ...]:
-        tags = product_metadata.get("tags", [])
-        if isinstance(tags, (list, tuple, set)):
-            normalized_tags = tuple(str(tag) for tag in tags)
-        else:
-            normalized_tags = (str(tags),)
-        created_at = (
-            "__fallback_now__"
-            if product_metadata.get("_ranking_fallback_metadata") is True
-            else product_metadata.get("created_at")
-        )
-        return (
-            product_metadata.get("price", 1.0),
-            product_metadata.get("rating", 3.0),
-            product_metadata.get("num_reviews", 1),
-            bool(product_metadata.get("in_stock", True)),
-            created_at,
-            normalized_tags,
-            product_metadata.get("brand", ""),
-        )
+        return RankingFeatureAssembler._metadata_fingerprint(product_metadata)
 
     def _get_product_feature_vector(
         self,
@@ -1357,40 +1300,9 @@ class RankingModel:
         current_time: float,
     ) -> np.ndarray:
         """Return product features while preserving request-time freshness for age."""
-        cache_key = (
-            product_id,
-            self._product_metadata_fingerprint(product_metadata),
+        return self.feature_assembler._product_features(
+            product_id, product_metadata, current_time
         )
-        with self._product_feature_cache_lock:
-            cached = self._product_feature_cache.get(cache_key)
-            if cached is not None:
-                static_features, created_at = cached
-                self._product_feature_cache.move_to_end(cache_key)
-            else:
-                static_features = None
-
-        if cached is None:
-            (
-                static_features,
-                created_at,
-            ) = self.feature_extractor.extract_static_product_features(product_metadata)
-            with self._product_feature_cache_lock:
-                if self._product_feature_cache_max_size > 0:
-                    self._product_feature_cache[cache_key] = (
-                        static_features,
-                        created_at,
-                    )
-                    if (
-                        len(self._product_feature_cache)
-                        > self._product_feature_cache_max_size
-                    ):
-                        self._product_feature_cache.popitem(last=False)
-        elif product_metadata.get("_ranking_fallback_metadata") is True:
-            created_at = current_time
-
-        product_features = static_features.copy()
-        product_features[4] = (current_time - created_at) / 86400
-        return product_features
 
     async def rank_candidates(
         self,
@@ -1629,23 +1541,17 @@ class RankingModel:
 
     async def train_model(
         self,
-        training_data: List[Dict[str, Any]],
+        training_data: Sequence[RankingTrainingExample],
         *,
-        user_features_map: Optional[Dict[str, Any]] = None,
-        product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
-        item_embedding_map: Optional[Dict[str, Any]] = None,
-        two_tower_model_version: Optional[str] = None,
         training_sample_source: str = "interaction_events",
     ):
-        """Train the ranking model on user interaction data."""
+        """Train from validated typed examples only."""
+        if not all(isinstance(row, RankingTrainingExample) for row in training_data):
+            raise TypeError("RankingModel.train_model requires typed training examples")
         try:
             saved_model_path = await asyncio.to_thread(
                 self._train_model_sync,
                 training_data,
-                user_features_map or {},
-                product_metadata_map or {},
-                item_embedding_map or {},
-                two_tower_model_version,
                 training_sample_source,
             )
             if saved_model_path:
@@ -1653,15 +1559,17 @@ class RankingModel:
 
         except Exception as e:
             logger.error(f"Error training model: {e}")
+            raise
 
     def _train_model_sync(
         self,
-        training_data: List[Dict[str, Any]],
+        training_data,
+        training_sample_source: str = "interaction_events",
+        *,
         user_features_map: Optional[Dict[str, Any]] = None,
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
         item_embedding_map: Optional[Dict[str, Any]] = None,
         two_tower_model_version: Optional[str] = None,
-        training_sample_source: str = "interaction_events",
     ) -> Optional[str]:
         if len(training_data) < self.config.training_min_samples:
             logger.warning("Insufficient data for ranking model training")
@@ -1690,14 +1598,25 @@ class RankingModel:
         logger.info(f"Training ranking model on {len(training_data)} samples")
 
         # Prepare training data
-        features, labels = self._prepare_training_data(
-            training_data,
-            user_features_map=user_features_map,
-            product_metadata_map=product_metadata_map,
-            item_embedding_map=item_embedding_map,
-            two_tower_model_version=two_tower_model_version,
-            training_sample_source=training_sample_source,
-        )
+        if not all(isinstance(row, RankingTrainingExample) for row in training_data):
+            from video_commerce.ml.legacy_training_adapter import (
+                LegacyTrainingDatasetAdapter,
+            )
+
+            training_data = LegacyTrainingDatasetAdapter(
+                feature_store=None,
+                vector_search=None,
+                ranking_model=self,
+                recommendation_engine=None,
+            ).build_from_maps(
+                training_data,
+                user_features_map=user_features_map or {},
+                product_metadata_map=product_metadata_map or {},
+                item_embedding_map=item_embedding_map or {},
+                two_tower_model_version=two_tower_model_version,
+                training_sample_source=training_sample_source,
+            )
+        features, labels = self._prepare_training_examples(training_data)
 
         if features.size(0) == 0:
             logger.warning("No valid training samples prepared")
@@ -1742,6 +1661,11 @@ class RankingModel:
 
         logger.info("Model training completed")
         return self.loaded_model_path
+
+    def _prepare_training_examples(
+        self, training_data: Sequence[RankingTrainingExample]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        return self.training_tensor_builder.build(training_data)
 
     def _ltr_grouped_training_enabled(self) -> bool:
         return bool(
@@ -1862,12 +1786,17 @@ class RankingModel:
                 if history_context is not None:
                     context[RANKING_HISTORY_CONTEXT_KEY] = history_context
                 candidate = self._training_candidate(sample)
-                feature_vector = self.feature_extractor.create_ranking_features(
-                    user_features,
-                    product_metadata,
-                    context,
-                    candidate,
-                    as_of_ts=self._training_as_of_timestamp(sample),
+                feature_vector = self.feature_assembler.build(
+                    FeatureBundle(
+                        as_of_ts=self._training_as_of_timestamp(sample),
+                        feature_definition_version=(
+                            RANKING_LTR_FEATURE_DEFINITION_VERSION
+                        ),
+                        user_features=user_features,
+                        product_metadata=product_metadata,
+                        context=context,
+                        candidate=candidate,
+                    )
                 )
                 feature_vector = np.asarray(feature_vector, dtype=np.float32)
                 if feature_vector.shape != (self.feature_extractor.total_feature_dim,):
@@ -2692,6 +2621,9 @@ class RankingModel:
                         "hidden_dims": self.model.hidden_dims,
                         "input_dim": self.feature_extractor.total_feature_dim,
                         "feature_schema_version": self.feature_schema_version,
+                        "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                        "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
+                        "feature_assembler_version": self.feature_assembler.version,
                         "ranking_objective_version": self.ranking_objective_version,
                         "value_transform_stats": self.value_transform_stats,
                         "value_bucket_mapping": self.value_bucket_mapping,

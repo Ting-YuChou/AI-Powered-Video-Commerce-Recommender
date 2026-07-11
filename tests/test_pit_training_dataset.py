@@ -13,6 +13,7 @@ from video_commerce.ml.pit_training_dataset import (
 )
 from video_commerce.ml.pit_manifest import PitManifestPublisher, _is_parquet_shard_uri
 from video_commerce.ml.ranking_features import RANKING_LTR_FEATURE_DEFINITION_VERSION
+from video_commerce.ml.ranking_training import RANKING_LABEL_DEFINITION_VERSION
 
 
 class LocalObjectStorage:
@@ -26,11 +27,18 @@ def _write_dataset(tmp_path, *, status="complete", definition_version=None):
     shard = tmp_path / "part-00000.parquet"
     row = {
         "observation_id": "imp-1:p1",
+        "impression_id": "imp-1",
         "user_id": "u1",
         "product_id": "p1",
         "action": "view",
         "as_of_ts": 50.0,
         "feature_definition_version": definition_version,
+        "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
+        "attributed_action": "click",
+        "attributed_click": 1,
+        "attributed_purchase": 0,
+        "attributed_value": None,
+        "attributed_value_source": None,
         "user_features_json": '{"total_interactions":3}',
         "product_metadata_json": '{"price":9.0}',
         "context_json": "{}",
@@ -70,9 +78,11 @@ def _write_dataset(tmp_path, *, status="complete", definition_version=None):
                 "iceberg_table_id": "video_commerce.ranking_training_pit",
                 "iceberg_snapshot_id": "42",
                 "feature_definition_version": definition_version,
+                "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
                 "schema_hash": arrow_schema_sha256(table.schema),
                 "attribution_cutoff": 1_700_000_000.0,
                 "row_count": 1,
+                "quarantine_row_count": 0,
                 "min_as_of_ts": 50.0,
                 "max_as_of_ts": 50.0,
                 "shards": [
@@ -110,15 +120,45 @@ async def test_pit_training_dataset_reader_pins_pointer_and_validates_parquet(tm
 
     assert loaded.dataset_version == "iceberg-snapshot-42"
     assert loaded.materialization_run_id == "run-42"
-    assert len(loaded.rows) == 1
-    assert loaded.rows[0]["user_features"] == {"total_interactions": 3}
-    assert loaded.rows[0]["product_metadata"] == {"price": 9.0}
-    assert loaded.rows[0]["candidate_scores"] == {
-        "collaborative_score": 0.8,
-        "content_similarity_score": 0.7,
-        "popularity_score": 0.6,
-        "combined_score": 0.5,
-    }
+    assert loaded.label_definition_version == RANKING_LABEL_DEFINITION_VERSION
+    assert loaded.quarantine_rows == 0
+    assert len(loaded.examples) == 1
+    example = loaded.examples[0]
+    assert example.impression_id == "imp-1"
+    assert example.bundle.user_features.total_interactions == 3
+    assert example.bundle.product_metadata == {"price": 9.0}
+    assert example.bundle.candidate.collaborative_score == 0.8
+    assert example.attribution.attributed_action == "click"
+
+
+@pytest.mark.asyncio
+async def test_pit_training_dataset_reader_rejects_missing_label_contract(tmp_path):
+    latest, manifest_path, _ = _write_dataset(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("label_definition_version")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    reader = PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    )
+    with pytest.raises(PitTrainingDatasetError, match="label definition version"):
+        await reader.read(str(latest))
+
+
+@pytest.mark.asyncio
+async def test_pit_training_dataset_reader_rejects_unpinned_iceberg_manifest(tmp_path):
+    latest, manifest_path, _ = _write_dataset(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("iceberg_snapshot_id")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    reader = PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    )
+    with pytest.raises(PitTrainingDatasetError, match="Iceberg table or snapshot"):
+        await reader.read(str(latest))
 
 
 @pytest.mark.asyncio
@@ -178,7 +218,9 @@ async def test_manifest_publisher_writes_manifest_before_latest_pointer(tmp_path
         iceberg_table_id="video_commerce.ranking_training_pit",
         iceberg_snapshot_id="99",
         feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
         attribution_cutoff=1_700_000_000.0,
+        quarantine_row_count=0,
     )
 
     pointer = json.loads((output / "latest.json").read_text(encoding="utf-8"))
@@ -188,6 +230,7 @@ async def test_manifest_publisher_writes_manifest_before_latest_pointer(tmp_path
     assert latest_uri == str(output / "latest.json")
     assert pointer["manifest_uri"] == str(output / "runs/run-99/manifest.json")
     assert manifest["status"] == "complete"
+    assert manifest["label_definition_version"] == RANKING_LABEL_DEFINITION_VERSION
     assert manifest["row_count"] == 1
     assert manifest["shards"][0]["sha256"]
 
@@ -199,7 +242,9 @@ async def test_manifest_publisher_writes_manifest_before_latest_pointer(tmp_path
             iceberg_table_id="video_commerce.ranking_training_pit",
             iceberg_snapshot_id="99",
             feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
             attribution_cutoff=1_700_000_000.0,
+            quarantine_row_count=0,
         )
 
 

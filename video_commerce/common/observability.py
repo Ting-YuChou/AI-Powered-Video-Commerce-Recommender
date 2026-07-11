@@ -632,6 +632,31 @@ class ObservabilityManager:
             "Rows violating PIT event-time or availability constraints",
             registry=self.registry,
         )
+        self.pit_assembler_vector_parity_ratio = Gauge(
+            "pit_assembler_vector_parity_ratio",
+            "Exact shared-assembler vector parity for identical bundles",
+            registry=self.registry,
+        )
+        self.pit_label_reconciliation_ratio = Gauge(
+            "pit_label_reconciliation_ratio",
+            "Typed labels reconciled with finalized attribution facts",
+            registry=self.registry,
+        )
+        self.pit_current_state_calls = Gauge(
+            "pit_current_state_calls",
+            "Forbidden current Redis/catalog calls observed during PIT training",
+            registry=self.registry,
+        )
+        self.pit_invalid_feature_or_label_rows = Gauge(
+            "pit_invalid_feature_or_label_rows",
+            "PIT rows containing invalid feature or label tensors",
+            registry=self.registry,
+        )
+        self.pit_value_mask_coverage_ratio = Gauge(
+            "pit_value_mask_coverage_ratio",
+            "Purchase rows containing an actual attributed business value",
+            registry=self.registry,
+        )
         self._process = psutil.Process()
 
     def record_request(
@@ -734,6 +759,27 @@ class ObservabilityManager:
 
     def record_pit_manifest_validation_failure(self, reason: str) -> None:
         self.pit_manifest_validation_failures_total.labels(reason=reason).inc()
+
+    def update_typed_pit_training_metrics(
+        self,
+        *,
+        assembler_parity_ratio: float,
+        label_reconciliation_ratio: float,
+        current_state_calls: int,
+        invalid_rows: int,
+        value_mask_coverage: float,
+    ) -> None:
+        self.pit_assembler_vector_parity_ratio.set(
+            max(0.0, min(1.0, float(assembler_parity_ratio)))
+        )
+        self.pit_label_reconciliation_ratio.set(
+            max(0.0, min(1.0, float(label_reconciliation_ratio)))
+        )
+        self.pit_current_state_calls.set(max(0, int(current_state_calls)))
+        self.pit_invalid_feature_or_label_rows.set(max(0, int(invalid_rows)))
+        self.pit_value_mask_coverage_ratio.set(
+            max(0.0, min(1.0, float(value_mask_coverage)))
+        )
 
     def record_recommendation(
         self,

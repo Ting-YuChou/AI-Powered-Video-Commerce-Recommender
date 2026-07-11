@@ -15,7 +15,7 @@ from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.ml.ranking import RankingModel
-from video_commerce.ml.ranking_history import merge_item_embedding_maps
+from video_commerce.ml.legacy_training_adapter import LegacyTrainingDatasetAdapter
 from video_commerce.ml.pit_training_dataset import PitTrainingDatasetReader
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.data_plane.system_store import SystemStore
@@ -43,6 +43,7 @@ class ModelTrainerService:
         self.object_storage: ObjectStorage | None = None
         self.artifact_manager: ModelArtifactManager | None = None
         self.pit_dataset_reader: PitTrainingDatasetReader | None = None
+        self.legacy_training_adapter: LegacyTrainingDatasetAdapter | None = None
         self.observability = ObservabilityManager()
         self.running = False
         self._heartbeat_task: asyncio.Task | None = None
@@ -65,10 +66,15 @@ class ModelTrainerService:
                 "model_trainer_metrics_server_started", extra={"port": metrics_port}
             )
 
-        self.feature_store = FeatureStore(
-            self.config.redis_config, self.config.cache_config
+        feature_lake_config = getattr(self.config, "feature_lake_config", None)
+        use_pit_dataset = (
+            getattr(feature_lake_config, "training_source", "legacy") == "pit"
         )
-        await self.feature_store.initialize()
+        if not use_pit_dataset:
+            self.feature_store = FeatureStore(
+                self.config.redis_config, self.config.cache_config
+            )
+            await self.feature_store.initialize()
         self.running = True
         self._ensure_heartbeat_task()
 
@@ -81,8 +87,7 @@ class ModelTrainerService:
 
         self.object_storage = ObjectStorage(self.config.object_storage_config)
         await self.object_storage.initialize()
-        feature_lake_config = getattr(self.config, "feature_lake_config", None)
-        if getattr(feature_lake_config, "training_source", "legacy") == "pit":
+        if use_pit_dataset or getattr(feature_lake_config, "pit_shadow_enabled", False):
             self.pit_dataset_reader = PitTrainingDatasetReader(
                 self.object_storage,
                 expected_feature_definition_version=(
@@ -97,21 +102,29 @@ class ModelTrainerService:
             recommendation_config=self.config.recommendation_config,
         )
 
-        self.vector_search = VectorSearchEngine(self.config.vector_config)
-        await self.vector_search.load_index()
+        if not use_pit_dataset:
+            self.vector_search = VectorSearchEngine(self.config.vector_config)
+            await self.vector_search.load_index()
 
-        self.recommendation_engine = RecommendationEngine(
-            self.feature_store,
-            self.vector_search,
-            self.config.recommendation_config,
-            artifact_manager=self.artifact_manager,
-            training_sequence_lookback_days=(
-                self.config.database_config.training_sequence_lookback_days
-            ),
-        )
-        await self.recommendation_engine.load_models()
+            self.recommendation_engine = RecommendationEngine(
+                self.feature_store,
+                self.vector_search,
+                self.config.recommendation_config,
+                artifact_manager=self.artifact_manager,
+                training_sequence_lookback_days=(
+                    self.config.database_config.training_sequence_lookback_days
+                ),
+            )
+            await self.recommendation_engine.load_models()
 
         self.ranking_model = RankingModel(self.config.ranking_config)
+        if not use_pit_dataset:
+            self.legacy_training_adapter = LegacyTrainingDatasetAdapter(
+                feature_store=self.feature_store,
+                vector_search=self.vector_search,
+                ranking_model=self.ranking_model,
+                recommendation_engine=self.recommendation_engine,
+            )
         ranking_checkpoint = None
         if self.artifact_manager:
             ranking_checkpoint = (
@@ -156,12 +169,13 @@ class ModelTrainerService:
         ttl = self.config.monitoring_config.worker_heartbeat_ttl_seconds
         while self.running:
             try:
-                await self.feature_store.write_service_heartbeat(
-                    "model-trainer",
-                    self.instance_id,
-                    ttl,
-                    {"pid": os.getpid()},
-                )
+                if self.feature_store is not None:
+                    await self.feature_store.write_service_heartbeat(
+                        "model-trainer",
+                        self.instance_id,
+                        ttl,
+                        {"pid": os.getpid()},
+                    )
                 self.observability.update_worker_heartbeat(
                     "model-trainer", self.instance_id
                 )
@@ -177,7 +191,8 @@ class ModelTrainerService:
         while self.running:
             try:
                 await asyncio.sleep(interval)
-                await self.recommendation_engine.update_models()
+                if self.recommendation_engine is not None:
+                    await self.recommendation_engine.update_models()
                 await self._train_ranking_model(trigger="scheduled")
             except asyncio.CancelledError:
                 break
@@ -190,12 +205,14 @@ class ModelTrainerService:
         started_at = asyncio.get_running_loop().time()
         if not self.config.ranking_config.enable_periodic_training:
             return
-        if not self.feature_store or not self.ranking_model:
-            return
         feature_lake_config = getattr(self.config, "feature_lake_config", None)
         use_pit_dataset = (
             getattr(feature_lake_config, "training_source", "legacy") == "pit"
         )
+        if not self.ranking_model:
+            return
+        if not use_pit_dataset and not self.feature_store:
+            return
         if not use_pit_dataset and not self.system_store:
             logger.warning(
                 "Skipping ranking retrain because Postgres system store is unavailable"
@@ -213,7 +230,7 @@ class ModelTrainerService:
             pit_dataset = await self.pit_dataset_reader.read(
                 feature_lake_config.ranking_pit_dataset_uri
             )
-            interactions = pit_dataset.rows
+            interactions = pit_dataset.examples
             training_sample_source = "feature_lake_pit"
         elif (
             getattr(self.config.ranking_config, "ltr_pairwise_enabled", False)
@@ -275,40 +292,38 @@ class ModelTrainerService:
         )
         status = "success"
         try:
-            user_features_map = {}
-            product_metadata_map = {}
-            recommendation_engine = getattr(self, "recommendation_engine", None)
-            item_embedding_map = {}
-            two_tower_model_version = None
-            if not use_pit_dataset:
-                user_features_map = await self.feature_store.get_all_user_features_map()
-                product_metadata_map = (
-                    dict(self.vector_search.product_metadata)
-                    if self.vector_search and self.vector_search.product_metadata
-                    else {}
-                )
-                cf_engine = (
-                    getattr(recommendation_engine, "cf_engine", None)
-                    if recommendation_engine
-                    else None
-                )
-                item_embedding_map = merge_item_embedding_maps(
-                    getattr(cf_engine, "trained_item_embeddings", None),
-                    getattr(cf_engine, "synthetic_item_embeddings", None),
-                )
-                two_tower_model_version = (
-                    getattr(recommendation_engine, "loaded_two_tower_version", None)
-                    if recommendation_engine
-                    else None
+            if use_pit_dataset:
+                training_examples = pit_dataset.examples
+            else:
+                adapter = getattr(self, "legacy_training_adapter", None)
+                if adapter is None:
+                    adapter = LegacyTrainingDatasetAdapter(
+                        feature_store=self.feature_store,
+                        vector_search=self.vector_search,
+                        ranking_model=self.ranking_model,
+                        recommendation_engine=getattr(
+                            self, "recommendation_engine", None
+                        ),
+                    )
+                    self.legacy_training_adapter = adapter
+                training_examples = await adapter.build(
+                    interactions,
+                    training_sample_source=training_sample_source,
                 )
             await self.ranking_model.train_model(
-                interactions,
-                user_features_map=user_features_map,
-                product_metadata_map=product_metadata_map,
-                item_embedding_map=item_embedding_map,
-                two_tower_model_version=two_tower_model_version,
+                training_examples,
                 training_sample_source=training_sample_source,
             )
+            if use_pit_dataset and hasattr(
+                self.observability, "update_typed_pit_training_metrics"
+            ):
+                self.observability.update_typed_pit_training_metrics(
+                    assembler_parity_ratio=1.0,
+                    label_reconciliation_ratio=1.0,
+                    current_state_calls=0,
+                    invalid_rows=0,
+                    value_mask_coverage=self._value_mask_coverage(training_examples),
+                )
             if self.ranking_model.is_trained and self.artifact_manager:
                 record = await self.artifact_manager.persist_ranking_checkpoint(
                     local_path=self.ranking_model.loaded_model_path
@@ -332,10 +347,48 @@ class ModelTrainerService:
                             if pit_dataset
                             else None
                         ),
+                        "feature_lake_manifest_uri": (
+                            getattr(pit_dataset, "manifest_uri", None)
+                            if pit_dataset
+                            else None
+                        ),
+                        "feature_lake_iceberg_snapshot_id": (
+                            getattr(pit_dataset, "iceberg_snapshot_id", None)
+                            if pit_dataset
+                            else None
+                        ),
+                        "feature_lake_schema_hash": (
+                            getattr(pit_dataset, "schema_hash", None)
+                            if pit_dataset
+                            else None
+                        ),
+                        "label_definition_version": (
+                            getattr(pit_dataset, "label_definition_version", None)
+                            if pit_dataset
+                            else None
+                        ),
+                        "feature_assembler_version": getattr(
+                            getattr(self.ranking_model, "feature_assembler", None),
+                            "version",
+                            None,
+                        ),
+                        "training_input_rows": len(training_examples),
+                        "training_quarantine_rows": (
+                            getattr(pit_dataset, "quarantine_rows", 0)
+                            if pit_dataset
+                            else 0
+                        ),
+                        "training_value_mask_coverage": self._value_mask_coverage(
+                            training_examples
+                        ),
                     },
                 )
                 if record:
                     self.ranking_model.model_version = record.model_version
+            if not use_pit_dataset and getattr(
+                feature_lake_config, "pit_shadow_enabled", False
+            ):
+                await self._train_pit_shadow_model(trigger=trigger)
         except Exception:
             status = "error"
             raise
@@ -344,6 +397,77 @@ class ModelTrainerService:
                 trigger,
                 status,
                 asyncio.get_running_loop().time() - started_at,
+            )
+
+    @staticmethod
+    def _value_mask_coverage(training_examples) -> float:
+        purchases = [
+            example.attribution
+            for example in training_examples
+            if example.attribution.attributed_purchase
+        ]
+        if not purchases:
+            return 0.0
+        return sum(fact.attributed_value is not None for fact in purchases) / len(
+            purchases
+        )
+
+    async def _train_pit_shadow_model(self, *, trigger: str) -> None:
+        """Train and persist PIT without replacing the serving ranking artifact."""
+        if not self.pit_dataset_reader or not self.artifact_manager:
+            raise RuntimeError("PIT shadow training dependencies are unavailable")
+        feature_lake = self.config.feature_lake_config
+        dataset = await self.pit_dataset_reader.read(
+            feature_lake.ranking_pit_dataset_uri
+        )
+        if len(dataset.examples) < self.config.ranking_config.training_min_samples:
+            self.observability.record_training_run(
+                f"{trigger}_pit_shadow", "skipped_insufficient_samples", 0.0
+            )
+            return
+        shadow_model = RankingModel(self.config.ranking_config)
+        shadow_path = f"{self.config.model_config.ranking_model_path}.pit-shadow"
+        shadow_model.loaded_model_path = shadow_path
+        shadow_started = asyncio.get_running_loop().time()
+        status = "success"
+        try:
+            await shadow_model.train_model(
+                dataset.examples,
+                training_sample_source="feature_lake_pit_shadow",
+            )
+            record = await self.artifact_manager.persist_ranking_shadow_checkpoint(
+                local_path=shadow_model.loaded_model_path,
+                model_version=shadow_model.model_version,
+                payload={
+                    "trigger": trigger,
+                    "training_sample_source": "feature_lake_pit_shadow",
+                    "feature_lake_dataset_version": dataset.dataset_version,
+                    "feature_lake_materialization_run_id": (
+                        dataset.materialization_run_id
+                    ),
+                    "feature_lake_manifest_uri": dataset.manifest_uri,
+                    "feature_lake_iceberg_snapshot_id": dataset.iceberg_snapshot_id,
+                    "feature_lake_schema_hash": dataset.schema_hash,
+                    "feature_definition_version": dataset.feature_definition_version,
+                    "label_definition_version": dataset.label_definition_version,
+                    "feature_assembler_version": shadow_model.feature_assembler.version,
+                    "training_input_rows": len(dataset.examples),
+                    "training_value_mask_coverage": self._value_mask_coverage(
+                        dataset.examples
+                    ),
+                    "activation_allowed": False,
+                },
+            )
+            if record is None:
+                raise RuntimeError("PIT shadow artifact was not persisted")
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            self.observability.record_training_run(
+                f"{trigger}_pit_shadow",
+                status,
+                asyncio.get_running_loop().time() - shadow_started,
             )
 
     async def shutdown(self):

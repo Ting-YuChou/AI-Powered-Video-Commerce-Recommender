@@ -12,6 +12,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from video_commerce.common.feature_history_contracts import payload_sha256
+from video_commerce.common.models import CandidateProduct, UserFeatures
+from video_commerce.ml.ranking_features import FeatureBundle
+from video_commerce.ml.ranking_training import (
+    RANKING_LABEL_DEFINITION_VERSION,
+    AttributionFacts,
+    RankingTrainingExample,
+)
 
 
 class PitTrainingDatasetError(ValueError):
@@ -23,7 +30,12 @@ class PitTrainingDataset:
     dataset_version: str
     materialization_run_id: str
     feature_definition_version: str
-    rows: List[dict[str, Any]]
+    label_definition_version: str
+    manifest_uri: str
+    iceberg_snapshot_id: str
+    schema_hash: str
+    quarantine_rows: int
+    examples: List[RankingTrainingExample]
 
 
 def arrow_schema_sha256(schema: pa.Schema) -> str:
@@ -38,10 +50,12 @@ class PitTrainingDatasetReader:
         object_storage,
         *,
         expected_feature_definition_version: str,
+        expected_label_definition_version: str = RANKING_LABEL_DEFINITION_VERSION,
         observability=None,
     ):
         self.object_storage = object_storage
         self.expected_feature_definition_version = expected_feature_definition_version
+        self.expected_label_definition_version = expected_label_definition_version
         self.observability = observability
 
     async def read(self, dataset_uri: str) -> PitTrainingDataset:
@@ -76,10 +90,21 @@ class PitTrainingDatasetReader:
             raise PitTrainingDatasetError(
                 "PIT dataset feature definition version does not match the trainer"
             )
+        label_definition_version = str(manifest.get("label_definition_version") or "")
+        if label_definition_version != self.expected_label_definition_version:
+            raise PitTrainingDatasetError(
+                "PIT dataset label definition version does not match the trainer"
+            )
         dataset_version = str(manifest.get("dataset_version") or "").strip()
         if not dataset_version:
             raise PitTrainingDatasetError(
                 "PIT dataset manifest is missing dataset_version"
+            )
+        iceberg_table_id = str(manifest.get("iceberg_table_id") or "").strip()
+        iceberg_snapshot_id = str(manifest.get("iceberg_snapshot_id") or "").strip()
+        if not iceberg_table_id or not iceberg_snapshot_id:
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest is missing Iceberg table or snapshot ID"
             )
         expected_schema_hash = str(manifest.get("schema_hash") or "").strip()
         if len(expected_schema_hash) != 64:
@@ -110,15 +135,22 @@ class PitTrainingDatasetReader:
             raise PitTrainingDatasetError(
                 f"PIT dataset row count mismatch: expected {expected_rows}, got {table.num_rows}"
             )
-        rows = [
-            self._normalize_training_row(row, definition_version)
+        examples = [
+            self._normalize_training_row(
+                row, definition_version, label_definition_version
+            )
             for row in table.to_pylist()
         ]
         return PitTrainingDataset(
             dataset_version=dataset_version,
             materialization_run_id=run_id,
             feature_definition_version=definition_version,
-            rows=rows,
+            label_definition_version=label_definition_version,
+            manifest_uri=manifest_uri,
+            iceberg_snapshot_id=iceberg_snapshot_id,
+            schema_hash=expected_schema_hash,
+            quarantine_rows=max(0, int(manifest.get("quarantine_row_count", 0))),
+            examples=examples,
         )
 
     async def _read_json_uri(self, uri: str, *, kind: str) -> Dict[str, Any]:
@@ -198,8 +230,10 @@ class PitTrainingDatasetReader:
 
     @staticmethod
     def _normalize_training_row(
-        row: Dict[str, Any], definition_version: str
-    ) -> Dict[str, Any]:
+        row: Dict[str, Any],
+        definition_version: str,
+        label_definition_version: str,
+    ) -> RankingTrainingExample:
         if row.get("as_of_ts") is None:
             raise PitTrainingDatasetError("PIT training row is missing as_of_ts")
         if len(str(row.get("feature_bundle_hash") or "")) != 64:
@@ -213,6 +247,10 @@ class PitTrainingDatasetReader:
         if row.get("feature_definition_version") != definition_version:
             raise PitTrainingDatasetError(
                 "PIT training row feature definition version does not match manifest"
+            )
+        if row.get("label_definition_version") != label_definition_version:
+            raise PitTrainingDatasetError(
+                "PIT training row label definition version does not match manifest"
             )
         normalized = dict(row)
         for source, target in (
@@ -246,7 +284,73 @@ class PitTrainingDatasetReader:
             raise PitTrainingDatasetError(
                 "PIT training row feature_bundle_hash does not match final bundle"
             )
-        return normalized
+        impression_id = str(normalized.get("impression_id") or "").strip()
+        observation_id = str(normalized.get("observation_id") or "").strip()
+        user_id = str(normalized.get("user_id") or "").strip()
+        product_id = str(normalized.get("product_id") or "").strip()
+        if not all((impression_id, observation_id, user_id, product_id)):
+            raise PitTrainingDatasetError(
+                "PIT training row is missing impression, observation, user, or product ID"
+            )
+        user_payload = normalized.get("user_features")
+        product_metadata = normalized.get("product_metadata")
+        context = normalized.get("context")
+        scores = normalized.get("candidate_scores")
+        if not isinstance(user_payload, dict) or not user_payload:
+            raise PitTrainingDatasetError("PIT training row is missing user features")
+        if not isinstance(product_metadata, dict) or not product_metadata:
+            raise PitTrainingDatasetError(
+                "PIT training row is missing product metadata"
+            )
+        if not isinstance(context, dict):
+            raise PitTrainingDatasetError("PIT training row is missing context")
+        required_scores = {
+            "collaborative_score",
+            "content_similarity_score",
+            "popularity_score",
+            "combined_score",
+        }
+        if not isinstance(scores, dict) or not required_scores.issubset(scores):
+            raise PitTrainingDatasetError(
+                "PIT training row is missing complete candidate scores"
+            )
+        user_payload = dict(user_payload)
+        user_payload.setdefault("user_id", user_id)
+        try:
+            user_features = UserFeatures(**user_payload)
+            candidate = CandidateProduct(
+                product_id=product_id,
+                collaborative_score=float(scores["collaborative_score"]),
+                content_similarity_score=float(scores["content_similarity_score"]),
+                popularity_score=float(scores["popularity_score"]),
+                combined_score=float(scores["combined_score"]),
+                source="pit_observation",
+            )
+            attribution = AttributionFacts(
+                attributed_action=str(normalized.get("attributed_action") or ""),
+                attributed_click=bool(normalized.get("attributed_click")),
+                attributed_purchase=bool(normalized.get("attributed_purchase")),
+                attributed_value=normalized.get("attributed_value"),
+                attributed_value_source=normalized.get("attributed_value_source"),
+            )
+            bundle = FeatureBundle(
+                as_of_ts=float(normalized["as_of_ts"]),
+                feature_definition_version=definition_version,
+                user_features=user_features,
+                product_metadata=dict(product_metadata),
+                context=dict(context),
+                candidate=candidate,
+            )
+            return RankingTrainingExample(
+                observation_id=observation_id,
+                impression_id=impression_id,
+                bundle=bundle,
+                attribution=attribution,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PitTrainingDatasetError(
+                f"PIT training row typed contract validation failed: {exc}"
+            ) from exc
 
     @staticmethod
     def _sha256(path: str) -> str:

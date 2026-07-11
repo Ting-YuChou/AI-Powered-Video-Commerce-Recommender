@@ -248,6 +248,42 @@ groups:
           summary: Online/offline feature bundle parity is below 99.9 percent
           description: Training source must remain legacy until parity recovers.
 
+      - alert: PitAssemblerParityLow
+        expr: pit_assembler_vector_parity_ratio < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Shared ranking assembler parity is not exact
+          description: PIT cutover is blocked until identical bundles match within 1e-6.
+
+      - alert: PitLabelReconciliationLow
+        expr: pit_label_reconciliation_ratio < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Typed PIT labels do not reconcile with attribution facts
+          description: PIT cutover is blocked until label reconciliation is complete.
+
+      - alert: PitCurrentStateDependencyDetected
+        expr: pit_current_state_calls > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT training accessed current serving state
+          description: Redis or current catalog access was observed in the fail-closed PIT path.
+
+      - alert: PitInvalidTrainingTensorDetected
+        expr: pit_invalid_feature_or_label_rows > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Invalid PIT feature or label tensor detected
+          description: NaN, infinity, or an invalid typed training row blocks cutover.
+
       - alert: PitLeakageDetected
         expr: pit_leakage_rows > 0
         for: 1m
