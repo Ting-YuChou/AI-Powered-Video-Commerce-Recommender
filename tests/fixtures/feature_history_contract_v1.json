@@ -1,0 +1,26 @@
+{
+  "event": {
+    "event_id": "fixture-event-1",
+    "event_type": "catalog_feature",
+    "entity_type": "item",
+    "entity_id": "product-1",
+    "event_time": 100.0,
+    "available_at": 105.0,
+    "source_event_id": "fixture-source-1",
+    "source_version": "catalog-v1",
+    "feature_definition_version": "ranking_ltr_v1",
+    "payload_schema_version": 1,
+    "payload_hash": "4f720dcda8254a930e75e018e490ef71f02a02600f02e8a901f550b177e7d2e9",
+    "payload": {
+      "price": 12.5,
+      "tags": ["shoe", "sale"],
+      "nested": {"b": 2, "a": 1},
+      "last_active": 1783037653.5775127,
+      "tiny": 0.0000001,
+      "whole_float": 42.0
+    },
+    "request_id": "request-1",
+    "future_additive_field": "ignored"
+  },
+  "canonical_payload_json": "{\"last_active\":1783037653.5775127,\"nested\":{\"a\":1,\"b\":2},\"price\":12.5,\"tags\":[\"shoe\",\"sale\"],\"tiny\":0.0000001,\"whole_float\":42}"
+}

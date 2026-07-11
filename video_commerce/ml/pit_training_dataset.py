@@ -1,11 +1,17 @@
-"""Read an immutable, manifest-guarded export of the Iceberg PIT dataset."""
+"""Fail-closed reader for immutable manifest-guarded PIT Parquet datasets."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
-from typing import Any, List
+from typing import Any, Dict, List
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from video_commerce.common.feature_history_contracts import payload_sha256
 
 
 class PitTrainingDatasetError(ValueError):
@@ -15,49 +21,56 @@ class PitTrainingDatasetError(ValueError):
 @dataclass(frozen=True)
 class PitTrainingDataset:
     dataset_version: str
+    materialization_run_id: str
     feature_definition_version: str
     rows: List[dict[str, Any]]
 
 
+def arrow_schema_sha256(schema: pa.Schema) -> str:
+    return hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
+
+
 class PitTrainingDatasetReader:
-    """Load a materialized Iceberg snapshot export without a legacy fallback.
+    """Resolve latest once, pin one manifest, and validate every shard before loading."""
 
-    The batch Flink job writes this JSONL manifest/export for the Python model
-    trainer. The manifest pins the Iceberg snapshot identifier and shared
-    feature-definition version before a single training row is accepted.
-    """
-
-    def __init__(self, object_storage, *, expected_feature_definition_version: str):
+    def __init__(
+        self,
+        object_storage,
+        *,
+        expected_feature_definition_version: str,
+        observability=None,
+    ):
         self.object_storage = object_storage
         self.expected_feature_definition_version = expected_feature_definition_version
+        self.observability = observability
 
     async def read(self, dataset_uri: str) -> PitTrainingDataset:
-        local_path, should_delete = await self.object_storage.materialize_for_processing(
-            dataset_uri,
-            suggested_suffix=".jsonl",
-        )
         try:
-            return self._read_local_path(local_path)
-        finally:
-            if should_delete and os.path.exists(local_path):
-                os.remove(local_path)
+            return await self._read_pinned(dataset_uri)
+        except PitTrainingDatasetError as exc:
+            if self.observability is not None:
+                self.observability.record_pit_manifest_validation_failure(
+                    type(exc).__name__
+                )
+            raise
 
-    def _read_local_path(self, path: str) -> PitTrainingDataset:
-        try:
-            with open(path, "r", encoding="utf-8") as dataset_file:
-                records = [
-                    json.loads(line)
-                    for line in dataset_file
-                    if line.strip()
-                ]
-        except (OSError, json.JSONDecodeError) as exc:
-            raise PitTrainingDatasetError(f"unable to read PIT dataset: {exc}") from exc
+    async def _read_pinned(self, dataset_uri: str) -> PitTrainingDataset:
+        pointer = await self._read_json_uri(dataset_uri, kind="latest pointer")
+        manifest_uri = str(pointer.get("manifest_uri") or "").strip()
+        pointer_run_id = str(pointer.get("materialization_run_id") or "").strip()
+        if not manifest_uri or not pointer_run_id:
+            raise PitTrainingDatasetError(
+                "PIT latest pointer is missing manifest_uri or materialization_run_id"
+            )
 
-        if not records or records[0].get("record_type") != "manifest":
-            raise PitTrainingDatasetError("PIT dataset must begin with a manifest record")
-        manifest = records[0]
+        manifest = await self._read_json_uri(manifest_uri, kind="manifest")
         if manifest.get("status") != "complete":
             raise PitTrainingDatasetError("PIT dataset manifest is not complete")
+        run_id = str(manifest.get("materialization_run_id") or "").strip()
+        if run_id != pointer_run_id:
+            raise PitTrainingDatasetError(
+                "PIT latest pointer and manifest materialization_run_id do not match"
+            )
         definition_version = str(manifest.get("feature_definition_version") or "")
         if definition_version != self.expected_feature_definition_version:
             raise PitTrainingDatasetError(
@@ -65,23 +78,180 @@ class PitTrainingDatasetReader:
             )
         dataset_version = str(manifest.get("dataset_version") or "").strip()
         if not dataset_version:
-            raise PitTrainingDatasetError("PIT dataset manifest is missing dataset_version")
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest is missing dataset_version"
+            )
+        expected_schema_hash = str(manifest.get("schema_hash") or "").strip()
+        if len(expected_schema_hash) != 64:
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest has invalid schema hash"
+            )
+        shards = manifest.get("shards")
+        if not isinstance(shards, list) or not shards:
+            raise PitTrainingDatasetError("PIT dataset manifest has no Parquet shards")
 
-        rows: List[dict[str, Any]] = []
-        for record in records[1:]:
-            if record.get("record_type") != "training_row":
-                continue
-            if record.get("feature_definition_version") != definition_version:
-                raise PitTrainingDatasetError(
-                    "PIT training row feature definition version does not match manifest"
-                )
-            if record.get("as_of_ts") is None:
-                raise PitTrainingDatasetError("PIT training row is missing as_of_ts")
-            if not record.get("feature_bundle_hash"):
-                raise PitTrainingDatasetError("PIT training row is missing feature_bundle_hash")
-            rows.append(dict(record))
+        tables: List[pa.Table] = []
+        pinned_schema: pa.Schema | None = None
+        for shard in shards:
+            table = await self._read_verified_shard(
+                shard,
+                expected_schema_hash=expected_schema_hash,
+                expected_definition_version=definition_version,
+            )
+            if pinned_schema is None:
+                pinned_schema = table.schema
+            elif table.schema != pinned_schema:
+                raise PitTrainingDatasetError("PIT Parquet shard schema mismatch")
+            tables.append(table)
+
+        table = pa.concat_tables(tables)
+        expected_rows = int(manifest.get("row_count", -1))
+        if expected_rows < 0 or table.num_rows != expected_rows:
+            raise PitTrainingDatasetError(
+                f"PIT dataset row count mismatch: expected {expected_rows}, got {table.num_rows}"
+            )
+        rows = [
+            self._normalize_training_row(row, definition_version)
+            for row in table.to_pylist()
+        ]
         return PitTrainingDataset(
             dataset_version=dataset_version,
+            materialization_run_id=run_id,
             feature_definition_version=definition_version,
             rows=rows,
         )
+
+    async def _read_json_uri(self, uri: str, *, kind: str) -> Dict[str, Any]:
+        path, should_delete = await self.object_storage.materialize_for_processing(
+            uri, suggested_suffix=".json"
+        )
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PitTrainingDatasetError(f"unable to read PIT {kind}: {exc}") from exc
+        finally:
+            if should_delete and os.path.exists(path):
+                os.remove(path)
+        if not isinstance(payload, dict):
+            raise PitTrainingDatasetError(f"PIT {kind} must be a JSON object")
+        return payload
+
+    async def _read_verified_shard(
+        self,
+        shard: Any,
+        *,
+        expected_schema_hash: str,
+        expected_definition_version: str,
+    ) -> pa.Table:
+        if not isinstance(shard, dict):
+            raise PitTrainingDatasetError("PIT manifest shard entry must be an object")
+        uri = str(shard.get("uri") or "").strip()
+        expected_size = int(shard.get("byte_size", -1))
+        expected_hash = str(shard.get("sha256") or "").strip()
+        if not uri or expected_size < 0 or len(expected_hash) != 64:
+            raise PitTrainingDatasetError("PIT manifest shard entry is incomplete")
+        try:
+            path, should_delete = await self.object_storage.materialize_for_processing(
+                uri, suggested_suffix=".parquet"
+            )
+        except (OSError, FileNotFoundError) as exc:
+            raise PitTrainingDatasetError(
+                f"PIT Parquet shard is missing: {uri}"
+            ) from exc
+        try:
+            if not os.path.exists(path):
+                raise PitTrainingDatasetError(f"PIT Parquet shard is missing: {uri}")
+            actual_size = os.path.getsize(path)
+            if actual_size != expected_size:
+                raise PitTrainingDatasetError(
+                    f"PIT Parquet shard size mismatch for {uri}"
+                )
+            actual_hash = self._sha256(path)
+            if actual_hash != expected_hash:
+                raise PitTrainingDatasetError(
+                    f"PIT Parquet shard checksum mismatch for {uri}"
+                )
+            try:
+                table = pq.read_table(path)
+            except Exception as exc:
+                raise PitTrainingDatasetError(
+                    f"unable to read PIT Parquet shard {uri}: {exc}"
+                ) from exc
+            if arrow_schema_sha256(table.schema) != expected_schema_hash:
+                raise PitTrainingDatasetError(
+                    f"PIT Parquet shard schema mismatch for {uri}"
+                )
+            if "feature_definition_version" not in table.column_names:
+                raise PitTrainingDatasetError(
+                    "PIT Parquet shard schema is missing feature_definition_version"
+                )
+            versions = set(table.column("feature_definition_version").to_pylist())
+            if versions != {expected_definition_version}:
+                raise PitTrainingDatasetError(
+                    "PIT Parquet shard feature definition version mismatch"
+                )
+            return table
+        finally:
+            if should_delete and os.path.exists(path):
+                os.remove(path)
+
+    @staticmethod
+    def _normalize_training_row(
+        row: Dict[str, Any], definition_version: str
+    ) -> Dict[str, Any]:
+        if row.get("as_of_ts") is None:
+            raise PitTrainingDatasetError("PIT training row is missing as_of_ts")
+        if len(str(row.get("feature_bundle_hash") or "")) != 64:
+            raise PitTrainingDatasetError(
+                "PIT training row is missing feature_bundle_hash"
+            )
+        if len(str(row.get("online_feature_bundle_hash") or "")) != 64:
+            raise PitTrainingDatasetError(
+                "PIT training row is missing online_feature_bundle_hash"
+            )
+        if row.get("feature_definition_version") != definition_version:
+            raise PitTrainingDatasetError(
+                "PIT training row feature definition version does not match manifest"
+            )
+        normalized = dict(row)
+        for source, target in (
+            ("user_features_json", "user_features"),
+            ("product_metadata_json", "product_metadata"),
+            ("context_json", "context"),
+            ("candidate_features_json", "candidate_scores"),
+        ):
+            raw = normalized.pop(source, None)
+            if raw is None:
+                continue
+            try:
+                normalized[target] = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise PitTrainingDatasetError(
+                    f"PIT training row has invalid {source}: {exc}"
+                ) from exc
+        expected_bundle_hash = payload_sha256(
+            {
+                "as_of_ts": float(normalized["as_of_ts"]),
+                "candidate_features": normalized.get("candidate_scores") or {},
+                "context": normalized.get("context") or {},
+                "feature_definition_version": definition_version,
+                "product_id": str(normalized.get("product_id") or ""),
+                "product_metadata": normalized.get("product_metadata") or {},
+                "user_features": normalized.get("user_features") or {},
+                "user_id": str(normalized.get("user_id") or ""),
+            }
+        )
+        if normalized["feature_bundle_hash"] != expected_bundle_hash:
+            raise PitTrainingDatasetError(
+                "PIT training row feature_bundle_hash does not match final bundle"
+            )
+        return normalized
+
+    @staticmethod
+    def _sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()

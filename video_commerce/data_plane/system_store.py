@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import logging
 import time
 from collections import Counter
@@ -24,14 +25,20 @@ from sqlalchemy import (
     desc,
     event,
     func,
+    or_,
     select,
     text,
+    update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from video_commerce.common.config import DatabaseConfig
+from video_commerce.common.feature_history_contracts import (
+    build_catalog_feature_event,
+    payload_sha256,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +57,78 @@ IMPRESSION_CONTEXT_KEYS = {
     "request_category",
     "recommendation_count",
 }
+
+
+@dataclass(frozen=True)
+class PreparedCatalogActivation:
+    activation_id: str
+    source_version: str
+    expected_count: int
+    manifest_hash: str
+    snapshot_rows: List[Dict[str, Any]]
+    outbox_rows: List[Dict[str, Any]]
+
+
+def prepare_catalog_activation(
+    *,
+    source_version: str,
+    metadata_map: Mapping[str, Mapping[str, Any]],
+    event_time: float,
+    available_at: float,
+) -> PreparedCatalogActivation:
+    """Build deterministic snapshot/outbox rows before opening a DB transaction."""
+    normalized_version = str(source_version or "").strip()
+    if not normalized_version:
+        raise ValueError("source_version must not be blank")
+    activation_id = hashlib.sha256(
+        f"catalog_activation\x00{normalized_version}".encode("utf-8")
+    ).hexdigest()
+    snapshot_rows: List[Dict[str, Any]] = []
+    outbox_rows: List[Dict[str, Any]] = []
+    for product_id in sorted(metadata_map):
+        payload = dict(metadata_map[product_id])
+        event = build_catalog_feature_event(
+            product_id=product_id,
+            source_version=normalized_version,
+            event_time=event_time,
+            available_at=available_at,
+            payload=payload,
+        )
+        event["activation_id"] = activation_id
+        snapshot_rows.append(
+            {
+                "product_id": product_id,
+                "snapshot": payload,
+                "updated_at": _coerce_datetime(available_at),
+            }
+        )
+        outbox_rows.append(
+            {
+                "event_id": event["event_id"],
+                "activation_id": activation_id,
+                "product_id": product_id,
+                "payload": event["payload"],
+                "payload_hash": event["payload_hash"],
+                "event_payload": event,
+                "event_time": _coerce_datetime(event_time),
+                "available_at": _coerce_datetime(available_at),
+            }
+        )
+    return PreparedCatalogActivation(
+        activation_id=activation_id,
+        source_version=normalized_version,
+        expected_count=len(outbox_rows),
+        manifest_hash=payload_sha256(
+            {
+                "source_version": normalized_version,
+                "products": {
+                    row["product_id"]: row["snapshot"] for row in snapshot_rows
+                },
+            }
+        ),
+        snapshot_rows=snapshot_rows,
+        outbox_rows=outbox_rows,
+    )
 
 
 def _utc_now() -> datetime:
@@ -240,7 +319,9 @@ def build_ltr_training_samples_from_impression_records(
         matched_interaction = strongest_interactions.get(
             (impression_id, product_id, user_id)
         )
-        action = str(matched_interaction.get("action") if matched_interaction else "view")
+        action = str(
+            matched_interaction.get("action") if matched_interaction else "view"
+        )
         impression_context = _safe_dict(item.get("context"))
         interaction_context = (
             _safe_dict(matched_interaction.get("context"))
@@ -449,7 +530,9 @@ class InteractionEvent(Base):
     product_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     context: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -461,14 +544,24 @@ class RecommendationImpression(Base):
     __tablename__ = "recommendation_impressions"
 
     impression_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    request_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     user_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    session_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
-    content_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    session_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    content_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
     model_version: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    ranking_model_version: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    ranking_model_version: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
     context: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 class RecommendationImpressionItem(Base):
@@ -485,7 +578,9 @@ class RecommendationImpressionItem(Base):
         default=dict,
     )
     scores: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 class ContentJob(Base):
@@ -494,7 +589,9 @@ class ContentJob(Base):
     content_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     filename: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     storage_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    user_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
     priority: Mapped[str] = mapped_column(String(32), nullable=False, default="normal")
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -517,11 +614,102 @@ class ProductCatalogSnapshot(Base):
 
     product_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     snapshot: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    activation_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    source_version: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+
+
+class CatalogActivation(Base):
+    __tablename__ = "catalog_activations"
+
+    activation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_version: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True
+    )
+    expected_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    manifest_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    actual_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="staging")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class CatalogFeatureOutbox(Base):
+    __tablename__ = "catalog_feature_outbox"
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    activation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    product_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    event_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    claimed_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    claim_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    published_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class FeatureHistoryBackfillRun(Base):
+    __tablename__ = "feature_history_backfill_runs"
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    range_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    range_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    phase: Mapped[str] = mapped_column(String(32), nullable=False, default="catalog")
+    cursor_time: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cursor_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    counts: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    reconciliation: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 
@@ -585,6 +773,19 @@ Index(
     RecommendationImpressionItem.product_id,
     unique=True,
 )
+Index(
+    "ix_catalog_feature_outbox_pending",
+    CatalogFeatureOutbox.published_at,
+    CatalogFeatureOutbox.claim_expires_at,
+    CatalogFeatureOutbox.created_at,
+)
+Index(
+    "ux_feature_history_backfill_active_range",
+    FeatureHistoryBackfillRun.range_start,
+    FeatureHistoryBackfillRun.range_end,
+    unique=True,
+    postgresql_where=FeatureHistoryBackfillRun.status == "active",
+)
 
 
 @dataclass
@@ -640,6 +841,7 @@ class SystemStore:
                     await self._ensure_partitioned_interaction_events(conn)
                 else:
                     await conn.run_sync(Base.metadata.create_all)
+                await self._ensure_feature_lake_operational_schema(conn)
                 await self._ensure_operational_indexes(conn)
 
         self.is_connected = True
@@ -659,6 +861,7 @@ class SystemStore:
                 "ON interaction_events (occurred_at DESC)"
             )
         )
+
         await conn.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS ix_interaction_events_action_occurred_at "
@@ -713,6 +916,22 @@ class SystemStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "ux_recommendation_impression_items_impression_product "
                 "ON recommendation_impression_items (impression_id, product_id)"
+            )
+        )
+
+    async def _ensure_feature_lake_operational_schema(self, conn) -> None:
+        """Apply additive feature-lake columns for existing operational tables."""
+        await conn.execute(
+            text(
+                "ALTER TABLE product_catalog_snapshot "
+                "ADD COLUMN IF NOT EXISTS activation_id VARCHAR(64), "
+                "ADD COLUMN IF NOT EXISTS source_version VARCHAR(255)"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE catalog_activations "
+                "ADD COLUMN IF NOT EXISTS manifest_hash VARCHAR(64)"
             )
         )
 
@@ -821,11 +1040,17 @@ class SystemStore:
             return
 
         @event.listens_for(self.engine.sync_engine, "before_cursor_execute")
-        def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-            conn.info.setdefault("video_commerce_query_start_time", []).append(time.perf_counter())
+        def before_cursor_execute(
+            conn, cursor, statement, parameters, context, executemany
+        ):
+            conn.info.setdefault("video_commerce_query_start_time", []).append(
+                time.perf_counter()
+            )
 
         @event.listens_for(self.engine.sync_engine, "after_cursor_execute")
-        def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        def after_cursor_execute(
+            conn, cursor, statement, parameters, context, executemany
+        ):
             started_stack = conn.info.get("video_commerce_query_start_time", [])
             started_at = started_stack.pop(-1) if started_stack else time.perf_counter()
             operation = _sql_operation(statement)
@@ -963,7 +1188,9 @@ class SystemStore:
         if self.config.interaction_events_partitioned:
             stmt = stmt.on_conflict_do_nothing()
         else:
-            stmt = stmt.on_conflict_do_nothing(index_elements=[InteractionEvent.event_id])
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=[InteractionEvent.event_id]
+            )
         async with self.session_factory.begin() as session:
             await session.execute(stmt)
         self._update_pool_metrics()
@@ -978,7 +1205,9 @@ class SystemStore:
             metadata.get("impression_id") or event.get("impression_id") or ""
         ).strip()
         user_id = str(event.get("user_id") or metadata.get("user_id") or "").strip()
-        displayed_items = metadata.get("displayed_items") or event.get("displayed_items") or []
+        displayed_items = (
+            metadata.get("displayed_items") or event.get("displayed_items") or []
+        )
         if not impression_id or not user_id or not isinstance(displayed_items, list):
             return
 
@@ -996,7 +1225,9 @@ class SystemStore:
         if metadata.get("content_id") is not None:
             context.setdefault("content_id", metadata.get("content_id"))
         if metadata.get("item_snapshot_scope") is not None:
-            context["item_snapshot_scope"] = str(metadata.get("item_snapshot_scope"))[:64]
+            context["item_snapshot_scope"] = str(metadata.get("item_snapshot_scope"))[
+                :64
+            ]
         rejected_candidate_items = metadata.get("rejected_candidate_items")
         if isinstance(rejected_candidate_items, list):
             bounded_rejected_items = []
@@ -1130,7 +1361,9 @@ class SystemStore:
             result = await session.execute(stmt)
             impression_rows = result.scalars().all()
 
-            impression_ids = {impression.impression_id for impression in impression_rows}
+            impression_ids = {
+                impression.impression_id for impression in impression_rows
+            }
             item_rows = []
             interaction_rows = []
             if impression_ids:
@@ -1157,9 +1390,9 @@ class SystemStore:
                     }
                 )
                 interaction_stmt = select(InteractionEvent).where(
-                    InteractionEvent.context["impression_id"].as_string().in_(
-                        sorted(impression_ids)
-                    )
+                    InteractionEvent.context["impression_id"]
+                    .as_string()
+                    .in_(sorted(impression_ids))
                 )
                 if user_ids:
                     interaction_stmt = interaction_stmt.where(
@@ -1249,7 +1482,9 @@ class SystemStore:
             result = await session.execute(stmt)
             impression_rows = result.scalars().all()
 
-            impression_ids = {impression.impression_id for impression in impression_rows}
+            impression_ids = {
+                impression.impression_id for impression in impression_rows
+            }
             item_rows = []
             interaction_rows = []
             if impression_ids:
@@ -1276,9 +1511,9 @@ class SystemStore:
                     }
                 )
                 interaction_stmt = select(InteractionEvent).where(
-                    InteractionEvent.context["impression_id"].as_string().in_(
-                        sorted(impression_ids)
-                    )
+                    InteractionEvent.context["impression_id"]
+                    .as_string()
+                    .in_(sorted(impression_ids))
                 )
                 if user_ids:
                     interaction_stmt = interaction_stmt.where(
@@ -1337,7 +1572,9 @@ class SystemStore:
             interactions,
         )
 
-    async def get_training_interactions(self, limit: int = 50000) -> List[Dict[str, Any]]:
+    async def get_training_interactions(
+        self, limit: int = 50000
+    ) -> List[Dict[str, Any]]:
         if not self.enabled:
             return []
 
@@ -1395,14 +1632,24 @@ class SystemStore:
             .where(*conditions)
             .group_by(InteractionEvent.user_id)
             .having(func.count(InteractionEvent.event_id) >= min_sequence_length)
-            .order_by(func.max(InteractionEvent.occurred_at).desc(), InteractionEvent.user_id.asc())
+            .order_by(
+                func.max(InteractionEvent.occurred_at).desc(),
+                InteractionEvent.user_id.asc(),
+            )
             .limit(max_users)
             .subquery()
         )
-        event_rank = func.row_number().over(
-            partition_by=InteractionEvent.user_id,
-            order_by=(InteractionEvent.occurred_at.desc(), InteractionEvent.event_id.desc()),
-        ).label("event_rank")
+        event_rank = (
+            func.row_number()
+            .over(
+                partition_by=InteractionEvent.user_id,
+                order_by=(
+                    InteractionEvent.occurred_at.desc(),
+                    InteractionEvent.event_id.desc(),
+                ),
+            )
+            .label("event_rank")
+        )
         ranked_events = (
             select(
                 InteractionEvent.event_id,
@@ -1473,8 +1720,7 @@ class SystemStore:
                     func.count(InteractionEvent.event_id),
                     func.count(func.distinct(InteractionEvent.user_id)),
                     func.count(func.distinct(InteractionEvent.product_id)),
-                )
-                .where(InteractionEvent.occurred_at >= cutoff)
+                ).where(InteractionEvent.occurred_at >= cutoff)
             )
             total_interactions, unique_users, unique_products = totals_result.one()
 
@@ -1642,6 +1888,508 @@ class SystemStore:
             await session.execute(stmt)
         self._update_pool_metrics()
 
+    async def activate_product_catalog(
+        self,
+        source_version: str,
+        metadata_map: Mapping[str, Mapping[str, Any]],
+        *,
+        event_time: Optional[float] = None,
+        available_at: Optional[float] = None,
+        batch_size: int = 500,
+    ) -> str:
+        """Atomically stage each catalog batch with its durable Kafka outbox rows."""
+        if not self.enabled:
+            raise RuntimeError("catalog activation requires Postgres system store")
+        if not metadata_map:
+            raise ValueError("catalog activation requires at least one product")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+
+        activation_time = float(
+            available_at if available_at is not None else time.time()
+        )
+        prepared = prepare_catalog_activation(
+            source_version=source_version,
+            metadata_map=metadata_map,
+            event_time=float(event_time if event_time is not None else activation_time),
+            available_at=activation_time,
+        )
+        activation_insert = (
+            pg_insert(CatalogActivation)
+            .values(
+                activation_id=prepared.activation_id,
+                source_version=prepared.source_version,
+                expected_count=prepared.expected_count,
+                manifest_hash=prepared.manifest_hash,
+                actual_count=0,
+                status="staging",
+            )
+            .on_conflict_do_nothing(index_elements=[CatalogActivation.activation_id])
+        )
+        async with self.session_factory.begin() as session:
+            await session.execute(activation_insert)
+
+        async with self.session_factory() as session:
+            activation = await session.get(CatalogActivation, prepared.activation_id)
+        if activation is None:
+            raise RuntimeError("catalog activation row was not persisted")
+        if (
+            activation.source_version != prepared.source_version
+            or activation.expected_count != prepared.expected_count
+            or activation.manifest_hash != prepared.manifest_hash
+        ):
+            raise RuntimeError(
+                "catalog activation retry does not match staged activation"
+            )
+        if activation.status == "complete":
+            return prepared.activation_id
+
+        for offset in range(0, prepared.expected_count, batch_size):
+            snapshot_rows = [
+                {
+                    **row,
+                    "activation_id": prepared.activation_id,
+                    "source_version": prepared.source_version,
+                }
+                for row in prepared.snapshot_rows[offset : offset + batch_size]
+            ]
+            outbox_rows = prepared.outbox_rows[offset : offset + batch_size]
+            snapshot_stmt = pg_insert(ProductCatalogSnapshot).values(snapshot_rows)
+            snapshot_stmt = snapshot_stmt.on_conflict_do_update(
+                index_elements=[ProductCatalogSnapshot.product_id],
+                set_={
+                    "snapshot": snapshot_stmt.excluded.snapshot,
+                    "activation_id": snapshot_stmt.excluded.activation_id,
+                    "source_version": snapshot_stmt.excluded.source_version,
+                    "updated_at": snapshot_stmt.excluded.updated_at,
+                },
+            )
+            outbox_stmt = (
+                pg_insert(CatalogFeatureOutbox)
+                .values(outbox_rows)
+                .on_conflict_do_nothing(index_elements=[CatalogFeatureOutbox.event_id])
+            )
+            async with self.session_factory.begin() as session:
+                await session.execute(snapshot_stmt)
+                await session.execute(outbox_stmt)
+
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(
+                    CatalogFeatureOutbox.event_id, CatalogFeatureOutbox.payload_hash
+                ).where(CatalogFeatureOutbox.activation_id == prepared.activation_id)
+            )
+            actual_hashes = {
+                event_id: payload_hash for event_id, payload_hash in result.all()
+            }
+            expected_hashes = {
+                row["event_id"]: row["payload_hash"] for row in prepared.outbox_rows
+            }
+            if actual_hashes != expected_hashes:
+                await session.execute(
+                    update(CatalogActivation)
+                    .where(CatalogActivation.activation_id == prepared.activation_id)
+                    .values(actual_count=len(actual_hashes), updated_at=_utc_now())
+                )
+                raise RuntimeError("catalog activation outbox reconciliation failed")
+            completed_at = _utc_now()
+            await session.execute(
+                update(CatalogActivation)
+                .where(
+                    CatalogActivation.activation_id == prepared.activation_id,
+                    CatalogActivation.status == "staging",
+                )
+                .values(
+                    actual_count=len(actual_hashes),
+                    status="complete",
+                    completed_at=completed_at,
+                    updated_at=completed_at,
+                )
+            )
+        self._update_pool_metrics()
+        return prepared.activation_id
+
+    async def claim_catalog_outbox(
+        self,
+        *,
+        worker_id: str,
+        batch_size: int,
+        lease_seconds: int,
+    ) -> List[Dict[str, Any]]:
+        """Lease unpublished rows from completed activations without worker contention."""
+        if not self.enabled:
+            return []
+        now = _utc_now()
+        lease_until = now + timedelta(seconds=max(1, int(lease_seconds)))
+        statement = (
+            select(CatalogFeatureOutbox)
+            .join(
+                CatalogActivation,
+                CatalogActivation.activation_id == CatalogFeatureOutbox.activation_id,
+            )
+            .where(
+                CatalogActivation.status == "complete",
+                CatalogFeatureOutbox.published_at.is_(None),
+                or_(
+                    CatalogFeatureOutbox.claim_expires_at.is_(None),
+                    CatalogFeatureOutbox.claim_expires_at < now,
+                ),
+            )
+            .order_by(CatalogFeatureOutbox.created_at, CatalogFeatureOutbox.event_id)
+            .limit(max(1, int(batch_size)))
+            .with_for_update(skip_locked=True, of=CatalogFeatureOutbox)
+        )
+        async with self.session_factory.begin() as session:
+            result = await session.execute(statement)
+            rows = list(result.scalars().all())
+            for row in rows:
+                row.claimed_by = worker_id
+                row.claim_expires_at = lease_until
+            events = [dict(row.event_payload or {}) for row in rows]
+        self._update_pool_metrics()
+        return events
+
+    async def mark_catalog_outbox_published(
+        self,
+        event_id: str,
+        *,
+        worker_id: str,
+    ) -> None:
+        if not self.enabled:
+            return
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                update(CatalogFeatureOutbox)
+                .where(
+                    CatalogFeatureOutbox.event_id == event_id,
+                    CatalogFeatureOutbox.claimed_by == worker_id,
+                    CatalogFeatureOutbox.published_at.is_(None),
+                )
+                .values(
+                    published_at=_utc_now(),
+                    attempts=CatalogFeatureOutbox.attempts + 1,
+                    last_error=None,
+                    claimed_by=None,
+                    claim_expires_at=None,
+                )
+            )
+        self._update_pool_metrics()
+
+    async def mark_catalog_outbox_failed(
+        self,
+        event_id: str,
+        error: str,
+        *,
+        worker_id: str,
+    ) -> None:
+        if not self.enabled:
+            return
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                update(CatalogFeatureOutbox)
+                .where(
+                    CatalogFeatureOutbox.event_id == event_id,
+                    CatalogFeatureOutbox.claimed_by == worker_id,
+                    CatalogFeatureOutbox.published_at.is_(None),
+                )
+                .values(
+                    attempts=CatalogFeatureOutbox.attempts + 1,
+                    last_error=str(error)[:4096],
+                    claimed_by=None,
+                    claim_expires_at=None,
+                )
+            )
+        self._update_pool_metrics()
+
+    async def prune_catalog_outbox(self, *, retention_days: int = 7) -> int:
+        if not self.enabled:
+            return 0
+        cutoff = _utc_now() - timedelta(days=max(1, int(retention_days)))
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                delete(CatalogFeatureOutbox).where(
+                    CatalogFeatureOutbox.published_at.is_not(None),
+                    CatalogFeatureOutbox.published_at < cutoff,
+                )
+            )
+        self._update_pool_metrics()
+        return int(result.rowcount or 0)
+
+    async def get_catalog_outbox_stats(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"pending": 0, "oldest_age_seconds": 0.0}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    func.count(CatalogFeatureOutbox.event_id),
+                    func.min(CatalogFeatureOutbox.created_at),
+                )
+                .join(
+                    CatalogActivation,
+                    CatalogActivation.activation_id
+                    == CatalogFeatureOutbox.activation_id,
+                )
+                .where(
+                    CatalogActivation.status == "complete",
+                    CatalogFeatureOutbox.published_at.is_(None),
+                )
+            )
+            pending, oldest = result.one()
+        oldest_age = max(0.0, (_utc_now() - oldest).total_seconds()) if oldest else 0.0
+        return {"pending": int(pending or 0), "oldest_age_seconds": oldest_age}
+
+    async def start_feature_history_backfill(
+        self,
+        *,
+        run_id: str,
+        range_start: float,
+        range_end: float,
+    ) -> Dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("feature history backfill requires Postgres")
+        start_at = _coerce_datetime(range_start)
+        end_at = _coerce_datetime(range_end)
+        if start_at is None or end_at is None or start_at >= end_at:
+            raise ValueError("backfill range must have range_start < range_end")
+        stmt = (
+            pg_insert(FeatureHistoryBackfillRun)
+            .values(
+                run_id=run_id,
+                range_start=start_at,
+                range_end=end_at,
+                status="active",
+                phase="catalog",
+                counts={},
+                reconciliation={},
+            )
+            .on_conflict_do_nothing()
+        )
+        async with self.session_factory.begin() as session:
+            await session.execute(stmt)
+        run = await self.get_feature_history_backfill_run(run_id)
+        if run is None:
+            raise RuntimeError("another active backfill already owns this range")
+        if (
+            run["range_start"] != start_at.timestamp()
+            or run["range_end"] != end_at.timestamp()
+        ):
+            raise RuntimeError("backfill run_id already exists with a different range")
+        return run
+
+    async def get_feature_history_backfill_run(
+        self, run_id: str
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            row = await session.get(FeatureHistoryBackfillRun, run_id)
+        if row is None:
+            return None
+        return {
+            "run_id": row.run_id,
+            "range_start": row.range_start.timestamp(),
+            "range_end": row.range_end.timestamp(),
+            "status": row.status,
+            "phase": row.phase,
+            "cursor_time": row.cursor_time.timestamp() if row.cursor_time else None,
+            "cursor_id": row.cursor_id,
+            "counts": dict(row.counts or {}),
+            "reconciliation": dict(row.reconciliation or {}),
+            "last_error": row.last_error,
+        }
+
+    async def checkpoint_feature_history_backfill(
+        self,
+        run_id: str,
+        *,
+        phase: Optional[str] = None,
+        cursor_time: Optional[float] = None,
+        cursor_id: Optional[str] = None,
+        counts: Optional[Mapping[str, Any]] = None,
+        status: Optional[str] = None,
+        reconciliation: Optional[Mapping[str, Any]] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        values: Dict[str, Any] = {"updated_at": _utc_now(), "last_error": last_error}
+        if phase is not None:
+            values["phase"] = phase
+        if cursor_time is not None:
+            values["cursor_time"] = _coerce_datetime(cursor_time)
+        elif phase is not None:
+            values["cursor_time"] = None
+        if cursor_id is not None:
+            values["cursor_id"] = cursor_id
+        elif phase is not None:
+            values["cursor_id"] = None
+        if counts is not None:
+            values["counts"] = dict(counts)
+        if reconciliation is not None:
+            values["reconciliation"] = dict(reconciliation)
+        if status is not None:
+            values["status"] = status
+            if status == "complete":
+                values["completed_at"] = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(FeatureHistoryBackfillRun)
+                .where(FeatureHistoryBackfillRun.run_id == run_id)
+                .values(**values)
+            )
+        if not result.rowcount:
+            raise RuntimeError(f"unknown feature history backfill run {run_id}")
+        self._update_pool_metrics()
+
+    async def get_backfill_interactions_page(
+        self,
+        *,
+        range_start: Optional[float] = None,
+        range_end: float,
+        cursor_time: Optional[float],
+        cursor_id: Optional[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        start_at = _coerce_datetime(range_start) if range_start is not None else None
+        end_at = _coerce_datetime(range_end)
+        statement = select(InteractionEvent).where(
+            InteractionEvent.occurred_at < end_at
+        )
+        if start_at is not None:
+            statement = statement.where(InteractionEvent.occurred_at >= start_at)
+        cursor_at = _coerce_datetime(cursor_time)
+        if cursor_at is not None:
+            statement = statement.where(
+                or_(
+                    InteractionEvent.occurred_at > cursor_at,
+                    (
+                        (InteractionEvent.occurred_at == cursor_at)
+                        & (InteractionEvent.event_id > str(cursor_id or ""))
+                    ),
+                )
+            )
+        statement = statement.order_by(
+            InteractionEvent.occurred_at, InteractionEvent.event_id
+        ).limit(max(1, int(limit)))
+        async with self.session_factory() as session:
+            result = await session.execute(statement)
+            rows = result.scalars().all()
+        return [
+            {
+                "event_id": row.event_id,
+                "request_id": row.request_id,
+                "user_id": row.user_id,
+                "product_id": row.product_id,
+                "action": row.action,
+                "context": dict(row.context or {}),
+                "occurred_at": row.occurred_at,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    async def get_backfill_catalog_snapshot(self) -> List[Dict[str, Any]]:
+        async with self.session_factory() as session:
+            latest_activation = (
+                select(CatalogActivation.activation_id)
+                .where(CatalogActivation.status == "complete")
+                .order_by(CatalogActivation.completed_at.desc())
+                .limit(1)
+                .scalar_subquery()
+            )
+            result = await session.execute(
+                select(ProductCatalogSnapshot)
+                .where(ProductCatalogSnapshot.activation_id == latest_activation)
+                .order_by(ProductCatalogSnapshot.product_id)
+            )
+            rows = result.scalars().all()
+        return [
+            {
+                "product_id": row.product_id,
+                "snapshot": dict(row.snapshot or {}),
+                "source_version": row.source_version,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+
+    async def get_backfill_impressions_page(
+        self,
+        *,
+        range_start: Optional[float] = None,
+        range_end: float,
+        cursor_time: Optional[float],
+        cursor_id: Optional[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        start_at = _coerce_datetime(range_start) if range_start is not None else None
+        end_at = _coerce_datetime(range_end)
+        statement = select(RecommendationImpression).where(
+            RecommendationImpression.created_at < end_at
+        )
+        if start_at is not None:
+            statement = statement.where(RecommendationImpression.created_at >= start_at)
+        cursor_at = _coerce_datetime(cursor_time)
+        if cursor_at is not None:
+            statement = statement.where(
+                or_(
+                    RecommendationImpression.created_at > cursor_at,
+                    (
+                        (RecommendationImpression.created_at == cursor_at)
+                        & (
+                            RecommendationImpression.impression_id
+                            > str(cursor_id or "")
+                        )
+                    ),
+                )
+            )
+        statement = statement.order_by(
+            RecommendationImpression.created_at,
+            RecommendationImpression.impression_id,
+        ).limit(max(1, int(limit)))
+        async with self.session_factory() as session:
+            impression_result = await session.execute(statement)
+            impressions = list(impression_result.scalars().all())
+            impression_ids = [row.impression_id for row in impressions]
+            items_by_impression: Dict[str, List[Dict[str, Any]]] = {
+                impression_id: [] for impression_id in impression_ids
+            }
+            if impression_ids:
+                item_result = await session.execute(
+                    select(RecommendationImpressionItem)
+                    .where(
+                        RecommendationImpressionItem.impression_id.in_(impression_ids)
+                    )
+                    .order_by(
+                        RecommendationImpressionItem.impression_id,
+                        RecommendationImpressionItem.position,
+                        RecommendationImpressionItem.id,
+                    )
+                )
+                for item in item_result.scalars().all():
+                    items_by_impression[item.impression_id].append(
+                        {
+                            "product_id": item.product_id,
+                            "position": item.position,
+                            "source": item.source,
+                            "feature_snapshot": dict(item.feature_snapshot or {}),
+                            "scores": dict(item.scores or {}),
+                        }
+                    )
+        return [
+            {
+                "impression_id": row.impression_id,
+                "request_id": row.request_id,
+                "user_id": row.user_id,
+                "session_id": row.session_id,
+                "content_id": row.content_id,
+                "model_version": row.model_version,
+                "ranking_model_version": row.ranking_model_version,
+                "context": dict(row.context or {}),
+                "created_at": row.created_at,
+                "displayed_items": items_by_impression.get(row.impression_id, []),
+            }
+            for row in impressions
+        ]
+
     async def record_model_checkpoint(
         self,
         model_name: str,
@@ -1663,7 +2411,9 @@ class SystemStore:
             )
         self._update_pool_metrics()
 
-    async def get_latest_model_checkpoint(self, model_name: str) -> Optional[Dict[str, Any]]:
+    async def get_latest_model_checkpoint(
+        self, model_name: str
+    ) -> Optional[Dict[str, Any]]:
         if not self.enabled:
             return None
 

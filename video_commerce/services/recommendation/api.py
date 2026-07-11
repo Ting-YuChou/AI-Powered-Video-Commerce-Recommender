@@ -22,6 +22,10 @@ import torch
 
 from video_commerce.common.cache_codec import json_dumps, json_loads
 from video_commerce.common.config import Config
+from video_commerce.common.feature_history_contracts import (
+    RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    payload_sha256,
+)
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.kafka_client import close_kafka, init_kafka
 from video_commerce.ml.model_artifacts import ModelArtifactManager
@@ -335,12 +339,14 @@ def _ranking_history_serving_context(runtime: Any) -> Dict[str, Any]:
         "enabled": True,
         "click_last_n": int(getattr(ranking_config, "history_click_last_n", 20)),
         "cart_last_n": int(getattr(ranking_config, "history_cart_last_n", 20)),
-        "purchase_last_n": int(
-            getattr(ranking_config, "history_purchase_last_n", 20)
-        ),
+        "purchase_last_n": int(getattr(ranking_config, "history_purchase_last_n", 20)),
         "embedding_dim": int(getattr(ranking_config, "history_embedding_dim", 128)),
-        "click_scale": round(float(getattr(ranking_config, "history_click_scale", 1.0)), 6),
-        "cart_scale": round(float(getattr(ranking_config, "history_cart_scale", 1.25)), 6),
+        "click_scale": round(
+            float(getattr(ranking_config, "history_click_scale", 1.0)), 6
+        ),
+        "cart_scale": round(
+            float(getattr(ranking_config, "history_cart_scale", 1.25)), 6
+        ),
         "purchase_scale": round(
             float(getattr(ranking_config, "history_purchase_scale", 1.75)),
             6,
@@ -416,7 +422,8 @@ def _build_cache_freshness_context(
         "serving_versions": serving_versions,
         "user_feature_token": user_feature_token,
         "user_sequence_token": user_sequence_token or _default_user_sequence_token(),
-        "content_feature_token": content_feature_token or _content_feature_cache_token(
+        "content_feature_token": content_feature_token
+        or _content_feature_cache_token(
             None,
             None,
             None,
@@ -547,14 +554,10 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
             else None
         ),
         "content_cluster_metadata_mtime": (
-            _safe_file_mtime(cluster_metadata_path)
-            if cluster_metadata_path
-            else None
+            _safe_file_mtime(cluster_metadata_path) if cluster_metadata_path else None
         ),
         "content_cluster_centroids_mtime": (
-            _safe_file_mtime(cluster_centroids_path)
-            if cluster_centroids_path
-            else None
+            _safe_file_mtime(cluster_centroids_path) if cluster_centroids_path else None
         ),
         "content_cluster": _content_cluster_serving_version_context(),
         "vector_index_mtime": _safe_file_mtime(vector_path),
@@ -817,6 +820,10 @@ def _build_displayed_item_snapshots(
     candidate_by_product: Dict[str, CandidateProduct],
     product_metadata_map: Dict[str, Dict[str, Any]],
     max_items: int,
+    user_id: Optional[str] = None,
+    user_features: Optional[UserFeatures] = None,
+    observation_context: Optional[Dict[str, Any]] = None,
+    as_of_ts: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Build bounded top-k item snapshots for impression-backed LTR."""
     if max_items <= 0:
@@ -853,54 +860,75 @@ def _build_displayed_item_snapshots(
                 ),
             }
         )
-        displayed_items.append(
-            {
+        feature_snapshot = {
+            **dict(metadata),
+            "price": _recommendation_field(
+                recommendation,
+                "price",
+                metadata.get("price"),
+            ),
+            "category": _recommendation_field(
+                recommendation,
+                "category",
+                metadata.get("category"),
+            ),
+            "brand": _recommendation_field(
+                recommendation,
+                "brand",
+                metadata.get("brand"),
+            ),
+            "candidate_source": source,
+        }
+        item_snapshot = {
+            "product_id": product_id,
+            "position": position,
+            "candidate_source": source,
+            "source": source,
+            "collaborative_score": scores.get("collaborative_score"),
+            "content_similarity_score": scores.get("content_similarity_score"),
+            "popularity_score": scores.get("popularity_score"),
+            "combined_score": scores.get("combined_score"),
+            "ranking_score": scores.get("ranking_score"),
+            "confidence_score": scores.get("confidence_score"),
+            "price": _recommendation_field(
+                recommendation,
+                "price",
+                metadata.get("price"),
+            ),
+            "category": _recommendation_field(
+                recommendation,
+                "category",
+                metadata.get("category"),
+            ),
+            "brand": _recommendation_field(
+                recommendation,
+                "brand",
+                metadata.get("brand"),
+            ),
+            "feature_snapshot": feature_snapshot,
+            "item_snapshot_complete": bool(metadata),
+            "scores": scores,
+        }
+        if as_of_ts is not None and user_id and user_features is not None:
+            user_feature_snapshot = _recommendation_item_payload(user_features)
+            bundle = {
+                "as_of_ts": float(as_of_ts),
+                "candidate_features": scores,
+                "context": dict(observation_context or {}),
+                "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
                 "product_id": product_id,
-                "position": position,
-                "candidate_source": source,
-                "source": source,
-                "collaborative_score": scores.get("collaborative_score"),
-                "content_similarity_score": scores.get("content_similarity_score"),
-                "popularity_score": scores.get("popularity_score"),
-                "combined_score": scores.get("combined_score"),
-                "ranking_score": scores.get("ranking_score"),
-                "confidence_score": scores.get("confidence_score"),
-                "price": _recommendation_field(
-                    recommendation,
-                    "price",
-                    metadata.get("price"),
-                ),
-                "category": _recommendation_field(
-                    recommendation,
-                    "category",
-                    metadata.get("category"),
-                ),
-                "brand": _recommendation_field(
-                    recommendation,
-                    "brand",
-                    metadata.get("brand"),
-                ),
-                "feature_snapshot": {
-                    "price": _recommendation_field(
-                        recommendation,
-                        "price",
-                        metadata.get("price"),
-                    ),
-                    "category": _recommendation_field(
-                        recommendation,
-                        "category",
-                        metadata.get("category"),
-                    ),
-                    "brand": _recommendation_field(
-                        recommendation,
-                        "brand",
-                        metadata.get("brand"),
-                    ),
-                    "candidate_source": source,
-                },
-                "scores": scores,
+                "product_metadata": feature_snapshot,
+                "user_features": user_feature_snapshot,
+                "user_id": user_id,
             }
-        )
+            item_snapshot.update(
+                {
+                    "as_of_ts": float(as_of_ts),
+                    "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                    "feature_bundle_hash": payload_sha256(bundle),
+                }
+            )
+        displayed_items.append(item_snapshot)
     return displayed_items
 
 
@@ -1092,14 +1120,6 @@ async def startup_event():
     feature_store.prime_product_metadata_memory_cache(vector_search.product_metadata)
     if runtime.config.recommendation_config.preload_product_metadata_on_startup:
         await feature_store.store_product_metadata_batch(vector_search.product_metadata)
-    if (
-        system_store
-        and runtime.config.recommendation_config.publish_catalog_snapshot_on_startup
-    ):
-        await system_store.store_product_catalog_snapshot_batch(
-            vector_search.product_metadata
-        )
-
     recommendation_engine = RecommendationEngine(
         feature_store,
         vector_search,
@@ -1484,6 +1504,10 @@ async def get_recommendations(
                     max_items=int(
                         runtime.config.recommendation_config.impression_max_items
                     ),
+                    user_id=payload.user_id,
+                    user_features=user_features,
+                    observation_context=dict(payload.context or {}),
+                    as_of_ts=start_time,
                 )
             client_connected = not await _is_request_disconnected(http_request)
             if kafka_manager and client_connected:
@@ -1500,11 +1524,21 @@ async def get_recommendations(
                                 if cache_impression_id
                                 else {}
                             ),
-                            "request_id": getattr(http_request.state, "request_id", None),
+                            "request_id": getattr(
+                                http_request.state, "request_id", None
+                            ),
                             "session_id": (payload.context or {}).get("session_id"),
                             "content_id": payload.content_id,
                             "model_version": "v1.0.0",
-                            "ranking_model_version": serving_versions.get("ranking_model"),
+                            "ranking_model_version": serving_versions.get(
+                                "ranking_model"
+                            ),
+                            "as_of_ts": start_time,
+                            "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                            "user_feature_snapshot": _recommendation_item_payload(
+                                user_features
+                            ),
+                            "feature_context": dict(payload.context or {}),
                             "context": _build_impression_context_snapshot(
                                 payload.context,
                                 content_id=payload.content_id,
@@ -1576,6 +1610,10 @@ async def get_recommendations(
                     max_items=int(
                         runtime.config.recommendation_config.impression_max_items
                     ),
+                    user_id=payload.user_id,
+                    user_features=user_features,
+                    observation_context=dict(payload.context or {}),
+                    as_of_ts=start_time,
                 )
             if kafka_manager and not await _is_request_disconnected(http_request):
                 _schedule_best_effort_task(
@@ -1593,11 +1631,21 @@ async def get_recommendations(
                                 if join_impression_id
                                 else {}
                             ),
-                            "request_id": getattr(http_request.state, "request_id", None),
+                            "request_id": getattr(
+                                http_request.state, "request_id", None
+                            ),
                             "session_id": (payload.context or {}).get("session_id"),
                             "content_id": payload.content_id,
                             "model_version": "v1.0.0",
-                            "ranking_model_version": serving_versions.get("ranking_model"),
+                            "ranking_model_version": serving_versions.get(
+                                "ranking_model"
+                            ),
+                            "as_of_ts": start_time,
+                            "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                            "user_feature_snapshot": _recommendation_item_payload(
+                                user_features
+                            ),
+                            "feature_context": dict(payload.context or {}),
                             "context": _build_impression_context_snapshot(
                                 payload.context,
                                 content_id=payload.content_id,
@@ -1860,7 +1908,10 @@ async def get_recommendations(
         if await _is_request_disconnected(http_request):
             raise HTTPException(status_code=499, detail="Client disconnected")
 
-        ranking_context = payload.context
+        ranking_context = {
+            **dict(payload.context or {}),
+            "_feature_as_of_ts": start_time,
+        }
         if _is_realtime_window_features_enabled(runtime):
             stage_started = time.perf_counter()
             ranking_context = await _attach_realtime_window_features(
@@ -1937,6 +1988,10 @@ async def get_recommendations(
                 max_items=int(
                     runtime.config.recommendation_config.impression_max_items
                 ),
+                user_id=payload.user_id,
+                user_features=user_features,
+                observation_context=ranking_context,
+                as_of_ts=start_time,
             )
             ranked_recommendation_payloads = _attach_displayed_item_snapshot_metadata(
                 ranked_recommendation_payloads,
@@ -2003,6 +2058,12 @@ async def get_recommendations(
                         "content_id": payload.content_id,
                         "model_version": "v1.0.0",
                         "ranking_model_version": serving_versions.get("ranking_model"),
+                        "as_of_ts": start_time,
+                        "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                        "user_feature_snapshot": _recommendation_item_payload(
+                            user_features
+                        ),
+                        "feature_context": ranking_context,
                         "context": _build_impression_context_snapshot(
                             payload.context,
                             content_id=payload.content_id,
@@ -2290,10 +2351,7 @@ async def _attach_realtime_window_features(
         return context
 
     serialized = {
-        entity_key: {
-            window: features.dict()
-            for window, features in windows.items()
-        }
+        entity_key: {window: features.dict() for window, features in windows.items()}
         for entity_key, windows in feature_map.items()
     }
     return {
@@ -2484,7 +2542,9 @@ def _ranking_request_body(
 
 
 def _ranking_deadline_unix_seconds(runtime) -> float:
-    topology = getattr(getattr(runtime, "config", None), "service_topology_config", None)
+    topology = getattr(
+        getattr(runtime, "config", None), "service_topology_config", None
+    )
     request_timeout = getattr(
         topology,
         "ranking_coordinator_request_timeout_seconds",

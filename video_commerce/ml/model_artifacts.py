@@ -61,15 +61,25 @@ class ModelArtifactManager:
 
     @property
     def two_tower_local_metadata_path(self) -> str:
-        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_meta.json"))
+        return str(
+            Path(self.recommendation_config.cf_index_path).with_suffix(".cf_meta.json")
+        )
 
     @property
     def two_tower_local_embedding_sidecar_path(self) -> str:
-        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_embeddings.npz"))
+        return str(
+            Path(self.recommendation_config.cf_index_path).with_suffix(
+                ".cf_embeddings.npz"
+            )
+        )
 
     @property
     def two_tower_local_adapter_path(self) -> str:
-        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_adapter.npz"))
+        return str(
+            Path(self.recommendation_config.cf_index_path).with_suffix(
+                ".cf_adapter.npz"
+            )
+        )
 
     @property
     def sasrec_local_checkpoint_path(self) -> str:
@@ -162,7 +172,9 @@ class ModelArtifactManager:
                 (
                     cf_index_path,
                     self.two_tower_local_index_path,
-                    self._extract_artifact_sha256(payload, "cf_index", legacy_key="cf_index_sha256"),
+                    self._extract_artifact_sha256(
+                        payload, "cf_index", legacy_key="cf_index_sha256"
+                    ),
                 )
             )
         if cf_metadata_path:
@@ -188,7 +200,9 @@ class ModelArtifactManager:
                 )
             )
         else:
-            stale_optional_local_paths.append(self.two_tower_local_embedding_sidecar_path)
+            stale_optional_local_paths.append(
+                self.two_tower_local_embedding_sidecar_path
+            )
         adapter_path = payload.get("cf_adapter_path")
         if adapter_path:
             artifact_specs.append(
@@ -233,12 +247,16 @@ class ModelArtifactManager:
             (
                 vocab_path,
                 self.sasrec_local_vocab_path,
-                self._extract_artifact_sha256(payload, "vocab", legacy_key="vocab_sha256"),
+                self._extract_artifact_sha256(
+                    payload, "vocab", legacy_key="vocab_sha256"
+                ),
             ),
             (
                 metadata_path,
                 self.sasrec_local_metadata_path,
-                self._extract_artifact_sha256(payload, "metadata", legacy_key="metadata_sha256"),
+                self._extract_artifact_sha256(
+                    payload, "metadata", legacy_key="metadata_sha256"
+                ),
             ),
         ]
         await self._sync_paths_to_local_atomically(artifact_specs)
@@ -325,6 +343,7 @@ class ModelArtifactManager:
         model_version: str,
         embedding_sidecar_path: Optional[str] = None,
         adapter_path: Optional[str] = None,
+        catalog_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> Optional[ModelArtifactRecord]:
         if not self.system_store:
@@ -433,6 +452,13 @@ class ModelArtifactManager:
                 **optional_payload,
             }
         )
+        catalog_activation_id = None
+        if catalog_metadata is not None:
+            catalog_activation_id = await self.system_store.activate_product_catalog(
+                model_version,
+                catalog_metadata,
+            )
+            record_payload["catalog_activation_id"] = catalog_activation_id
         await self.system_store.record_model_checkpoint(
             model_name=self.TWO_TOWER_MODEL_NAME,
             model_version=model_version,
@@ -678,4 +704,6 @@ class ModelArtifactManager:
             try:
                 Path(path).unlink(missing_ok=True)
             except OSError as exc:
-                logger.warning("Failed to remove stale local artifact %s: %s", path, exc)
+                logger.warning(
+                    "Failed to remove stale local artifact %s: %s", path, exc
+                )

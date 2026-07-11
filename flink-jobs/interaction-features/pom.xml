@@ -16,6 +16,7 @@
     <flink.kafka.version>3.3.0-1.20</flink.kafka.version>
     <flink.jdbc.version>3.3.0-1.20</flink.jdbc.version>
     <iceberg.version>1.11.0</iceberg.version>
+    <hadoop.version>3.4.2</hadoop.version>
     <junit.version>5.10.2</junit.version>
     <jackson.version>2.15.3</jackson.version>
   </properties>
@@ -45,6 +46,21 @@
       <version>${iceberg.version}</version>
     </dependency>
     <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-aws-bundle</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client-api</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client-runtime</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+    <dependency>
       <groupId>org.apache.flink</groupId>
       <artifactId>flink-statebackend-rocksdb</artifactId>
       <version>${flink.version}</version>
@@ -63,6 +79,11 @@
       <groupId>org.apache.flink</groupId>
       <artifactId>flink-connector-jdbc</artifactId>
       <version>${flink.jdbc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-parquet</artifactId>
+      <version>${flink.version}</version>
     </dependency>
     <dependency>
       <groupId>org.postgresql</groupId>

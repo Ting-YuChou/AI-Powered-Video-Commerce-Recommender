@@ -20,7 +20,11 @@ from video_commerce.ml.pit_training_dataset import PitTrainingDatasetReader
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.ml.vector_search import VectorSearchEngine
-from video_commerce.common.observability import ObservabilityManager, configure_logging, start_worker_metrics_server
+from video_commerce.common.observability import (
+    ObservabilityManager,
+    configure_logging,
+    start_worker_metrics_server,
+)
 from video_commerce.common.telemetry import configure_tracing
 
 logger = logging.getLogger(__name__)
@@ -57,9 +61,13 @@ class ModelTrainerService:
             default_port=9103,
         )
         if metrics_port:
-            logger.info("model_trainer_metrics_server_started", extra={"port": metrics_port})
+            logger.info(
+                "model_trainer_metrics_server_started", extra={"port": metrics_port}
+            )
 
-        self.feature_store = FeatureStore(self.config.redis_config, self.config.cache_config)
+        self.feature_store = FeatureStore(
+            self.config.redis_config, self.config.cache_config
+        )
         await self.feature_store.initialize()
         self.running = True
         self._ensure_heartbeat_task()
@@ -80,6 +88,7 @@ class ModelTrainerService:
                 expected_feature_definition_version=(
                     feature_lake_config.feature_definition_version
                 ),
+                observability=self.observability,
             )
         self.artifact_manager = ModelArtifactManager(
             system_store=self.system_store,
@@ -105,10 +114,14 @@ class ModelTrainerService:
         self.ranking_model = RankingModel(self.config.ranking_config)
         ranking_checkpoint = None
         if self.artifact_manager:
-            ranking_checkpoint = await self.artifact_manager.sync_latest_ranking_checkpoint()
+            ranking_checkpoint = (
+                await self.artifact_manager.sync_latest_ranking_checkpoint()
+            )
         loaded_existing_checkpoint = False
         try:
-            await self.ranking_model.load_model(self.config.model_config.ranking_model_path)
+            await self.ranking_model.load_model(
+                self.config.model_config.ranking_model_path
+            )
             loaded_existing_checkpoint = True
         except RuntimeError:
             if (
@@ -149,7 +162,9 @@ class ModelTrainerService:
                     ttl,
                     {"pid": os.getpid()},
                 )
-                self.observability.update_worker_heartbeat("model-trainer", self.instance_id)
+                self.observability.update_worker_heartbeat(
+                    "model-trainer", self.instance_id
+                )
             except Exception as exc:
                 logger.warning(f"Failed to publish trainer heartbeat: {exc}")
             await asyncio.sleep(interval)
@@ -182,7 +197,9 @@ class ModelTrainerService:
             getattr(feature_lake_config, "training_source", "legacy") == "pit"
         )
         if not use_pit_dataset and not self.system_store:
-            logger.warning("Skipping ranking retrain because Postgres system store is unavailable")
+            logger.warning(
+                "Skipping ranking retrain because Postgres system store is unavailable"
+            )
             return
 
         training_sample_source = "interaction_events"
@@ -199,12 +216,9 @@ class ModelTrainerService:
             interactions = pit_dataset.rows
             training_sample_source = "feature_lake_pit"
         elif (
-            (
-                getattr(self.config.ranking_config, "ltr_pairwise_enabled", False)
-                or getattr(self.config.ranking_config, "ltr_listwise_enabled", False)
-            )
-            and hasattr(self.system_store, "get_ltr_training_impressions")
-        ):
+            getattr(self.config.ranking_config, "ltr_pairwise_enabled", False)
+            or getattr(self.config.ranking_config, "ltr_listwise_enabled", False)
+        ) and hasattr(self.system_store, "get_ltr_training_impressions"):
             impression_samples = await self.system_store.get_ltr_training_impressions(
                 limit=50000,
                 lookback_days=getattr(
@@ -213,7 +227,10 @@ class ModelTrainerService:
                     30,
                 ),
             )
-            if len(impression_samples) >= self.config.ranking_config.training_min_samples:
+            if (
+                len(impression_samples)
+                >= self.config.ranking_config.training_min_samples
+            ):
                 interactions = impression_samples
                 training_sample_source = "recommendation_impressions"
             else:
@@ -227,7 +244,9 @@ class ModelTrainerService:
                 )
 
         if not interactions and not use_pit_dataset:
-            interactions = await self.system_store.get_training_interactions(limit=50000)
+            interactions = await self.system_store.get_training_interactions(
+                limit=50000
+            )
         if len(interactions) < self.config.ranking_config.training_min_samples:
             self.observability.record_training_run(
                 trigger,
@@ -292,7 +311,8 @@ class ModelTrainerService:
             )
             if self.ranking_model.is_trained and self.artifact_manager:
                 record = await self.artifact_manager.persist_ranking_checkpoint(
-                    local_path=self.ranking_model.loaded_model_path or self.config.model_config.ranking_model_path,
+                    local_path=self.ranking_model.loaded_model_path
+                    or self.config.model_config.ranking_model_path,
                     model_version=self.ranking_model.model_version,
                     payload={
                         "trigger": trigger,
@@ -303,6 +323,9 @@ class ModelTrainerService:
                         "training_sample_source": training_sample_source,
                         "feature_lake_dataset_version": (
                             pit_dataset.dataset_version if pit_dataset else None
+                        ),
+                        "feature_lake_materialization_run_id": (
+                            pit_dataset.materialization_run_id if pit_dataset else None
                         ),
                         "feature_definition_version": (
                             getattr(pit_dataset, "feature_definition_version", None)
@@ -339,7 +362,10 @@ class ModelTrainerService:
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     config = Config()
     service = ModelTrainerService(config)
     await service.initialize()

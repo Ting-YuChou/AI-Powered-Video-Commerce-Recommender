@@ -23,6 +23,7 @@ class HistoricalFeatureRecord:
     available_at: float
     feature_definition_version: str
     values: Mapping[str, Any]
+    source_event_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,10 +50,14 @@ class RankingObservation:
             "user_features": dict(self.user_features),
             "user_id": self.user_id,
         }
-        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        serialized = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
-    def as_training_row(self, *, action: str, label_context: Optional[Mapping[str, Any]] = None) -> dict:
+    def as_training_row(
+        self, *, action: str, label_context: Optional[Mapping[str, Any]] = None
+    ) -> dict:
         context = dict(self.context)
         if label_context:
             context.update(label_context)
@@ -98,7 +103,14 @@ class PointInTimeFeatureJoiner:
         ]
         if not eligible:
             return None
-        return max(eligible, key=lambda record: (float(record.event_time), float(record.available_at)))
+        return max(
+            eligible,
+            key=lambda record: (
+                float(record.event_time),
+                float(record.available_at),
+                str(record.source_event_id),
+            ),
+        )
 
     def build_ranking_observation(
         self,

@@ -179,6 +179,16 @@ public class InteractionFeatureJob {
         .addSink(new WindowFeatureRedisSink(config.redisConfig()))
         .name("redis-realtime-window-features");
 
+    windowFeatures
+        .map(new WindowFeatureUpdateJsonMapper())
+        .sinkTo(
+            buildKafkaSink(
+                config.kafkaBootstrapServers,
+                config.featureUpdatesTopic,
+                "interaction-window-feature-updates",
+                config))
+        .name("window-feature-update-events");
+
     env.execute("video-commerce-interaction-features");
   }
 
@@ -567,7 +577,9 @@ public class InteractionFeatureJob {
       }
       accumulator.apply(event);
       accumulatorState.update(accumulator);
-      out.collect(accumulator.snapshot());
+      UserFeatureSnapshot snapshot = accumulator.snapshot();
+      snapshot.availableAt = Instant.now().toEpochMilli() / 1000.0;
+      out.collect(snapshot);
     }
   }
 
@@ -650,6 +662,7 @@ public class InteractionFeatureJob {
       snapshot.conversionRate = ratio(counts.purchases, counts.clicks);
       snapshot.windowStart = context.window().getStart() / 1000.0;
       snapshot.windowEnd = context.window().getEnd() / 1000.0;
+      snapshot.availableAt = Instant.now().toEpochMilli() / 1000.0;
       out.collect(snapshot);
     }
   }
@@ -744,20 +757,55 @@ public class InteractionFeatureJob {
   static final class FeatureUpdateJsonMapper implements MapFunction<UserFeatureSnapshot, String> {
     @Override
     public String map(UserFeatureSnapshot snapshot) throws Exception {
-      Map<String, Object> updates = new HashMap<>();
-      updates.put("interactions_processed", snapshot.totalInteractions);
-      updates.put("action_counts", snapshot.actionCounts());
-      updates.put("preferred_categories", snapshot.preferredCategories);
-      updates.put("updated_at", snapshot.lastActive);
+      Map<String, Object> payload = snapshot.userFeaturePayload();
+      String sourceEventId =
+          FeatureHistoryContract.deterministicId(
+              "user_feature",
+              snapshot.userId,
+              snapshot.sourceEventId,
+              FeatureHistoryContract.payloadHash(payload));
+      Map<String, Object> event =
+          FeatureHistoryContract.build(
+              "user_feature",
+              "user",
+              snapshot.userId,
+              snapshot.eventTime,
+              snapshot.availableAt,
+              sourceEventId,
+              "interaction-features-v1",
+              payload,
+              null,
+              sourceEventId);
+      event.put("upstream_source_event_id", snapshot.sourceEventId);
+      return JSON.writeValueAsString(event);
+    }
+  }
 
-      Map<String, Object> event = new HashMap<>();
-      event.put("schema_version", 1);
-      event.put("event_id", "feature-update-" + snapshot.userId + "-" + snapshot.totalInteractions);
-      event.put("event_type", "feature_update");
-      event.put("entity_type", "user");
-      event.put("entity_id", snapshot.userId);
-      event.put("updates", updates);
-      event.put("timestamp", Instant.now().toEpochMilli() / 1000.0);
+  static final class WindowFeatureUpdateJsonMapper
+      implements MapFunction<WindowFeatureSnapshot, String> {
+    @Override
+    public String map(WindowFeatureSnapshot snapshot) throws Exception {
+      Map<String, Object> payload = snapshot.payload();
+      String sourceEventId =
+          FeatureHistoryContract.deterministicId(
+              "window_feature",
+              snapshot.entityType,
+              snapshot.entityId,
+              snapshot.window,
+              Double.toString(snapshot.windowEnd),
+              FeatureHistoryContract.payloadHash(payload));
+      Map<String, Object> event =
+          FeatureHistoryContract.build(
+              "window_feature",
+              snapshot.entityType,
+              snapshot.entityId,
+              snapshot.windowEnd,
+              snapshot.availableAt,
+              sourceEventId,
+              "interaction-features-v1",
+              payload,
+              null,
+              sourceEventId);
       return JSON.writeValueAsString(event);
     }
   }
@@ -1098,6 +1146,8 @@ public class InteractionFeatureJob {
     public double lastActive;
     public LinkedHashSet<String> preferredCategories = new LinkedHashSet<>();
     public List<SequenceEvent> sequence = new ArrayList<>();
+    public double featureEventTime;
+    public String featureSourceEventId;
 
     public UserAccumulator() {}
 
@@ -1108,6 +1158,14 @@ public class InteractionFeatureJob {
     void apply(InteractionEvent event) {
       totalInteractions += 1;
       lastActive = Math.max(lastActive, event.occurredAtSeconds);
+      double sourceEventTime = event.eventTimeMillis / 1000.0;
+      if (sourceEventTime > featureEventTime
+          || (sourceEventTime == featureEventTime
+              && (featureSourceEventId == null
+                  || event.eventId.compareTo(featureSourceEventId) > 0))) {
+        featureEventTime = sourceEventTime;
+        featureSourceEventId = event.eventId;
+      }
       String action = event.action.toLowerCase(Locale.ROOT);
       if ("view".equals(action)) {
         totalViews += 1;
@@ -1151,6 +1209,8 @@ public class InteractionFeatureJob {
       snapshot.totalAddToCarts = totalAddToCarts;
       snapshot.totalPurchases = totalPurchases;
       snapshot.sequence = new ArrayList<>(sequence);
+      snapshot.eventTime = featureEventTime;
+      snapshot.sourceEventId = featureSourceEventId;
       return snapshot;
     }
   }
@@ -1169,6 +1229,9 @@ public class InteractionFeatureJob {
     public long totalAddToCarts;
     public long totalPurchases;
     public List<SequenceEvent> sequence = new ArrayList<>();
+    public double eventTime;
+    public double availableAt;
+    public String sourceEventId;
 
     Map<String, Object> userFeaturePayload() {
       Map<String, Object> payload = new HashMap<>();
@@ -1332,6 +1395,7 @@ public class InteractionFeatureJob {
     public double conversionRate;
     public double windowStart;
     public double windowEnd;
+    public double availableAt;
 
     Map<String, Object> payload() {
       Map<String, Object> payload = new HashMap<>();

@@ -1,0 +1,46 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Materialization lag",
+      "type": "timeseries",
+      "targets": [{"expr": "feature_lake_materialization_lag_seconds", "legendFormat": "{{record_type}}"}]
+    },
+    {
+      "id": 2,
+      "title": "Catalog outbox",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "catalog_outbox_pending", "legendFormat": "pending"},
+        {"expr": "catalog_outbox_oldest_age_seconds", "legendFormat": "oldest seconds"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "PIT safety gates",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "pit_online_offline_parity_ratio", "legendFormat": "parity"},
+        {"expr": "pit_leakage_rows", "legendFormat": "leakage rows"}
+      ]
+    },
+    {
+      "id": 4,
+      "title": "DLQ and manifest failures",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "rate(feature_lake_dlq_total[5m])", "legendFormat": "DLQ/s"},
+        {"expr": "increase(pit_manifest_validation_failures_total[10m])", "legendFormat": "manifest failures"}
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["feature-lake", "pit"],
+  "templating": {"list": []},
+  "time": {"from": "now-24h", "to": "now"},
+  "title": "Feature Lake and PIT Training",
+  "uid": "feature-lake-pit",
+  "version": 1
+}

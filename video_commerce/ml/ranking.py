@@ -551,7 +551,9 @@ class RankingModel:
         self.feature_schema_version = RANKING_FEATURE_SCHEMA_VERSION
         self.training_data_source = RANKING_TRAINING_DATA_SOURCE
         self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
-        self.value_transform_stats: Dict[str, Any] = self._default_value_transform_stats()
+        self.value_transform_stats: Dict[
+            str, Any
+        ] = self._default_value_transform_stats()
         self.value_bucket_mapping: Dict[str, int] = {}
 
         # Performance tracking
@@ -807,7 +809,10 @@ class RankingModel:
         expected_schema = self.feature_schema_version
         checkpoint_input_dim = checkpoint_config.get("input_dim")
         checkpoint_schema = checkpoint_config.get("feature_schema_version")
-        if checkpoint_input_dim != expected_input_dim or checkpoint_schema != expected_schema:
+        if (
+            checkpoint_input_dim != expected_input_dim
+            or checkpoint_schema != expected_schema
+        ):
             raise RuntimeError(
                 "Ranking history embeddings require a freshly trained v2 checkpoint: "
                 f"path={model_path}, checkpoint_input_dim={checkpoint_input_dim}, "
@@ -996,10 +1001,10 @@ class RankingModel:
 
         for request_offset, request in enumerate(requests):
             request_started = time.perf_counter()
-            current_time = time.time()
             candidates = request.get("candidates") or []
             user_features = request["user_features"]
             context = request.get("context") or {}
+            current_time = float(context.get("_feature_as_of_ts", time.time()))
             product_metadata_map = request.get("product_metadata_map") or {}
             valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]] = []
             row_start = row_count
@@ -1181,7 +1186,9 @@ class RankingModel:
     ) -> None:
         if not getattr(self.config, "business_score_enabled", True):
             return
-        raw_values = np.asarray(predictions.get("gmv", []), dtype=np.float64).reshape(-1)
+        raw_values = np.asarray(predictions.get("gmv", []), dtype=np.float64).reshape(
+            -1
+        )
         if raw_values.size == 0:
             return
         bucket_ids: List[Optional[int]]
@@ -1210,12 +1217,12 @@ class RankingModel:
         )
         predictions["predicted_value"] = predicted_values
         predictions["gmv"] = predicted_values
-        ctr = np.asarray(predictions.get("ctr", np.zeros_like(predicted_values))).reshape(
-            -1
-        )
-        cvr = np.asarray(predictions.get("cvr", np.zeros_like(predicted_values))).reshape(
-            -1
-        )
+        ctr = np.asarray(
+            predictions.get("ctr", np.zeros_like(predicted_values))
+        ).reshape(-1)
+        cvr = np.asarray(
+            predictions.get("cvr", np.zeros_like(predicted_values))
+        ).reshape(-1)
         ctcvr = np.asarray(predictions.get("ctcvr", ctr * cvr)).reshape(-1)
         predictions["ctcvr"] = np.clip(ctcvr, 0.0, 1.0).astype(np.float32)
         predictions["business_score"] = (
@@ -1492,7 +1499,9 @@ class RankingModel:
 
             predictions, inference_profile = self.run_inference_batch(
                 feature_matrix,
-                value_bucket_ids=self._value_bucket_ids_for_candidates(valid_candidates),
+                value_bucket_ids=self._value_bucket_ids_for_candidates(
+                    valid_candidates
+                ),
             )
             profile["tensor_prep_ms"] = inference_profile["tensor_prep_ms"]
             profile["model_forward_ms"] = inference_profile["model_forward_ms"]
@@ -1924,7 +1933,8 @@ class RankingModel:
                     "impression_id"
                 )
                 is_slate_sample = bool(
-                    training_sample_source == "recommendation_impressions"
+                    training_sample_source
+                    in {"recommendation_impressions", "feature_lake_pit"}
                     and impression_id
                 )
                 if is_slate_sample:
@@ -1943,9 +1953,7 @@ class RankingModel:
 
             self._fit_value_transform(value_records)
             value_labels = [
-                self._transform_business_value(value, bucket_id)
-                if mask > 0.0
-                else 0.0
+                self._transform_business_value(value, bucket_id) if mask > 0.0 else 0.0
                 for value, bucket_id, mask in zip(
                     business_value_labels,
                     value_bucket_ids,
@@ -1972,7 +1980,9 @@ class RankingModel:
                 "value": torch.tensor(value_labels, dtype=torch.float32)
                 .to(self.device)
                 .unsqueeze(1),
-                "business_value": torch.tensor(business_value_labels, dtype=torch.float32)
+                "business_value": torch.tensor(
+                    business_value_labels, dtype=torch.float32
+                )
                 .to(self.device)
                 .unsqueeze(1),
                 "value_mask": torch.tensor(value_masks, dtype=torch.float32)
@@ -1981,9 +1991,7 @@ class RankingModel:
                 "value_bucket": torch.tensor(value_bucket_ids, dtype=torch.long).to(
                     self.device
                 ),
-                "ranking_relevance": torch.tensor(
-                    relevance_labels, dtype=torch.float32
-                )
+                "ranking_relevance": torch.tensor(relevance_labels, dtype=torch.float32)
                 .to(self.device)
                 .unsqueeze(1),
                 "pairwise_group": torch.tensor(group_ids, dtype=torch.long).to(
@@ -2165,7 +2173,15 @@ class RankingModel:
             getattr(
                 self.config,
                 "value_label_preference",
-                ["margin", "profit", "gross_margin", "value", "gmv", "purchase_value", "price"],
+                [
+                    "margin",
+                    "profit",
+                    "gross_margin",
+                    "value",
+                    "gmv",
+                    "purchase_value",
+                    "price",
+                ],
             )
             or []
         )
@@ -2222,7 +2238,9 @@ class RankingModel:
         by_bucket: Dict[int, List[float]] = {}
         all_values: List[float] = []
         for record in records:
-            value = max(0.0, self._first_float(record.get("business_value"), default=0.0))
+            value = max(
+                0.0, self._first_float(record.get("business_value"), default=0.0)
+            )
             bucket_id = int(record.get("value_bucket", -1))
             all_values.append(value)
             by_bucket.setdefault(bucket_id, []).append(value)
@@ -2261,7 +2279,9 @@ class RankingModel:
             "std": std,
         }
 
-    def _stats_for_value_bucket(self, bucket_id: Optional[int] = None) -> Dict[str, Any]:
+    def _stats_for_value_bucket(
+        self, bucket_id: Optional[int] = None
+    ) -> Dict[str, Any]:
         stats = self.value_transform_stats or self._default_value_transform_stats()
         if bucket_id is not None:
             bucket_stats = (stats.get("buckets") or {}).get(str(int(bucket_id)))
@@ -2269,7 +2289,9 @@ class RankingModel:
                 return bucket_stats
         return stats.get("global") or self._default_value_transform_stats()["global"]
 
-    def _transform_business_value(self, value: float, bucket_id: Optional[int]) -> float:
+    def _transform_business_value(
+        self, value: float, bucket_id: Optional[int]
+    ) -> float:
         stats = self._stats_for_value_bucket(bucket_id)
         clip = stats.get("clip")
         raw = max(0.0, float(value))
@@ -2340,11 +2362,13 @@ class RankingModel:
             return f"session:{session_id}"
 
         user_id = str(sample.get("user_id") or "unknown")
-        timestamp = self._first_float(
+        timestamp = self._optional_float(
+            sample.get("as_of_ts"),
             sample.get("occurred_at"),
             sample.get("timestamp"),
-            default=time.time(),
         )
+        if timestamp is None:
+            timestamp = time.time()
         time_bucket = int(max(timestamp, 0.0) // 1800)
         return f"user_time:{user_id}:{time_bucket}"
 
@@ -2399,7 +2423,9 @@ class RankingModel:
             # Combined loss with weights
             total_loss = (
                 self.config.ctr_weight * ctr_loss
-                + float(getattr(self.config, "direct_cvr_weight", self.config.cvr_weight))
+                + float(
+                    getattr(self.config, "direct_cvr_weight", self.config.cvr_weight)
+                )
                 * cvr_loss
                 + float(getattr(self.config, "ctcvr_weight", 0.0)) * ctcvr_loss
                 + self.config.gmv_weight * gmv_loss
@@ -2456,7 +2482,9 @@ class RankingModel:
         if pos_weight is not None:
             weight = torch.where(
                 targets > 0.0,
-                torch.as_tensor(float(pos_weight), device=losses.device, dtype=losses.dtype),
+                torch.as_tensor(
+                    float(pos_weight), device=losses.device, dtype=losses.dtype
+                ),
                 torch.ones((), device=losses.device, dtype=losses.dtype),
             )
             losses = losses * weight

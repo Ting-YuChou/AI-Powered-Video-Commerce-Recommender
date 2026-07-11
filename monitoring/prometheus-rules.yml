@@ -182,3 +182,77 @@ groups:
         annotations:
           summary: Database p95 latency is high
           description: Application-observed Postgres p95 latency is above 500ms.
+
+  - name: video-commerce-feature-lake
+    rules:
+      - alert: FeatureLakeMaterializationLagHigh
+        expr: max by (record_type) ({__name__=~"(.+_)?feature_lake_materialization_lag_seconds",record_type!="window_feature"}) > 120
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Feature lake raw materialization lag is above two minutes
+          description: Kafka to Iceberg history materialization is outside the shadow gate.
+
+      - alert: FeatureLakeWindowLagHigh
+        expr: max by (record_type) ({__name__=~"(.+_)?feature_lake_materialization_lag_seconds",record_type="window_feature"}) > 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Feature lake window snapshot lag is above fifteen minutes
+          description: Window history materialization is outside the shadow gate.
+
+      - alert: FeatureLakeDlqTraffic
+        expr: sum(rate({__name__=~"(.+_)?feature_lake_dlq_total"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Feature lake events are being rejected to DLQ
+          description: Inspect contract validation failures before allowing PIT cutover.
+
+      - alert: CatalogOutboxBacklog
+        expr: catalog_outbox_oldest_age_seconds > 300 or catalog_outbox_pending > 10000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Catalog transactional outbox is backlogged
+          description: The oldest completed-activation event has not reached Kafka within five minutes.
+
+      - alert: FeatureLakeIcebergCommitFailure
+        expr: increase(flink_taskmanager_job_task_operator_iceberg_commit_failed_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Iceberg atomic commit failed
+          description: Pause materialization cutover and inspect the Flink checkpoint/commit failure.
+
+      - alert: PitManifestValidationFailure
+        expr: increase(pit_manifest_validation_failures_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT manifest or Parquet shard validation failed
+          description: Trainer has failed closed and will not fall back to legacy data.
+
+      - alert: PitOnlineOfflineParityLow
+        expr: pit_online_offline_parity_ratio < 0.999
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: Online/offline feature bundle parity is below 99.9 percent
+          description: Training source must remain legacy until parity recovers.
+
+      - alert: PitLeakageDetected
+        expr: pit_leakage_rows > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Point-in-time leakage rows detected
+          description: One or more training rows used a future or unavailable feature.

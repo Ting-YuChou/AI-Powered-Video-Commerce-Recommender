@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 import numpy as np
 
+from video_commerce.common.feature_history_contracts import (
+    RANKING_LTR_FEATURE_DEFINITION_VERSION,
+)
 from video_commerce.common.models import CandidateProduct, UserFeatures
 
 if TYPE_CHECKING:
     from video_commerce.ml.ranking import FeatureExtractor
-
-
-RANKING_LTR_FEATURE_DEFINITION_VERSION = "ranking_ltr_v1"
 
 
 @dataclass(frozen=True)

@@ -114,7 +114,12 @@ def test_build_recommendations_uses_business_score_over_raw_ranking_score():
     candidates = [
         (
             CandidateProduct(product_id=f"p{i}", combined_score=0.1, source="test"),
-            {"title": f"Product {i}", "price": 10.0, "category": "cat", "brand": "brand"},
+            {
+                "title": f"Product {i}",
+                "price": 10.0,
+                "category": "cat",
+                "brand": "brand",
+            },
         )
         for i in range(3)
     ]
@@ -135,7 +140,9 @@ def test_build_recommendations_uses_business_score_over_raw_ranking_score():
     )
 
     assert [item.product_id for item in recommendations] == ["p2", "p0"]
-    assert [item.ranking_score for item in recommendations] == pytest.approx([12.8, 4.05])
+    assert [item.ranking_score for item in recommendations] == pytest.approx(
+        [12.8, 4.05]
+    )
 
 
 def test_mmr_diversifies_high_relevance_duplicate_cluster():
@@ -269,6 +276,45 @@ def test_displayed_item_snapshots_restore_cached_candidate_scores():
     assert snapshots[0]["ranking_score"] == 0.91
 
 
+def test_displayed_item_snapshot_captures_versioned_observation_bundle():
+    user_features = UserFeatures(
+        user_id="u1",
+        total_interactions=3,
+        preferred_categories=["Shoes"],
+    )
+    snapshots = _build_displayed_item_snapshots(
+        [
+            ProductRecommendation(
+                product_id="p1",
+                title="Shoe",
+                price=19.0,
+                category="Shoes",
+                brand="A",
+                ranking_score=0.9,
+                confidence_score=0.8,
+            )
+        ],
+        candidate_by_product={
+            "p1": CandidateProduct(
+                product_id="p1", combined_score=0.7, source="two_tower"
+            )
+        },
+        product_metadata_map={"p1": {"price": 19.0, "stock": 5}},
+        max_items=1,
+        user_id="u1",
+        user_features=user_features,
+        observation_context={"surface": "home"},
+        as_of_ts=100.0,
+    )
+
+    item = snapshots[0]
+    assert item["as_of_ts"] == 100.0
+    assert item["feature_definition_version"] == "ranking_ltr_v1"
+    assert item["feature_bundle_hash"]
+    assert item["feature_snapshot"]["stock"] == 5
+    assert item["item_snapshot_complete"] is True
+
+
 def test_impression_context_snapshot_excludes_realtime_window_features():
     snapshot = _build_impression_context_snapshot(
         {
@@ -363,9 +409,14 @@ def test_realtime_window_features_are_optional_and_zero_filled():
     base = RankingModel(RankingConfig())
     enabled = RankingModel(RankingConfig(realtime_window_features_enabled=True))
     assert base.feature_extractor.total_feature_dim == 28
-    assert enabled.feature_extractor.total_feature_dim > base.feature_extractor.total_feature_dim
+    assert (
+        enabled.feature_extractor.total_feature_dim
+        > base.feature_extractor.total_feature_dim
+    )
 
-    user_features = UserFeatures(user_id="u1", total_interactions=1, last_active=time.time())
+    user_features = UserFeatures(
+        user_id="u1", total_interactions=1, last_active=time.time()
+    )
     candidate = CandidateProduct(product_id="p1", combined_score=0.5, source="test")
     metadata = {"category": "cat", "brand": "brand", "price": 10.0}
 
@@ -379,7 +430,9 @@ def test_realtime_window_features_are_optional_and_zero_filled():
     assert matrix.shape[1] == enabled.feature_extractor.total_feature_dim
     np.testing.assert_allclose(
         matrix[0, -enabled.feature_extractor.realtime_window_feature_dim :],
-        np.zeros(enabled.feature_extractor.realtime_window_feature_dim, dtype=np.float32),
+        np.zeros(
+            enabled.feature_extractor.realtime_window_feature_dim, dtype=np.float32
+        ),
     )
 
 
@@ -387,11 +440,27 @@ def test_history_builder_separates_actions_and_applies_last_n_scale_and_coverage
     now = 10 * 86400.0
     sequence = [
         {"product_id": "old_click", "action": "click", "occurred_at": now - 9 * 86400},
-        {"product_id": "missing_click", "action": "click", "occurred_at": now - 4 * 86400},
+        {
+            "product_id": "missing_click",
+            "action": "click",
+            "occurred_at": now - 4 * 86400,
+        },
         {"product_id": "p_click", "action": "click", "occurred_at": now - 3 * 86400},
-        {"product_id": "p_cart", "action": "add_to_cart", "occurred_at": now - 2 * 86400},
-        {"product_id": "p_purchase_1", "action": "purchase", "occurred_at": now - 2 * 86400},
-        {"product_id": "p_purchase_2", "action": "purchase", "occurred_at": now - 1 * 86400},
+        {
+            "product_id": "p_cart",
+            "action": "add_to_cart",
+            "occurred_at": now - 2 * 86400,
+        },
+        {
+            "product_id": "p_purchase_1",
+            "action": "purchase",
+            "occurred_at": now - 2 * 86400,
+        },
+        {
+            "product_id": "p_purchase_2",
+            "action": "purchase",
+            "occurred_at": now - 1 * 86400,
+        },
     ]
     embeddings = {
         "old_click": np.array([9.0, 9.0], dtype=np.float32),
@@ -469,9 +538,7 @@ def test_history_features_add_expected_v2_dimensions_without_realtime_shift():
     assert history_enabled.feature_extractor.total_feature_dim == 28 + 399
     assert (
         both_enabled.feature_extractor.total_feature_dim
-        == 28
-        + 399
-        + both_enabled.feature_extractor.realtime_window_feature_dim
+        == 28 + 399 + both_enabled.feature_extractor.realtime_window_feature_dim
     )
 
 
@@ -518,7 +585,9 @@ def test_history_feature_vector_uses_candidate_specific_similarity_by_product_id
 
 def test_realtime_window_features_populate_ranking_vector():
     ranking = RankingModel(RankingConfig(realtime_window_features_enabled=True))
-    user_features = UserFeatures(user_id="u1", total_interactions=1, last_active=time.time())
+    user_features = UserFeatures(
+        user_id="u1", total_interactions=1, last_active=time.time()
+    )
     candidate = CandidateProduct(product_id="p1", combined_score=0.5, source="test")
     metadata = {"category": "cat", "brand": "brand", "price": 10.0}
     context = {
@@ -556,9 +625,8 @@ def test_realtime_window_features_populate_ranking_vector():
     tail = matrix[0, -ranking.feature_extractor.realtime_window_feature_dim :]
     assert tail[0] == pytest.approx(0.01)
     assert tail[1] == pytest.approx(0.002)
-    product_offset = (
-        len(ranking.feature_extractor.WINDOW_FEATURE_NAMES)
-        * len(ranking.feature_extractor.WINDOW_FEATURE_METRICS)
+    product_offset = len(ranking.feature_extractor.WINDOW_FEATURE_NAMES) * len(
+        ranking.feature_extractor.WINDOW_FEATURE_METRICS
     )
     assert tail[product_offset] == pytest.approx(0.02)
 
@@ -687,6 +755,46 @@ def test_sasrec_candidate_keeps_existing_ranking_feature_dimension():
     assert ranking.feature_extractor.total_feature_dim == 28
     assert candidate_features.shape == (4,)
     assert candidate_features.tolist() == [0.8, 0.0, 0.0, 0.32]
+
+
+def test_pit_candidate_scores_reach_ranking_feature_vector():
+    ranking = RankingModel(RankingConfig())
+
+    candidate = ranking._training_candidate(
+        {
+            "product_id": "p1",
+            "candidate_scores": {
+                "collaborative_score": 0.8,
+                "content_similarity_score": 0.7,
+                "popularity_score": 0.6,
+                "combined_score": 0.5,
+            },
+        }
+    )
+
+    assert ranking.feature_extractor.extract_candidate_features(candidate).tolist() == [
+        0.8,
+        0.7,
+        0.6,
+        0.5,
+    ]
+
+
+def test_pit_rows_keep_impression_grouping_and_never_need_wall_clock(monkeypatch):
+    ranking = RankingModel(RankingConfig())
+    sample = {
+        "user_id": "u1",
+        "impression_id": "imp-1",
+        "as_of_ts": 3_600.0,
+        "context": {},
+    }
+    monkeypatch.setattr(
+        ranking_module.time, "time", lambda: (_ for _ in ()).throw(AssertionError)
+    )
+
+    assert ranking._training_pairwise_group_key(sample) == "impression:imp-1"
+    sample.pop("impression_id")
+    assert ranking._training_pairwise_group_key(sample) == "user_time:u1:2"
 
 
 def test_ranking_brand_feature_uses_stable_hash_bucket():
@@ -1055,9 +1163,9 @@ async def test_ranking_checkpoint_persists_business_objective_metadata(tmp_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     assert checkpoint["config"]["ranking_objective_version"] == "business_v1"
-    assert checkpoint["config"]["value_transform_stats"]["global"]["clip"] == pytest.approx(
-        20.0
-    )
+    assert checkpoint["config"]["value_transform_stats"]["global"][
+        "clip"
+    ] == pytest.approx(20.0)
 
 
 def test_training_history_context_uses_only_prior_user_events():
@@ -1348,6 +1456,7 @@ async def test_model_trainer_uses_pit_dataset_without_current_online_feature_map
             assert dataset_uri == "s3://feature-lake/ranking-pit.jsonl"
             return SimpleNamespace(
                 dataset_version="iceberg-snapshot-42",
+                materialization_run_id="run-42",
                 rows=[
                     {
                         "user_id": "u1",
@@ -1387,10 +1496,16 @@ async def test_model_trainer_uses_pit_dataset_without_current_online_feature_map
     assert service.ranking_model.received["training_data"][0]["as_of_ts"] == 100.0
     assert service.ranking_model.received["user_features_map"] == {}
     assert service.ranking_model.received["product_metadata_map"] == {}
-    assert service.ranking_model.received["training_sample_source"] == "feature_lake_pit"
+    assert (
+        service.ranking_model.received["training_sample_source"] == "feature_lake_pit"
+    )
     assert (
         service.artifact_manager.payload["feature_lake_dataset_version"]
         == "iceberg-snapshot-42"
+    )
+    assert (
+        service.artifact_manager.payload["feature_lake_materialization_run_id"]
+        == "run-42"
     )
 
 
@@ -1488,8 +1603,7 @@ async def test_model_trainer_falls_back_when_impression_samples_are_insufficient
 
     assert service.ranking_model.received["training_data"] == event_samples
     assert (
-        service.ranking_model.received["training_sample_source"]
-        == "interaction_events"
+        service.ranking_model.received["training_sample_source"] == "interaction_events"
     )
     assert (
         service.artifact_manager.payload["training_sample_source"]
@@ -1545,8 +1659,7 @@ async def test_model_trainer_listwise_fallback_keeps_event_source():
 
     assert service.ranking_model.received["training_data"] == event_samples
     assert (
-        service.ranking_model.received["training_sample_source"]
-        == "interaction_events"
+        service.ranking_model.received["training_sample_source"] == "interaction_events"
     )
     assert (
         service.artifact_manager.payload["training_sample_source"]
@@ -1761,7 +1874,9 @@ def test_recommendation_cache_context_changes_when_slate_diversity_is_enabled():
 
 
 @pytest.mark.asyncio
-async def test_attach_ranking_history_embeddings_adds_internal_ranker_context(monkeypatch):
+async def test_attach_ranking_history_embeddings_adds_internal_ranker_context(
+    monkeypatch,
+):
     class FakeFeatureStore:
         def __init__(self):
             self.limit = None
@@ -1820,7 +1935,9 @@ async def test_attach_ranking_history_embeddings_adds_internal_ranker_context(mo
 
 
 @pytest.mark.asyncio
-async def test_attach_ranking_history_embeddings_uses_lazy_embedding_lookup(monkeypatch):
+async def test_attach_ranking_history_embeddings_uses_lazy_embedding_lookup(
+    monkeypatch,
+):
     class FakeFeatureStore:
         async def get_user_sequence(self, user_id, limit=200):
             return [
@@ -1882,9 +1999,12 @@ async def test_attach_ranking_history_embeddings_uses_lazy_embedding_lookup(monk
         {"two_tower_model": "two-tower-test"},
     )
 
-    assert context[RANKING_HISTORY_CONTEXT_KEY]["candidate_similarities"]["candidate"][
-        "click"
-    ] == 1.0
+    assert (
+        context[RANKING_HISTORY_CONTEXT_KEY]["candidate_similarities"]["candidate"][
+            "click"
+        ]
+        == 1.0
+    )
 
 
 @pytest.mark.asyncio
@@ -2257,7 +2377,9 @@ async def test_recommendation_path_does_not_force_empty_interactions_when_swing_
     monkeypatch.setattr(recommendation_api_module, "feature_store", FakeFeatureStore())
     monkeypatch.setattr(recommendation_api_module, "recommendation_engine", engine)
     monkeypatch.setattr(recommendation_api_module, "vector_search", FakeVectorSearch())
-    monkeypatch.setattr(recommendation_api_module, "ranking_batcher", FakeRankingBatcher())
+    monkeypatch.setattr(
+        recommendation_api_module, "ranking_batcher", FakeRankingBatcher()
+    )
     monkeypatch.setattr(
         recommendation_api_module,
         "ranking_model",
@@ -2292,7 +2414,9 @@ async def test_recommendation_admission_rejects_at_inflight_limit(monkeypatch):
             service_topology_config=SimpleNamespace(max_inflight_recommendations=1),
         ),
     )
-    request = SimpleNamespace(state=SimpleNamespace(request_started_at=time.perf_counter()))
+    request = SimpleNamespace(
+        state=SimpleNamespace(request_started_at=time.perf_counter())
+    )
     monkeypatch.setattr(
         recommendation_api_module.app.state,
         "runtime",
@@ -2328,9 +2452,7 @@ async def test_recommendation_local_ranking_path_passes_deadline(monkeypatch):
             deadline_unix_seconds=None,
         ):
             self.deadline_unix_seconds = deadline_unix_seconds
-            return [_recommendation(candidates[0].product_id, 1.0)], {
-                "path": "fake"
-            }
+            return [_recommendation(candidates[0].product_id, 1.0)], {"path": "fake"}
 
     ranking_batcher = CapturingRankingBatcher()
     runtime = SimpleNamespace(
@@ -2534,8 +2656,12 @@ async def test_missing_content_features_skips_candidate_and_recommendation_cache
         recommendation_api_module, "recommendation_engine", FakeRecommendationEngine()
     )
     monkeypatch.setattr(recommendation_api_module, "vector_search", FakeVectorSearch())
-    monkeypatch.setattr(recommendation_api_module, "ranking_batcher", FakeRankingBatcher())
-    monkeypatch.setattr(recommendation_api_module, "ranking_coordinator_client_pool", None)
+    monkeypatch.setattr(
+        recommendation_api_module, "ranking_batcher", FakeRankingBatcher()
+    )
+    monkeypatch.setattr(
+        recommendation_api_module, "ranking_coordinator_client_pool", None
+    )
     monkeypatch.setattr(recommendation_api_module, "ranking_client_pool", None)
     monkeypatch.setattr(
         recommendation_api_module,

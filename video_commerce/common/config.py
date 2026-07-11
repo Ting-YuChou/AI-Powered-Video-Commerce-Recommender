@@ -105,7 +105,8 @@ class ModelConfig(BaseSettings):
     max_video_length: int = Field(300, description="Maximum video length in seconds")
     num_keyframes: int = Field(8, description="Number of keyframes to extract")
     ffmpeg_frame_extraction_enabled: bool = Field(
-        True, description="Use FFmpeg/ffprobe for video metadata and keyframe extraction"
+        True,
+        description="Use FFmpeg/ffprobe for video metadata and keyframe extraction",
     )
     ffmpeg_timeout_seconds: float = Field(
         30.0, description="Timeout for each FFmpeg/ffprobe command"
@@ -114,7 +115,8 @@ class ModelConfig(BaseSettings):
         640, description="Maximum frame width produced by FFmpeg extraction"
     )
     speech_to_text_enabled: bool = Field(
-        False, description="Transcribe uploaded video audio through the internal ASR service"
+        False,
+        description="Transcribe uploaded video audio through the internal ASR service",
     )
     speech_to_text_base_url: str = Field(
         "http://asr-service:8010", description="Internal ASR service base URL"
@@ -358,7 +360,8 @@ class RecommendationConfig(BaseSettings):
         100, description="Maximum positive events per user used for Swing training"
     )
     swing_itemcf_max_items_per_user: int = Field(
-        100, description="Maximum deduplicated positive items per user in Swing training"
+        100,
+        description="Maximum deduplicated positive items per user in Swing training",
     )
     swing_itemcf_max_users_per_item: int = Field(
         500, description="Maximum users retained per item when building Swing pairs"
@@ -489,7 +492,8 @@ class RecommendationConfig(BaseSettings):
         0.2, description="Explicit negative share sourced from no-click impressions"
     )
     tt_ranker_rejected_negative_ratio: float = Field(
-        0.1, description="Explicit negative share sourced from ranker-rejected candidates"
+        0.1,
+        description="Explicit negative share sourced from ranker-rejected candidates",
     )
     tt_hard_negative_weight: float = Field(
         0.35, description="Loss denominator weight for ANN hard negatives"
@@ -1264,6 +1268,23 @@ class KafkaConfig(BaseSettings):
     feature_updates_topic: str = Field(
         "feature-updates", description="Feature updates topic"
     )
+    catalog_feature_events_topic: str = Field(
+        "catalog-feature-events", description="Versioned catalog feature events topic"
+    )
+    user_interactions_backfill_topic: str = Field(
+        "user-interactions-backfill", description="One-time interaction backfill topic"
+    )
+    recommendation_events_backfill_topic: str = Field(
+        "recommendation-events-backfill",
+        description="One-time observation backfill topic",
+    )
+    catalog_feature_events_backfill_topic: str = Field(
+        "catalog-feature-events-backfill", description="Initial catalog snapshot topic"
+    )
+    feature_history_backfill_quarantine_topic: str = Field(
+        "feature-history-backfill-quarantine",
+        description="Legacy records that cannot satisfy the current feature definition",
+    )
 
     # Producer settings
     producer_acks: str = Field("all", description="Producer acknowledgment level")
@@ -1404,6 +1425,18 @@ class FeatureLakeConfig(BaseSettings):
         168,
         description="Maximum feedback attribution window after a ranking impression",
     )
+    catalog_outbox_batch_size: int = Field(
+        500, description="Catalog outbox rows claimed by one publisher iteration"
+    )
+    catalog_outbox_lease_seconds: int = Field(
+        60, description="Catalog outbox publisher claim lease"
+    )
+    catalog_outbox_poll_seconds: float = Field(
+        1.0, description="Catalog outbox publisher idle polling interval"
+    )
+    catalog_outbox_retention_days: int = Field(
+        7, description="Published catalog outbox retention"
+    )
 
     @validator("training_source")
     def validate_training_source(cls, value: str) -> str:
@@ -1412,10 +1445,21 @@ class FeatureLakeConfig(BaseSettings):
             raise ValueError("training_source must be one of: legacy, pit")
         return normalized
 
-    @validator("attribution_window_hours")
-    def validate_attribution_window_hours(cls, value: int) -> int:
+    @validator(
+        "attribution_window_hours",
+        "catalog_outbox_batch_size",
+        "catalog_outbox_lease_seconds",
+        "catalog_outbox_retention_days",
+    )
+    def validate_positive_feature_lake_ints(cls, value: int) -> int:
         if value <= 0:
-            raise ValueError("attribution_window_hours must be positive")
+            raise ValueError("feature lake integer settings must be positive")
+        return value
+
+    @validator("catalog_outbox_poll_seconds")
+    def validate_catalog_outbox_poll_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("catalog_outbox_poll_seconds must be positive")
         return value
 
     class Config:

@@ -115,3 +115,48 @@ def test_remote_object_storage_cleans_temp_file_on_download_failure(tmp_path):
         asyncio.run(storage.materialize_for_processing("s3://bucket/uploads/video.mp4"))
 
     assert list(download_dir.iterdir()) == []
+
+
+def test_remote_create_only_upload_injects_atomic_if_none_match_header(tmp_path):
+    class Events:
+        def __init__(self):
+            self.handlers = {}
+
+        def register_first(self, name, handler, *, unique_id):
+            self.handlers[(name, unique_id)] = handler
+
+        def unregister(self, name, *, unique_id):
+            self.handlers.pop((name, unique_id))
+
+    class Meta:
+        def __init__(self):
+            self.events = Events()
+
+    class Client:
+        def __init__(self):
+            self.meta = Meta()
+            self.headers = None
+
+        def put_object(self, **kwargs):
+            params = {"headers": {}}
+            for (name, _), handler in list(self.meta.events.handlers.items()):
+                if name == "before-call.s3.PutObject":
+                    handler(params=params)
+            self.headers = params["headers"]
+            assert kwargs["Body"].read() == b"manifest"
+
+    staged = tmp_path / "manifest.json"
+    staged.write_bytes(b"manifest")
+    storage = ObjectStorage(ObjectStorageConfig(backend="s3", bucket="bucket"))
+    client = Client()
+    storage._client = client
+
+    uri = asyncio.run(
+        storage.persist_staged_file_create_only(
+            str(staged), object_name="training/run/manifest.json"
+        )
+    )
+
+    assert uri == "s3://bucket/training/run/manifest.json"
+    assert client.headers == {"If-None-Match": "*"}
+    assert client.meta.events.handlers == {}

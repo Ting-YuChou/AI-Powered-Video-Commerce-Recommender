@@ -40,7 +40,11 @@ class ObjectStorage:
             aws_access_key_id=self.config.access_key_id,
             aws_secret_access_key=self.config.secret_access_key,
             config=BotoConfig(
-                s3={"addressing_style": "path" if self.config.force_path_style else "virtual"},
+                s3={
+                    "addressing_style": "path"
+                    if self.config.force_path_style
+                    else "virtual"
+                },
                 connect_timeout=self.config.connect_timeout_seconds,
                 read_timeout=self.config.read_timeout_seconds,
                 retries={"max_attempts": self.config.max_attempts, "mode": "standard"},
@@ -73,6 +77,49 @@ class ObjectStorage:
         )
         return f"s3://{self.config.bucket}/{object_name}"
 
+    async def persist_staged_file_create_only(
+        self,
+        local_path: str,
+        *,
+        object_name: str,
+        content_type: Optional[str] = None,
+    ) -> str:
+        """Create an immutable S3 object and fail if the key already exists."""
+        if not Path(local_path).exists():
+            raise FileNotFoundError(f"Staged file does not exist: {local_path}")
+        if not self.is_remote:
+            raise RuntimeError("create-only object persistence requires S3 storage")
+        extra_args = self._build_upload_extra_args(content_type)
+
+        def _put() -> None:
+            event_name = "before-call.s3.PutObject"
+            event_id = f"create-only-{id(self)}-{object_name}"
+
+            def _add_create_only_header(*, params, **_kwargs) -> None:
+                params.setdefault("headers", {})["If-None-Match"] = "*"
+
+            # Older botocore service models do not expose IfNoneMatch as a
+            # PutObject argument. Injecting the signed HTTP header preserves
+            # the server-side atomic create-only condition on S3 and MinIO.
+            self._client.meta.events.register_first(
+                event_name, _add_create_only_header, unique_id=event_id
+            )
+            with open(local_path, "rb") as handle:
+                try:
+                    self._client.put_object(
+                        Bucket=self.config.bucket,
+                        Key=object_name,
+                        Body=handle,
+                        **extra_args,
+                    )
+                finally:
+                    self._client.meta.events.unregister(
+                        event_name, unique_id=event_id
+                    )
+
+        await asyncio.to_thread(_put)
+        return f"s3://{self.config.bucket}/{object_name}"
+
     async def materialize_for_processing(
         self,
         storage_path: str,
@@ -103,6 +150,36 @@ class ObjectStorage:
         if storage_path and os.path.exists(storage_path):
             os.remove(storage_path)
 
+    async def list_storage_uris(
+        self, prefix_uri: str, *, suffix: str = ""
+    ) -> list[str]:
+        """List immutable objects under a local or configured S3 prefix."""
+        if self.is_remote and self.is_remote_uri(prefix_uri):
+            bucket, prefix = self._parse_s3_uri(prefix_uri.rstrip("/") + "/_")
+            prefix = prefix.rsplit("/", 1)[0] + "/"
+            if bucket != self.config.bucket:
+                raise ValueError("storage prefix bucket does not match configuration")
+
+            def _list() -> list[str]:
+                paginator = self._client.get_paginator("list_objects_v2")
+                uris = []
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for item in page.get("Contents", []):
+                        key = str(item.get("Key") or "")
+                        if key and (not suffix or key.endswith(suffix)):
+                            uris.append(f"s3://{bucket}/{key}")
+                return sorted(uris)
+
+            return await asyncio.to_thread(_list)
+        root = Path(prefix_uri)
+        if not root.exists():
+            return []
+        return sorted(
+            str(path)
+            for path in root.rglob(f"*{suffix}" if suffix else "*")
+            if path.is_file()
+        )
+
     @staticmethod
     def is_remote_uri(storage_path: str) -> bool:
         return storage_path.startswith("s3://")
@@ -123,7 +200,9 @@ class ObjectStorage:
         safe_model_name = self._sanitize_path_segment(model_name)
         safe_model_version = self._sanitize_path_segment(model_version or "latest")
         safe_filename = Path(filename).name
-        object_name = f"artifacts/{safe_model_name}/{safe_model_version}/{safe_filename}"
+        object_name = (
+            f"artifacts/{safe_model_name}/{safe_model_version}/{safe_filename}"
+        )
         return f"{prefix}/{object_name}" if prefix else object_name
 
     async def sync_to_local_path(
@@ -171,7 +250,9 @@ class ObjectStorage:
         try:
             if self.is_remote and self.is_remote_uri(storage_path):
                 bucket, key = self._parse_s3_uri(storage_path)
-                await asyncio.to_thread(self._client.download_file, bucket, key, tmp_path)
+                await asyncio.to_thread(
+                    self._client.download_file, bucket, key, tmp_path
+                )
             else:
                 source_path = Path(storage_path)
                 if source_path.resolve() == target_path.resolve():

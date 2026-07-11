@@ -3,12 +3,35 @@ package com.videocommerce.flink;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class InteractionFeatureJobTest {
+  private static final ObjectMapper JSON = new ObjectMapper();
+
+  @Test
+  void javaContractParsesSharedPythonFixtureWithSameCanonicalHash() throws Exception {
+    Map<String, Object> fixture =
+        JSON.readValue(
+            Files.readString(Path.of("../../tests/fixtures/feature_history_contract_v1.json")),
+            new TypeReference<Map<String, Object>>() {});
+    Map<String, Object> event = (Map<String, Object>) fixture.get("event");
+
+    FeatureHistoryContract.Record record = FeatureHistoryContract.parse(event);
+
+    assertEquals(
+        fixture.get("canonical_payload_json"),
+        FeatureHistoryContract.canonicalJson(record.payload));
+    assertEquals(event.get("payload_hash"), FeatureHistoryContract.payloadHash(record.payload));
+  }
+
   @Test
   void parserPrefersEventTimeAndContextCategory() throws Exception {
     String raw =
@@ -220,16 +243,72 @@ class InteractionFeatureJobTest {
   }
 
   @Test
+  void pitCatalogUsesExplicitS3FileIoEndpointAndPathStyle() {
+    String sql =
+        PointInTimeFeatureJoinJob.buildRestCatalogSql(
+            "feature_catalog",
+            "http://iceberg-rest:8181",
+            "s3://features/warehouse",
+            "http://minio:9000");
+
+    assertTrue(sql.contains("'io-impl'='org.apache.iceberg.aws.s3.S3FileIO'"));
+    assertTrue(sql.contains("'s3.endpoint'='http://minio:9000'"));
+    assertTrue(sql.contains("'s3.path-style-access'='true'"));
+  }
+
+  @Test
   void pointInTimeJoinSqlEnforcesEventAndAvailabilityCutsAndSevenDayAttribution() {
     String sql = PointInTimeFeatureJoinJob.buildPointInTimeInsertSql(
         "video_commerce", "ranking_ltr_v1", 168);
 
-    assertEquals(true, sql.contains("u.event_time <= o.event_time"));
-    assertEquals(true, sql.contains("u.available_at <= o.event_time"));
-    assertEquals(true, sql.contains("i.event_time <= o.event_time"));
-    assertEquals(true, sql.contains("i.available_at <= o.event_time"));
-    assertEquals(true, sql.contains("INTERVAL '168' HOUR"));
+    assertEquals(true, sql.contains("u.event_time_epoch<=o.event_time_epoch"));
+    assertEquals(true, sql.contains("u.available_at_epoch<=o.event_time_epoch"));
+    assertEquals(true, sql.contains("i.event_time_epoch<=o.event_time_epoch"));
+    assertEquals(true, sql.contains("i.available_at_epoch<=o.event_time_epoch"));
+    assertEquals(true, sql.contains("i.event_time_epoch<=o.event_time_epoch+604800"));
+    assertEquals(true, sql.contains("source_event_id DESC"));
+    assertEquals(true, sql.contains("item_snapshot_complete"));
+    assertEquals(true, sql.contains("CAST(1699391600.000 AS DOUBLE)"));
+    assertEquals(true, sql.contains("i.available_at_epoch<=CAST(1700000000.000 AS DOUBLE)"));
     assertEquals(true, sql.contains("ranking_ltr_v1"));
+    assertEquals(true, sql.startsWith("INSERT INTO"));
+    assertEquals(false, sql.contains("INSERT OVERWRITE"));
+    assertEquals(true, sql.contains("pit_feature_bundle_hash"));
+    assertEquals(true, sql.contains("o.feature_bundle_hash"));
+    assertEquals(
+        true,
+        PointInTimeFeatureJoinJob.buildExistingRunSql("video_commerce", "run-1")
+            .contains("ranking_training_pit_quarantine"));
+  }
+
+  @Test
+  void pitBundleHashReflectsFinalJoinedFeatures() throws Exception {
+    PointInTimeFeatureJoinJob.PitFeatureBundleHash function =
+        new PointInTimeFeatureJoinJob.PitFeatureBundleHash();
+
+    String first =
+        function.eval(
+            50.0,
+            "u1",
+            "p1",
+            "{\"total_interactions\":3}",
+            "{\"price\":9.0}",
+            "{}",
+            "{\"combined_score\":0.5}",
+            "ranking_ltr_v1");
+    String changed =
+        function.eval(
+            50.0,
+            "u1",
+            "p1",
+            "{\"total_interactions\":4}",
+            "{\"price\":9.0}",
+            "{}",
+            "{\"combined_score\":0.5}",
+            "ranking_ltr_v1");
+
+    assertEquals(64, first.length());
+    assertEquals(false, first.equals(changed));
   }
 
   @Test
@@ -255,6 +334,18 @@ class InteractionFeatureJobTest {
     assertEquals("p1", snapshot.sequence.get(0).productId);
     assertEquals("p2", snapshot.sequence.get(1).productId);
     assertEquals("e2", snapshot.sequenceToken().get("latest_event_id"));
+
+    snapshot.availableAt = 3.0;
+    Map<String, Object> kafkaEvent =
+        JSON.readValue(
+            new InteractionFeatureJob.FeatureUpdateJsonMapper().map(snapshot),
+            new TypeReference<Map<String, Object>>() {});
+    assertEquals(
+        FeatureHistoryContract.canonicalJson(snapshot.userFeaturePayload()),
+        FeatureHistoryContract.canonicalJson((Map<String, Object>) kafkaEvent.get("payload")));
+    assertEquals("ranking_ltr_v1", kafkaEvent.get("feature_definition_version"));
+    assertEquals(2.0, kafkaEvent.get("event_time"));
+    assertEquals(3.0, kafkaEvent.get("available_at"));
   }
 
   @Test
@@ -271,5 +362,33 @@ class InteractionFeatureJobTest {
     assertEquals(4, counts.totalEvents);
     assertEquals(0.5, InteractionFeatureJob.ratio(counts.clicks, counts.views));
     assertEquals(1.0, InteractionFeatureJob.ratio(counts.purchases, counts.clicks));
+  }
+
+  @Test
+  void windowSnapshotPublishesTheSamePayloadUsedByRedis() throws Exception {
+    InteractionFeatureJob.WindowFeatureSnapshot snapshot =
+        new InteractionFeatureJob.WindowFeatureSnapshot();
+    snapshot.entityType = "user";
+    snapshot.entityId = "u1";
+    snapshot.window = "5m";
+    snapshot.views = 2;
+    snapshot.clicks = 1;
+    snapshot.totalEvents = 3;
+    snapshot.clickThroughRate = 0.5;
+    snapshot.windowStart = 100.0;
+    snapshot.windowEnd = 400.0;
+    snapshot.availableAt = 405.0;
+
+    Map<String, Object> kafkaEvent =
+        JSON.readValue(
+            new InteractionFeatureJob.WindowFeatureUpdateJsonMapper().map(snapshot),
+            new TypeReference<Map<String, Object>>() {});
+
+    assertEquals(
+        FeatureHistoryContract.canonicalJson(snapshot.payload()),
+        FeatureHistoryContract.canonicalJson((Map<String, Object>) kafkaEvent.get("payload")));
+    assertEquals("window_feature", kafkaEvent.get("event_type"));
+    assertEquals(400.0, kafkaEvent.get("event_time"));
+    assertEquals(405.0, kafkaEvent.get("available_at"));
   }
 }

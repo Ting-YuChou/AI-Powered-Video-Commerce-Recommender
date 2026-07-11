@@ -583,6 +583,55 @@ class ObservabilityManager:
             ["priority", "status"],
             registry=self.registry,
         )
+        self.feature_lake_materialization_lag_seconds = Gauge(
+            "feature_lake_materialization_lag_seconds",
+            "Latest observed feature-lake materialization lag",
+            ["record_type"],
+            registry=self.registry,
+        )
+        self.feature_lake_records_total = Counter(
+            "feature_lake_records_total",
+            "Feature-lake records by type and status",
+            ["record_type", "status"],
+            registry=self.registry,
+        )
+        self.feature_lake_dlq_total = Counter(
+            "feature_lake_dlq_total",
+            "Feature-lake records routed to DLQ",
+            ["source_topic"],
+            registry=self.registry,
+        )
+        self.catalog_outbox_pending = Gauge(
+            "catalog_outbox_pending",
+            "Unpublished catalog outbox rows from completed activations",
+            registry=self.registry,
+        )
+        self.catalog_outbox_oldest_age_seconds = Gauge(
+            "catalog_outbox_oldest_age_seconds",
+            "Age of the oldest unpublished catalog outbox row",
+            registry=self.registry,
+        )
+        self.pit_export_rows = Gauge(
+            "pit_export_rows",
+            "Rows in the latest PIT Parquet export",
+            registry=self.registry,
+        )
+        self.pit_manifest_validation_failures_total = Counter(
+            "pit_manifest_validation_failures_total",
+            "Fail-closed PIT manifest or shard validation failures",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.pit_online_offline_parity_ratio = Gauge(
+            "pit_online_offline_parity_ratio",
+            "Finalized online/offline feature bundle parity ratio",
+            registry=self.registry,
+        )
+        self.pit_leakage_rows = Gauge(
+            "pit_leakage_rows",
+            "Rows violating PIT event-time or availability constraints",
+            registry=self.registry,
+        )
         self._process = psutil.Process()
 
     def record_request(
@@ -678,6 +727,13 @@ class ObservabilityManager:
     def record_training_run(self, trigger: str, status: str, duration: float) -> None:
         self.worker_training_runs_total.labels(trigger=trigger, status=status).inc()
         self.worker_training_duration_seconds.labels(trigger=trigger).observe(duration)
+
+    def update_catalog_outbox(self, *, pending: int, oldest_age_seconds: float) -> None:
+        self.catalog_outbox_pending.set(max(0, int(pending)))
+        self.catalog_outbox_oldest_age_seconds.set(max(0.0, float(oldest_age_seconds)))
+
+    def record_pit_manifest_validation_failure(self, reason: str) -> None:
+        self.pit_manifest_validation_failures_total.labels(reason=reason).inc()
 
     def record_recommendation(
         self,
