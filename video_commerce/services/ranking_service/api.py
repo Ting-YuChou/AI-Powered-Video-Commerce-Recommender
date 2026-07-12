@@ -28,7 +28,11 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
     RankingCoordinatorClientPool,
     RankingCoordinatorError,
 )
-from video_commerce.ranking_runtime.ranking_payloads import RankRequest, coerce_rank_payload, model_payload
+from video_commerce.ranking_runtime.ranking_payloads import (
+    RankRequest,
+    coerce_rank_payload,
+    model_payload,
+)
 from video_commerce.common.service_common import (
     build_health_response,
     build_liveness_payload,
@@ -338,7 +342,14 @@ async def rank(request: Request):
         recommendations, profile = await ranking_batcher.rank_candidates(
             candidates=payload.candidates,
             user_features=payload.user_features,
-            context=payload.context,
+            context={
+                **payload.context,
+                **(
+                    {"temporal_multimodal": payload.multimodal_context}
+                    if payload.multimodal_context
+                    else {}
+                ),
+            },
             product_metadata_map=payload.product_metadata_map,
             k=payload.k,
             include_profile=True,

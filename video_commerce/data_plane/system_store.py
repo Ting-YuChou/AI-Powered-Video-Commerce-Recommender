@@ -610,6 +610,25 @@ class ContentJob(Base):
     )
 
 
+class ContentFeatureArtifact(Base):
+    """Durable source of truth for offline multimodal training features."""
+
+    __tablename__ = "content_feature_artifacts"
+
+    content_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    features: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class ProductCatalogSnapshot(Base):
     __tablename__ = "product_catalog_snapshot"
 
@@ -1865,6 +1884,77 @@ class SystemStore:
         async with self.session_factory.begin() as session:
             await session.execute(stmt)
         self._update_pool_metrics()
+
+    async def upsert_content_feature_artifact(
+        self,
+        content_id: str,
+        features: Dict[str, Any],
+        *,
+        schema_version: str,
+    ) -> None:
+        if not self.enabled:
+            return
+        stmt = pg_insert(ContentFeatureArtifact).values(
+            content_id=content_id,
+            schema_version=schema_version,
+            features=features,
+            updated_at=_utc_now(),
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[ContentFeatureArtifact.content_id],
+            set_={
+                "schema_version": schema_version,
+                "features": features,
+                "updated_at": _utc_now(),
+            },
+        )
+        async with self.session_factory.begin() as session:
+            await session.execute(stmt)
+        self._update_pool_metrics()
+
+    async def get_content_feature_artifact(
+        self, content_id: str
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            row = await session.get(ContentFeatureArtifact, content_id)
+        self._update_pool_metrics()
+        return dict(row.features) if row is not None else None
+
+    async def list_content_jobs_missing_feature_artifact(
+        self, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Return completed durable uploads not yet backfilled to the new schema."""
+        if not self.enabled:
+            return []
+        statement = (
+            select(ContentJob)
+            .outerjoin(
+                ContentFeatureArtifact,
+                ContentFeatureArtifact.content_id == ContentJob.content_id,
+            )
+            .where(
+                ContentJob.status == "completed",
+                ContentJob.storage_path.is_not(None),
+                ContentFeatureArtifact.content_id.is_(None),
+            )
+            .order_by(ContentJob.created_at, ContentJob.content_id)
+            .limit(max(1, int(limit)))
+        )
+        async with self.session_factory() as session:
+            rows = (await session.execute(statement)).scalars().all()
+        self._update_pool_metrics()
+        return [
+            {
+                "content_id": row.content_id,
+                "filename": row.filename,
+                "storage_path": row.storage_path,
+                "user_id": row.user_id,
+                "priority": row.priority,
+            }
+            for row in rows
+        ]
 
     async def update_content_job_status(
         self,

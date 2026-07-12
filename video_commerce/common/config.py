@@ -86,7 +86,7 @@ class ModelConfig(BaseSettings):
 
     # CLIP model settings
     clip_model: str = Field(
-        "openai/clip-vit-large-patch14", description="CLIP model identifier"
+        "openai/clip-vit-base-patch16", description="CLIP model identifier"
     )
     embedding_dim: int = Field(512, description="Embedding dimension")
 
@@ -103,7 +103,22 @@ class ModelConfig(BaseSettings):
     device: str = Field("auto", description="Compute device (cpu/cuda/auto)")
     batch_size: int = Field(32, description="Processing batch size")
     max_video_length: int = Field(300, description="Maximum video length in seconds")
-    num_keyframes: int = Field(8, description="Number of keyframes to extract")
+    num_keyframes: int = Field(16, description="Maximum adaptive keyframes to extract")
+    min_keyframes: int = Field(8, description="Minimum temporal frame budget")
+    temporal_encoder_enabled: bool = Field(
+        True, description="Persist frame sequences for learned temporal ranking"
+    )
+    ocr_backend: str = Field(
+        "paddle",
+        description="OCR region detector/recognizer backend: paddle or tesseract",
+    )
+    ocr_language: str = Field("en", description="OCR recognition language")
+    ocr_detection_threshold: float = Field(0.3, ge=0.0, le=1.0)
+    ocr_recognition_threshold: float = Field(0.5, ge=0.0, le=1.0)
+    ocr_temporal_text_similarity: float = Field(0.8, ge=0.0, le=1.0)
+    ocr_temporal_iou_threshold: float = Field(0.3, ge=0.0, le=1.0)
+    ocr_temporal_max_missed_frames: int = Field(1, ge=0)
+    ocr_temporal_max_gap_seconds: float = Field(5.0, gt=0.0)
     ffmpeg_frame_extraction_enabled: bool = Field(
         True,
         description="Use FFmpeg/ffprobe for video metadata and keyframe extraction",
@@ -2133,6 +2148,12 @@ class Config:
             errors.append(
                 "Model keyframe sampling strategy must be scene_adaptive or uniform"
             )
+        if self.model_config.min_keyframes < 1:
+            errors.append("Model minimum keyframes must be positive")
+        if self.model_config.min_keyframes > self.model_config.num_keyframes:
+            errors.append("Model minimum keyframes must not exceed maximum keyframes")
+        if self.model_config.ocr_backend not in {"paddle", "tesseract"}:
+            errors.append("Model OCR backend must be paddle or tesseract")
         if not 0.0 <= self.model_config.keyframe_scene_threshold <= 1.0:
             errors.append("Model keyframe scene threshold must be between 0.0 and 1.0")
         if self.model_config.keyframe_floor_seconds <= 0:
@@ -2140,7 +2161,9 @@ class Config:
         if self.model_config.keyframe_min_scene_gap_seconds <= 0:
             errors.append("Model keyframe minimum scene gap must be positive")
         if self.model_config.keyframe_dedupe_luma_diff_threshold < 0:
-            errors.append("Model keyframe dedupe luma diff threshold must be non-negative")
+            errors.append(
+                "Model keyframe dedupe luma diff threshold must be non-negative"
+            )
         if self.model_config.keyframe_dedupe_luma_diff_threshold > 255:
             errors.append(
                 "Model keyframe dedupe luma diff threshold must be at most 255"

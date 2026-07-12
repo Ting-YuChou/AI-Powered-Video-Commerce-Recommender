@@ -37,9 +37,15 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
     encode_response,
     read_frame,
 )
-from video_commerce.ranking_runtime.ranking_payloads import coerce_rank_payload, model_payload
+from video_commerce.ranking_runtime.ranking_payloads import (
+    coerce_rank_payload,
+    model_payload,
+)
 from video_commerce.ranking_runtime.ranking_runner_client import RankingRunnerClientPool
-from video_commerce.common.service_common import ServiceRuntime, configure_service_logging
+from video_commerce.common.service_common import (
+    ServiceRuntime,
+    configure_service_logging,
+)
 from video_commerce.data_plane.system_store import SystemStore
 
 
@@ -287,7 +293,14 @@ class RankingCoordinator:
             recommendations, profile = await self.ranking_batcher.rank_candidates(
                 candidates=payload.candidates,
                 user_features=payload.user_features,
-                context=payload.context,
+                context={
+                    **payload.context,
+                    **(
+                        {"temporal_multimodal": payload.multimodal_context}
+                        if payload.multimodal_context
+                        else {}
+                    ),
+                },
                 product_metadata_map=payload.product_metadata_map,
                 k=payload.k,
                 include_profile=True,
