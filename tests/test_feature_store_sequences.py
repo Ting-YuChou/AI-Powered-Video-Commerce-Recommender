@@ -29,6 +29,15 @@ class FakePipeline:
         self.ops.append(("get", key))
         self.client.get_calls.append(key)
 
+    def zrange(self, key, start, end):
+        self.ops.append(("zrange", key, start, end))
+
+    def zadd(self, key, mapping):
+        self.ops.append(("zadd", key, mapping))
+
+    def zremrangebyrank(self, key, start, end):
+        self.ops.append(("zremrangebyrank", key, start, end))
+
     async def execute(self):
         results = []
         for op in self.ops:
@@ -46,6 +55,21 @@ class FakePipeline:
             elif op[0] == "get":
                 _, key = op
                 results.append(self.client.data.get(key))
+            elif op[0] == "zrange":
+                _, key, start, end = op
+                values = self.client.data.get(key, [])
+                results.append(values[start:] if end == -1 else values[start : end + 1])
+            elif op[0] == "zadd":
+                _, key, mapping = op
+                bucket = self.client.data.setdefault(key, [])
+                bucket.extend(mapping)
+            elif op[0] == "zremrangebyrank":
+                _, key, start, end = op
+                bucket = self.client.data.get(key, [])
+                if end < 0:
+                    end = len(bucket) + end
+                if end >= start:
+                    del bucket[start : end + 1]
         return results
 
 
@@ -126,6 +150,8 @@ async def test_log_user_interactions_batch_preserves_sequence_fields():
     assert newest["event_id"] == "e2"
     assert newest["occurred_at"] == 2.0
     assert newest["schema_version"] == 1
+    assert len(fake.data["uiza:click:u1"]) == 1
+    assert "uiza:view:u1" not in fake.data
 
 
 @pytest.mark.asyncio
@@ -177,6 +203,43 @@ async def test_get_user_sequence_returns_positive_events_oldest_to_newest():
 
     assert [event["product_id"] for event in sequence] == ["p1", "p2", "p4"]
     assert [event["event_id"] for event in sequence] == ["e1", "e2", "e4"]
+
+
+@pytest.mark.asyncio
+async def test_get_din_behavior_sequences_reads_action_zsets_in_one_pipeline():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uiza:click:u1"] = [
+        json.dumps(
+            {
+                "product_id": "p1",
+                "action": "click",
+                "occurred_at": 10.0,
+                "available_at": 10.0,
+                "event_id": "e1",
+            }
+        )
+    ]
+    fake.data["uiza:cart:u1"] = [
+        json.dumps(
+            {
+                "product_id": "p2",
+                "action": "add_to_cart",
+                "occurred_at": 20.0,
+                "available_at": 20.0,
+                "event_id": "e2",
+            }
+        )
+    ]
+
+    sequences = await store.get_din_behavior_sequences(
+        "u1", as_of_ts=30.0, last_n=2
+    )
+
+    assert sequences.actions["click"].product_ids == ("", "p1")
+    assert sequences.actions["cart"].product_ids == ("", "p2")
+    assert sequences.actions["purchase"].mask == (False, False)
 
 
 @pytest.mark.asyncio

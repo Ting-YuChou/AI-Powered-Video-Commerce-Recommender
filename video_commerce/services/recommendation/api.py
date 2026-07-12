@@ -52,6 +52,7 @@ from video_commerce.ml.ranking_history import (
     history_context_profile,
     ranking_history_config_from_settings,
 )
+from video_commerce.ml.din import DIN_SEQUENCE_CONTEXT_KEY, build_din_freshness_token
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.common.service_common import (
     build_health_response,
@@ -369,6 +370,12 @@ def _calculate_mmr_rerank_pool_size(
     multiplier = max(
         1, int(getattr(recommendation_config, "mmr_rerank_pool_multiplier", 5))
     )
+
+
+def _is_din_enabled(runtime: Any) -> bool:
+    config = getattr(runtime, "config", None)
+    ranking_config = getattr(config, "ranking_config", None)
+    return bool(getattr(ranking_config, "din_enabled", False))
     min_pool_size = max(
         1, int(getattr(recommendation_config, "mmr_min_rerank_pool_size", 50))
     )
@@ -1420,6 +1427,7 @@ async def get_recommendations(
                 name="recommendation-content-processed-at",
             )
 
+        din_sequences = None
         stage_started = time.perf_counter()
         user_features, user_sequence_token = await _bounded_hot_path_read(
             runtime,
@@ -1438,6 +1446,17 @@ async def get_recommendations(
             (time.perf_counter() - stage_started) * 1000, 2
         )
         profile["user_sequence_token_ms"] = 0.0
+        if _is_din_enabled(runtime):
+            din_sequences = await _bounded_hot_path_read(
+                runtime,
+                "din_behavior_sequences",
+                feature_store.get_din_behavior_sequences(
+                    payload.user_id,
+                    as_of_ts=start_time,
+                    last_n=runtime.config.ranking_config.din_sequence_last_n,
+                ),
+                None,
+            )
 
         if content_features_task:
             (
@@ -1464,6 +1483,10 @@ async def get_recommendations(
                 content_processed_at,
             ),
         )
+        if din_sequences is not None:
+            freshness_context["din_sequence_token"] = build_din_freshness_token(
+                din_sequences
+            )
         cache_key = feature_store.generate_context_hash(
             {
                 **_build_recommendation_cache_context(
@@ -1915,6 +1938,8 @@ async def get_recommendations(
             **dict(payload.context or {}),
             "_feature_as_of_ts": start_time,
         }
+        if din_sequences is not None:
+            ranking_context[DIN_SEQUENCE_CONTEXT_KEY] = din_sequences.to_dict()
         if _is_realtime_window_features_enabled(runtime):
             stage_started = time.perf_counter()
             ranking_context = await _attach_realtime_window_features(

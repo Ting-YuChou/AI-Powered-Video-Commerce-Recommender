@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from video_commerce.common.cache_codec import json_dumps, json_loads
 from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
 from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.din import DIN_SEQUENCE_CONTEXT_KEY
 from video_commerce.ranking_runtime.ranking_coordinator_client import MAX_FRAME_BYTES
 from video_commerce.ranking_runtime.ranking_payloads import coerce_candidate, coerce_user_features, model_payload
 from video_commerce.ranking_runtime.ranking_runner_client import (
@@ -97,12 +98,12 @@ def _trim_product_metadata(metadata: Any) -> Dict[str, Any]:
 
 
 def normalize_ranking_batch_payloads(raw_payload: Any) -> List[Dict[str, Any]]:
-    """Decode v2 batch-level metadata payloads while preserving v1 request lists."""
+    """Decode v2/v3 batch metadata while preserving v1 request lists."""
     if isinstance(raw_payload, dict):
         requests = raw_payload.get("requests")
         if not isinstance(requests, list):
             return []
-        if raw_payload.get("payload_version") != 2:
+        if raw_payload.get("payload_version") not in (2, 3):
             return requests
 
         batch_metadata_map = raw_payload.get("product_metadata_map") or {}
@@ -169,7 +170,14 @@ def run_ranking_batch_payloads(
                 "index": payload["index"],
                 "candidates": candidates,
                 "user_features": user_features,
-                "context": payload.get("context") or {},
+                "context": {
+                    **(payload.get("context") or {}),
+                    **(
+                        {DIN_SEQUENCE_CONTEXT_KEY: payload["behavior_sequences"]}
+                        if payload.get("behavior_sequences") is not None
+                        else {}
+                    ),
+                },
                 "product_metadata_map": payload.get("product_metadata_map") or {},
                 "k": int(payload["k"]),
                 "batch_wait_ms": payload["batch_wait_ms"],
@@ -414,6 +422,7 @@ class RankingBatcher:
         self.runner_payload_v2_enabled = bool(
             getattr(config, "runner_payload_v2_enabled", True)
         )
+        self.din_enabled = bool(getattr(config, "din_enabled", False))
         self._runner_payload_v2_capability_warning_logged = False
         self.runner_payload_max_bytes = max(
             1024,
@@ -931,8 +940,19 @@ class RankingBatcher:
                     "deadline_unix_seconds": request.deadline_unix_seconds,
                 }
             )
+        payload_version = 3 if self.din_enabled and self._remote_payload_v3_supported() else 2
+        if payload_version == 3:
+            for request_payload, request in zip(requests, batch):
+                sequences = request.context.get(DIN_SEQUENCE_CONTEXT_KEY)
+                if sequences is not None:
+                    request_payload["behavior_sequences"] = sequences
+                    request_payload["context"] = {
+                        key: value
+                        for key, value in request_payload["context"].items()
+                        if key != DIN_SEQUENCE_CONTEXT_KEY
+                    }
         return {
-            "payload_version": 2,
+            "payload_version": payload_version,
             "product_metadata_map": product_metadata_map,
             "requests": requests,
         }
@@ -959,6 +979,17 @@ class RankingBatcher:
             )
             self._runner_payload_v2_capability_warning_logged = True
         return False
+
+    def _remote_payload_v3_supported(self) -> bool:
+        if self.runner_pool is None:
+            return True
+        supports_version = getattr(
+            self.runner_pool, "supports_batch_payload_version", None
+        )
+        supported = bool(supports_version and supports_version(3))
+        if not supported:
+            self._record_direct("runner_payload_v3_capability_mismatch")
+        return supported
 
     def _build_remote_batch_body(
         self,

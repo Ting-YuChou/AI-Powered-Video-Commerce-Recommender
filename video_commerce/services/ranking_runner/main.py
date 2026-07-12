@@ -448,8 +448,8 @@ class RankingRunner:
             "service": self.runtime.service_name,
             "checks": {"ranking_model": ranking_health},
             "process_id": os.getpid(),
-            "batch_payload_versions": [1, 2],
-            "capabilities": {"batch_payload_versions": [1, 2]},
+            "batch_payload_versions": [1, 2, 3],
+            "capabilities": {"batch_payload_versions": [1, 2, 3]},
         }
         self.runtime.observability.record_request(
             "GET",

@@ -94,6 +94,10 @@ class ModelConfig(BaseSettings):
     ranking_model_path: Optional[str] = Field(
         None, description="Path to trained ranking model"
     )
+    ranking_din_sidecar_path: str = Field(
+        "/tmp/ranking_din_embeddings.npz",
+        description="Ranking-owned frozen DIN item embedding sidecar",
+    )
     cf_model_path: Optional[str] = Field(
         None, description="Path to collaborative filtering model"
     )
@@ -876,6 +880,26 @@ class RankingConfig(BaseSettings):
         1.75,
         description="Scale applied to purchase last-N ranking history vectors",
     )
+    din_enabled: bool = Field(
+        False,
+        description="Enable PIT-trained candidate-aware DIN ranking features",
+    )
+    din_sequence_last_n: int = Field(
+        60,
+        description="Fixed history length retained per DIN action",
+    )
+    din_sequence_lookback_days: int = Field(
+        30,
+        description="Point-in-time lookback window for DIN histories",
+    )
+    din_min_nonempty_ratio: float = Field(
+        0.30,
+        description="Minimum training-row ratio with a non-empty DIN history",
+    )
+    din_embedding_sidecar_path: str = Field(
+        "/tmp/ranking_din_embeddings.npz",
+        description="Local ranking-owned frozen DIN item embedding sidecar",
+    )
     max_queue_wait_ms: float = Field(
         150.0,
         description="Maximum time a ranking request may wait in the queue before failing fast",
@@ -1093,6 +1117,34 @@ class RankingConfig(BaseSettings):
         if value < 0:
             raise ValueError("ranking history scales must be >= 0")
         return value
+
+    @validator("din_sequence_last_n")
+    def validate_din_sequence_last_n(cls, value: int) -> int:
+        if value != 60:
+            raise ValueError("din_sequence_last_n must be 60 for din_sequence_v1")
+        return value
+
+    @validator("din_sequence_lookback_days")
+    def validate_din_sequence_lookback_days(cls, value: int) -> int:
+        if value != 30:
+            raise ValueError(
+                "din_sequence_lookback_days must be 30 for din_sequence_v1"
+            )
+        return value
+
+    @validator("din_min_nonempty_ratio")
+    def validate_din_min_nonempty_ratio(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("din_min_nonempty_ratio must be between 0 and 1")
+        return value
+
+    @root_validator(skip_on_failure=True)
+    def validate_din_replaces_averaged_history(cls, values):
+        if values.get("din_enabled") and values.get("history_embeddings_enabled"):
+            raise ValueError(
+                "DIN replaces averaged ranking history embeddings; enable only one"
+            )
+        return values
 
     @validator("runner_payload_max_bytes")
     def validate_runner_payload_max_bytes(cls, value: int) -> int:

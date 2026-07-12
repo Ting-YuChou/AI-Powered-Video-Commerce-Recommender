@@ -34,6 +34,13 @@ from video_commerce.common.cache_codec import (
     unpack_cache_payload,
 )
 from video_commerce.common.config import RedisConfig, CacheConfig
+from video_commerce.ml.din import (
+    DIN_ACTIONS,
+    DIN_ACTION_MAP,
+    DINBehaviorSequences,
+    build_din_behavior_sequences,
+    build_din_freshness_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +90,7 @@ class FeatureStore:
             "content_status": "cs:",
             "user_interactions": "ui:",
             "user_interactions_zset": "uiz:",
+            "din_user_interactions_zset": "uiza:",
             "user_sequence_token": "ust:",
             "realtime_window_features": "rtwf:",
             "recommendations_cache": "rc:",
@@ -906,6 +914,21 @@ class FeatureStore:
             pipeline.lpush(user_key, *serialized)
             pipeline.ltrim(user_key, 0, 999)
             pipeline.expire(user_key, 86400 * 30)
+            for serialized_interaction in serialized:
+                payload = json.loads(serialized_interaction)
+                action = DIN_ACTION_MAP.get(str(payload.get("action") or "").lower())
+                if action is None:
+                    continue
+                action_key = (
+                    f"{self.prefixes['din_user_interactions_zset']}"
+                    f"{action}:{user_id}"
+                )
+                pipeline.zadd(
+                    action_key,
+                    {serialized_interaction: float(payload["occurred_at"])},
+                )
+                pipeline.zremrangebyrank(action_key, 0, -201)
+                pipeline.expire(action_key, 86400 * 30)
             await pipeline.execute()
             self.mark_user_known(user_id)
             await self.refresh_user_sequence_token(user_id)
@@ -993,6 +1016,58 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error getting user sequence for {user_id}: {e}")
             return []
+
+    async def get_din_behavior_sequences(
+        self,
+        user_id: str,
+        *,
+        as_of_ts: Optional[float] = None,
+        last_n: int = 60,
+        namespace: str = "official",
+    ) -> DINBehaviorSequences:
+        """Read action-specific DIN histories with one Redis round trip."""
+        resolved_as_of = float(as_of_ts if as_of_ts is not None else time.time())
+        client = self._client_for_key_type("user_interactions")
+        events: List[Dict[str, Any]] = []
+        try:
+            pipeline = client.pipeline(transaction=False)
+            for action in DIN_ACTIONS:
+                key = (
+                    f"{self._feature_namespace_prefix(namespace)}"
+                    f"{self.prefixes['din_user_interactions_zset']}{action}:{user_id}"
+                )
+                pipeline.zrange(key, -last_n, -1)
+            raw_sequences = await pipeline.execute()
+            for raw_values in raw_sequences:
+                for raw in raw_values or []:
+                    try:
+                        events.append(self._loads_redis_json(raw))
+                    except Exception:
+                        continue
+        except Exception:
+            events = []
+
+        if not events:
+            events = await self.get_user_sequence(user_id, limit=1000)
+        return build_din_behavior_sequences(
+            events,
+            as_of_ts=resolved_as_of,
+            last_n=last_n,
+        )
+
+    async def get_din_freshness_token(
+        self,
+        user_id: str,
+        *,
+        as_of_ts: Optional[float] = None,
+        last_n: int = 60,
+    ) -> Dict[str, Any]:
+        sequences = await self.get_din_behavior_sequences(
+            user_id,
+            as_of_ts=as_of_ts,
+            last_n=last_n,
+        )
+        return build_din_freshness_token(sequences)
 
     async def _get_user_interactions_zset(
         self,

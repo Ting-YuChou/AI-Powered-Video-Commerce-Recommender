@@ -12,6 +12,7 @@ from typing import Any, Dict, Mapping, Optional
 
 FEATURE_HISTORY_PAYLOAD_SCHEMA_VERSION = 1
 RANKING_LTR_FEATURE_DEFINITION_VERSION = "ranking_ltr_v1"
+RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION = "ranking_ltr_v2_din"
 
 
 class FeatureHistoryContractError(ValueError):

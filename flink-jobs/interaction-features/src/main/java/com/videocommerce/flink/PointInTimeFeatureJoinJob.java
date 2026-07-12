@@ -200,7 +200,7 @@ public final class PointInTimeFeatureJoinJob {
             + "materialization_run_id STRING,observation_id STRING,impression_id STRING,"
             + "user_id STRING,product_id STRING,"
             + "action STRING,as_of_ts DOUBLE,user_features_json STRING,product_metadata_json STRING,"
-            + "context_json STRING,candidate_features_json STRING,online_feature_bundle_hash STRING,"
+            + "context_json STRING,behavior_sequences_json STRING,candidate_features_json STRING,online_feature_bundle_hash STRING,"
             + "feature_bundle_hash STRING,"
             + "attributed_action STRING,attributed_click INT,attributed_purchase INT,"
             + "attributed_value DOUBLE,attributed_value_source STRING,"
@@ -294,7 +294,7 @@ public final class PointInTimeFeatureJoinJob {
         List.of(
             "materialization_run_id", "observation_id", "impression_id", "user_id", "product_id",
             "action", "as_of_ts", "user_features_json", "product_metadata_json", "context_json",
-            "candidate_features_json", "online_feature_bundle_hash", "feature_bundle_hash",
+            "behavior_sequences_json", "candidate_features_json", "online_feature_bundle_hash", "feature_bundle_hash",
             "attributed_action", "attributed_click", "attributed_purchase", "attributed_value",
             "attributed_value_source", "feature_definition_version", "label_definition_version",
             "materialized_at", "materialization_date"));
@@ -319,6 +319,10 @@ public final class PointInTimeFeatureJoinJob {
             allowedLatenessHours,
             materializationCutoff);
     String selectList = buildPitSelectList(targetColumns, run, version);
+    String dinEligibility =
+        "ranking_ltr_v2_din".equals(featureDefinitionVersion)
+            ? "AND JSON_VALUE(o.context_json,'$._din_behavior_sequences.contract_version')='din_sequence_v1' "
+            : "";
     return String.format(
         "INSERT INTO `%s`.`ranking_training_pit`\n%s\n"
             + "SELECT %s\n"
@@ -334,7 +338,8 @@ public final class PointInTimeFeatureJoinJob {
             + "AND JSON_VALUE(o.candidate_features_json,'$.popularity_score') IS NOT NULL "
             + "AND JSON_VALUE(o.candidate_features_json,'$.combined_score') IS NOT NULL AND ("
             + "JSON_VALUE(o.canonical_payload_json,'$.item_snapshot_complete')='true' "
-            + "OR it.canonical_payload_json IS NOT NULL)",
+            + "OR it.canonical_payload_json IS NOT NULL) "
+            + dinEligibility,
         identifier(namespace), eligible, selectList);
   }
 
@@ -356,10 +361,13 @@ public final class PointInTimeFeatureJoinJob {
           expressions.add("CASE WHEN JSON_VALUE(o.canonical_payload_json,'$.item_snapshot_complete')='true' THEN o.item_snapshot_json ELSE it.canonical_payload_json END");
           break;
         case "context_json": expressions.add("o.context_json"); break;
+        case "behavior_sequences_json":
+          expressions.add("JSON_QUERY(o.context_json,'$._din_behavior_sequences')");
+          break;
         case "candidate_features_json": expressions.add("o.candidate_features_json"); break;
         case "online_feature_bundle_hash": expressions.add("o.feature_bundle_hash"); break;
         case "feature_bundle_hash":
-          expressions.add("pit_feature_bundle_hash(o.event_time_epoch,o.user_id,o.product_id,u.canonical_payload_json,CASE WHEN JSON_VALUE(o.canonical_payload_json,'$.item_snapshot_complete')='true' THEN o.item_snapshot_json ELSE it.canonical_payload_json END,o.context_json,o.candidate_features_json,'" + version + "')");
+          expressions.add("pit_feature_bundle_hash(o.event_time_epoch,o.user_id,o.product_id,u.canonical_payload_json,CASE WHEN JSON_VALUE(o.canonical_payload_json,'$.item_snapshot_complete')='true' THEN o.item_snapshot_json ELSE it.canonical_payload_json END,o.context_json,JSON_QUERY(o.context_json,'$._din_behavior_sequences'),o.candidate_features_json,'" + version + "')");
           break;
         case "attributed_click": expressions.add("COALESCE(f.attributed_click,0)"); break;
         case "attributed_purchase": expressions.add("COALESCE(f.attributed_purchase,0)"); break;
@@ -512,7 +520,7 @@ public final class PointInTimeFeatureJoinJob {
         "CREATE TEMPORARY TABLE pit_parquet_export (observation_id STRING,impression_id STRING,"
             + "user_id STRING,"
             + "product_id STRING,action STRING,as_of_ts DOUBLE,user_features_json STRING,"
-            + "product_metadata_json STRING,context_json STRING,candidate_features_json STRING,"
+            + "product_metadata_json STRING,context_json STRING,behavior_sequences_json STRING,candidate_features_json STRING,"
             + "online_feature_bundle_hash STRING,feature_bundle_hash STRING,"
             + "attributed_action STRING,attributed_click INT,attributed_purchase INT,"
             + "attributed_value DOUBLE,attributed_value_source STRING,"
@@ -531,7 +539,7 @@ public final class PointInTimeFeatureJoinJob {
     return String.format(
         "INSERT INTO pit_parquet_export SELECT observation_id,impression_id,user_id,product_id,"
             + "action,as_of_ts,"
-            + "user_features_json,product_metadata_json,context_json,candidate_features_json,"
+            + "user_features_json,product_metadata_json,context_json,behavior_sequences_json,candidate_features_json,"
             + "online_feature_bundle_hash,feature_bundle_hash,attributed_action,"
             + "attributed_click,attributed_purchase,attributed_value,attributed_value_source,"
             + "feature_definition_version,label_definition_version "
@@ -557,8 +565,26 @@ public final class PointInTimeFeatureJoinJob {
         String candidateFeaturesJson,
         String featureDefinitionVersion)
         throws Exception {
+      return eval(asOfTs, userId, productId, userFeaturesJson, productMetadataJson,
+          contextJson, null, candidateFeaturesJson, featureDefinitionVersion);
+    }
+
+    public String eval(
+        Double asOfTs,
+        String userId,
+        String productId,
+        String userFeaturesJson,
+        String productMetadataJson,
+        String contextJson,
+        String behaviorSequencesJson,
+        String candidateFeaturesJson,
+        String featureDefinitionVersion)
+        throws Exception {
       Map<String, Object> bundle = new LinkedHashMap<>();
       bundle.put("as_of_ts", asOfTs);
+      if (behaviorSequencesJson != null) {
+        bundle.put("behavior_sequences", parseMap(behaviorSequencesJson));
+      }
       bundle.put("candidate_features", parseMap(candidateFeaturesJson));
       bundle.put("context", parseMap(contextJson));
       bundle.put("feature_definition_version", featureDefinitionVersion);

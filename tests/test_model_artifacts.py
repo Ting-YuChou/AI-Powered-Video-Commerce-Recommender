@@ -131,6 +131,39 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
         fake_store.recorded[-1]["payload"]["artifact_sha256"]
         == hashlib.sha256(b"ranking").hexdigest()
     )
+
+
+def test_persist_ranking_checkpoint_activates_din_sidecar_in_same_record(tmp_path):
+    fake_store = FakeSystemStore()
+    ranking_path = tmp_path / "ranking.pt"
+    sidecar_path = tmp_path / "ranking-din.npz"
+    ranking_path.write_bytes(b"ranking")
+    sidecar_path.write_bytes(b"sidecar")
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(
+            ranking_model_path=str(ranking_path),
+            ranking_din_sidecar_path=str(sidecar_path),
+        ),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    asyncio.run(
+        manager.persist_ranking_checkpoint(
+            local_path=str(ranking_path),
+            model_version="ranking-din-1",
+            payload={"din_embedding_sidecar_local_path": str(sidecar_path)},
+        )
+    )
+
+    manifest = fake_store.recorded[-1]["payload"]["artifact_manifest"]
+    assert manifest["checkpoint"]["sha256"] == hashlib.sha256(b"ranking").hexdigest()
+    assert manifest["din_embedding_sidecar"]["sha256"] == hashlib.sha256(
+        b"sidecar"
+    ).hexdigest()
     assert (
         fake_store.recorded[-1]["payload"]["artifact_manifest"]["checkpoint"]["sha256"]
         == hashlib.sha256(b"ranking").hexdigest()

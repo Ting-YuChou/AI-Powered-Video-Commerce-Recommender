@@ -14,6 +14,7 @@ from video_commerce.ml.pit_training_dataset import (
 )
 from video_commerce.ml.pit_manifest import PitManifestPublisher, _is_parquet_shard_uri
 from video_commerce.ml.ranking_features import RANKING_LTR_FEATURE_DEFINITION_VERSION
+from video_commerce.common.feature_history_contracts import RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
 from video_commerce.ml.ranking_training import RANKING_LABEL_DEFINITION_VERSION
 
 
@@ -41,9 +42,15 @@ async def test_missing_latest_pointer_is_bootstrap_unavailable(tmp_path):
         await reader.read(str(tmp_path / "missing-latest.json"))
 
 
-def _write_dataset(tmp_path, *, status="complete", definition_version=None):
+def _write_dataset(
+    tmp_path, *, status="complete", definition_version=None, behavior_sequences=None
+):
     tmp_path.mkdir(parents=True, exist_ok=True)
-    definition_version = definition_version or RANKING_LTR_FEATURE_DEFINITION_VERSION
+    definition_version = definition_version or (
+        RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+        if behavior_sequences is not None
+        else RANKING_LTR_FEATURE_DEFINITION_VERSION
+    )
     shard = tmp_path / "part-00000.parquet"
     row = {
         "observation_id": "imp-1:p1",
@@ -68,8 +75,9 @@ def _write_dataset(tmp_path, *, status="complete", definition_version=None):
         ),
         "online_feature_bundle_hash": "a" * 64,
     }
-    row["feature_bundle_hash"] = payload_sha256(
-        {
+    if behavior_sequences is not None:
+        row["behavior_sequences_json"] = json.dumps(behavior_sequences)
+    bundle_payload = {
             "as_of_ts": 50.0,
             "candidate_features": {
                 "collaborative_score": 0.8,
@@ -84,7 +92,9 @@ def _write_dataset(tmp_path, *, status="complete", definition_version=None):
             "user_features": {"total_interactions": 3},
             "user_id": "u1",
         }
-    )
+    if behavior_sequences is not None:
+        bundle_payload["behavior_sequences"] = behavior_sequences
+    row["feature_bundle_hash"] = payload_sha256(bundle_payload)
     table = pa.Table.from_pylist([row])
     pq.write_table(table, shard)
     shard_bytes = shard.read_bytes()
@@ -129,6 +139,31 @@ def _write_dataset(tmp_path, *, status="complete", definition_version=None):
     return latest, manifest, shard
 
 
+def _din_sequences(*, leaking=False):
+    actions = {}
+    for action in ("click", "cart", "purchase"):
+        product_ids = [""] * 60
+        event_times = [0.0] * 60
+        event_ids = [None] * 60
+        mask = [False] * 60
+        if action == "click":
+            product_ids[-1] = "p-history"
+            event_times[-1] = 51.0 if leaking else 49.0
+            event_ids[-1] = "event-1"
+            mask[-1] = True
+        actions[action] = {
+            "product_ids": product_ids,
+            "event_times": event_times,
+            "event_ids": event_ids,
+            "mask": mask,
+        }
+    return {
+        "contract_version": "din_sequence_v1",
+        "as_of_ts": 50.0,
+        "actions": actions,
+    }
+
+
 @pytest.mark.asyncio
 async def test_pit_training_dataset_reader_pins_pointer_and_validates_parquet(tmp_path):
     latest, _, _ = _write_dataset(tmp_path)
@@ -149,6 +184,34 @@ async def test_pit_training_dataset_reader_pins_pointer_and_validates_parquet(tm
     assert example.bundle.product_metadata == {"price": 9.0}
     assert example.bundle.candidate.collaborative_score == 0.8
     assert example.attribution.attributed_action == "click"
+
+
+@pytest.mark.asyncio
+async def test_pit_reader_loads_canonical_din_sequences(tmp_path):
+    latest, _, _ = _write_dataset(tmp_path, behavior_sequences=_din_sequences())
+
+    loaded = await PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
+    ).read(str(latest))
+
+    sequences = loaded.examples[0].bundle.behavior_sequences
+    assert sequences is not None
+    assert sequences.actions["click"].length == 1
+    assert sequences.actions["click"].product_ids[-1] == "p-history"
+
+
+@pytest.mark.asyncio
+async def test_pit_reader_rejects_leaking_din_sequence(tmp_path):
+    latest, _, _ = _write_dataset(
+        tmp_path, behavior_sequences=_din_sequences(leaking=True)
+    )
+
+    with pytest.raises(PitTrainingDatasetError, match="DIN click sequence leaks"):
+        await PitTrainingDatasetReader(
+            LocalObjectStorage(),
+            expected_feature_definition_version=RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
+        ).read(str(latest))
 
 
 @pytest.mark.asyncio

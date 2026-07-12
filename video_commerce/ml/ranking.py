@@ -47,6 +47,7 @@ from video_commerce.ml.ranking_history import (
 )
 from video_commerce.common.feature_history_contracts import (
     RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
 )
 from video_commerce.ml.ranking_features import FeatureBundle, RankingFeatureAssembler
 from video_commerce.ml.ranking_training import (
@@ -54,10 +55,19 @@ from video_commerce.ml.ranking_training import (
     RankingTrainingExample,
     TrainingTensorBuilder,
 )
+from video_commerce.ml.din import (
+    DIN_SEQUENCE_CONTEXT_KEY,
+    DeepInterestNetwork,
+    build_din_behavior_sequences,
+    build_din_batch_inputs,
+    load_din_embedding_sidecar,
+    parse_din_behavior_sequences,
+)
 
 logger = logging.getLogger(__name__)
 
 RANKING_FEATURE_SCHEMA_VERSION = "ranking_v2_00_history_embeddings"
+RANKING_DIN_FEATURE_SCHEMA_VERSION = "ranking_v3_din"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
 RANKING_OBJECTIVE_VERSION = "business_v1"
 LEGACY_RANKING_OBJECTIVE_VERSION = "legacy_multi_objective"
@@ -65,6 +75,20 @@ LEGACY_RANKING_OBJECTIVE_VERSION = "legacy_multi_objective"
 
 class RankingTrainingCancelled(RuntimeError):
     """Raised by the synchronous trainer after cooperative cancellation."""
+
+
+class RankingFeatureMatrix(np.ndarray):
+    """Dense candidate matrix carrying non-duplicated structured DIN tensors."""
+
+    din_inputs: Any = None
+
+    def __new__(cls, values, *, din_inputs=None):
+        instance = np.asarray(values, dtype=np.float32).view(cls)
+        instance.din_inputs = din_inputs
+        return instance
+
+    def __array_finalize__(self, source):
+        self.din_inputs = getattr(source, "din_inputs", None)
 
 
 def _stable_hash_bucket(value: Any, buckets: int = 100) -> int:
@@ -104,10 +128,17 @@ class MultiObjectiveRankingModel(nn.Module):
         hidden_dims: Optional[List[int]] = None,
         cross_layers: Optional[int] = None,
         low_rank_dim: Optional[int] = None,
+        din_item_embeddings: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.config = config
         self.input_dim = input_dim
+        self.din = (
+            DeepInterestNetwork(din_item_embeddings)
+            if din_item_embeddings is not None
+            else None
+        )
+        model_input_dim = input_dim + (140 if self.din is not None else 0)
         self.architecture = normalize_architecture(
             architecture or getattr(config, "architecture", "dcn"),
             supported=RANKING_ARCHITECTURES,
@@ -137,7 +168,7 @@ class MultiObjectiveRankingModel(nn.Module):
 
         if self.architecture == "mlp":
             layers = []
-            prev_dim = input_dim
+            prev_dim = model_input_dim
 
             for hidden_dim in hidden_dims:
                 layers.extend(
@@ -153,7 +184,7 @@ class MultiObjectiveRankingModel(nn.Module):
             self.shared_layers = nn.Sequential(*layers)
         elif self.architecture == "dcn":
             self.shared_layers = DeepAndCrossNetwork(
-                input_dim,
+                model_input_dim,
                 hidden_dims,
                 hidden_dims[-1],
                 cross_layers=self.cross_layers,
@@ -162,7 +193,7 @@ class MultiObjectiveRankingModel(nn.Module):
             )
         else:
             self.shared_layers = LowRankDeepAndCrossNetwork(
-                input_dim,
+                model_input_dim,
                 hidden_dims,
                 hidden_dims[-1],
                 cross_layers=self.cross_layers,
@@ -228,8 +259,38 @@ class MultiObjectiveRankingModel(nn.Module):
         """Collapse a 2-unit head into one scalar while avoiding Linear(..., 1)."""
         return x[:, 1:2] - x[:, 0:1]
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        *,
+        candidate_indices=None,
+        history_indices=None,
+        history_recency=None,
+        history_mask=None,
+        summary_features=None,
+    ):
         """Forward pass through the model."""
+        if self.din is not None:
+            if any(
+                value is None
+                for value in (
+                    candidate_indices,
+                    history_indices,
+                    history_recency,
+                    history_mask,
+                    summary_features,
+                )
+            ):
+                raise ValueError("DIN ranking requires structured sequence tensors")
+            interest = self.din(
+                candidate_indices,
+                history_indices,
+                history_recency,
+                history_mask,
+            )
+            if summary_features.shape != (x.shape[0], 12):
+                raise ValueError("DIN summary_features must have shape [batch, 12]")
+            x = torch.cat([x, interest, summary_features], dim=1)
         # Shared representation
         shared_features = self.shared_layers(x)
 
@@ -558,6 +619,18 @@ class RankingModel:
                 config, "product_feature_cache_size", 50000
             ),
         )
+        self.din_product_index: Dict[str, int] = {}
+        self.din_item_embeddings: Optional[torch.Tensor] = None
+        self.din_sidecar_metadata: Dict[str, Any] = {}
+        if getattr(config, "din_enabled", False):
+            sidecar_path = getattr(config, "din_embedding_sidecar_path", None)
+            if sidecar_path and Path(sidecar_path).exists():
+                (
+                    self.din_item_embeddings,
+                    self.din_product_index,
+                    self.din_sidecar_metadata,
+                ) = load_din_embedding_sidecar(sidecar_path)
+            self.feature_assembler.version = "ranking_feature_assembler_v2_din"
 
         # Model components
         self.model: Optional[MultiObjectiveRankingModel] = None
@@ -568,7 +641,11 @@ class RankingModel:
         self.is_trained = False
         self.model_version = "1.0.0"
         self.last_training_time = 0
-        self.feature_schema_version = RANKING_FEATURE_SCHEMA_VERSION
+        self.feature_schema_version = (
+            RANKING_DIN_FEATURE_SCHEMA_VERSION
+            if getattr(config, "din_enabled", False)
+            else RANKING_FEATURE_SCHEMA_VERSION
+        )
         self.training_data_source = RANKING_TRAINING_DATA_SOURCE
         self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
         self.value_transform_stats: Dict[
@@ -658,6 +735,7 @@ class RankingModel:
             hidden_dims=hidden_dims,
             cross_layers=cross_layers,
             low_rank_dim=low_rank_dim,
+            din_item_embeddings=self.din_item_embeddings,
         ).to(self.device)
         optimizer = optim.Adam(
             model.parameters(),
@@ -830,7 +908,10 @@ class RankingModel:
         *,
         model_path: str,
     ) -> None:
-        if not getattr(self.config, "history_embeddings_enabled", False):
+        if not (
+            getattr(self.config, "history_embeddings_enabled", False)
+            or getattr(self.config, "din_enabled", False)
+        ):
             return
         expected_input_dim = self.feature_extractor.total_feature_dim
         expected_schema = self.feature_schema_version
@@ -851,6 +932,15 @@ class RankingModel:
     async def load_model(self, model_path: str = None):
         """Load or initialize the ranking model."""
         try:
+            if getattr(self.config, "din_enabled", False):
+                sidecar_path = getattr(self.config, "din_embedding_sidecar_path", "")
+                if not sidecar_path or not Path(sidecar_path).exists():
+                    raise RuntimeError("DIN ranking embedding sidecar is unavailable")
+                (
+                    self.din_item_embeddings,
+                    self.din_product_index,
+                    self.din_sidecar_metadata,
+                ) = load_din_embedding_sidecar(sidecar_path)
             resolved_model_path = model_path or self.loaded_model_path
 
             # Load pre-trained weights if available
@@ -1013,6 +1103,7 @@ class RankingModel:
 
         feature_matrix = np.empty((total_candidates, total_dim), dtype=np.float32)
         prepared_requests: List[Dict[str, Any]] = []
+        all_bundles: List[FeatureBundle] = []
         row_count = 0
 
         for request_offset, request in enumerate(requests):
@@ -1021,6 +1112,29 @@ class RankingModel:
             user_features = request["user_features"]
             context = request.get("context") or {}
             current_time = float(context.get("_feature_as_of_ts", time.time()))
+            raw_din_sequences = context.get(DIN_SEQUENCE_CONTEXT_KEY)
+            din_sequences = (
+                parse_din_behavior_sequences(
+                    raw_din_sequences,
+                    expected_as_of_ts=current_time,
+                    last_n=int(getattr(self.config, "din_sequence_last_n", 60)),
+                    lookback_days=int(
+                        getattr(self.config, "din_sequence_lookback_days", 30)
+                    ),
+                )
+                if getattr(self.config, "din_enabled", False)
+                and raw_din_sequences is not None
+                else None
+            )
+            if getattr(self.config, "din_enabled", False) and din_sequences is None:
+                din_sequences = build_din_behavior_sequences(
+                    [],
+                    as_of_ts=current_time,
+                    last_n=int(getattr(self.config, "din_sequence_last_n", 60)),
+                    lookback_days=int(
+                        getattr(self.config, "din_sequence_lookback_days", 30)
+                    ),
+                )
             product_metadata_map = request.get("product_metadata_map") or {}
             valid_candidates: List[Tuple[CandidateProduct, Dict[str, Any]]] = []
             row_start = row_count
@@ -1036,12 +1150,15 @@ class RankingModel:
                         FeatureBundle(
                             as_of_ts=current_time,
                             feature_definition_version=(
-                                RANKING_LTR_FEATURE_DEFINITION_VERSION
+                                RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+                                if getattr(self.config, "din_enabled", False)
+                                else RANKING_LTR_FEATURE_DEFINITION_VERSION
                             ),
                             user_features=user_features,
                             product_metadata=product_metadata,
                             context=context,
                             candidate=candidate,
+                            behavior_sequences=din_sequences,
                         )
                     )
                     valid_candidates.append((candidate, product_metadata))
@@ -1058,6 +1175,7 @@ class RankingModel:
                 feature_matrix[row_start:row_end] = self.feature_assembler.build_many(
                     bundles
                 )
+                all_bundles.extend(bundles)
 
             prepared_requests.append(
                 {
@@ -1084,6 +1202,20 @@ class RankingModel:
         if row_count < total_candidates:
             feature_matrix = feature_matrix[:row_count]
         np.nan_to_num(feature_matrix, nan=0.0, copy=False)
+        if getattr(self.config, "din_enabled", False):
+            if self.din_item_embeddings is None:
+                raise RuntimeError("DIN ranking embedding sidecar is not loaded")
+            feature_matrix = RankingFeatureMatrix(
+                feature_matrix,
+                din_inputs=build_din_batch_inputs(
+                    all_bundles,
+                    self.din_product_index,
+                    sequence_length=int(
+                        getattr(self.config, "din_sequence_last_n", 60)
+                    ),
+                    device=self.device,
+                ),
+            )
         return feature_matrix, prepared_requests, feature_extraction_ms
 
     def run_inference_batch(
@@ -1110,7 +1242,21 @@ class RankingModel:
             inference_model = self._compiled_model or model
             inference_path = "compiled" if self._compiled_model is not None else "eager"
             try:
-                predictions = inference_model(features_tensor)
+                din_inputs = getattr(feature_matrix, "din_inputs", None)
+                if din_inputs is None:
+                    predictions = inference_model(features_tensor)
+                else:
+                    history_indices, history_recency, history_mask = (
+                        din_inputs.expanded_histories()
+                    )
+                    predictions = inference_model(
+                        features_tensor,
+                        candidate_indices=din_inputs.candidate_indices,
+                        history_indices=history_indices,
+                        history_recency=history_recency,
+                        history_mask=history_mask,
+                        summary_features=din_inputs.summary_features,
+                    )
             except Exception as exc:
                 if self._compiled_model is None:
                     raise
@@ -1127,7 +1273,17 @@ class RankingModel:
                     },
                 )
                 inference_path = "eager"
-                predictions = model(features_tensor)
+                if din_inputs is None:
+                    predictions = model(features_tensor)
+                else:
+                    predictions = model(
+                        features_tensor,
+                        candidate_indices=din_inputs.candidate_indices,
+                        history_indices=history_indices,
+                        history_recency=history_recency,
+                        history_mask=history_mask,
+                        summary_features=din_inputs.summary_features,
+                    )
             model_forward_ms = round(
                 (time.perf_counter() - model_stage_started) * 1000, 2
             )
@@ -1687,7 +1843,17 @@ class RankingModel:
                 if cancellation_event is not None and cancellation_event.is_set():
                     raise RankingTrainingCancelled("ranking training was cancelled")
                 self.optimizer.zero_grad()
-                predictions = self.model(batch_features)
+                if getattr(self.config, "din_enabled", False):
+                    predictions = self.model(
+                        batch_features,
+                        candidate_indices=batch_labels["_din_candidate_indices"],
+                        history_indices=batch_labels["_din_history_indices"],
+                        history_recency=batch_labels["_din_history_recency"],
+                        history_mask=batch_labels["_din_history_mask"],
+                        summary_features=batch_labels["_din_summary_features"],
+                    )
+                else:
+                    predictions = self.model(batch_features)
                 loss = self._compute_loss(predictions, batch_labels)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -1711,6 +1877,9 @@ class RankingModel:
         if cancellation_event is not None and cancellation_event.is_set():
             raise RankingTrainingCancelled("ranking training was cancelled")
         self.model.eval()
+        self.training_history.append(
+            self._training_quality_metrics(features, labels, loss=avg_loss)
+        )
         self.is_trained = True
         self.last_training_time = time.time()
         self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
@@ -1720,10 +1889,67 @@ class RankingModel:
         logger.info("Model training completed")
         return self.loaded_model_path
 
+    def _training_quality_metrics(self, features, labels, *, loss: float):
+        with torch.no_grad():
+            if getattr(self.config, "din_enabled", False):
+                predictions = self.model(
+                    features,
+                    candidate_indices=labels["_din_candidate_indices"],
+                    history_indices=labels["_din_history_indices"],
+                    history_recency=labels["_din_history_recency"],
+                    history_mask=labels["_din_history_mask"],
+                    summary_features=labels["_din_summary_features"],
+                )
+            else:
+                predictions = self.model(features)
+        ctr_labels = labels["ctr"].detach().cpu().numpy().reshape(-1)
+        ctr_scores = predictions["ctr"].detach().cpu().numpy().reshape(-1)
+        auc = float(roc_auc_score(ctr_labels, ctr_scores)) if len(set(ctr_labels)) > 1 else None
+        scores = predictions["ranking_score"].detach().cpu().numpy().reshape(-1)
+        relevance = labels["ranking_relevance"].detach().cpu().numpy().reshape(-1)
+        groups = labels["ltr_group"].detach().cpu().numpy().reshape(-1)
+        group_ndcg = []
+        for group in np.unique(groups):
+            selected = groups == group
+            if int(selected.sum()) > 1:
+                group_ndcg.append(
+                    float(ndcg_score([relevance[selected]], [scores[selected]]))
+                )
+        return {
+            "loss": float(loss),
+            "auc": auc,
+            "ndcg": float(np.mean(group_ndcg)) if group_ndcg else None,
+            "attention_entropy": getattr(
+                getattr(self.model, "din", None), "last_attention_entropy", None
+            ),
+        }
+
     def _prepare_training_examples(
         self, training_data: Sequence[RankingTrainingExample]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        return self.training_tensor_builder.build(training_data)
+        features, labels = self.training_tensor_builder.build(training_data)
+        if getattr(self.config, "din_enabled", False):
+            if self.din_item_embeddings is None:
+                raise RuntimeError("DIN ranking embedding sidecar is not loaded")
+            din_inputs = build_din_batch_inputs(
+                [example.bundle for example in training_data],
+                self.din_product_index,
+                sequence_length=int(getattr(self.config, "din_sequence_last_n", 60)),
+                device=self.device,
+            )
+            history_indices, history_recency, history_mask = (
+                din_inputs.expanded_histories()
+            )
+            labels.update(
+                {
+                    "_din_candidate_indices": din_inputs.candidate_indices,
+                    "_din_history_indices": history_indices,
+                    "_din_history_recency": history_recency,
+                    "_din_history_mask": history_mask,
+                    "_din_summary_features": din_inputs.summary_features,
+                }
+            )
+        return features, labels
 
     def _ltr_grouped_training_enabled(self) -> bool:
         return bool(
@@ -2670,8 +2896,15 @@ class RankingModel:
         try:
             if self.model and self.is_trained:
                 Path(model_path).parent.mkdir(parents=True, exist_ok=True)
+                state_dict = self.model.state_dict()
+                if getattr(self.config, "din_enabled", False):
+                    state_dict = {
+                        key: value
+                        for key, value in state_dict.items()
+                        if key != "din.item_embedding.weight"
+                    }
                 checkpoint = {
-                    "model_state_dict": self.model.state_dict(),
+                    "model_state_dict": state_dict,
                     "config": {
                         "architecture": self.model.architecture,
                         "cross_layers": self.model.cross_layers,
@@ -2679,12 +2912,18 @@ class RankingModel:
                         "hidden_dims": self.model.hidden_dims,
                         "input_dim": self.feature_extractor.total_feature_dim,
                         "feature_schema_version": self.feature_schema_version,
-                        "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                        "feature_definition_version": (
+                            RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+                            if getattr(self.config, "din_enabled", False)
+                            else RANKING_LTR_FEATURE_DEFINITION_VERSION
+                        ),
                         "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
                         "feature_assembler_version": self.feature_assembler.version,
                         "ranking_objective_version": self.ranking_objective_version,
                         "value_transform_stats": self.value_transform_stats,
                         "value_bucket_mapping": self.value_bucket_mapping,
+                        "din_enabled": bool(getattr(self.config, "din_enabled", False)),
+                        "din_sidecar_metadata": self.din_sidecar_metadata,
                     },
                 }
                 torch.save(checkpoint, model_path)
