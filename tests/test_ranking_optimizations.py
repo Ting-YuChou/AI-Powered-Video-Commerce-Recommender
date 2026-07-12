@@ -2718,6 +2718,32 @@ async def test_recommendation_path_expands_ranker_pool_and_caches_post_mmr(monke
 
 @pytest.mark.asyncio
 async def test_din_history_failure_routes_to_combined_score_fallback(monkeypatch):
+    class PopulatedCache:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_cached_recommendations(self, _user_id, _cache_key):
+            self.calls += 1
+            return [_recommendation("cached-din-result", 1.0)]
+
+    populated_cache = PopulatedCache()
+    monkeypatch.setattr(recommendation_api_module, "feature_store", populated_cache)
+    cached, _ = await recommendation_api_module._read_recommendation_cache(
+        SimpleNamespace(
+            config=SimpleNamespace(
+                cache_config=SimpleNamespace(
+                    hot_path_read_timeout_ms=1000,
+                    recommendation_cache_race_timeout_ms=5,
+                )
+            )
+        ),
+        "u1",
+        "cache-key",
+        skip=True,
+    )
+    assert cached is None
+    assert populated_cache.calls == 0
+
     async def must_not_rank(**_kwargs):
         raise AssertionError(
             "trained DIN ranker must not run after history read failure"

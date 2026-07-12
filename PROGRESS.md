@@ -25,7 +25,8 @@
   atomic checkpoint writes, v3 fail-closed negotiation, stable history reuse,
   unknown-item zeroing, Iceberg schema evolution, corrupt Redis reads,
   full-sequence history identity, score-bounded ZSET reads, and explicit
-  combined-score fallback when official DIN history is unavailable.
+  combined-score fallback when official DIN history is unavailable; the
+  degraded path also bypasses recommendation-cache reads and writes.
   CPU DIN-branch p95 with 10 valid
   events/action was 26.5 ms at 100 candidates and 48.3 ms at 250 candidates.
 - Follow-up/blocker: the approved +10 ms p95 activation budget is not met on the

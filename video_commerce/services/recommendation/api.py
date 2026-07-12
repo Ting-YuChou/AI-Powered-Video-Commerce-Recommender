@@ -1495,22 +1495,11 @@ async def get_recommendations(
                 **freshness_context,
             }
         )
-        recommendation_cache_task = asyncio.create_task(
-            _timed_awaitable(
-                _bounded_hot_path_read(
-                    runtime,
-                    "cached_recommendations",
-                    feature_store.get_cached_recommendations(
-                        payload.user_id, cache_key
-                    ),
-                    None,
-                )
-            ),
-            name="recommendation-cache",
-        )
-        cached, profile["cache_lookup_ms"] = await _await_recommendation_cache_race(
+        cached, profile["cache_lookup_ms"] = await _read_recommendation_cache(
             runtime,
-            recommendation_cache_task,
+            payload.user_id,
+            cache_key,
+            skip=din_history_failed,
         )
         if cached:
             profile["cache_hit"] = True
@@ -2659,6 +2648,25 @@ async def _await_candidate_cache_race(
     except asyncio.TimeoutError:
         _cancel_optional_task(candidate_cache_task)
         return None, round((time.perf_counter() - started_at) * 1000, 2)
+
+
+async def _read_recommendation_cache(
+    runtime, user_id: str, cache_key: str, *, skip: bool
+):
+    if skip:
+        return None, 0.0
+    task = asyncio.create_task(
+        _timed_awaitable(
+            _bounded_hot_path_read(
+                runtime,
+                "cached_recommendations",
+                feature_store.get_cached_recommendations(user_id, cache_key),
+                None,
+            )
+        ),
+        name="recommendation-cache",
+    )
+    return await _await_recommendation_cache_race(runtime, task)
 
 
 async def _await_recommendation_cache_race(
