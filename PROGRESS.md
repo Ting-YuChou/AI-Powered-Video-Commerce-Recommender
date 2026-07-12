@@ -1,5 +1,28 @@
 # Progress
 
+## 2026-07-12 — Temporal multimodal video ranking and region OCR
+
+- Replaced fixed eight-frame mean-only content features with an adaptive
+  8–16-frame contract, trainable temporal encoding, and candidate-conditioned
+  visual/OCR attention for a retrained ranking v3 model.
+- Added PaddleOCR v5 mobile detection/recognition in an isolated persistent
+  content-worker subprocess, plus edit-similarity and polygon-IoU temporal OCR
+  tracking that keeps the first occurrence anchor.
+- Preserved the legacy pooled embedding for recall/checkpoint compatibility and
+  added durable Postgres `content_feature_artifacts` beside the Redis serving
+  cache. Ranking runner payload versions 1/2 remain supported alongside v3.
+- Key files: `video_commerce/ml/temporal_multimodal.py`,
+  `video_commerce/ml/video_ocr.py`, `video_commerce/ml/content_processor.py`,
+  `video_commerce/ml/ranking.py`, and
+  `migrations/postgres/007_temporal_multimodal_features.sql`.
+- Verification: focused Docker backend suite `164 passed`; fresh host suites
+  `8 passed` and `66 passed`; dedicated isolated PaddleOCR content-worker image
+  built on linux/arm64; application and OCR virtualenv imports passed; Compose
+  config and `git diff --check` passed. Helm CLI was unavailable locally.
+- Follow-up: apply migration 007, backfill completed durable content jobs, train
+  a fresh v3 checkpoint, and gate activation on offline NDCG/CTR/CVR plus
+  coverage. Paddle model weights should be pre-cached for production startup.
+
 ## 2026-07-09 — Ranking PIT feature-store foundation
 
 - Added a shared versioned ranking feature contract and deterministic `as_of_ts`

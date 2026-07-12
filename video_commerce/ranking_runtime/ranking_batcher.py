@@ -15,10 +15,18 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from video_commerce.common.cache_codec import json_dumps, json_loads
-from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
+from video_commerce.common.models import (
+    CandidateProduct,
+    ProductRecommendation,
+    UserFeatures,
+)
 from video_commerce.ml.ranking import RankingModel
 from video_commerce.ranking_runtime.ranking_coordinator_client import MAX_FRAME_BYTES
-from video_commerce.ranking_runtime.ranking_payloads import coerce_candidate, coerce_user_features, model_payload
+from video_commerce.ranking_runtime.ranking_payloads import (
+    coerce_candidate,
+    coerce_user_features,
+    model_payload,
+)
 from video_commerce.ranking_runtime.ranking_runner_client import (
     RankingRunnerTimeout,
     RankingRunnerUnavailable,
@@ -102,7 +110,7 @@ def normalize_ranking_batch_payloads(raw_payload: Any) -> List[Dict[str, Any]]:
         requests = raw_payload.get("requests")
         if not isinstance(requests, list):
             return []
-        if raw_payload.get("payload_version") != 2:
+        if raw_payload.get("payload_version") not in {2, 3}:
             return requests
 
         batch_metadata_map = raw_payload.get("product_metadata_map") or {}
@@ -126,8 +134,7 @@ def normalize_ranking_batch_payloads(raw_payload: Any) -> List[Dict[str, Any]]:
                 request_metadata_map = {
                     str(product_id): batch_metadata_map[str(product_id)]
                     for product_id in product_ids
-                    if product_id is not None
-                    and str(product_id) in batch_metadata_map
+                    if product_id is not None and str(product_id) in batch_metadata_map
                 }
             normalized_requests.append(
                 {
@@ -932,10 +939,18 @@ class RankingBatcher:
                 }
             )
         return {
-            "payload_version": 2,
+            "payload_version": 3 if self._remote_payload_v3_supported() else 2,
             "product_metadata_map": product_metadata_map,
             "requests": requests,
         }
+
+    def _remote_payload_v3_supported(self) -> bool:
+        if self.runner_pool is None:
+            return True
+        supports_version = getattr(
+            self.runner_pool, "supports_batch_payload_version", None
+        )
+        return bool(supports_version and supports_version(3))
 
     def _remote_payload_v2_supported(self) -> bool:
         if not self.runner_payload_v2_enabled:
@@ -954,9 +969,7 @@ class RankingBatcher:
 
         self._record_direct("runner_payload_v2_capability_mismatch")
         if not self._runner_payload_v2_capability_warning_logged:
-            logger.warning(
-                "ranking_runner_payload_v2_disabled_capability_mismatch"
-            )
+            logger.warning("ranking_runner_payload_v2_disabled_capability_mismatch")
             self._runner_payload_v2_capability_warning_logged = True
         return False
 
@@ -1005,9 +1018,7 @@ class RankingBatcher:
             if result_index < 0 or result_index >= len(batch):
                 raise RankingQueueTimeoutError("ranking_runner_invalid_response")
             if result_index in seen_indexes:
-                raise RankingQueueTimeoutError(
-                    "ranking_runner_incomplete_response"
-                )
+                raise RankingQueueTimeoutError("ranking_runner_incomplete_response")
             seen_indexes.add(result_index)
 
             if not isinstance(recommendation_payloads, list):

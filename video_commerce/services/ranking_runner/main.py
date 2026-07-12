@@ -20,7 +20,10 @@ from video_commerce.common.config import Config
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.ml.ranking import RankingModel
-from video_commerce.ranking_runtime.ranking_batcher import normalize_ranking_batch_payloads, run_ranking_batch_payloads
+from video_commerce.ranking_runtime.ranking_batcher import (
+    normalize_ranking_batch_payloads,
+    run_ranking_batch_payloads,
+)
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     HEALTH_OPERATION,
     METRICS_OPERATION,
@@ -29,7 +32,10 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
     read_frame,
 )
 from video_commerce.ranking_runtime.ranking_runner_client import BATCH_RANK_OPERATION
-from video_commerce.common.service_common import ServiceRuntime, configure_service_logging
+from video_commerce.common.service_common import (
+    ServiceRuntime,
+    configure_service_logging,
+)
 from video_commerce.data_plane.system_store import SystemStore
 
 
@@ -448,8 +454,8 @@ class RankingRunner:
             "service": self.runtime.service_name,
             "checks": {"ranking_model": ranking_health},
             "process_id": os.getpid(),
-            "batch_payload_versions": [1, 2],
-            "capabilities": {"batch_payload_versions": [1, 2]},
+            "batch_payload_versions": [1, 2, 3],
+            "capabilities": {"batch_payload_versions": [1, 2, 3]},
         }
         self.runtime.observability.record_request(
             "GET",
