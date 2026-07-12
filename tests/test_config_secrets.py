@@ -150,7 +150,9 @@ def test_feature_pipeline_defaults_to_official_flink(monkeypatch):
 def test_config_reads_feature_lake_pit_training_env(monkeypatch):
     monkeypatch.setenv("FEATURE_LAKE_ENABLED", "true")
     monkeypatch.setenv("FEATURE_LAKE_CATALOG_URI", "http://iceberg-rest:8181")
-    monkeypatch.setenv("FEATURE_LAKE_WAREHOUSE_URI", "s3://video-commerce-features/warehouse")
+    monkeypatch.setenv(
+        "FEATURE_LAKE_WAREHOUSE_URI", "s3://video-commerce-features/warehouse"
+    )
     monkeypatch.setenv("FEATURE_LAKE_TRAINING_SOURCE", "pit")
     monkeypatch.setenv("FEATURE_LAKE_PIT_SHADOW_ENABLED", "true")
     monkeypatch.setenv(
@@ -158,6 +160,14 @@ def test_config_reads_feature_lake_pit_training_env(monkeypatch):
         "s3://video-commerce-features/training/ranking-pit.jsonl",
     )
     monkeypatch.setenv("FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS", "168")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED", "true")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_SCHEDULE_HOUR_UTC", "2")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_ORCHESTRATOR_LEASE_SECONDS", "7200")
+    monkeypatch.setenv("FEATURE_LAKE_FLINK_JOBMANAGER", "flink-jobmanager:8081")
+    monkeypatch.setenv(
+        "FEATURE_LAKE_PIT_EXPORT_URI",
+        "s3://video-commerce-features/training/ranking-pit",
+    )
     monkeypatch.delenv("ENVIRONMENT", raising=False)
 
     reset_config()
@@ -168,6 +178,10 @@ def test_config_reads_feature_lake_pit_training_env(monkeypatch):
     assert config.feature_lake_config.training_source == "pit"
     assert config.feature_lake_config.pit_shadow_enabled is True
     assert config.feature_lake_config.attribution_window_hours == 168
+    assert config.feature_lake_config.pit_orchestrator_enabled is True
+    assert config.feature_lake_config.pit_schedule_hour_utc == 2
+    assert config.feature_lake_config.pit_orchestrator_lease_seconds == 7200
+    assert config.feature_lake_config.flink_jobmanager == "flink-jobmanager:8081"
 
     reset_config()
 

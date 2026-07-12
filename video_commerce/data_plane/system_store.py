@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     Index,
     Integer,
@@ -713,6 +714,49 @@ class FeatureHistoryBackfillRun(Base):
     )
 
 
+class PitMaterializationRun(Base):
+    __tablename__ = "pit_materialization_runs"
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    phase: Mapped[str] = mapped_column(String(32), nullable=False, default="export")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    export_attempt: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    flink_job_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    worker_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    snapshot_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    manifest_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    row_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    quarantine_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    training_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    training_worker_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    training_lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    trained_model_version: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+
+
 class ModelCheckpoint(Base):
     __tablename__ = "model_checkpoints"
 
@@ -720,12 +764,24 @@ class ModelCheckpoint(Base):
     model_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     model_version: Mapped[str] = mapped_column(String(128), nullable=False)
     checkpoint_path: Mapped[str] = mapped_column(Text, nullable=False)
+    materialization_run_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
     payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
     )
+
+
+Index(
+    "uq_model_checkpoints_pit_run",
+    ModelCheckpoint.model_name,
+    ModelCheckpoint.materialization_run_id,
+    unique=True,
+    postgresql_where=ModelCheckpoint.materialization_run_id.is_not(None),
+)
 
 
 Index("ix_interaction_events_occurred_at_desc", InteractionEvent.occurred_at.desc())
@@ -785,6 +841,18 @@ Index(
     FeatureHistoryBackfillRun.range_end,
     unique=True,
     postgresql_where=FeatureHistoryBackfillRun.status == "active",
+)
+Index(
+    "ix_pit_materialization_runs_status_lease",
+    PitMaterializationRun.status,
+    PitMaterializationRun.lease_expires_at,
+    PitMaterializationRun.cutoff_at,
+)
+Index(
+    "uq_pit_single_running_materialization",
+    PitMaterializationRun.status,
+    unique=True,
+    postgresql_where=PitMaterializationRun.status == "running",
 )
 
 
@@ -2138,6 +2206,395 @@ class SystemStore:
         oldest_age = max(0.0, (_utc_now() - oldest).total_seconds()) if oldest else 0.0
         return {"pending": int(pending or 0), "oldest_age_seconds": oldest_age}
 
+    @staticmethod
+    def _pit_materialization_run_dict(
+        row: PitMaterializationRun, *, claimed: bool
+    ) -> Dict[str, Any]:
+        return {
+            "run_id": row.run_id,
+            "cutoff_ts": row.cutoff_at.timestamp(),
+            "status": row.status,
+            "phase": row.phase,
+            "attempts": row.attempts,
+            "export_attempt": row.export_attempt,
+            "flink_job_id": row.flink_job_id,
+            "worker_id": row.worker_id,
+            "lease_expires_at": (
+                row.lease_expires_at.timestamp() if row.lease_expires_at else None
+            ),
+            "snapshot_id": row.snapshot_id,
+            "manifest_uri": row.manifest_uri,
+            "row_count": row.row_count,
+            "quarantine_count": row.quarantine_count,
+            "last_error": row.last_error,
+            "claimed": claimed,
+        }
+
+    async def claim_pit_materialization_run(
+        self,
+        *,
+        run_id: str,
+        cutoff_ts: float,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> Dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("PIT materialization orchestration requires Postgres")
+        cutoff_at = _coerce_datetime(cutoff_ts)
+        if cutoff_at is None:
+            raise ValueError("PIT materialization cutoff must be a Unix timestamp")
+        now = _utc_now()
+        lease_until = now + timedelta(seconds=max(60, int(lease_seconds)))
+        async with self.session_factory.begin() as session:
+            await session.execute(select(func.pg_advisory_xact_lock(1_947_420_117)))
+            active_result = await session.execute(
+                select(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id != run_id,
+                    PitMaterializationRun.status == "running",
+                )
+                .order_by(PitMaterializationRun.cutoff_at)
+                .with_for_update()
+            )
+            active = active_result.scalars().first()
+            if active is not None:
+                lease_valid = (
+                    active.lease_expires_at is not None
+                    and active.lease_expires_at >= now
+                )
+                if lease_valid:
+                    return self._pit_materialization_run_dict(active, claimed=False)
+                active.attempts += 1
+                active.worker_id = worker_id
+                active.lease_expires_at = lease_until
+                active.last_error = None
+                active.completed_at = None
+                active.updated_at = now
+                await session.flush()
+                return self._pit_materialization_run_dict(active, claimed=True)
+            await session.execute(
+                pg_insert(PitMaterializationRun)
+                .values(
+                    run_id=run_id,
+                    cutoff_at=cutoff_at,
+                    status="pending",
+                    phase="export",
+                    attempts=0,
+                )
+                .on_conflict_do_nothing(index_elements=[PitMaterializationRun.run_id])
+            )
+            result = await session.execute(
+                select(PitMaterializationRun)
+                .where(PitMaterializationRun.run_id == run_id)
+                .with_for_update()
+            )
+            row = result.scalar_one()
+            if row.cutoff_at != cutoff_at:
+                raise RuntimeError(
+                    "PIT materialization run_id already exists with a different cutoff"
+                )
+            terminal = row.status in {"completed", "waiting_for_eligible_rows"}
+            lease_held = (
+                row.status == "running"
+                and row.lease_expires_at is not None
+                and row.lease_expires_at >= now
+                and row.worker_id != worker_id
+            )
+            if terminal or lease_held:
+                return self._pit_materialization_run_dict(row, claimed=False)
+            row.status = "running"
+            row.attempts += 1
+            row.worker_id = worker_id
+            row.lease_expires_at = lease_until
+            row.last_error = None
+            row.completed_at = None
+            row.updated_at = now
+            await session.flush()
+            return self._pit_materialization_run_dict(row, claimed=True)
+
+    async def mark_pit_materialization_phase(
+        self,
+        run_id: str,
+        *,
+        phase: str,
+        worker_id: str,
+        export_attempt: Optional[int] = None,
+        flink_job_id: Optional[str] = None,
+        lease_seconds: Optional[int] = None,
+    ) -> None:
+        if phase not in {"export", "flink", "manifest"}:
+            raise ValueError(
+                "PIT materialization phase must be export, flink, or manifest"
+            )
+        now = _utc_now()
+        updates: Dict[str, Any] = {"phase": phase, "updated_at": now}
+        if export_attempt is not None:
+            updates["export_attempt"] = max(1, int(export_attempt))
+        if flink_job_id is not None:
+            normalized_job_id = str(flink_job_id).strip().lower()
+            if len(normalized_job_id) != 32:
+                raise ValueError("Flink job ID must be 32 hexadecimal characters")
+            int(normalized_job_id, 16)
+            updates["flink_job_id"] = normalized_job_id
+        if lease_seconds is not None:
+            updates["lease_expires_at"] = now + timedelta(
+                seconds=max(60, int(lease_seconds))
+            )
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.status == "running",
+                    PitMaterializationRun.worker_id == worker_id,
+                    PitMaterializationRun.lease_expires_at >= now,
+                )
+                .values(**updates)
+            )
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError("PIT materialization phase update lost its lease")
+
+    async def renew_pit_materialization_lease(
+        self, run_id: str, *, worker_id: str, lease_seconds: int
+    ) -> None:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.status == "running",
+                    PitMaterializationRun.worker_id == worker_id,
+                    PitMaterializationRun.lease_expires_at >= now,
+                )
+                .values(
+                    lease_expires_at=now
+                    + timedelta(seconds=max(60, int(lease_seconds))),
+                    updated_at=now,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError("PIT materialization lease renewal lost ownership")
+
+    async def complete_pit_materialization_run(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        snapshot_id: str,
+        manifest_uri: str,
+        row_count: int,
+        quarantine_count: int,
+    ) -> None:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.status == "running",
+                    PitMaterializationRun.worker_id == worker_id,
+                    PitMaterializationRun.lease_expires_at >= now,
+                )
+                .values(
+                    status="completed",
+                    phase="manifest",
+                    snapshot_id=str(snapshot_id),
+                    manifest_uri=str(manifest_uri),
+                    row_count=max(0, int(row_count)),
+                    quarantine_count=max(0, int(quarantine_count)),
+                    worker_id=None,
+                    lease_expires_at=None,
+                    last_error=None,
+                    completed_at=now,
+                    updated_at=now,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError("PIT materialization completion lost its lease")
+
+    async def mark_pit_materialization_waiting(
+        self, run_id: str, *, worker_id: str
+    ) -> None:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.status == "running",
+                    PitMaterializationRun.worker_id == worker_id,
+                    PitMaterializationRun.lease_expires_at >= now,
+                )
+                .values(
+                    status="waiting_for_eligible_rows",
+                    phase="export",
+                    export_attempt=None,
+                    flink_job_id=None,
+                    worker_id=None,
+                    lease_expires_at=None,
+                    completed_at=now,
+                    updated_at=now,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError("PIT materialization waiting update lost its lease")
+
+    async def fail_pit_materialization_run(
+        self, run_id: str, *, worker_id: str, error: str
+    ) -> None:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.status == "running",
+                    PitMaterializationRun.worker_id == worker_id,
+                )
+                .values(
+                    status="failed",
+                    worker_id=None,
+                    lease_expires_at=None,
+                    last_error=str(error)[:4096],
+                    updated_at=now,
+                )
+            )
+
+    async def claim_pit_training_run(
+        self, *, run_id: str, worker_id: str, lease_seconds: int
+    ) -> Dict[str, Any]:
+        now = _utc_now()
+        lease_until = now + timedelta(seconds=max(300, int(lease_seconds)))
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(PitMaterializationRun)
+                .where(PitMaterializationRun.run_id == run_id)
+                .with_for_update()
+            )
+            row = result.scalar_one_or_none()
+            if row is None or row.status != "completed":
+                raise RuntimeError(
+                    "PIT training requires a completed materialization run"
+                )
+            completed = row.training_status == "completed"
+            held = (
+                row.training_status == "running"
+                and row.training_lease_expires_at is not None
+                and row.training_lease_expires_at >= now
+                and row.training_worker_id != worker_id
+            )
+            if completed or held:
+                return {
+                    "claimed": False,
+                    "status": row.training_status,
+                    "model_version": row.trained_model_version,
+                }
+            row.training_status = "running"
+            row.training_worker_id = worker_id
+            row.training_lease_expires_at = lease_until
+            row.updated_at = now
+            return {"claimed": True, "status": "running"}
+
+    async def get_pit_operational_metrics(self) -> Dict[str, Any]:
+        now = _utc_now()
+        async with self.session_factory() as session:
+            latest_result = await session.execute(
+                select(PitMaterializationRun)
+                .order_by(desc(PitMaterializationRun.cutoff_at))
+                .limit(1)
+            )
+            latest = latest_result.scalar_one_or_none()
+            running_result = await session.execute(
+                select(PitMaterializationRun)
+                .where(PitMaterializationRun.status == "running")
+                .limit(1)
+            )
+            running = running_result.scalar_one_or_none()
+            success_result = await session.execute(
+                select(func.max(PitMaterializationRun.completed_at)).where(
+                    PitMaterializationRun.status == "completed"
+                )
+            )
+            last_success = success_result.scalar_one_or_none()
+        return {
+            "last_success_timestamp": (
+                last_success.timestamp() if last_success is not None else 0.0
+            ),
+            "waiting_for_rows": bool(
+                latest is not None and latest.status == "waiting_for_eligible_rows"
+            ),
+            "run_in_progress": running is not None,
+            "lease_expired": bool(
+                running is not None
+                and running.lease_expires_at is not None
+                and running.lease_expires_at < now
+            ),
+        }
+
+    async def renew_pit_training_lease(
+        self, *, run_id: str, worker_id: str, lease_seconds: int
+    ) -> None:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.training_status == "running",
+                    PitMaterializationRun.training_worker_id == worker_id,
+                    PitMaterializationRun.training_lease_expires_at >= now,
+                )
+                .values(
+                    training_lease_expires_at=now
+                    + timedelta(seconds=max(300, int(lease_seconds))),
+                    updated_at=now,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError("PIT training lease renewal lost ownership")
+
+    async def complete_pit_training_run(
+        self, *, run_id: str, worker_id: str, model_version: str
+    ) -> None:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.training_status == "running",
+                    PitMaterializationRun.training_worker_id == worker_id,
+                    PitMaterializationRun.training_lease_expires_at >= now,
+                )
+                .values(
+                    training_status="completed",
+                    training_worker_id=None,
+                    training_lease_expires_at=None,
+                    trained_model_version=str(model_version),
+                    updated_at=now,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError("PIT training completion lost its lease")
+
+    async def fail_pit_training_run(self, *, run_id: str, worker_id: str) -> None:
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.training_status == "running",
+                    PitMaterializationRun.training_worker_id == worker_id,
+                )
+                .values(
+                    training_status="failed",
+                    training_worker_id=None,
+                    training_lease_expires_at=None,
+                    updated_at=_utc_now(),
+                )
+            )
+
     async def start_feature_history_backfill(
         self,
         *,
@@ -2396,20 +2853,35 @@ class SystemStore:
         model_version: str,
         checkpoint_path: str,
         payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         if not self.enabled:
-            return
+            return False
 
+        record_payload = payload or {}
+        materialization_run_id = (
+            str(record_payload.get("feature_lake_materialization_run_id") or "").strip()
+            or None
+        )
         async with self.session_factory.begin() as session:
-            session.add(
-                ModelCheckpoint(
+            result = await session.execute(
+                pg_insert(ModelCheckpoint)
+                .values(
                     model_name=model_name,
                     model_version=model_version,
                     checkpoint_path=checkpoint_path,
-                    payload=payload or {},
+                    materialization_run_id=materialization_run_id,
+                    payload=record_payload,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        ModelCheckpoint.model_name,
+                        ModelCheckpoint.materialization_run_id,
+                    ],
+                    index_where=ModelCheckpoint.materialization_run_id.is_not(None),
                 )
             )
         self._update_pool_metrics()
+        return int(result.rowcount or 0) == 1
 
     async def get_latest_model_checkpoint(
         self, model_name: str
@@ -2430,6 +2902,31 @@ class SystemStore:
         if row is None:
             return None
 
+        return {
+            "id": row.id,
+            "model_name": row.model_name,
+            "model_version": row.model_version,
+            "checkpoint_path": row.checkpoint_path,
+            "payload": row.payload or {},
+            "created_at": row.created_at.timestamp() if row.created_at else None,
+        }
+
+    async def get_model_checkpoint_for_materialization_run(
+        self, model_name: str, materialization_run_id: str
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelCheckpoint).where(
+                    ModelCheckpoint.model_name == model_name,
+                    ModelCheckpoint.materialization_run_id
+                    == str(materialization_run_id),
+                )
+            )
+            row = result.scalar_one_or_none()
+        if row is None:
+            return None
         return {
             "id": row.id,
             "model_name": row.model_name,

@@ -21,3 +21,37 @@ tests:
             exp_annotations:
               summary: "gateway-api 5xx rate is above the 5% error budget burn threshold"
               description: "gateway-api has exceeded the 5xx error budget for at least 10 minutes."
+
+  - interval: 1m
+    input_series:
+      - series: 'pit_orchestrator_run_in_progress{job="pit-state-exporter"}'
+        values: '1x130'
+    alert_rule_test:
+      - eval_time: 125m
+        alertname: PitOrchestratorRunStuck
+        exp_alerts:
+          - exp_labels:
+              job: pit-state-exporter
+              severity: critical
+            exp_annotations:
+              summary: "PIT orchestrator run exceeded its lease duration"
+              description: "The durable run remains active beyond the two-hour lease and requires takeover or investigation."
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_worker_training_runs_total{job="model-trainer",trigger="scheduled",status="error"}'
+        values: '0+1x30'
+      - series: 'pit_trainer_waiting_for_manifest{job="model-trainer"}'
+        values: '0x31'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PitTrainerManifestFailure
+        exp_alerts:
+          - exp_labels:
+              job: model-trainer
+              severity: critical
+              status: error
+              trigger: scheduled
+            exp_annotations:
+              summary: "PIT manifest exists but typed training continues to fail"
+              description: "The trainer has failed closed; inspect manifest, shard hash, schema, and version errors."

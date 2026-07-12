@@ -1,10 +1,17 @@
+import asyncio
 import numpy as np
 import pytest
+import threading
+import time
 
 from video_commerce.common.config import RankingConfig
 from video_commerce.common.models import CandidateProduct, UserFeatures
 from video_commerce.ml.ranking import FeatureExtractor, RankingModel
 from video_commerce.ml.ranking_features import FeatureBundle, RankingFeatureAssembler
+from video_commerce.ml.ranking_training import (
+    AttributionFacts,
+    RankingTrainingExample,
+)
 
 
 def _bundle() -> FeatureBundle:
@@ -125,6 +132,53 @@ def test_online_request_matrix_routes_through_shared_assembler(monkeypatch):
     assert calls[0].as_of_ts == bundle.as_of_ts
 
 
+@pytest.mark.asyncio
+async def test_untrained_ranker_uses_candidate_score_fallback(monkeypatch):
+    class ObservabilitySpy:
+        calls = 0
+
+        def record_ranking_untrained_fallback(self):
+            self.calls += 1
+
+    observability = ObservabilitySpy()
+    ranking = RankingModel(
+        RankingConfig(offload_inference_to_thread=False),
+        observability=observability,
+    )
+    await ranking.load_model()
+    assert ranking.is_trained is False
+    ranking.model = None
+
+    monkeypatch.setattr(
+        ranking,
+        "prepare_request_matrix",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("untrained neural inference executed")
+        ),
+    )
+    recommendations, profile = await ranking.rank_candidates(
+        [
+            CandidateProduct(product_id="low", combined_score=0.2, source="test"),
+            CandidateProduct(product_id="high", combined_score=0.9, source="test"),
+            CandidateProduct(
+                product_id="zero",
+                combined_score=0.0,
+                collaborative_score=1.0,
+                source="test",
+            ),
+        ],
+        UserFeatures(user_id="u1"),
+        {},
+        k=3,
+        include_profile=True,
+    )
+
+    assert [item.product_id for item in recommendations] == ["high", "low", "zero"]
+    assert profile["path"] == "fallback_untrained"
+    assert ranking.untrained_fallback_count == 1
+    assert observability.calls == 1
+
+
 def test_ranking_training_uses_pit_bundle_and_observation_timestamp(monkeypatch):
     ranking = RankingModel(RankingConfig())
     captured = {}
@@ -158,3 +212,42 @@ def test_ranking_training_uses_pit_bundle_and_observation_timestamp(monkeypatch)
     assert captured["user_features"].total_interactions == 3
     assert captured["product_metadata"]["price"] == 9.0
     assert captured["as_of_ts"] == pytest.approx(1_700_000_123.0)
+
+
+@pytest.mark.asyncio
+async def test_async_training_cancellation_waits_for_sync_worker_exit(monkeypatch):
+    ranking = RankingModel(RankingConfig(training_min_samples=1))
+    worker_started = threading.Event()
+    worker_stopped = threading.Event()
+    cancellation_event = threading.Event()
+
+    def cancellable_sync_worker(
+        _training_data,
+        _training_sample_source,
+        *,
+        cancellation_event,
+        **_kwargs,
+    ):
+        worker_started.set()
+        while not cancellation_event.is_set():
+            time.sleep(0.001)
+        worker_stopped.set()
+        return None
+
+    monkeypatch.setattr(ranking, "_train_model_sync", cancellable_sync_worker)
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=_bundle(),
+        attribution=AttributionFacts("click", True, False),
+    )
+    task = asyncio.create_task(
+        ranking.train_model([example], cancellation_event=cancellation_event)
+    )
+    assert await asyncio.to_thread(worker_started.wait, 1.0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert worker_stopped.is_set()

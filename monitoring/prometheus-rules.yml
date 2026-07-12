@@ -292,3 +292,57 @@ groups:
         annotations:
           summary: Point-in-time leakage rows detected
           description: One or more training rows used a future or unavailable feature.
+
+      - alert: PitDailyRunMissing
+        expr: |
+          (pit_orchestrator_last_success_timestamp{job="pit-state-exporter"} == 0
+            and time() - pit_orchestrator_start_timestamp{job="pit-state-exporter"} > 93600)
+          or
+          (pit_orchestrator_last_success_timestamp{job="pit-state-exporter"} > 0
+            and time() - pit_orchestrator_last_success_timestamp{job="pit-state-exporter"} > 93600)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: No successful PIT dataset run for more than 26 hours
+          description: Inspect the durable run state, Flink submission, and manifest publication stages.
+
+      - alert: PitTrainerManifestFailure
+        expr: |
+          increase(video_commerce_worker_training_runs_total{status="error"}[30m]) > 0
+          and on(job) pit_trainer_waiting_for_manifest == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT manifest exists but typed training continues to fail
+          description: The trainer has failed closed; inspect manifest, shard hash, schema, and version errors.
+
+      - alert: PitOrchestratorRunStuck
+        expr: pit_orchestrator_run_in_progress{job="pit-state-exporter"} == 1
+        for: 2h
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT orchestrator run exceeded its lease duration
+          description: The durable run remains active beyond the two-hour lease and requires takeover or investigation.
+
+      - alert: PitOrchestratorLeaseExpired
+        expr: pit_orchestrator_lease_expired{job="pit-state-exporter"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT orchestrator lease expired
+          description: A durable running PIT job has stopped renewing its lease and requires takeover.
+
+      - alert: RankingArtifactFallbackPersisting
+        expr: |
+          sum(increase(video_commerce_worker_training_runs_total{status="success"}[24h])) > 0
+          and sum(rate(ranking_untrained_fallback_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: Serving still uses untrained fallback after PIT artifact creation
+          description: Check artifact activation, checksum sync, and ranking runner reload state.

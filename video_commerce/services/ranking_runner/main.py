@@ -86,7 +86,10 @@ class RankingRunner:
             recommendation_config=self.config.recommendation_config,
         )
 
-        self.ranking_model = RankingModel(self.config.ranking_config)
+        self.ranking_model = RankingModel(
+            self.config.ranking_config,
+            observability=self.runtime.observability,
+        )
         ranking_checkpoint = (
             await self.artifact_manager.sync_latest_ranking_checkpoint()
         )

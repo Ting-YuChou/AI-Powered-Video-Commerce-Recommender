@@ -1132,7 +1132,10 @@ async def startup_event():
     await recommendation_engine.load_serving_state()
 
     if _should_initialize_local_ranker(runtime):
-        ranking_model = RankingModel(runtime.config.ranking_config)
+        ranking_model = RankingModel(
+            runtime.config.ranking_config,
+            observability=runtime.observability,
+        )
         ranking_checkpoint = None
         if artifact_manager:
             ranking_checkpoint = await artifact_manager.sync_latest_ranking_checkpoint()

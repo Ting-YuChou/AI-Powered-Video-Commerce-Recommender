@@ -174,15 +174,82 @@ class PitManifestPublisher:
             "max_as_of_ts": max_as_of,
             "shards": shards,
         }
+        existing_manifest = await self._read_json_if_exists(manifest_uri)
+        latest_pointer = {
+            "manifest_uri": manifest_uri,
+            "materialization_run_id": run_id,
+            "attribution_cutoff": float(attribution_cutoff),
+        }
+        if existing_manifest is not None:
+            if existing_manifest != manifest:
+                raise PitTrainingDatasetError(
+                    "existing immutable PIT manifest conflicts with retry payload"
+                )
+            await self._write_latest_pointer(latest_uri, latest_pointer)
+            return latest_uri
         await self._write_json(manifest_uri, manifest, create_only=True)
-        await self._write_json(
-            latest_uri,
-            {
-                "manifest_uri": manifest_uri,
-                "materialization_run_id": run_id,
-            },
-        )
+        await self._write_latest_pointer(latest_uri, latest_pointer)
         return latest_uri
+
+    async def _write_latest_pointer(
+        self, latest_uri: str, pointer: Dict[str, Any]
+    ) -> None:
+        existing = await self._read_json_if_exists(latest_uri)
+        if existing is not None:
+            existing_cutoff = float(existing.get("attribution_cutoff") or 0.0)
+            new_cutoff = float(pointer["attribution_cutoff"])
+            if existing_cutoff > new_cutoff:
+                return
+            if (
+                existing_cutoff == new_cutoff
+                and existing.get("materialization_run_id")
+                != pointer["materialization_run_id"]
+            ):
+                raise PitTrainingDatasetError(
+                    "PIT latest pointer cutoff conflicts with another run"
+                )
+        await self._write_json(latest_uri, pointer)
+
+    async def _read_json_if_exists(self, uri: str) -> Dict[str, Any] | None:
+        if not uri.startswith("s3://"):
+            path = Path(uri)
+            if not path.exists():
+                return None
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise PitTrainingDatasetError(
+                    f"existing PIT manifest cannot be read: {uri}"
+                ) from exc
+        try:
+            path, should_delete = await self.object_storage.materialize_for_processing(
+                uri, suggested_suffix=".json"
+            )
+        except Exception as exc:
+            if self._is_not_found(exc):
+                return None
+            raise PitTrainingDatasetError(
+                f"existing PIT manifest cannot be read: {uri}"
+            ) from exc
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PitTrainingDatasetError(
+                f"existing PIT manifest cannot be read: {uri}"
+            ) from exc
+        finally:
+            if should_delete and os.path.exists(path):
+                os.remove(path)
+
+    @staticmethod
+    def _is_not_found(exc: Exception) -> bool:
+        if isinstance(exc, FileNotFoundError):
+            return True
+        response = getattr(exc, "response", None)
+        if not isinstance(response, dict):
+            return False
+        code = str((response.get("Error") or {}).get("Code") or "")
+        return code in {"404", "NoSuchKey", "NotFound"}
 
     async def _write_json(
         self, uri: str, payload: Dict[str, Any], *, create_only: bool = False
@@ -283,11 +350,15 @@ async def _main() -> None:
         raise PitTrainingDatasetError("run ID, export URI, and cutoff are required")
     storage = ObjectStorage(config.object_storage_config)
     await storage.initialize()
-    shard_prefix = f"{export_prefix.rstrip('/')}/runs/{run_id}/shards"
+    export_attempt = max(1, int(os.environ.get("FEATURE_LAKE_EXPORT_ATTEMPT", "1")))
+    shard_prefix = (
+        f"{export_prefix.rstrip('/')}/runs/{run_id}/attempts/"
+        f"{export_attempt}/shards"
+    )
     shard_objects = await storage.list_storage_uris(shard_prefix)
     shards = [uri for uri in shard_objects if _is_parquet_shard_uri(uri)]
     snapshot_id, iceberg_row_count, quarantine_row_count = await asyncio.to_thread(
-        _load_pinned_iceberg_run,
+        load_pinned_iceberg_run,
         catalog_uri=feature_lake.catalog_uri,
         warehouse_uri=feature_lake.warehouse_uri,
         namespace=feature_lake.namespace,
@@ -312,7 +383,7 @@ async def _main() -> None:
     )
 
 
-def _load_pinned_iceberg_run(
+def load_pinned_iceberg_run(
     *, catalog_uri: str, warehouse_uri: str, namespace: str, storage: Any, run_id: str
 ) -> tuple[str, int, int]:
     from pyiceberg.catalog import load_catalog
@@ -335,16 +406,12 @@ def _load_pinned_iceberg_run(
     table = catalog.load_table(f"{namespace}.ranking_training_pit")
     snapshot = table.current_snapshot()
     if snapshot is None:
-        raise PitTrainingDatasetError("ranking_training_pit has no committed snapshot")
+        return "", 0, 0
     rows = table.scan(
         row_filter=EqualTo("materialization_run_id", run_id),
         selected_fields=("observation_id",),
         snapshot_id=snapshot.snapshot_id,
     ).to_arrow()
-    if rows.num_rows <= 0:
-        raise PitTrainingDatasetError(
-            "committed PIT snapshot contains no rows for run ID"
-        )
     quarantine = catalog.load_table(f"{namespace}.ranking_training_pit_quarantine")
     quarantine_snapshot = quarantine.current_snapshot()
     quarantine_rows = 0
@@ -359,6 +426,9 @@ def _load_pinned_iceberg_run(
             .num_rows
         )
     return str(snapshot.snapshot_id), rows.num_rows, quarantine_rows
+
+
+_load_pinned_iceberg_run = load_pinned_iceberg_run
 
 
 if __name__ == "__main__":

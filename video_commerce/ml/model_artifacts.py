@@ -303,10 +303,19 @@ class ModelArtifactManager:
             return None
 
         artifact_sha256 = ObjectStorage.calculate_sha256(local_path)
+        materialization_run_id = str(
+            (payload or {}).get("feature_lake_materialization_run_id") or ""
+        ).strip()
+        storage_version = model_version
+        if materialization_run_id:
+            # A trainer whose lease expires during an in-flight S3 upload must
+            # never overwrite the winner's bytes. Content-address the PIT object
+            # while keeping the externally visible model version deterministic.
+            storage_version = f"{model_version}-{artifact_sha256[:16]}"
         persisted_path = await self._persist_artifact(
             local_path=local_path,
             model_name=self.RANKING_MODEL_NAME,
-            model_version=model_version,
+            model_version=storage_version,
         )
         record_payload = dict(payload or {})
         record_payload.update(
@@ -322,18 +331,59 @@ class ModelArtifactManager:
                 },
             }
         )
-        await self.system_store.record_model_checkpoint(
+        inserted = await self.system_store.record_model_checkpoint(
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
             checkpoint_path=persisted_path,
             payload=record_payload,
         )
+        if inserted is False:
+            if not materialization_run_id:
+                raise RuntimeError("ranking checkpoint record was not persisted")
+            existing = (
+                await self.system_store.get_model_checkpoint_for_materialization_run(
+                    self.RANKING_MODEL_NAME,
+                    materialization_run_id,
+                )
+            )
+            if existing is None:
+                raise RuntimeError(
+                    "PIT ranking checkpoint conflict has no durable winner"
+                )
+            await self._verify_existing_checkpoint(existing)
+            return ModelArtifactRecord(
+                model_name=str(existing["model_name"]),
+                model_version=str(existing["model_version"]),
+                checkpoint_path=str(existing["checkpoint_path"]),
+                payload=dict(existing.get("payload") or {}),
+            )
         return ModelArtifactRecord(
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
             checkpoint_path=persisted_path,
             payload=record_payload,
         )
+
+    async def _verify_existing_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        path = str(checkpoint.get("checkpoint_path") or "").strip()
+        payload = dict(checkpoint.get("payload") or {})
+        expected_sha256 = str(payload.get("artifact_sha256") or "").strip()
+        if not path or len(expected_sha256) != 64:
+            raise RuntimeError("existing PIT ranking checkpoint is incomplete")
+        if self.object_storage is None:
+            ObjectStorage.verify_sha256(path, expected_sha256)
+            return
+        (
+            local_path,
+            should_delete,
+        ) = await self.object_storage.materialize_for_processing(
+            path, suggested_suffix=Path(path).suffix or ".pt"
+        )
+        try:
+            ObjectStorage.verify_sha256(local_path, expected_sha256)
+        finally:
+            if should_delete and os.path.exists(local_path):
+                os.remove(local_path)
 
     async def persist_ranking_shadow_checkpoint(
         self,

@@ -33,8 +33,12 @@ def readiness_reasons(
     for partition in sorted(partitions):
         committed = int(committed_offsets.get(partition, -1))
         end = int(end_offsets.get(partition, 0))
-        if committed < 0 or committed < end:
-            reasons.append(f"consumer_lag:{partition}:{max(0, end - committed)}")
+        if committed < 0:
+            if end > 0:
+                reasons.append(f"consumer_lag:{partition}:{end}")
+            continue
+        if committed < end:
+            reasons.append(f"consumer_lag:{partition}:{end - committed}")
     return reasons
 
 
@@ -50,7 +54,13 @@ def _read_json(url: str) -> Dict[str, Any]:
 
 def _flink_status(rest_url: str, job_name: str) -> tuple[str, int]:
     overview = _read_json(f"{rest_url.rstrip('/')}/jobs/overview")
-    matches = [job for job in overview.get("jobs", []) if job.get("name") == job_name]
+    terminal_states = {"FINISHED", "CANCELED", "FAILED", "SUSPENDED"}
+    matches = [
+        job
+        for job in overview.get("jobs", [])
+        if job.get("name") == job_name
+        and str(job.get("state") or "UNKNOWN").upper() not in terminal_states
+    ]
     if len(matches) != 1:
         return "MISSING", 0
     job = matches[0]
@@ -63,10 +73,11 @@ def _flink_status(rest_url: str, job_name: str) -> tuple[str, int]:
 
 
 async def _read_kafka_offsets(
-    bootstrap_servers: str, group_id: str
+    bootstrap_servers: str, group_id: str, topics: list[str]
 ) -> tuple[dict, dict]:
     from aiokafka import AIOKafkaConsumer
     from aiokafka.admin import AIOKafkaAdminClient
+    from aiokafka.structs import TopicPartition
 
     admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap_servers)
     consumer = AIOKafkaConsumer(bootstrap_servers=bootstrap_servers)
@@ -74,9 +85,14 @@ async def _read_kafka_offsets(
     await consumer.start()
     try:
         offsets = await admin.list_consumer_group_offsets(group_id)
-        topic_partitions = list(offsets)
+        topic_partitions = set(offsets)
+        for topic in topics:
+            for partition in consumer.partitions_for_topic(topic) or set():
+                topic_partitions.add(TopicPartition(topic, partition))
         end_offsets_raw = (
-            await consumer.end_offsets(topic_partitions) if topic_partitions else {}
+            await consumer.end_offsets(list(topic_partitions))
+            if topic_partitions
+            else {}
         )
         committed = {
             f"{tp.topic}:{tp.partition}": int(metadata.offset)
@@ -92,8 +108,44 @@ async def _read_kafka_offsets(
         await admin.close()
 
 
-def _kafka_offsets(bootstrap_servers: str, group_id: str) -> tuple[dict, dict]:
-    return asyncio.run(_read_kafka_offsets(bootstrap_servers, group_id))
+def _kafka_offsets(
+    bootstrap_servers: str, group_id: str, topics: list[str]
+) -> tuple[dict, dict]:
+    return asyncio.run(_read_kafka_offsets(bootstrap_servers, group_id, topics))
+
+
+def _materializer_topics() -> list[str]:
+    topics = [
+        os.environ.get("KAFKA_USER_INTERACTIONS_TOPIC", "user-interactions"),
+        os.environ.get("KAFKA_RECOMMENDATION_EVENTS_TOPIC", "recommendation-events"),
+        os.environ.get("KAFKA_FEATURE_UPDATES_TOPIC", "feature-updates"),
+        os.environ.get("KAFKA_CATALOG_FEATURE_EVENTS_TOPIC", "catalog-feature-events"),
+    ]
+    if (
+        os.environ.get("FEATURE_HISTORY_INCLUDE_BACKFILL_TOPICS", "false").lower()
+        == "true"
+    ):
+        topics.extend(
+            [
+                os.environ.get(
+                    "KAFKA_USER_INTERACTIONS_BACKFILL_TOPIC",
+                    "user-interactions-backfill",
+                ),
+                os.environ.get(
+                    "KAFKA_RECOMMENDATION_EVENTS_BACKFILL_TOPIC",
+                    "recommendation-events-backfill",
+                ),
+                os.environ.get(
+                    "KAFKA_FEATURE_UPDATES_BACKFILL_TOPIC",
+                    "feature-updates-backfill",
+                ),
+                os.environ.get(
+                    "KAFKA_CATALOG_FEATURE_EVENTS_BACKFILL_TOPIC",
+                    "catalog-feature-events-backfill",
+                ),
+            ]
+        )
+    return topics
 
 
 def wait_until_ready() -> None:
@@ -106,6 +158,7 @@ def wait_until_ready() -> None:
     group_id = os.environ.get(
         "FEATURE_HISTORY_CONSUMER_GROUP", "feature-history-materializer-v1"
     )
+    topics = _materializer_topics()
     timeout = max(
         1, int(os.environ.get("FEATURE_LAKE_READINESS_TIMEOUT_SECONDS", "600"))
     )
@@ -116,7 +169,7 @@ def wait_until_ready() -> None:
     while time.monotonic() < deadline:
         try:
             state, checkpoint_at = _flink_status(rest_url, job_name)
-            committed, ends = _kafka_offsets(bootstrap, group_id)
+            committed, ends = _kafka_offsets(bootstrap, group_id, topics)
             last_reasons = readiness_reasons(
                 job_state=state,
                 completed_checkpoint_at_ms=checkpoint_at,

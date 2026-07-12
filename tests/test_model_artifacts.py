@@ -28,9 +28,23 @@ class FakeSystemStore:
         }
         self.recorded.append(record)
         self.latest[model_name] = record
+        return True
 
     async def get_latest_model_checkpoint(self, model_name):
         return self.latest.get(model_name)
+
+    async def get_model_checkpoint_for_materialization_run(
+        self, model_name, materialization_run_id
+    ):
+        record = self.latest.get(model_name)
+        if not record:
+            return None
+        if (
+            record["payload"].get("feature_lake_materialization_run_id")
+            != materialization_run_id
+        ):
+            return None
+        return record
 
     async def activate_product_catalog(self, source_version, metadata_map, **kwargs):
         self.catalog_activations.append(
@@ -123,14 +137,67 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
     )
 
 
-def test_persist_ranking_shadow_checkpoint_uses_non_activating_model_namespace(tmp_path):
+def test_pit_checkpoint_conflict_returns_and_verifies_existing_artifact(tmp_path):
+    existing_path = tmp_path / "ranking-existing.pt"
+    existing_path.write_bytes(b"existing-ranking")
+    existing_hash = hashlib.sha256(b"existing-ranking").hexdigest()
+    candidate_path = tmp_path / "ranking-candidate.pt"
+    candidate_path.write_bytes(b"different-ranking")
+
+    class ConflictStore(FakeSystemStore):
+        async def record_model_checkpoint(self, *args, **kwargs):
+            return False
+
+    store = ConflictStore()
+    store.latest[ModelArtifactManager.RANKING_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.RANKING_MODEL_NAME,
+        "model_version": "pit-run-42",
+        "checkpoint_path": str(existing_path),
+        "payload": {
+            "feature_lake_materialization_run_id": "run-42",
+            "artifact_sha256": existing_hash,
+        },
+        "created_at": 1.0,
+    }
+    manager = ModelArtifactManager(
+        system_store=store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
+        ),
+        model_config=ModelConfig(
+            ranking_model_path=str(candidate_path), cache_dir=str(tmp_path / "models")
+        ),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    record = asyncio.run(
+        manager.persist_ranking_checkpoint(
+            local_path=str(candidate_path),
+            model_version="pit-run-42",
+            payload={"feature_lake_materialization_run_id": "run-42"},
+        )
+    )
+
+    assert record.checkpoint_path == str(existing_path)
+    assert record.payload["artifact_sha256"] == existing_hash
+
+
+def test_persist_ranking_shadow_checkpoint_uses_non_activating_model_namespace(
+    tmp_path,
+):
     fake_store = FakeSystemStore()
     shadow_path = tmp_path / "ranking.pit-shadow.pt"
     shadow_path.write_bytes(b"shadow")
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(ranking_model_path=str(tmp_path / "ranking.pt")),
         recommendation_config=RecommendationConfig(

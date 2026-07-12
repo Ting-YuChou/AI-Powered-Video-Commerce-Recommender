@@ -176,6 +176,44 @@ def run_ranking_batch_payloads(
             }
         )
 
+    # The micro-batch path must preserve the same trained-state contract as
+    # RankingModel._rank_candidates_sync.  In particular, a freshly
+    # initialized torch module is not a valid ranking artifact and must never
+    # be used for inference.
+    if not getattr(ranking_model, "is_trained", True):
+        fallback_started = time.perf_counter()
+        results = []
+        for item in normalized_requests:
+            recommendations, profile = ranking_model._rank_candidates_sync(
+                item["candidates"],
+                item["user_features"],
+                item["context"],
+                item["k"],
+                True,
+                item["product_metadata_map"],
+            )
+            results.append(
+                (
+                    item["index"],
+                    [
+                        model_payload(recommendation)
+                        for recommendation in recommendations
+                    ],
+                    {
+                        **profile,
+                        "batch_request_count": len(normalized_requests),
+                        "batch_candidate_count": sum(
+                            len(request["candidates"])
+                            for request in normalized_requests
+                        ),
+                        "batch_wait_ms": item["batch_wait_ms"],
+                    },
+                )
+            )
+        stages["fallback_untrained"] = time.perf_counter() - fallback_started
+        stages["total_execution"] = time.perf_counter() - batch_execution_started
+        return {"results": results, "stages": stages}
+
     feature_matrix, prepared, _ = ranking_model.prepare_batch_matrix(
         normalized_requests
     )

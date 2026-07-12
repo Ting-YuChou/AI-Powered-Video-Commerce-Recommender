@@ -17,6 +17,7 @@ import logging
 from collections import OrderedDict
 from typing import Dict, List, Any, Optional, Sequence, Tuple
 import json
+import threading
 import time
 from pathlib import Path
 import pickle
@@ -60,6 +61,10 @@ RANKING_FEATURE_SCHEMA_VERSION = "ranking_v2_00_history_embeddings"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
 RANKING_OBJECTIVE_VERSION = "business_v1"
 LEGACY_RANKING_OBJECTIVE_VERSION = "legacy_multi_objective"
+
+
+class RankingTrainingCancelled(RuntimeError):
+    """Raised by the synchronous trainer after cooperative cancellation."""
 
 
 def _stable_hash_bucket(value: Any, buckets: int = 100) -> int:
@@ -539,8 +544,9 @@ class RankingModel:
     Neural ranking model wrapper that handles training, inference, and model management.
     """
 
-    def __init__(self, config: RankingConfig):
+    def __init__(self, config: RankingConfig, *, observability: Any = None):
         self.config = config
+        self.observability = observability
         self.feature_extractor = FeatureExtractor(
             enable_realtime_window_features=config.realtime_window_features_enabled,
             enable_history_embeddings=config.history_embeddings_enabled,
@@ -588,6 +594,7 @@ class RankingModel:
         self.torch_compile_fallback_count = 0
         self.torch_compile_last_fallback_error: Optional[str] = None
         self.torch_compile_last_inference_path = "eager"
+        self.untrained_fallback_count = 0
         self.enable_profiling_logs = False
         self.profiling_log_min_duration_ms = 250.0
         self._product_feature_cache_max_size = max(
@@ -1353,12 +1360,31 @@ class RankingModel:
         Returns:
             Ranked list of product recommendations
         """
-        if not self.model:
-            logger.error("Model not loaded")
-            return []
-
         if not candidates:
             logger.warning("No candidates to rank")
+            return []
+
+        if not self.is_trained:
+            self.untrained_fallback_count += 1
+            if self.observability is not None:
+                self.observability.record_ranking_untrained_fallback()
+            fallback = self._fallback_rank_candidates(candidates, k)
+            if include_profile:
+                return fallback, {
+                    "path": "fallback_untrained",
+                    "feature_extraction_ms": 0.0,
+                    "tensor_prep_ms": 0.0,
+                    "model_forward_ms": 0.0,
+                    "response_build_ms": 0.0,
+                    "total_ms": 0.0,
+                    "inference_path": "fallback_untrained",
+                    "candidate_count": len(candidates),
+                    "ranked_count": len(fallback),
+                }
+            return fallback
+
+        if not self.model:
+            logger.error("Model not loaded")
             return []
 
         if not self.torch_inference_available:
@@ -1480,9 +1506,11 @@ class RankingModel:
                 _candidate_get(candidate, "content_similarity_score") or 0.0
             )
             popularity = _candidate_get(candidate, "popularity_score") or 0.0
-            combined = _candidate_get(candidate, "combined_score") or (
-                0.5 * collaborative + 0.3 * content_similarity + 0.2 * popularity
-            )
+            combined = _candidate_get(candidate, "combined_score")
+            if combined is None:
+                combined = (
+                    0.5 * collaborative + 0.3 * content_similarity + 0.2 * popularity
+                )
             confidence_score = max(0.0, min(combined, 1.0))
             product_id = str(_candidate_get(candidate, "product_id", ""))
 
@@ -1544,19 +1572,34 @@ class RankingModel:
         training_data: Sequence[RankingTrainingExample],
         *,
         training_sample_source: str = "interaction_events",
+        cancellation_event: Optional[threading.Event] = None,
     ):
         """Train from validated typed examples only."""
         if not all(isinstance(row, RankingTrainingExample) for row in training_data):
             raise TypeError("RankingModel.train_model requires typed training examples")
-        try:
-            saved_model_path = await asyncio.to_thread(
+        cancel_requested = cancellation_event or threading.Event()
+        training_task = asyncio.create_task(
+            asyncio.to_thread(
                 self._train_model_sync,
                 training_data,
                 training_sample_source,
+                cancellation_event=cancel_requested,
             )
+        )
+        try:
+            saved_model_path = await asyncio.shield(training_task)
             if saved_model_path:
                 await self.save_model(saved_model_path)
-
+        except asyncio.CancelledError:
+            # asyncio cannot terminate a to_thread worker. Signal the sync loop
+            # and wait for it to stop before the caller releases a durable
+            # training lease or permits another trainer to take over.
+            cancel_requested.set()
+            try:
+                await training_task
+            except RankingTrainingCancelled:
+                pass
+            raise
         except Exception as e:
             logger.error(f"Error training model: {e}")
             raise
@@ -1570,7 +1613,10 @@ class RankingModel:
         product_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
         item_embedding_map: Optional[Dict[str, Any]] = None,
         two_tower_model_version: Optional[str] = None,
+        cancellation_event: Optional[threading.Event] = None,
     ) -> Optional[str]:
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise RankingTrainingCancelled("ranking training was cancelled")
         if len(training_data) < self.config.training_min_samples:
             logger.warning("Insufficient data for ranking model training")
             return None
@@ -1618,6 +1664,9 @@ class RankingModel:
             )
         features, labels = self._prepare_training_examples(training_data)
 
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise RankingTrainingCancelled("ranking training was cancelled")
+
         if features.size(0) == 0:
             logger.warning("No valid training samples prepared")
             return None
@@ -1626,6 +1675,8 @@ class RankingModel:
         self.model.train()
 
         for epoch in range(self.config.epochs):
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise RankingTrainingCancelled("ranking training was cancelled")
             epoch_loss = 0.0
             num_batches = 0
 
@@ -1633,6 +1684,8 @@ class RankingModel:
                 features,
                 labels,
             ):
+                if cancellation_event is not None and cancellation_event.is_set():
+                    raise RankingTrainingCancelled("ranking training was cancelled")
                 self.optimizer.zero_grad()
                 predictions = self.model(batch_features)
                 loss = self._compute_loss(predictions, batch_labels)
@@ -1643,6 +1696,9 @@ class RankingModel:
                 epoch_loss += loss.item()
                 num_batches += 1
 
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise RankingTrainingCancelled("ranking training was cancelled")
+
             avg_loss = epoch_loss / max(num_batches, 1)
 
             if epoch % 10 == 0:
@@ -1652,6 +1708,8 @@ class RankingModel:
                 logger.info(f"Early stopping at epoch {epoch}")
                 break
 
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise RankingTrainingCancelled("ranking training was cancelled")
         self.model.eval()
         self.is_trained = True
         self.last_training_time = time.time()
@@ -2652,6 +2710,7 @@ class RankingModel:
             if self.model
             else 0,
             "feature_dim": self.feature_extractor.total_feature_dim,
+            "untrained_fallback_count": self.untrained_fallback_count,
             "architecture": getattr(self.model, "architecture", None)
             if self.model
             else None,
@@ -2681,6 +2740,7 @@ class RankingModel:
                 if self.model
                 else None,
                 "torch_inference_available": self.torch_inference_available,
+                "untrained_fallback_count": self.untrained_fallback_count,
             }
             status.update(self._torch_compile_status())
 

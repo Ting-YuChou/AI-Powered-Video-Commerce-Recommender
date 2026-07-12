@@ -301,6 +301,55 @@ class InteractionFeatureJobTest {
         .contains("label_definition_version STRING"));
     assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql("s3://bucket/pit", "run-1")
         .contains("attributed_action STRING"));
+    assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql(
+        "s3://bucket/pit", "run-1", 2).contains("/runs/run-1/attempts/2/shards"));
+  }
+
+  @Test
+  void pitJobCliArgumentsOverrideEnvironmentDefaults() {
+    Map<String, String> environment = Map.ofEntries(
+        Map.entry("FEATURE_LAKE_CATALOG_URI", "http://catalog:8181"),
+        Map.entry("FEATURE_LAKE_WAREHOUSE_URI", "s3://features/warehouse"),
+        Map.entry("FEATURE_LAKE_S3_ENDPOINT", "http://minio:9000"),
+        Map.entry("FEATURE_LAKE_NAMESPACE", "environment_namespace"),
+        Map.entry("FEATURE_LAKE_MATERIALIZATION_CUTOFF", "100"),
+        Map.entry("FEATURE_LAKE_MATERIALIZATION_RUN_ID", "environment-run"),
+        Map.entry("FEATURE_LAKE_PIT_EXPORT_URI", "s3://features/environment"));
+
+    PointInTimeFeatureJoinJob.JobConfig config = PointInTimeFeatureJoinJob.JobConfig.resolve(
+        new String[] {
+          "--catalog-name", "cli_catalog",
+          "--catalog-uri", "http://cli-catalog:8181",
+          "--warehouse-uri", "s3://cli-features/warehouse",
+          "--s3-endpoint", "http://cli-minio:9000",
+          "--feature-definition-version", "ranking_ltr_v1",
+          "--attribution-window-hours", "168",
+          "--allowed-lateness-hours", "1",
+          "--materialization-run-id", "pit-20260711",
+          "--materialization-cutoff", "1752215200",
+          "--namespace", "video_commerce",
+          "--export-uri", "s3://features/training/ranking-pit",
+          "--export-attempt", "2"
+        },
+        environment);
+
+    assertEquals("pit-20260711", config.runId);
+    assertEquals("cli_catalog", config.catalog);
+    assertEquals("http://cli-catalog:8181", config.catalogUri);
+    assertEquals("s3://cli-features/warehouse", config.warehouseUri);
+    assertEquals("http://cli-minio:9000", config.s3Endpoint);
+    assertEquals(1752215200.0, config.materializationCutoff);
+    assertEquals("video_commerce", config.namespace);
+    assertEquals("s3://features/training/ranking-pit", config.exportPrefix);
+    assertEquals(2, config.exportAttempt);
+  }
+
+  @Test
+  void pitJobRejectsUnknownCliArguments() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> PointInTimeFeatureJoinJob.JobConfig.resolve(
+            new String[] {"--materialization-run-idd", "pit-20260711"}, Map.of()));
   }
 
   @Test

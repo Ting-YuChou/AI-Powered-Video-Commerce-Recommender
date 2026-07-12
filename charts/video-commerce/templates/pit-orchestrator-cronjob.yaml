@@ -1,0 +1,58 @@
+{{- if .Values.pitOrchestrator.enabled }}
+{{- if not .Values.external.featureLake.enabled }}
+{{- fail "external.featureLake.enabled=true is required for PIT production" }}
+{{- end }}
+{{- if ne .Values.external.featureLake.trainingSource "pit" }}
+{{- fail "external.featureLake.trainingSource=pit is required for PIT production" }}
+{{- end }}
+{{- $catalog := required "external.featureLake.catalogUri is required for PIT production" .Values.external.featureLake.catalogUri -}}
+{{- $warehouse := required "external.featureLake.warehouseUri is required for PIT production" .Values.external.featureLake.warehouseUri -}}
+{{- $flink := required "external.featureLake.flinkJobmanager is required for PIT production" .Values.external.featureLake.flinkJobmanager -}}
+{{- $export := required "external.featureLake.pitExportUri is required for PIT production" .Values.external.featureLake.pitExportUri -}}
+{{- $kafka := required "external.kafka.bootstrapServers is required for PIT production" .Values.external.kafka.bootstrapServers -}}
+{{- $bucket := required "external.objectStorage.bucket is required for PIT production" .Values.external.objectStorage.bucket -}}
+{{- $s3Endpoint := required "external.objectStorage.endpointUrl is required for PIT production" .Values.external.objectStorage.endpointUrl -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "video-commerce.fullname" . }}-pit-orchestrator
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pit-orchestrator
+spec:
+  schedule: {{ .Values.pitOrchestrator.schedule | quote }}
+  timeZone: Etc/UTC
+  concurrencyPolicy: {{ .Values.pitOrchestrator.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.pitOrchestrator.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.pitOrchestrator.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.pitOrchestrator.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.pitOrchestrator.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "video-commerce.selectorLabels" (dict "root" . "component" "pit-orchestrator") | nindent 12 }}
+        spec:
+          serviceAccountName: {{ include "video-commerce.serviceAccountName" . }}
+          automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.securityContext.pod | nindent 12 }}
+          containers:
+            - name: pit-orchestrator
+              image: {{ printf "%s:%s" .Values.images.pitOrchestrator.repository .Values.images.pitOrchestrator.tag | quote }}
+              imagePullPolicy: {{ .Values.images.pitOrchestrator.pullPolicy }}
+              command: ["python", "-m", "video_commerce.services.pit_dataset_orchestrator.main"]
+              args: ["--once"]
+              envFrom:
+                - configMapRef:
+                    name: {{ include "video-commerce.fullname" . }}-backend-config
+              env:
+                {{- include "video-commerce.secretEnv" . | nindent 16 }}
+                {{- include "video-commerce.mapEnv" .Values.pitOrchestrator.env | nindent 16 }}
+              resources:
+                {{- toYaml .Values.pitOrchestrator.resources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.securityContext.container | nindent 16 }}
+{{- end }}

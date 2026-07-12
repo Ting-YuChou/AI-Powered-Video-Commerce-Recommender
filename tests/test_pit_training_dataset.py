@@ -8,6 +8,7 @@ import pytest
 from video_commerce.common.feature_history_contracts import payload_sha256
 from video_commerce.ml.pit_training_dataset import (
     PitTrainingDatasetError,
+    PitTrainingDatasetUnavailable,
     PitTrainingDatasetReader,
     arrow_schema_sha256,
 )
@@ -19,6 +20,25 @@ from video_commerce.ml.ranking_training import RANKING_LABEL_DEFINITION_VERSION
 class LocalObjectStorage:
     async def materialize_for_processing(self, storage_path, *, suggested_suffix=""):
         return storage_path, False
+
+
+class DownloadedObjectStorage:
+    def __init__(self, local_path):
+        self.local_path = str(local_path)
+
+    async def materialize_for_processing(self, storage_path, *, suggested_suffix=""):
+        return self.local_path, True
+
+
+@pytest.mark.asyncio
+async def test_missing_latest_pointer_is_bootstrap_unavailable(tmp_path):
+    reader = PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    )
+
+    with pytest.raises(PitTrainingDatasetUnavailable, match="latest pointer"):
+        await reader.read(str(tmp_path / "missing-latest.json"))
 
 
 def _write_dataset(tmp_path, *, status="complete", definition_version=None):
@@ -234,18 +254,47 @@ async def test_manifest_publisher_writes_manifest_before_latest_pointer(tmp_path
     assert manifest["row_count"] == 1
     assert manifest["shards"][0]["sha256"]
 
-    with pytest.raises(PitTrainingDatasetError, match="immutable"):
+    retry_uri = await publisher.publish(
+        shard_uris=[str(shard)],
+        output_prefix=str(output),
+        materialization_run_id="run-99",
+        iceberg_table_id="video_commerce.ranking_training_pit",
+        iceberg_snapshot_id="99",
+        feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
+        attribution_cutoff=1_700_000_000.0,
+        quarantine_row_count=0,
+    )
+    assert retry_uri == latest_uri
+
+    with pytest.raises(PitTrainingDatasetError, match="conflicts"):
         await publisher.publish(
             shard_uris=[str(shard)],
             output_prefix=str(output),
             materialization_run_id="run-99",
             iceberg_table_id="video_commerce.ranking_training_pit",
-            iceberg_snapshot_id="99",
+            iceberg_snapshot_id="100",
             feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
             label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
             attribution_cutoff=1_700_000_000.0,
             quarantine_row_count=0,
         )
+
+    await publisher.publish(
+        shard_uris=[str(shard)],
+        output_prefix=str(output),
+        materialization_run_id="run-98",
+        iceberg_table_id="video_commerce.ranking_training_pit",
+        iceberg_snapshot_id="98",
+        feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
+        attribution_cutoff=1_699_999_999.0,
+        quarantine_row_count=0,
+    )
+    pointer_after_older_run = json.loads(
+        (output / "latest.json").read_text(encoding="utf-8")
+    )
+    assert pointer_after_older_run["materialization_run_id"] == "run-99"
 
 
 def test_manifest_discovers_flink_parquet_part_files_without_extension():
@@ -253,3 +302,17 @@ def test_manifest_discovers_flink_parquet_part_files_without_extension():
     assert _is_parquet_shard_uri("s3://features/run/shards/part-abc.parquet")
     assert not _is_parquet_shard_uri("s3://features/run/shards/_SUCCESS")
     assert not _is_parquet_shard_uri("s3://features/run/shards/.staging/file")
+
+
+@pytest.mark.asyncio
+async def test_manifest_retry_reads_and_cleans_downloaded_s3_manifest_once(tmp_path):
+    downloaded = tmp_path / "downloaded-manifest.json"
+    downloaded.write_text('{"status":"complete"}', encoding="utf-8")
+    publisher = PitManifestPublisher(DownloadedObjectStorage(downloaded))
+
+    payload = await publisher._read_json_if_exists(
+        "s3://video-commerce-features/runs/run-1/manifest.json"
+    )
+
+    assert payload == {"status": "complete"}
+    assert not downloaded.exists()

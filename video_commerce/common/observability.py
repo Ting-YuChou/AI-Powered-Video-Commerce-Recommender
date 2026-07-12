@@ -657,6 +657,53 @@ class ObservabilityManager:
             "Purchase rows containing an actual attributed business value",
             registry=self.registry,
         )
+        self.pit_orchestrator_runs_total = Counter(
+            "pit_orchestrator_runs_total",
+            "Daily PIT orchestration outcomes",
+            ["status"],
+            registry=self.registry,
+        )
+        self.pit_orchestrator_last_success_timestamp = Gauge(
+            "pit_orchestrator_last_success_timestamp",
+            "Unix timestamp of the latest completed PIT orchestration run",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_start_timestamp = Gauge(
+            "pit_orchestrator_start_timestamp",
+            "Unix timestamp when this PIT orchestrator process started",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_start_timestamp.set(time.time())
+        self.pit_orchestrator_run_in_progress = Gauge(
+            "pit_orchestrator_run_in_progress",
+            "Whether a PIT run currently holds the orchestration lease",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_lease_expired = Gauge(
+            "pit_orchestrator_lease_expired",
+            "Whether a durable PIT run has an expired active lease",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_waiting_for_rows = Gauge(
+            "pit_orchestrator_waiting_for_rows",
+            "Whether the PIT orchestrator is waiting for eligible observations",
+            registry=self.registry,
+        )
+        self.pit_trainer_waiting_for_manifest = Gauge(
+            "pit_trainer_waiting_for_manifest",
+            "Whether the PIT trainer is waiting for the first complete manifest",
+            registry=self.registry,
+        )
+        self.pit_training_duplicate_manifest_skips_total = Counter(
+            "pit_training_duplicate_manifest_skips_total",
+            "Completed PIT manifests skipped because they were already trained",
+            registry=self.registry,
+        )
+        self.ranking_untrained_fallback_total = Counter(
+            "ranking_untrained_fallback_total",
+            "Ranking requests served by combined-score fallback before a valid artifact",
+            registry=self.registry,
+        )
         self._process = psutil.Process()
 
     def record_request(
@@ -759,6 +806,42 @@ class ObservabilityManager:
 
     def record_pit_manifest_validation_failure(self, reason: str) -> None:
         self.pit_manifest_validation_failures_total.labels(reason=reason).inc()
+
+    def record_pit_orchestrator_run(self, status: str) -> None:
+        normalized = str(status or "unknown")
+        self.pit_orchestrator_runs_total.labels(status=normalized).inc()
+        if normalized == "completed":
+            self.pit_orchestrator_last_success_timestamp.set(time.time())
+
+    def set_pit_orchestrator_waiting_for_rows(self, waiting: bool) -> None:
+        self.pit_orchestrator_waiting_for_rows.set(1 if waiting else 0)
+
+    def set_pit_orchestrator_run_in_progress(self, running: bool) -> None:
+        self.pit_orchestrator_run_in_progress.set(1 if running else 0)
+
+    def update_pit_durable_state(
+        self,
+        *,
+        last_success_timestamp: float,
+        waiting_for_rows: bool,
+        run_in_progress: bool,
+        lease_expired: bool,
+    ) -> None:
+        self.pit_orchestrator_last_success_timestamp.set(
+            max(0.0, float(last_success_timestamp))
+        )
+        self.pit_orchestrator_waiting_for_rows.set(1 if waiting_for_rows else 0)
+        self.pit_orchestrator_run_in_progress.set(1 if run_in_progress else 0)
+        self.pit_orchestrator_lease_expired.set(1 if lease_expired else 0)
+
+    def set_pit_trainer_waiting_for_manifest(self, waiting: bool) -> None:
+        self.pit_trainer_waiting_for_manifest.set(1 if waiting else 0)
+
+    def record_pit_duplicate_manifest_skip(self) -> None:
+        self.pit_training_duplicate_manifest_skips_total.inc()
+
+    def record_ranking_untrained_fallback(self) -> None:
+        self.ranking_untrained_fallback_total.inc()
 
     def update_typed_pit_training_metrics(
         self,

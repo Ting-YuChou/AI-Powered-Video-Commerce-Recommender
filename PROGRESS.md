@@ -96,7 +96,61 @@
   Prometheus rules, Grafana JSON, Python compile/diff checks, and Black checks
   passed. Existing Iceberg table migration, PIT export, completed manifest,
   typed reader, shared assembler/labels/trainer, and checkpoint smoke passed.
-- Follow-up: keep `FEATURE_LAKE_TRAINING_SOURCE=legacy` and enable PIT shadow
-  only. A real seven-day shadow window, online load p95/throughput comparison,
-  and production parity/coverage/lag evidence remain rollout gates rather than
-  one-time local test claims.
+- Follow-up superseded by the greenfield Phase 4 decision below: this checkout
+  has no production traffic/artifact to protect, so rollout is PIT-first with
+  per-run correctness gates instead of a seven-day shadow window.
+
+## 2026-07-11 — Offline Feature Store phase 4 direct PIT rollout
+
+- Added a leased, deterministic daily `PitDatasetOrchestrator` with Postgres run
+  state, `02:00 UTC` cutoffs, deterministic Flink REST job IDs, takeover-safe
+  polling/lease renewal, crash-resumable manifest publication,
+  attempt-isolated Parquet shards, and terminal empty-run bootstrap behavior
+  that never publishes `latest.json`. A new daily invocation first completes
+  any expired prior run, then continues its originally requested cutoff.
+- Made the primary trainer wait for a missing first pointer, fail closed for a
+  malformed manifest, restore/skip already-trained materialization run IDs, and
+  stay isolated from Redis/current catalog. Untrained serving now always orders
+  by candidate `combined_score`, even when no neural module is initialized.
+- Added the tracked Compose `pit-production` preset and dedicated Flink REST
+  submitter image, the external-dependency Helm
+  `values-pit-production.yaml` preset and daily `concurrencyPolicy: Forbid`
+  CronJob, durable trainer claims/idempotent artifact records, a long-lived PIT
+  state metrics exporter, rollout alerts/dashboard panels, and greenfield
+  bootstrap/retry/rollback operations documentation.
+- PIT training renews its Postgres lease while running. Lease loss signals the
+  synchronous PyTorch worker cooperatively and waits for that thread to exit
+  before releasing the claim. PIT artifact objects are content-addressed;
+  checkpoint conflicts load and checksum-verify the durable winner rather than
+  overwriting it.
+- Greenfield readiness now treats uncommitted Kafka partitions as ready only
+  when their broker end offsets are zero, and ignores terminal same-name Flink
+  job history while still rejecting multiple active materializers. Flink 1.20
+  unknown-job 500 responses are normalized only for its explicit
+  `FlinkJobNotFoundException`. PIT REST submissions carry catalog, warehouse,
+  S3 endpoint, feature, attribution, and lateness settings as CLI arguments so
+  externally managed Flink does not depend on orchestrator container env.
+- Key files: `video_commerce/services/pit_dataset_orchestrator/main.py`,
+  `migrations/postgres/006_pit_materialization_runs.sql`,
+  `flink-jobs/interaction-features/src/main/java/com/videocommerce/flink/PointInTimeFeatureJoinJob.java`,
+  `deploy/compose/pit-production.conf`,
+  `charts/video-commerce/values-pit-production.yaml`, and
+  `docs/operations/offline-feature-store.md`.
+- Verification: final pre-fallback Docker backend `433 passed, 4 skipped`; the
+  subsequent micro-batch fallback regression suite passed `5` focused tests.
+  Flink Maven passed all 25 tests. Default and PIT Compose config, Helm lint,
+  PIT production render, strict kubeconform (36 resources), Prometheus rule
+  tests, Python compile, and diff checks passed. A clean Feature Lake runtime
+  reached healthy MinIO, Iceberg, Flink, state-exporter, trainer, and a
+  restart-safe readiness exit. Deterministic run `pit-20260711` ended in
+  `waiting_for_eligible_rows` with zero rows and no training prefix or
+  `latest.json`. Direct serving verification proved the untrained micro-batch
+  path orders `combined_score=0.9` before `0.1`, reports
+  `fallback_untrained`, and performs no neural forward. A public hot load
+  completed 3000/3000 HTTP 200 requests; it had no candidates and therefore is
+  not treated as fallback model performance evidence.
+- Follow-up: run matched fallback/trained serving load gates after the first
+  legitimate 168-hour mature PIT manifest and artifact exist. The attempted
+  1000-request internal fallback load was blocked by local execution quota
+  after the direct runtime assertion succeeded. Host-wide Black remains noisy
+  on pre-existing formatting; changed-line compile and diff checks passed.

@@ -25,6 +25,10 @@ class PitTrainingDatasetError(ValueError):
     """Raised when a PIT export cannot be safely used for model training."""
 
 
+class PitTrainingDatasetUnavailable(PitTrainingDatasetError):
+    """Raised while a greenfield deployment is waiting for its first pointer."""
+
+
 @dataclass(frozen=True)
 class PitTrainingDataset:
     dataset_version: str
@@ -61,6 +65,8 @@ class PitTrainingDatasetReader:
     async def read(self, dataset_uri: str) -> PitTrainingDataset:
         try:
             return await self._read_pinned(dataset_uri)
+        except PitTrainingDatasetUnavailable:
+            raise
         except PitTrainingDatasetError as exc:
             if self.observability is not None:
                 self.observability.record_pit_manifest_validation_failure(
@@ -154,12 +160,25 @@ class PitTrainingDatasetReader:
         )
 
     async def _read_json_uri(self, uri: str, *, kind: str) -> Dict[str, Any]:
-        path, should_delete = await self.object_storage.materialize_for_processing(
-            uri, suggested_suffix=".json"
-        )
+        try:
+            path, should_delete = await self.object_storage.materialize_for_processing(
+                uri, suggested_suffix=".json"
+            )
+        except Exception as exc:
+            if kind == "latest pointer" and self._is_not_found(exc):
+                raise PitTrainingDatasetUnavailable(
+                    f"PIT {kind} is unavailable: {uri}"
+                ) from exc
+            raise PitTrainingDatasetError(f"unable to read PIT {kind}: {exc}") from exc
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
+        except FileNotFoundError as exc:
+            if kind == "latest pointer":
+                raise PitTrainingDatasetUnavailable(
+                    f"PIT {kind} is unavailable: {uri}"
+                ) from exc
+            raise PitTrainingDatasetError(f"unable to read PIT {kind}: {exc}") from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise PitTrainingDatasetError(f"unable to read PIT {kind}: {exc}") from exc
         finally:
@@ -168,6 +187,16 @@ class PitTrainingDatasetReader:
         if not isinstance(payload, dict):
             raise PitTrainingDatasetError(f"PIT {kind} must be a JSON object")
         return payload
+
+    @staticmethod
+    def _is_not_found(exc: Exception) -> bool:
+        if isinstance(exc, FileNotFoundError):
+            return True
+        response = getattr(exc, "response", None)
+        if not isinstance(response, dict):
+            return False
+        code = str((response.get("Error") or {}).get("Code") or "")
+        return code in {"404", "NoSuchKey", "NotFound"}
 
     async def _read_verified_shard(
         self,

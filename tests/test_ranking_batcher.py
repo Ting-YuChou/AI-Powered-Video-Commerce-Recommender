@@ -5,7 +5,9 @@ import numpy as np
 import pytest
 
 from video_commerce.common.cache_codec import json_dumps, json_loads
+from video_commerce.common.config import RankingConfig
 from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
+from video_commerce.ml.ranking import RankingModel
 from video_commerce.ml.ranking_history import RANKING_HISTORY_CONTEXT_KEY
 from video_commerce.ranking_runtime.ranking_batcher import (
     RankingBatcher,
@@ -670,6 +672,47 @@ def test_ranking_runner_payload_v2_round_trip_and_v1_fallback():
     assert normalize_ranking_batch_payloads(v1_payload)[0]["product_metadata_map"][
         "p1"
     ]["title"] == "V2 title"
+
+
+@pytest.mark.asyncio
+async def test_untrained_microbatch_uses_combined_score_fallback():
+    ranking = RankingModel(RankingConfig())
+    await ranking.load_model()
+    assert ranking.is_trained is False
+
+    result = run_ranking_batch_payloads(
+        ranking,
+        {
+            "requests": [
+                {
+                    "index": 0,
+                    "candidates": [
+                        {
+                            "product_id": "low",
+                            "combined_score": 0.1,
+                            "source": "test",
+                        },
+                        {
+                            "product_id": "high",
+                            "combined_score": 0.9,
+                            "source": "test",
+                        },
+                    ],
+                    "user_features": {"user_id": "u1"},
+                    "context": {},
+                    "product_metadata_map": {},
+                    "k": 2,
+                    "batch_wait_ms": 0.0,
+                }
+            ]
+        },
+    )
+
+    _, recommendations, profile = result["results"][0]
+    assert [item["product_id"] for item in recommendations] == ["high", "low"]
+    assert profile["path"] == "fallback_untrained"
+    assert profile["inference_path"] == "fallback_untrained"
+    assert ranking.untrained_fallback_count == 1
 
 
 @pytest.mark.asyncio

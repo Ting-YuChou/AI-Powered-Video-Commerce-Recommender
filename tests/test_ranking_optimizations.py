@@ -34,6 +34,10 @@ from video_commerce.ml.ranking_history import (
     build_ranking_history_context,
 )
 from video_commerce.ml.ranking_features import FeatureBundle
+from video_commerce.ml.pit_training_dataset import (
+    PitTrainingDatasetError,
+    PitTrainingDatasetUnavailable,
+)
 from video_commerce.ml.ranking_training import AttributionFacts, RankingTrainingExample
 from video_commerce.ml import ranking as ranking_module
 from video_commerce.services.recommendation.api import (
@@ -1300,6 +1304,7 @@ class FakeTrainerSystemStore:
     def __init__(self, *, impression_samples=None, event_samples=None):
         self.impression_samples = impression_samples
         self.event_samples = event_samples
+        self.pit_training_renewals = 0
 
     async def get_training_interactions(self, limit=50000):
         if self.event_samples is not None:
@@ -1317,6 +1322,18 @@ class FakeTrainerSystemStore:
     async def get_ltr_training_impressions(self, *, limit=50000, lookback_days=30):
         return self.impression_samples or []
 
+    async def claim_pit_training_run(self, **_kwargs):
+        return {"claimed": True, "status": "running"}
+
+    async def complete_pit_training_run(self, **result):
+        self.completed_pit_training = result
+
+    async def renew_pit_training_lease(self, **_result):
+        self.pit_training_renewals += 1
+
+    async def fail_pit_training_run(self, **result):
+        self.failed_pit_training = result
+
 
 class FakeTrainerRankingModel:
     def __init__(self):
@@ -1333,11 +1350,15 @@ class FakeTrainerRankingModel:
         training_data,
         *,
         training_sample_source=None,
+        cancellation_event=None,
     ):
         self.received = {
             "training_data": training_data,
             "training_sample_source": training_sample_source,
         }
+
+    async def save_model(self, model_path):
+        self.loaded_model_path = model_path
 
 
 class FakeTrainerLegacyAdapter:
@@ -1554,7 +1575,7 @@ async def test_model_trainer_uses_pit_dataset_without_current_online_feature_map
         model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
     )
     service.feature_store = None
-    service.system_store = None
+    service.system_store = FakeTrainerSystemStore()
     service.pit_dataset_reader = PitReader()
     service.ranking_model = FakeTrainerRankingModel()
     service.vector_search = None
@@ -1581,6 +1602,293 @@ async def test_model_trainer_uses_pit_dataset_without_current_online_feature_map
         == "ranking_labels_v1"
     )
     assert service.artifact_manager.payload["feature_lake_iceberg_snapshot_id"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_waits_when_pit_latest_pointer_is_unavailable():
+    class UnavailableReader:
+        async def read(self, _dataset_uri):
+            raise PitTrainingDatasetUnavailable("PIT latest pointer is unavailable")
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/latest.json",
+        ),
+    )
+    service.feature_store = None
+    service.system_store = None
+    service.pit_dataset_reader = UnavailableReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="startup")
+
+    assert service.ranking_model.received is None
+    assert service.observability.runs[-1][1] == "waiting_for_pit_manifest"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_clears_waiting_state_for_corrupt_pit_manifest():
+    class CorruptReader:
+        async def read(self, _dataset_uri):
+            raise PitTrainingDatasetError("PIT dataset manifest is not complete")
+
+    class Observability(FakeTrainerObservability):
+        waiting = None
+
+        def set_pit_trainer_waiting_for_manifest(self, waiting):
+            self.waiting = waiting
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/latest.json",
+        ),
+    )
+    service.feature_store = None
+    service.system_store = None
+    service.pit_dataset_reader = CorruptReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.observability = Observability()
+
+    with pytest.raises(PitTrainingDatasetError, match="not complete"):
+        await service._train_ranking_model(trigger="scheduled")
+
+    assert service.observability.waiting is False
+    assert service.observability.runs[-1][1] == "error"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_skips_an_already_trained_pit_manifest():
+    class DuplicateReader:
+        async def read(self, _dataset_uri):
+            return SimpleNamespace(
+                materialization_run_id="run-42",
+                examples=[object()],
+            )
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/latest.json",
+        ),
+    )
+    service.feature_store = None
+    service.system_store = None
+    service.pit_dataset_reader = DuplicateReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.observability = FakeTrainerObservability()
+    service.last_trained_pit_run_id = "run-42"
+
+    await service._train_ranking_model(trigger="scheduled")
+
+    assert service.ranking_model.received is None
+    assert service.observability.runs[-1][1] == "skipped_duplicate_manifest"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_respects_durable_pit_training_claim():
+    class DatasetReader:
+        async def read(self, _dataset_uri):
+            return SimpleNamespace(
+                materialization_run_id="run-42",
+                examples=[object()],
+            )
+
+    class ClaimedStore(FakeTrainerSystemStore):
+        async def claim_pit_training_run(self, **_kwargs):
+            return {"claimed": False, "status": "completed"}
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/latest.json",
+            pit_training_lease_seconds=21600,
+        ),
+    )
+    service.feature_store = None
+    service.system_store = ClaimedStore()
+    service.pit_dataset_reader = DatasetReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.observability = FakeTrainerObservability()
+    service.last_trained_pit_run_id = None
+
+    await service._train_ranking_model(trigger="scheduled")
+
+    assert service.ranking_model.received is None
+    assert service.observability.runs[-1][1] == "skipped_duplicate_manifest"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_renews_pit_training_lease_while_training():
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=FeatureBundle(
+            as_of_ts=100.0,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={"price": 9.0},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1", combined_score=0.5, source="pit_test"
+            ),
+        ),
+        attribution=AttributionFacts("click", True, False),
+    )
+
+    class DatasetReader:
+        async def read(self, _dataset_uri):
+            return SimpleNamespace(
+                dataset_version="snapshot-42",
+                materialization_run_id="run-42",
+                feature_definition_version="ranking_ltr_v1",
+                label_definition_version="ranking_labels_v1",
+                manifest_uri="s3://features/run-42/manifest.json",
+                iceberg_snapshot_id="42",
+                schema_hash="a" * 64,
+                quarantine_rows=0,
+                examples=[example],
+            )
+
+    release_training = asyncio.Event()
+
+    class SlowRankingModel(FakeTrainerRankingModel):
+        async def train_model(
+            self,
+            training_data,
+            *,
+            training_sample_source=None,
+            cancellation_event=None,
+        ):
+            self.received = {"training_data": training_data}
+            await release_training.wait()
+
+    store = FakeTrainerSystemStore()
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True, training_min_samples=1
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://features/latest.json",
+            pit_training_lease_seconds=300,
+        ),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = None
+    service.system_store = store
+    service.pit_dataset_reader = DatasetReader()
+    service.ranking_model = SlowRankingModel()
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+    service.instance_id = "trainer-1"
+    service.last_trained_pit_run_id = None
+    service._pit_training_heartbeat_interval_seconds = 0.001
+
+    task = asyncio.create_task(service._train_ranking_model(trigger="scheduled"))
+    for _ in range(100):
+        if store.pit_training_renewals:
+            break
+        await asyncio.sleep(0.001)
+    release_training.set()
+    await task
+
+    assert store.pit_training_renewals >= 1
+    assert store.completed_pit_training["run_id"] == "run-42"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_stops_before_artifact_when_training_lease_is_lost():
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=FeatureBundle(
+            as_of_ts=100.0,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1", combined_score=0.5, source="pit_test"
+            ),
+        ),
+        attribution=AttributionFacts("click", True, False),
+    )
+
+    class DatasetReader:
+        async def read(self, _dataset_uri):
+            return SimpleNamespace(
+                dataset_version="snapshot-42",
+                materialization_run_id="run-42",
+                feature_definition_version="ranking_ltr_v1",
+                label_definition_version="ranking_labels_v1",
+                manifest_uri="s3://features/run-42/manifest.json",
+                iceberg_snapshot_id="42",
+                schema_hash="a" * 64,
+                quarantine_rows=0,
+                examples=[example],
+            )
+
+    class LeaseLostStore(FakeTrainerSystemStore):
+        async def renew_pit_training_lease(self, **_result):
+            raise RuntimeError("lease expired")
+
+    class NeverFinishesRankingModel(FakeTrainerRankingModel):
+        async def train_model(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    store = LeaseLostStore()
+    artifacts = FakeTrainerArtifactManager()
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True, training_min_samples=1
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://features/latest.json",
+            pit_training_lease_seconds=300,
+        ),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = None
+    service.system_store = store
+    service.pit_dataset_reader = DatasetReader()
+    service.ranking_model = NeverFinishesRankingModel()
+    service.artifact_manager = artifacts
+    service.observability = FakeTrainerObservability()
+    service.instance_id = "trainer-1"
+    service.last_trained_pit_run_id = None
+    service._pit_training_heartbeat_interval_seconds = 0.001
+
+    with pytest.raises(RuntimeError, match="lost its durable lease"):
+        await service._train_ranking_model(trigger="scheduled")
+
+    assert artifacts.payload is None
+    assert store.failed_pit_training["run_id"] == "run-42"
 
 
 @pytest.mark.asyncio
@@ -1616,7 +1924,8 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
             return dataset
 
     class ShadowModel:
-        def __init__(self, _config):
+        def __init__(self, _config, *, observability=None):
+            assert observability is service.observability
             self.loaded_model_path = None
             self.model_version = "shadow-1"
             self.feature_assembler = SimpleNamespace(

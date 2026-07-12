@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.table.api.EnvironmentSettings;
@@ -21,59 +22,164 @@ public final class PointInTimeFeatureJoinJob {
   private PointInTimeFeatureJoinJob() {}
 
   public static void main(String[] args) throws Exception {
-    String catalog = requiredEnv("FEATURE_LAKE_CATALOG_NAME", "feature_catalog");
-    String catalogUri = requiredEnv("FEATURE_LAKE_CATALOG_URI", null);
-    String warehouseUri = requiredEnv("FEATURE_LAKE_WAREHOUSE_URI", null);
-    String s3Endpoint = requiredEnv("FEATURE_LAKE_S3_ENDPOINT", null);
-    String namespace = requiredEnv("FEATURE_LAKE_NAMESPACE", "video_commerce");
-    String featureDefinitionVersion =
-        requiredEnv("FEATURE_LAKE_FEATURE_DEFINITION_VERSION", "ranking_ltr_v1");
-    int attributionWindowHours =
-        Integer.parseInt(requiredEnv("FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS", "168"));
-    int allowedLatenessHours =
-        Integer.parseInt(requiredEnv("FEATURE_LAKE_ALLOWED_LATENESS_HOURS", "1"));
-    double materializationCutoff =
-        Double.parseDouble(requiredEnv("FEATURE_LAKE_MATERIALIZATION_CUTOFF", null));
-    String runId = requiredEnv("FEATURE_LAKE_MATERIALIZATION_RUN_ID", null);
-    String exportPrefix = requiredEnv("FEATURE_LAKE_PIT_EXPORT_URI", null);
+    JobConfig config = JobConfig.resolve(args, System.getenv());
 
     TableEnvironment tables =
         TableEnvironment.create(EnvironmentSettings.newInstance().inBatchMode().build());
     tables.createTemporarySystemFunction("pit_feature_bundle_hash", PitFeatureBundleHash.class);
-    tables.executeSql(buildRestCatalogSql(catalog, catalogUri, warehouseUri, s3Endpoint));
-    tables.executeSql("USE CATALOG `" + catalog + "`");
-    tables.executeSql("CREATE DATABASE IF NOT EXISTS `" + namespace + "`");
-    tables.executeSql(buildTrainingTableSql(namespace));
-    evolveTrainingTable(tables, namespace);
+    tables.executeSql(
+        buildRestCatalogSql(
+            config.catalog, config.catalogUri, config.warehouseUri, config.s3Endpoint));
+    tables.executeSql("USE CATALOG `" + config.catalog + "`");
+    tables.executeSql("CREATE DATABASE IF NOT EXISTS `" + config.namespace + "`");
+    tables.executeSql(buildTrainingTableSql(config.namespace));
+    evolveTrainingTable(tables, config.namespace);
     List<String> trainingColumns =
-        tables.from("`" + identifier(namespace) + "`.`ranking_training_pit`")
+        tables.from("`" + identifier(config.namespace) + "`.`ranking_training_pit`")
             .getResolvedSchema()
             .getColumnNames();
-    tables.executeSql(buildQuarantineTableSql(namespace));
-    rejectExistingRun(tables, namespace, runId);
-    tables
-        .executeSql(
-            buildQuarantineInsertSql(
-                namespace,
-                featureDefinitionVersion,
-                attributionWindowHours,
-                allowedLatenessHours,
-                materializationCutoff,
-                runId))
-        .await();
-    tables
-        .executeSql(
-            buildPointInTimeInsertSql(
-                namespace,
-                featureDefinitionVersion,
-                attributionWindowHours,
-                allowedLatenessHours,
-                materializationCutoff,
-                runId,
-                trainingColumns))
-        .await();
-    tables.executeSql(buildParquetExportTableSql(exportPrefix, runId));
-    tables.executeSql(buildParquetExportInsertSql(namespace, runId)).await();
+    tables.executeSql(buildQuarantineTableSql(config.namespace));
+    if (existingRunCount(tables, config.namespace, "ranking_training_pit", config.runId) == 0L) {
+      tables
+          .executeSql(
+              buildPointInTimeInsertSql(
+                  config.namespace,
+                  config.featureDefinitionVersion,
+                  config.attributionWindowHours,
+                  config.allowedLatenessHours,
+                  config.materializationCutoff,
+                  config.runId,
+                  trainingColumns))
+          .await();
+    }
+    if (existingRunCount(
+            tables, config.namespace, "ranking_training_pit_quarantine", config.runId)
+        == 0L) {
+      tables
+          .executeSql(
+              buildQuarantineInsertSql(
+                  config.namespace,
+                  config.featureDefinitionVersion,
+                  config.attributionWindowHours,
+                  config.allowedLatenessHours,
+                  config.materializationCutoff,
+                  config.runId))
+          .await();
+    }
+    tables.executeSql(
+        buildParquetExportTableSql(config.exportPrefix, config.runId, config.exportAttempt));
+    tables.executeSql(buildParquetExportInsertSql(config.namespace, config.runId)).await();
+  }
+
+  static final class JobConfig {
+    private static final Set<String> SUPPORTED_OPTIONS = Set.of(
+        "--catalog-name",
+        "--catalog-uri",
+        "--warehouse-uri",
+        "--s3-endpoint",
+        "--feature-definition-version",
+        "--attribution-window-hours",
+        "--allowed-lateness-hours",
+        "--materialization-run-id",
+        "--materialization-cutoff",
+        "--namespace",
+        "--export-uri",
+        "--export-attempt");
+    final String catalog;
+    final String catalogUri;
+    final String warehouseUri;
+    final String s3Endpoint;
+    final String namespace;
+    final String featureDefinitionVersion;
+    final int attributionWindowHours;
+    final int allowedLatenessHours;
+    final double materializationCutoff;
+    final String runId;
+    final String exportPrefix;
+    final int exportAttempt;
+
+    private JobConfig(
+        String catalog,
+        String catalogUri,
+        String warehouseUri,
+        String s3Endpoint,
+        String namespace,
+        String featureDefinitionVersion,
+        int attributionWindowHours,
+        int allowedLatenessHours,
+        double materializationCutoff,
+        String runId,
+        String exportPrefix,
+        int exportAttempt) {
+      this.catalog = catalog;
+      this.catalogUri = catalogUri;
+      this.warehouseUri = warehouseUri;
+      this.s3Endpoint = s3Endpoint;
+      this.namespace = namespace;
+      this.featureDefinitionVersion = featureDefinitionVersion;
+      this.attributionWindowHours = attributionWindowHours;
+      this.allowedLatenessHours = allowedLatenessHours;
+      this.materializationCutoff = materializationCutoff;
+      this.runId = runId;
+      this.exportPrefix = exportPrefix;
+      this.exportAttempt = exportAttempt;
+    }
+
+    static JobConfig resolve(String[] args, Map<String, String> environment) {
+      Map<String, String> options = new LinkedHashMap<>();
+      for (int index = 0; index < args.length; index += 2) {
+        if (index + 1 >= args.length || !args[index].startsWith("--")) {
+          throw new IllegalArgumentException("PIT job arguments must be --name value pairs");
+        }
+        if (!SUPPORTED_OPTIONS.contains(args[index])) {
+          throw new IllegalArgumentException("Unsupported PIT job argument " + args[index]);
+        }
+        options.put(args[index], args[index + 1]);
+      }
+      return new JobConfig(
+          option(options, "--catalog-name", environment, "FEATURE_LAKE_CATALOG_NAME", "feature_catalog"),
+          option(options, "--catalog-uri", environment, "FEATURE_LAKE_CATALOG_URI", null),
+          option(options, "--warehouse-uri", environment, "FEATURE_LAKE_WAREHOUSE_URI", null),
+          option(options, "--s3-endpoint", environment, "FEATURE_LAKE_S3_ENDPOINT", null),
+          option(options, "--namespace", environment, "FEATURE_LAKE_NAMESPACE", "video_commerce"),
+          option(options, "--feature-definition-version", environment, "FEATURE_LAKE_FEATURE_DEFINITION_VERSION", "ranking_ltr_v1"),
+          Integer.parseInt(option(options, "--attribution-window-hours", environment, "FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS", "168")),
+          Integer.parseInt(option(options, "--allowed-lateness-hours", environment, "FEATURE_LAKE_ALLOWED_LATENESS_HOURS", "1")),
+          Double.parseDouble(option(options, "--materialization-cutoff", environment, "FEATURE_LAKE_MATERIALIZATION_CUTOFF", null)),
+          option(options, "--materialization-run-id", environment, "FEATURE_LAKE_MATERIALIZATION_RUN_ID", null),
+          option(options, "--export-uri", environment, "FEATURE_LAKE_PIT_EXPORT_URI", null),
+          Integer.parseInt(
+              option(
+                  options,
+                  "--export-attempt",
+                  environment,
+                  "FEATURE_LAKE_EXPORT_ATTEMPT",
+                  "1")));
+    }
+
+    private static String option(
+        Map<String, String> options,
+        String option,
+        Map<String, String> environment,
+        String environmentName,
+        String defaultValue) {
+      String value = options.get(option);
+      return value == null || value.trim().isEmpty()
+          ? required(environment, environmentName, defaultValue)
+          : value.trim();
+    }
+
+    private static String required(
+        Map<String, String> environment, String name, String defaultValue) {
+      String value = environment.get(name);
+      if (value == null || value.trim().isEmpty()) {
+        value = defaultValue;
+      }
+      if (value == null || value.trim().isEmpty()) {
+        throw new IllegalArgumentException(name + " must be configured");
+      }
+      return value.trim();
+    }
   }
 
   static String buildRestCatalogSql(
@@ -148,15 +254,20 @@ public final class PointInTimeFeatureJoinJob {
         identifier(namespace), literal(runId), identifier(namespace), literal(runId));
   }
 
-  private static void rejectExistingRun(
-      TableEnvironment tables, String namespace, String runId) throws Exception {
+  static String buildExistingTableRunSql(String namespace, String tableName, String runId) {
+    if (!Set.of("ranking_training_pit", "ranking_training_pit_quarantine").contains(tableName)) {
+      throw new IllegalArgumentException("unsupported PIT run table " + tableName);
+    }
+    return String.format(
+        "SELECT COUNT(*) FROM `%s`.`%s` WHERE materialization_run_id='%s'",
+        identifier(namespace), tableName, literal(runId));
+  }
+
+  private static long existingRunCount(
+      TableEnvironment tables, String namespace, String tableName, String runId) throws Exception {
     try (CloseableIterator<Row> rows =
-        tables.executeSql(buildExistingRunSql(namespace, runId)).collect()) {
-      long existing = rows.hasNext() ? ((Number) rows.next().getField(0)).longValue() : 0L;
-      if (existing > 0L) {
-        throw new IllegalStateException(
-            "materialization_run_id already exists and is immutable: " + runId);
-      }
+        tables.executeSql(buildExistingTableRunSql(namespace, tableName, runId)).collect()) {
+      return rows.hasNext() ? ((Number) rows.next().getField(0)).longValue() : 0L;
     }
   }
 
@@ -389,6 +500,14 @@ public final class PointInTimeFeatureJoinJob {
   }
 
   static String buildParquetExportTableSql(String exportPrefix, String runId) {
+    return buildParquetExportTableSql(exportPrefix, runId, 1);
+  }
+
+  static String buildParquetExportTableSql(
+      String exportPrefix, String runId, int exportAttempt) {
+    if (exportAttempt < 1) {
+      throw new IllegalArgumentException("export attempt must be positive");
+    }
     return String.format(
         "CREATE TEMPORARY TABLE pit_parquet_export (observation_id STRING,impression_id STRING,"
             + "user_id STRING,"
@@ -400,7 +519,12 @@ public final class PointInTimeFeatureJoinJob {
             + "feature_definition_version STRING,label_definition_version STRING) "
             + "WITH ('connector'='filesystem','path'='%s',"
             + "'format'='parquet','sink.rolling-policy.file-size'='128mb')",
-        literal(exportPrefix) + "/runs/" + literal(runId) + "/shards");
+        literal(exportPrefix)
+            + "/runs/"
+            + literal(runId)
+            + "/attempts/"
+            + exportAttempt
+            + "/shards");
   }
 
   static String buildParquetExportInsertSql(String namespace, String runId) {
@@ -473,14 +597,4 @@ public final class PointInTimeFeatureJoinJob {
     return value.replace("'", "''");
   }
 
-  private static String requiredEnv(String name, String defaultValue) {
-    String value = System.getenv(name);
-    if (value == null || value.trim().isEmpty()) {
-      value = defaultValue;
-    }
-    if (value == null || value.trim().isEmpty()) {
-      throw new IllegalArgumentException(name + " must be configured");
-    }
-    return value.trim();
-  }
 }

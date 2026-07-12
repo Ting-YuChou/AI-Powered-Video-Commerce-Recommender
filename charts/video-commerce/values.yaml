@@ -21,6 +21,10 @@ images:
     repository: video-commerce-backend
     tag: ci
     pullPolicy: IfNotPresent
+  pitOrchestrator:
+    repository: video-commerce-pit-orchestrator
+    tag: ci
+    pullPolicy: IfNotPresent
   frontend:
     repository: video-commerce-edge
     tag: ci
@@ -122,10 +126,35 @@ external:
     rankingPitDatasetUri: ""
     featureDefinitionVersion: ranking_ltr_v1
     attributionWindowHours: 168
+    allowedLatenessHours: 1
     catalogOutboxBatchSize: 500
     catalogOutboxLeaseSeconds: 60
     catalogOutboxPollSeconds: 1
     catalogOutboxRetentionDays: 7
+    pitOrchestratorEnabled: false
+    pitScheduleHourUtc: 2
+    pitOrchestratorLeaseSeconds: 7200
+    pitTrainingLeaseSeconds: 21600
+    flinkJobmanager: ""
+    pitExportUri: ""
+    pitJobJarPath: /opt/flink/usrlib/interaction-features.jar
+
+pitOrchestrator:
+  enabled: false
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  backoffLimit: 3
+  activeDeadlineSeconds: 7200
+  env:
+    MONITORING_WORKER_METRICS_PORT: "9105"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
 
 appConfig:
   environment: production
@@ -658,6 +687,39 @@ backend:
       pdb:
         enabled: true
         minAvailable: 1
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    pitStateExporter:
+      enabled: false
+      name: pit-state-exporter
+      replicaCount: 1
+      command: ["python", "-m", "video_commerce.services.pit_state_exporter.main"]
+      env:
+        MONITORING_WORKER_METRICS_PORT: "9106"
+      service:
+        enabled: true
+        port: 9106
+        targetPort: 9106
+        portName: metrics
+        annotations: {}
+      probes:
+        type: metrics
+        livenessPath: /metrics
+        initialDelaySeconds: 15
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: 50m
+          memory: 96Mi
+        limits:
+          memory: 256Mi
+      hpa:
+        enabled: false
+      pdb:
+        enabled: false
       serviceMonitor:
         enabled: true
         path: /metrics

@@ -5,10 +5,12 @@ Offline model trainer service.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import logging
 import os
 import signal
 import socket
+import threading
 
 from video_commerce.common.config import Config
 from video_commerce.data_plane.feature_store import FeatureStore
@@ -16,7 +18,11 @@ from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.ml.ranking import RankingModel
 from video_commerce.ml.legacy_training_adapter import LegacyTrainingDatasetAdapter
-from video_commerce.ml.pit_training_dataset import PitTrainingDatasetReader
+from video_commerce.ml.pit_training_dataset import (
+    PitTrainingDatasetError,
+    PitTrainingDatasetReader,
+    PitTrainingDatasetUnavailable,
+)
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.ml.vector_search import VectorSearchEngine
@@ -43,6 +49,7 @@ class ModelTrainerService:
         self.object_storage: ObjectStorage | None = None
         self.artifact_manager: ModelArtifactManager | None = None
         self.pit_dataset_reader: PitTrainingDatasetReader | None = None
+        self.last_trained_pit_run_id: str | None = None
         self.legacy_training_adapter: LegacyTrainingDatasetAdapter | None = None
         self.observability = ObservabilityManager()
         self.running = False
@@ -117,7 +124,10 @@ class ModelTrainerService:
             )
             await self.recommendation_engine.load_models()
 
-        self.ranking_model = RankingModel(self.config.ranking_config)
+        self.ranking_model = RankingModel(
+            self.config.ranking_config,
+            observability=self.observability,
+        )
         if not use_pit_dataset:
             self.legacy_training_adapter = LegacyTrainingDatasetAdapter(
                 feature_store=self.feature_store,
@@ -158,6 +168,15 @@ class ModelTrainerService:
             self.ranking_model.loaded_checkpoint_mtime = 0.0
         if ranking_checkpoint and loaded_existing_checkpoint:
             self.ranking_model.model_version = ranking_checkpoint.model_version
+            self.last_trained_pit_run_id = (
+                str(
+                    ranking_checkpoint.payload.get(
+                        "feature_lake_materialization_run_id"
+                    )
+                    or ""
+                ).strip()
+                or None
+            )
 
         if self.config.ranking_config.enable_periodic_training:
             await self._train_ranking_model(trigger="startup")
@@ -227,9 +246,41 @@ class ModelTrainerService:
                 raise RuntimeError(
                     "PIT ranking training is configured but the dataset reader is unavailable"
                 )
-            pit_dataset = await self.pit_dataset_reader.read(
-                feature_lake_config.ranking_pit_dataset_uri
-            )
+            try:
+                pit_dataset = await self.pit_dataset_reader.read(
+                    feature_lake_config.ranking_pit_dataset_uri
+                )
+            except PitTrainingDatasetUnavailable:
+                self.observability.record_training_run(
+                    trigger,
+                    "waiting_for_pit_manifest",
+                    asyncio.get_running_loop().time() - started_at,
+                )
+                if hasattr(self.observability, "set_pit_trainer_waiting_for_manifest"):
+                    self.observability.set_pit_trainer_waiting_for_manifest(True)
+                return
+            except PitTrainingDatasetError:
+                if hasattr(self.observability, "set_pit_trainer_waiting_for_manifest"):
+                    self.observability.set_pit_trainer_waiting_for_manifest(False)
+                self.observability.record_training_run(
+                    trigger,
+                    "error",
+                    asyncio.get_running_loop().time() - started_at,
+                )
+                raise
+            if hasattr(self.observability, "set_pit_trainer_waiting_for_manifest"):
+                self.observability.set_pit_trainer_waiting_for_manifest(False)
+            if pit_dataset.materialization_run_id == getattr(
+                self, "last_trained_pit_run_id", None
+            ):
+                self.observability.record_training_run(
+                    trigger,
+                    "skipped_duplicate_manifest",
+                    asyncio.get_running_loop().time() - started_at,
+                )
+                if hasattr(self.observability, "record_pit_duplicate_manifest_skip"):
+                    self.observability.record_pit_duplicate_manifest_skip()
+                return
             interactions = pit_dataset.examples
             training_sample_source = "feature_lake_pit"
         elif (
@@ -281,6 +332,67 @@ class ModelTrainerService:
             )
             return
 
+        pit_training_claimed = False
+        pit_training_heartbeat_task: asyncio.Task | None = None
+        pit_training_lease_error: Exception | None = None
+        pit_training_cancel_event: threading.Event | None = None
+        if use_pit_dataset:
+            if not self.system_store or not hasattr(
+                self.system_store, "claim_pit_training_run"
+            ):
+                raise RuntimeError("PIT training requires durable Postgres run claims")
+            training_claim = await self.system_store.claim_pit_training_run(
+                run_id=pit_dataset.materialization_run_id,
+                worker_id=getattr(self, "instance_id", "model-trainer"),
+                lease_seconds=getattr(
+                    feature_lake_config, "pit_training_lease_seconds", 21600
+                ),
+            )
+            if not training_claim.get("claimed", False):
+                self.observability.record_training_run(
+                    trigger,
+                    "skipped_duplicate_manifest",
+                    asyncio.get_running_loop().time() - started_at,
+                )
+                if hasattr(self.observability, "record_pit_duplicate_manifest_skip"):
+                    self.observability.record_pit_duplicate_manifest_skip()
+                return
+            pit_training_claimed = True
+            pit_training_cancel_event = threading.Event()
+            training_lease_seconds = int(
+                getattr(feature_lake_config, "pit_training_lease_seconds", 21600)
+            )
+            heartbeat_interval = float(
+                getattr(
+                    self,
+                    "_pit_training_heartbeat_interval_seconds",
+                    max(30.0, min(300.0, training_lease_seconds / 3.0)),
+                )
+            )
+            owner_task = asyncio.current_task()
+
+            async def renew_training_lease() -> None:
+                nonlocal pit_training_lease_error
+                while True:
+                    await asyncio.sleep(max(0.001, heartbeat_interval))
+                    try:
+                        await self.system_store.renew_pit_training_lease(
+                            run_id=pit_dataset.materialization_run_id,
+                            worker_id=getattr(self, "instance_id", "model-trainer"),
+                            lease_seconds=training_lease_seconds,
+                        )
+                    except Exception as exc:
+                        pit_training_lease_error = exc
+                        pit_training_cancel_event.set()
+                        if owner_task is not None:
+                            owner_task.cancel()
+                        return
+
+            pit_training_heartbeat_task = asyncio.create_task(
+                renew_training_lease(),
+                name=f"pit-training-lease-{pit_dataset.materialization_run_id}",
+            )
+
         logger.info(
             "Starting ranking retrain",
             extra={
@@ -310,10 +422,18 @@ class ModelTrainerService:
                     interactions,
                     training_sample_source=training_sample_source,
                 )
-            await self.ranking_model.train_model(
-                training_examples,
-                training_sample_source=training_sample_source,
-            )
+            training_kwargs = {"training_sample_source": training_sample_source}
+            if pit_training_cancel_event is not None:
+                training_kwargs["cancellation_event"] = pit_training_cancel_event
+            await self.ranking_model.train_model(training_examples, **training_kwargs)
+            if use_pit_dataset and self.ranking_model.is_trained:
+                self.ranking_model.model_version = (
+                    f"pit-{pit_dataset.materialization_run_id}"
+                )
+                await self.ranking_model.save_model(
+                    self.ranking_model.loaded_model_path
+                    or self.config.model_config.ranking_model_path
+                )
             if use_pit_dataset and hasattr(
                 self.observability, "update_typed_pit_training_metrics"
             ):
@@ -385,14 +505,46 @@ class ModelTrainerService:
                 )
                 if record:
                     self.ranking_model.model_version = record.model_version
+                    if use_pit_dataset:
+                        self.last_trained_pit_run_id = (
+                            pit_dataset.materialization_run_id
+                        )
+                        await self.system_store.complete_pit_training_run(
+                            run_id=pit_dataset.materialization_run_id,
+                            worker_id=getattr(self, "instance_id", "model-trainer"),
+                            model_version=record.model_version,
+                        )
+                elif use_pit_dataset:
+                    raise RuntimeError("PIT ranking artifact was not persisted")
             if not use_pit_dataset and getattr(
                 feature_lake_config, "pit_shadow_enabled", False
             ):
                 await self._train_pit_shadow_model(trigger=trigger)
+        except asyncio.CancelledError as exc:
+            status = "error"
+            if pit_training_claimed:
+                await self.system_store.fail_pit_training_run(
+                    run_id=pit_dataset.materialization_run_id,
+                    worker_id=getattr(self, "instance_id", "model-trainer"),
+                )
+            if pit_training_lease_error is not None:
+                raise RuntimeError("PIT training lost its durable lease") from (
+                    pit_training_lease_error
+                )
+            raise exc
         except Exception:
             status = "error"
+            if pit_training_claimed:
+                await self.system_store.fail_pit_training_run(
+                    run_id=pit_dataset.materialization_run_id,
+                    worker_id=getattr(self, "instance_id", "model-trainer"),
+                )
             raise
         finally:
+            if pit_training_heartbeat_task is not None:
+                pit_training_heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pit_training_heartbeat_task
             self.observability.record_training_run(
                 trigger,
                 status,
@@ -425,7 +577,10 @@ class ModelTrainerService:
                 f"{trigger}_pit_shadow", "skipped_insufficient_samples", 0.0
             )
             return
-        shadow_model = RankingModel(self.config.ranking_config)
+        shadow_model = RankingModel(
+            self.config.ranking_config,
+            observability=self.observability,
+        )
         shadow_path = f"{self.config.model_config.ranking_model_path}.pit-shadow"
         shadow_model.loaded_model_path = shadow_path
         shadow_started = asyncio.get_running_loop().time()

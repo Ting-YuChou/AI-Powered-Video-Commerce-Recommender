@@ -228,6 +228,13 @@ x-common-service: &common-service
     FEATURE_LAKE_CATALOG_OUTBOX_LEASE_SECONDS: ${FEATURE_LAKE_CATALOG_OUTBOX_LEASE_SECONDS:-60}
     FEATURE_LAKE_CATALOG_OUTBOX_POLL_SECONDS: ${FEATURE_LAKE_CATALOG_OUTBOX_POLL_SECONDS:-1}
     FEATURE_LAKE_CATALOG_OUTBOX_RETENTION_DAYS: ${FEATURE_LAKE_CATALOG_OUTBOX_RETENTION_DAYS:-7}
+    FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED: ${FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED:-false}
+    FEATURE_LAKE_PIT_SCHEDULE_HOUR_UTC: ${FEATURE_LAKE_PIT_SCHEDULE_HOUR_UTC:-2}
+    FEATURE_LAKE_PIT_ORCHESTRATOR_LEASE_SECONDS: ${FEATURE_LAKE_PIT_ORCHESTRATOR_LEASE_SECONDS:-7200}
+    FEATURE_LAKE_PIT_TRAINING_LEASE_SECONDS: ${FEATURE_LAKE_PIT_TRAINING_LEASE_SECONDS:-21600}
+    FEATURE_LAKE_FLINK_JOBMANAGER: ${FEATURE_LAKE_FLINK_JOBMANAGER:-}
+    FEATURE_LAKE_PIT_EXPORT_URI: ${FEATURE_LAKE_PIT_EXPORT_URI:-}
+    FEATURE_LAKE_PIT_JOB_JAR_PATH: ${FEATURE_LAKE_PIT_JOB_JAR_PATH:-/opt/flink/usrlib/interaction-features.jar}
   volumes:
     - models_data:/app/models
     - upload_data:/app/uploads
@@ -582,6 +589,74 @@ services:
           memory: 2G
           cpus: "1.0"
 
+  pit-dataset-orchestrator:
+    <<: *common-service
+    profiles: ["pit-production"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: pit-orchestrator
+      args:
+        PYTHON_VERSION: "3.10"
+        BUILD_ENV: production
+    command: python -m video_commerce.services.pit_dataset_orchestrator.main
+    environment:
+      <<: *common-env
+      FEATURE_LAKE_ENABLED: "true"
+      FEATURE_LAKE_TRAINING_SOURCE: pit
+      FEATURE_LAKE_PIT_SHADOW_ENABLED: "false"
+      FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED: "true"
+      FEATURE_LAKE_CATALOG_URI: http://iceberg-rest:8181
+      FEATURE_LAKE_WAREHOUSE_URI: s3://video-commerce-features/warehouse
+      FEATURE_LAKE_S3_ENDPOINT: http://minio:9000
+      FEATURE_LAKE_FLINK_JOBMANAGER: flink-jobmanager:8081
+      FEATURE_LAKE_PIT_EXPORT_URI: s3://video-commerce-features/training/ranking-pit
+      FEATURE_LAKE_ALLOWED_LATENESS_HOURS: ${FEATURE_LAKE_ALLOWED_LATENESS_HOURS:-1}
+      FEATURE_LAKE_RANKING_PIT_DATASET_URI: s3://video-commerce-features/training/ranking-pit/latest.json
+      OBJECT_STORAGE_BACKEND: s3
+      OBJECT_STORAGE_ENDPOINT_URL: http://minio:9000
+      OBJECT_STORAGE_BUCKET: video-commerce-features
+      OBJECT_STORAGE_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.20.1.jar
+      MONITORING_WORKER_METRICS_PORT: 9105
+    expose:
+      - "9105"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      feature-lake-readiness-gate:
+        condition: service_completed_successfully
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+      iceberg-rest:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+
+  pit-state-exporter:
+    <<: *common-service
+    profiles: ["pit-production"]
+    command: python -m video_commerce.services.pit_state_exporter.main
+    environment:
+      <<: *common-env
+      MONITORING_WORKER_METRICS_PORT: 9106
+    expose:
+      - "9106"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
   redis:
     image: redis:7-alpine
     command:
@@ -763,7 +838,10 @@ services:
       - flink_savepoints:/flink/savepoints
 
   flink-jobmanager:
-    image: flink:1.20.1-scala_2.12-java17
+    image: ${FLINK_FEATURE_IMAGE:-video-commerce-flink-feature:local}
+    build:
+      context: ./flink-jobs/interaction-features
+      dockerfile: Dockerfile
     profiles: ["flink", "feature-lake", "feature-lake-pit"]
     command: jobmanager
     environment:
@@ -800,7 +878,10 @@ services:
     restart: unless-stopped
 
   flink-taskmanager:
-    image: flink:1.20.1-scala_2.12-java17
+    image: ${FLINK_FEATURE_IMAGE:-video-commerce-flink-feature:local}
+    build:
+      context: ./flink-jobs/interaction-features
+      dockerfile: Dockerfile
     profiles: ["flink", "feature-lake", "feature-lake-pit"]
     command: taskmanager
     environment:
@@ -890,6 +971,7 @@ services:
 
   flink-feature-history-materializer:
     profiles: ["feature-lake", "feature-lake-pit"]
+    image: ${FLINK_FEATURE_IMAGE:-video-commerce-flink-feature:local}
     build:
       context: ./flink-jobs/interaction-features
       dockerfile: Dockerfile
@@ -982,7 +1064,7 @@ services:
 
   feature-lake-readiness-gate:
     <<: *common-service
-    profiles: ["feature-lake-pit"]
+    profiles: ["feature-lake-pit", "pit-production"]
     command: python -m video_commerce.ml.feature_lake_readiness
     environment:
       <<: *common-env

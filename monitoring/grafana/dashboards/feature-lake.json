@@ -46,6 +46,19 @@
         {"expr": "pit_current_state_calls", "legendFormat": "forbidden current-state calls"},
         {"expr": "pit_invalid_feature_or_label_rows", "legendFormat": "invalid tensor rows"}
       ]
+    },
+    {
+      "id": 6,
+      "title": "PIT production rollout state",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "pit_orchestrator_waiting_for_rows", "legendFormat": "orchestrator waiting"},
+        {"expr": "pit_orchestrator_run_in_progress", "legendFormat": "orchestrator running"},
+        {"expr": "pit_orchestrator_lease_expired", "legendFormat": "orchestrator lease expired"},
+        {"expr": "pit_trainer_waiting_for_manifest", "legendFormat": "trainer waiting"},
+        {"expr": "increase(pit_training_duplicate_manifest_skips_total[24h])", "legendFormat": "duplicate manifests skipped"},
+        {"expr": "rate(ranking_untrained_fallback_total[5m])", "legendFormat": "untrained fallback/s"}
+      ]
     }
   ],
   "schemaVersion": 39,

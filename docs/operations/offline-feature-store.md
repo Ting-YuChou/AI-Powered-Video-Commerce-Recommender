@@ -114,27 +114,86 @@ materialization run, Iceberg snapshot, schema hash, feature/label/assembler
 versions, input and quarantine counts, and value-mask coverage in artifact
 metadata.
 
-## Seven-day cutover and rollback
+## Greenfield PIT-first rollout
 
-Keep `FEATURE_LAKE_TRAINING_SOURCE=legacy` until seven consecutive UTC daily
-reports pass all gates: zero leakage and duplicates, complete reconciliation,
-99.9% bundle parity at `1e-6`, lag/outbox thresholds, coverage within 0.1
-percentage point, and 100% shadow training/artifact persistence. Phase 3 also
-requires exact typed assembler parity, exact label reconciliation, zero PIT
-current-state reads, zero invalid numeric rows, serving p95 regression no more
-than 5%, and throughput at least 95% of baseline.
+This environment has no production traffic or artifact to preserve, so the
+production-like Compose preset uses PIT as the primary source immediately. It
+does not shorten the 168-hour attribution window or create an empty manifest.
 
-Then set:
-
-```text
-FEATURE_LAKE_TRAINING_SOURCE=pit
-FEATURE_LAKE_RANKING_PIT_DATASET_URI=s3://video-commerce-features/training/ranking-pit/latest.json
+```bash
+docker compose --env-file deploy/compose/pit-production.conf \
+  --profile feature-lake --profile pit-production up -d --build
 ```
 
-Rollback changes only `FEATURE_LAKE_TRAINING_SOURCE` to `legacy`. Publisher,
-materializer, or batch jobs may be paused independently and do not affect
-online recommendation serving.
+The first healthy state is normally `waiting_for_eligible_rows` in
+`pit_materialization_runs` and `waiting_for_pit_manifest` in trainer metrics.
+That state is expected until observations are older than the attribution window
+plus allowed lateness. `latest.json` remains absent. The trainer never reads
+current Redis/catalog state and does not fall back to legacy. Until a valid PIT
+artifact is activated, ranking sorts candidates by their existing
+`combined_score`; it does not execute a randomly initialized neural model.
 
-Kubernetes remains application-only. The Helm chart can deploy
-`catalogEventPublisher`, but Postgres, Kafka, S3, Iceberg REST, and the Flink
-cluster/jobs must be externally managed.
+Every daily cutoff is `02:00:00 UTC` with deterministic run ID
+`pit-YYYYMMDD`. Retry a particular UTC run without changing its identity:
+
+```bash
+docker compose --env-file deploy/compose/pit-production.conf \
+  --profile feature-lake --profile pit-production run --rm \
+  pit-dataset-orchestrator --once --date 2026-07-11
+```
+
+Waiting runs are terminal for that daily cutoff; the next daily run reevaluates
+newly eligible data. Failed runs are retryable. A run that already reached
+the manifest phase resumes there without appending a second PIT Iceberg run.
+An identical completed manifest may be republished to repair `latest.json`, but
+different content under the same run ID fails closed.
+
+Inspect durable orchestration and artifact lineage:
+
+```bash
+docker compose exec -T postgres psql -U video_commerce -d video_commerce \
+  -c "select run_id,status,phase,attempts,snapshot_id,manifest_uri,row_count,last_error from pit_materialization_runs order by cutoff_at desc limit 10"
+
+docker compose exec -T postgres psql -U video_commerce -d video_commerce \
+  -c "select model_name,model_version,payload->>'feature_lake_materialization_run_id' as pit_run from model_checkpoints order by created_at desc limit 10"
+```
+
+The Helm preset is application-only and deliberately fails rendering until
+external Kafka, S3, Iceberg REST, and Flink endpoints are supplied:
+
+```bash
+helm upgrade --install video-commerce charts/video-commerce \
+  -f charts/video-commerce/values-pit-production.yaml \
+  --set external.kafka.bootstrapServers=kafka.example:9092 \
+  --set external.objectStorage.endpointUrl=https://s3.example \
+  --set external.objectStorage.bucket=video-commerce-features \
+  --set external.featureLake.catalogUri=https://iceberg.example \
+  --set external.featureLake.warehouseUri=s3://video-commerce-features/warehouse \
+  --set external.featureLake.flinkJobmanager=flink.example:8081
+```
+
+The CronJob runs daily at `02:00 UTC` with `concurrencyPolicy: Forbid` and
+submits a deterministic Job ID through the Flink REST API. The long-lived
+`pit-state-exporter` exposes Postgres-backed last-success, waiting, running, and
+expired-lease state after CronJob pods exit. REST-submitted application setup
+runs on the external JobManager, so both JobManager and TaskManager images must
+provide the cluster-level runtime used by the Compose feature image:
+
+- Flink 1.20.1 on Java 17.
+- Hadoop client API/runtime 3.4.2 in `/opt/flink/lib`.
+- The Flink S3 filesystem plugin enabled on every node.
+- Network access and credentials for the configured Iceberg REST catalog and
+  S3-compatible warehouse.
+
+The application JAR carries Iceberg 1.11 and the PIT code, while catalog,
+warehouse, S3 endpoint, feature version, attribution window, and allowed
+lateness are passed explicitly through the REST `programArgsList`. Credentials
+remain cluster-managed and are never sent as job arguments.
+
+Activation still requires each individual run to pass manifest/hash/schema,
+PIT leakage, typed assembler, label reconciliation, and finite-tensor gates.
+The seven-day shadow gate is not used for this greenfield rollout.
+
+Emergency rollback changes only `FEATURE_LAKE_TRAINING_SOURCE=legacy` and
+restarts the trainer. Kafka-to-Iceberg materialization may continue; serving
+never reads Iceberg directly.

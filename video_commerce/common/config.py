@@ -1408,6 +1408,10 @@ class FeatureLakeConfig(BaseSettings):
         None,
         description="S3 warehouse URI used by the Iceberg catalog",
     )
+    s3_endpoint: Optional[str] = Field(
+        None,
+        description="S3 endpoint passed to externally submitted Flink PIT jobs",
+    )
     namespace: str = Field("video_commerce", description="Iceberg namespace")
     training_source: str = Field(
         "legacy",
@@ -1416,6 +1420,36 @@ class FeatureLakeConfig(BaseSettings):
     pit_shadow_enabled: bool = Field(
         False,
         description="Train a non-activating typed PIT shadow artifact beside legacy",
+    )
+    pit_orchestrator_enabled: bool = Field(
+        False,
+        description="Run the leased daily PIT export and manifest orchestrator",
+    )
+    pit_schedule_hour_utc: int = Field(
+        2,
+        ge=0,
+        le=23,
+        description="UTC hour used for deterministic daily PIT run cutoffs",
+    )
+    pit_orchestrator_lease_seconds: int = Field(
+        7200,
+        description="Lease duration for one daily PIT orchestration attempt",
+    )
+    pit_training_lease_seconds: int = Field(
+        21600,
+        description="Lease duration for one PIT training and artifact persistence run",
+    )
+    flink_jobmanager: Optional[str] = Field(
+        None,
+        description="Flink JobManager REST endpoint used by the PIT orchestrator",
+    )
+    pit_export_uri: Optional[str] = Field(
+        None,
+        description="Immutable Parquet and manifest output prefix",
+    )
+    pit_job_jar_path: str = Field(
+        "/opt/flink/usrlib/interaction-features.jar",
+        description="PIT Flink job jar path inside the orchestrator image",
     )
     ranking_pit_dataset_uri: Optional[str] = Field(
         None,
@@ -1428,6 +1462,11 @@ class FeatureLakeConfig(BaseSettings):
     attribution_window_hours: int = Field(
         168,
         description="Maximum feedback attribution window after a ranking impression",
+    )
+    allowed_lateness_hours: int = Field(
+        1,
+        ge=0,
+        description="Additional lateness allowed before PIT observations finalize",
     )
     catalog_outbox_batch_size: int = Field(
         500, description="Catalog outbox rows claimed by one publisher iteration"
@@ -1454,6 +1493,8 @@ class FeatureLakeConfig(BaseSettings):
         "catalog_outbox_batch_size",
         "catalog_outbox_lease_seconds",
         "catalog_outbox_retention_days",
+        "pit_orchestrator_lease_seconds",
+        "pit_training_lease_seconds",
     )
     def validate_positive_feature_lake_ints(cls, value: int) -> int:
         if value <= 0:
@@ -2142,6 +2183,23 @@ class Config:
             if not self.feature_lake_config.ranking_pit_dataset_uri:
                 errors.append(
                     "FEATURE_LAKE_RANKING_PIT_DATASET_URI is required when FEATURE_LAKE_PIT_SHADOW_ENABLED=true"
+                )
+        if self.feature_lake_config.pit_orchestrator_enabled:
+            if not self.feature_lake_config.enabled:
+                errors.append(
+                    "FEATURE_LAKE_ENABLED=true is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
+                )
+            if self.feature_lake_config.training_source != "pit":
+                errors.append(
+                    "FEATURE_LAKE_TRAINING_SOURCE=pit is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
+                )
+            if not self.feature_lake_config.flink_jobmanager:
+                errors.append(
+                    "FEATURE_LAKE_FLINK_JOBMANAGER is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
+                )
+            if not self.feature_lake_config.pit_export_uri:
+                errors.append(
+                    "FEATURE_LAKE_PIT_EXPORT_URI is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
                 )
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":
