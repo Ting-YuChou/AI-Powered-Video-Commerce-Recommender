@@ -32,6 +32,9 @@ class FakePipeline:
     def zrange(self, key, start, end):
         self.ops.append(("zrange", key, start, end))
 
+    def zrevrangebyscore(self, key, maximum, minimum, start=0, num=None):
+        self.ops.append(("zrevrangebyscore", key, maximum, minimum, start, num))
+
     def zadd(self, key, mapping):
         self.ops.append(("zadd", key, mapping))
 
@@ -59,6 +62,28 @@ class FakePipeline:
                 _, key, start, end = op
                 values = self.client.data.get(key, [])
                 results.append(values[start:] if end == -1 else values[start : end + 1])
+            elif op[0] == "zrevrangebyscore":
+                _, key, maximum, minimum, start, num = op
+                max_value = float(str(maximum).lstrip("("))
+                exclusive = str(maximum).startswith("(")
+                eligible = []
+                for value in self.client.data.get(key, []):
+                    try:
+                        payload = json.loads(value)
+                        score = float(
+                            payload.get("occurred_at", payload.get("timestamp", 0))
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        score = 0.0
+                    if score >= float(minimum) and (
+                        score < max_value if exclusive else score <= max_value
+                    ):
+                        eligible.append((score, value))
+                eligible.sort(key=lambda item: item[0], reverse=True)
+                selected = [value for _, value in eligible]
+                results.append(
+                    selected[start : start + num] if num else selected[start:]
+                )
             elif op[0] == "zadd":
                 _, key, mapping = op
                 bucket = self.client.data.setdefault(key, [])
@@ -251,6 +276,33 @@ async def test_get_din_behavior_sequences_fails_closed_on_official_corruption():
         await store.get_din_behavior_sequences("u1", as_of_ts=30.0, last_n=2)
 
     assert store.din_sequence_decode_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_get_din_behavior_sequences_filters_by_score_before_last_n():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uiza:click:u1"] = [
+        json.dumps(
+            {
+                "product_id": product_id,
+                "action": "click",
+                "occurred_at": occurred_at,
+                "event_id": product_id,
+            }
+        )
+        for product_id, occurred_at in (
+            ("valid-1", 10.0),
+            ("valid-2", 20.0),
+            ("future-1", 40.0),
+            ("future-2", 50.0),
+        )
+    ]
+
+    sequences = await store.get_din_behavior_sequences("u1", as_of_ts=30.0, last_n=2)
+
+    assert sequences.actions["click"].product_ids == ("valid-1", "valid-2")
 
 
 @pytest.mark.asyncio

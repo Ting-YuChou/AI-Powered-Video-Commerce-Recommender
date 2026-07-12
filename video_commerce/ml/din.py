@@ -105,9 +105,7 @@ def build_din_batch_inputs(
         sequences = getattr(bundle, "behavior_sequences", None)
         key = (
             float(bundle.as_of_ts),
-            build_din_freshness_token(sequences)["sequence_hash"]
-            if sequences is not None
-            else "empty",
+            din_sequence_identity(sequences) if sequences is not None else "empty",
         )
         request_index = request_keys.get(key)
         if request_index is None:
@@ -308,6 +306,12 @@ def build_din_freshness_token(sequences: DINBehaviorSequences) -> Dict[str, Any]
         "actions": action_tokens,
         "sequence_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     }
+
+
+def din_sequence_identity(sequences: DINBehaviorSequences) -> str:
+    """Hash every sequence field for collision-safe request-history reuse."""
+    canonical = json.dumps(sequences.to_dict(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def parse_din_behavior_sequences(

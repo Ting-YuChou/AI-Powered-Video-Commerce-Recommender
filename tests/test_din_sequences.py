@@ -177,6 +177,48 @@ def test_din_batch_reuses_request_history_and_emits_candidate_mapping():
     assert torch.count_nonzero(batch.summary_features[1]) == 0
 
 
+def test_din_batch_does_not_dedupe_histories_with_same_freshness_tail():
+    as_of = 4_000_000.0
+    first = build_din_behavior_sequences(
+        [
+            _event("older-a", "click", as_of - 120, event_id="older-a"),
+            _event("latest", "click", as_of - 60, event_id="latest"),
+        ],
+        as_of_ts=as_of,
+        last_n=3,
+    )
+    second = build_din_behavior_sequences(
+        [
+            _event("older-b", "click", as_of - 120, event_id="older-b"),
+            _event("latest", "click", as_of - 60, event_id="latest"),
+        ],
+        as_of_ts=as_of,
+        last_n=3,
+    )
+    user = UserFeatures(user_id="u1")
+    bundles = [
+        FeatureBundle(
+            as_of_ts=as_of,
+            feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            user_features=user,
+            product_metadata={"price": 1.0},
+            context={},
+            candidate=CandidateProduct(product_id=f"c{index}", source="test"),
+            behavior_sequences=sequences,
+        )
+        for index, sequences in enumerate((first, second), start=1)
+    ]
+
+    batch = build_din_batch_inputs(
+        bundles,
+        {"older-a": 1, "older-b": 2, "latest": 3, "c1": 4, "c2": 5},
+        sequence_length=3,
+    )
+
+    assert batch.request_history_indices.shape[0] == 2
+    assert batch.candidate_to_request.tolist() == [0, 1]
+
+
 def test_ranking_model_backpropagates_existing_loss_into_din_attention():
     torch.manual_seed(9)
     config = RankingConfig(

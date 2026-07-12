@@ -2717,6 +2717,39 @@ async def test_recommendation_path_expands_ranker_pool_and_caches_post_mmr(monke
 
 
 @pytest.mark.asyncio
+async def test_din_history_failure_routes_to_combined_score_fallback(monkeypatch):
+    async def must_not_rank(**_kwargs):
+        raise AssertionError(
+            "trained DIN ranker must not run after history read failure"
+        )
+
+    monkeypatch.setattr(
+        recommendation_api_module, "_rank_candidates_for_request", must_not_rank
+    )
+    (
+        recommendations,
+        profile,
+    ) = await recommendation_api_module._rank_candidates_with_din_guard(
+        din_history_failed=True,
+        candidates=[
+            CandidateProduct(product_id="low", combined_score=0.1, source="test"),
+            CandidateProduct(product_id="high", combined_score=0.9, source="test"),
+        ],
+        user_features=UserFeatures(user_id="u1"),
+        context={},
+        product_metadata_map={
+            "high": {"title": "High", "price": 1.0},
+            "low": {"title": "Low", "price": 1.0},
+        },
+        k=2,
+        http_request=None,
+    )
+
+    assert [item.product_id for item in recommendations] == ["high", "low"]
+    assert profile["path"] == "fallback_din_history_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_recommendation_path_does_not_force_empty_interactions_when_swing_needs_them(
     monkeypatch,
 ):

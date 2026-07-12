@@ -1039,7 +1039,13 @@ class FeatureStore:
                     f"{self._feature_namespace_prefix(namespace)}"
                     f"{self.prefixes['din_user_interactions_zset']}{action}:{user_id}"
                 )
-                pipeline.zrange(key, -last_n, -1)
+                pipeline.zrevrangebyscore(
+                    key,
+                    f"({resolved_as_of}",
+                    resolved_as_of - 30 * 86400.0,
+                    start=0,
+                    num=last_n,
+                )
             raw_sequences = await pipeline.execute()
             for raw_values in raw_sequences:
                 for raw in raw_values or []:
