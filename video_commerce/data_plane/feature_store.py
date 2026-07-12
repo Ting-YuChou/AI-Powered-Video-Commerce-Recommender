@@ -34,6 +34,13 @@ from video_commerce.common.cache_codec import (
     unpack_cache_payload,
 )
 from video_commerce.common.config import RedisConfig, CacheConfig
+from video_commerce.ml.din import (
+    DIN_ACTIONS,
+    DIN_ACTION_MAP,
+    DINBehaviorSequences,
+    build_din_behavior_sequences,
+    build_din_freshness_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +82,8 @@ class FeatureStore:
         self.redis_client: Optional[redis.Redis] = None
         self.cache_redis_client: Optional[redis.Redis] = None
         self.is_connected = False
+        self.din_sequence_read_failures = 0
+        self.din_sequence_decode_failures = 0
 
         # Key prefixes for different data types
         self.prefixes = {
@@ -83,6 +92,7 @@ class FeatureStore:
             "content_status": "cs:",
             "user_interactions": "ui:",
             "user_interactions_zset": "uiz:",
+            "din_user_interactions_zset": "uiza:",
             "user_sequence_token": "ust:",
             "realtime_window_features": "rtwf:",
             "recommendations_cache": "rc:",
@@ -308,9 +318,9 @@ class FeatureStore:
             return
         self._known_content_feature_ids.add(content_id)
         if features is not None:
-            self._content_features_memory_cache[content_id] = self._clone_content_features(
-                features
-            )
+            self._content_features_memory_cache[
+                content_id
+            ] = self._clone_content_features(features)
 
     async def refresh_content_feature_snapshot(self) -> int:
         """Refresh local content-feature IDs and values for request-time miss avoidance."""
@@ -338,9 +348,7 @@ class FeatureStore:
                     memory_cache[content_id] = ContentFeatures(**data)
                     known_ids.add(content_id)
                 except (Exception, CacheDecodeError) as exc:
-                    logger.warning(
-                        "content_feature_snapshot_decode_failed: %s", exc
-                    )
+                    logger.warning("content_feature_snapshot_decode_failed: %s", exc)
             key_batch = []
             id_batch = []
 
@@ -458,7 +466,10 @@ class FeatureStore:
     ) -> Tuple[UserFeatures, Dict[str, Any]]:
         """Read user features and the compact sequence token with one Redis round trip."""
         if self._can_skip_user_context_redis(user_id):
-            return self._default_user_features(user_id), self._empty_user_sequence_token()
+            return (
+                self._default_user_features(user_id),
+                self._empty_user_sequence_token(),
+            )
 
         try:
             client = self._client_for_key_type("user_features")
@@ -906,6 +917,21 @@ class FeatureStore:
             pipeline.lpush(user_key, *serialized)
             pipeline.ltrim(user_key, 0, 999)
             pipeline.expire(user_key, 86400 * 30)
+            for serialized_interaction in serialized:
+                payload = json.loads(serialized_interaction)
+                action = DIN_ACTION_MAP.get(str(payload.get("action") or "").lower())
+                if action is None:
+                    continue
+                action_key = (
+                    f"{self.prefixes['din_user_interactions_zset']}"
+                    f"{action}:{user_id}"
+                )
+                pipeline.zadd(
+                    action_key,
+                    {serialized_interaction: float(payload["occurred_at"])},
+                )
+                pipeline.zremrangebyrank(action_key, 0, -201)
+                pipeline.expire(action_key, 86400 * 30)
             await pipeline.execute()
             self.mark_user_known(user_id)
             await self.refresh_user_sequence_token(user_id)
@@ -993,6 +1019,76 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error getting user sequence for {user_id}: {e}")
             return []
+
+    async def get_din_behavior_sequences(
+        self,
+        user_id: str,
+        *,
+        as_of_ts: Optional[float] = None,
+        last_n: int = 60,
+        namespace: str = "official",
+    ) -> DINBehaviorSequences:
+        """Read action-specific DIN histories with one Redis round trip."""
+        resolved_as_of = float(as_of_ts if as_of_ts is not None else time.time())
+        client = self._client_for_key_type("user_interactions")
+        events: List[Dict[str, Any]] = []
+        try:
+            pipeline = client.pipeline(transaction=False)
+            for action in DIN_ACTIONS:
+                key = (
+                    f"{self._feature_namespace_prefix(namespace)}"
+                    f"{self.prefixes['din_user_interactions_zset']}{action}:{user_id}"
+                )
+                pipeline.zrevrangebyscore(
+                    key,
+                    f"({resolved_as_of}",
+                    resolved_as_of - 30 * 86400.0,
+                    start=0,
+                    num=last_n,
+                )
+            raw_sequences = await pipeline.execute()
+            for raw_values in raw_sequences:
+                for raw in raw_values or []:
+                    try:
+                        events.append(self._loads_redis_json(raw))
+                    except Exception as exc:
+                        self.din_sequence_decode_failures += 1
+                        logger.error(
+                            "Invalid official DIN action-history member for %s: %s",
+                            user_id,
+                            exc,
+                        )
+                        raise RuntimeError(
+                            "official DIN action history contains invalid data"
+                        ) from exc
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            self.din_sequence_read_failures += 1
+            logger.error("Unable to read official DIN action histories: %s", exc)
+            raise RuntimeError("official DIN action history read failed") from exc
+
+        if not events and namespace == "legacy":
+            events = await self.get_user_sequence(user_id, limit=1000)
+        return build_din_behavior_sequences(
+            events,
+            as_of_ts=resolved_as_of,
+            last_n=last_n,
+        )
+
+    async def get_din_freshness_token(
+        self,
+        user_id: str,
+        *,
+        as_of_ts: Optional[float] = None,
+        last_n: int = 60,
+    ) -> Dict[str, Any]:
+        sequences = await self.get_din_behavior_sequences(
+            user_id,
+            as_of_ts=as_of_ts,
+            last_n=last_n,
+        )
+        return build_din_freshness_token(sequences)
 
     async def _get_user_interactions_zset(
         self,

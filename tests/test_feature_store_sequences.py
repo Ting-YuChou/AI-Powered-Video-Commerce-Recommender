@@ -29,6 +29,18 @@ class FakePipeline:
         self.ops.append(("get", key))
         self.client.get_calls.append(key)
 
+    def zrange(self, key, start, end):
+        self.ops.append(("zrange", key, start, end))
+
+    def zrevrangebyscore(self, key, maximum, minimum, start=0, num=None):
+        self.ops.append(("zrevrangebyscore", key, maximum, minimum, start, num))
+
+    def zadd(self, key, mapping):
+        self.ops.append(("zadd", key, mapping))
+
+    def zremrangebyrank(self, key, start, end):
+        self.ops.append(("zremrangebyrank", key, start, end))
+
     async def execute(self):
         results = []
         for op in self.ops:
@@ -46,6 +58,43 @@ class FakePipeline:
             elif op[0] == "get":
                 _, key = op
                 results.append(self.client.data.get(key))
+            elif op[0] == "zrange":
+                _, key, start, end = op
+                values = self.client.data.get(key, [])
+                results.append(values[start:] if end == -1 else values[start : end + 1])
+            elif op[0] == "zrevrangebyscore":
+                _, key, maximum, minimum, start, num = op
+                max_value = float(str(maximum).lstrip("("))
+                exclusive = str(maximum).startswith("(")
+                eligible = []
+                for value in self.client.data.get(key, []):
+                    try:
+                        payload = json.loads(value)
+                        score = float(
+                            payload.get("occurred_at", payload.get("timestamp", 0))
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        score = 0.0
+                    if score >= float(minimum) and (
+                        score < max_value if exclusive else score <= max_value
+                    ):
+                        eligible.append((score, value))
+                eligible.sort(key=lambda item: item[0], reverse=True)
+                selected = [value for _, value in eligible]
+                results.append(
+                    selected[start : start + num] if num else selected[start:]
+                )
+            elif op[0] == "zadd":
+                _, key, mapping = op
+                bucket = self.client.data.setdefault(key, [])
+                bucket.extend(mapping)
+            elif op[0] == "zremrangebyrank":
+                _, key, start, end = op
+                bucket = self.client.data.get(key, [])
+                if end < 0:
+                    end = len(bucket) + end
+                if end >= start:
+                    del bucket[start : end + 1]
         return results
 
 
@@ -126,6 +175,8 @@ async def test_log_user_interactions_batch_preserves_sequence_fields():
     assert newest["event_id"] == "e2"
     assert newest["occurred_at"] == 2.0
     assert newest["schema_version"] == 1
+    assert len(fake.data["uiza:click:u1"]) == 1
+    assert "uiza:view:u1" not in fake.data
 
 
 @pytest.mark.asyncio
@@ -177,6 +228,81 @@ async def test_get_user_sequence_returns_positive_events_oldest_to_newest():
 
     assert [event["product_id"] for event in sequence] == ["p1", "p2", "p4"]
     assert [event["event_id"] for event in sequence] == ["e1", "e2", "e4"]
+
+
+@pytest.mark.asyncio
+async def test_get_din_behavior_sequences_reads_action_zsets_in_one_pipeline():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uiza:click:u1"] = [
+        json.dumps(
+            {
+                "product_id": "p1",
+                "action": "click",
+                "occurred_at": 10.0,
+                "available_at": 10.0,
+                "event_id": "e1",
+            }
+        )
+    ]
+    fake.data["uiza:cart:u1"] = [
+        json.dumps(
+            {
+                "product_id": "p2",
+                "action": "add_to_cart",
+                "occurred_at": 20.0,
+                "available_at": 20.0,
+                "event_id": "e2",
+            }
+        )
+    ]
+
+    sequences = await store.get_din_behavior_sequences("u1", as_of_ts=30.0, last_n=2)
+
+    assert sequences.actions["click"].product_ids == ("", "p1")
+    assert sequences.actions["cart"].product_ids == ("", "p2")
+    assert sequences.actions["purchase"].mask == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_get_din_behavior_sequences_fails_closed_on_official_corruption():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uiza:click:u1"] = ["not-json"]
+
+    with pytest.raises(RuntimeError, match="invalid data"):
+        await store.get_din_behavior_sequences("u1", as_of_ts=30.0, last_n=2)
+
+    assert store.din_sequence_decode_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_get_din_behavior_sequences_filters_by_score_before_last_n():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uiza:click:u1"] = [
+        json.dumps(
+            {
+                "product_id": product_id,
+                "action": "click",
+                "occurred_at": occurred_at,
+                "event_id": product_id,
+            }
+        )
+        for product_id, occurred_at in (
+            ("valid-1", 10.0),
+            ("valid-2", 20.0),
+            ("future-1", 40.0),
+            ("future-2", 50.0),
+        )
+    ]
+
+    sequences = await store.get_din_behavior_sequences("u1", as_of_ts=30.0, last_n=2)
+
+    assert sequences.actions["click"].product_ids == ("valid-1", "valid-2")
 
 
 @pytest.mark.asyncio
@@ -446,9 +572,7 @@ async def test_content_feature_snapshot_serves_known_content_from_memory():
             "speech_categories": ["electronics"],
         },
     )
-    fake.data["cf:content-1"] = pack_cache_payload(
-        "content_features", features.dict()
-    )
+    fake.data["cf:content-1"] = pack_cache_payload("content_features", features.dict())
     store.configure_content_feature_snapshot(enabled=True, max_items=100)
 
     count = await store.refresh_content_feature_snapshot()

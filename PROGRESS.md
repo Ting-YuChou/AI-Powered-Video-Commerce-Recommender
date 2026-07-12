@@ -1,5 +1,42 @@
 # Progress
 
+## 2026-07-12 — PIT DIN ranking implementation
+
+- Added `din_sequence_v1` click/cart/purchase histories with strict 30-day PIT
+  filtering, chronological left-padding to 60, repeated-event preservation,
+  action-specific Redis ZSETs, and sequence-aware cache freshness.
+- Added candidate-aware DIN attention over a checksummed, ranking-owned frozen
+  128-d two-tower sidecar; ranking keeps the existing CTR/CVR/CTCVR/GMV and LTR
+  objectives and now records AUC, NDCG, attention entropy, sequence coverage,
+  embedding coverage, and unknown-item rate.
+- Added `ranking_ltr_v2_din`, `ranking_feature_assembler_v2_din`,
+  `ranking_v3_din`, PIT `behavior_sequences_json`, payload v3 capability
+  negotiation, request-level history reuse, a 30% non-empty sequence gate, and
+  jointly checksummed checkpoint/embedding-sidecar activation metadata with
+  strict load-time lineage validation.
+- Key files: `video_commerce/ml/din.py`, `video_commerce/ml/ranking.py`,
+  `video_commerce/ml/pit_training_dataset.py`,
+  `video_commerce/ranking_runtime/ranking_batcher.py`,
+  `video_commerce/services/model_trainer/main.py`, and the Flink interaction/PIT
+  jobs.
+- Verification: Docker backend suite 472 passed, 4 skipped; Flink Maven 27
+  passed; targeted Black, `docker compose config -q`, and Helm lint passed.
+  After merging the temporal multimodal ranking work from `main`, the combined
+  DIN/batcher/temporal/ranking optimization Docker suite passed 113 tests.
+  Independent review findings were fixed for strict checkpoint/sidecar lineage,
+  atomic checkpoint writes, v3 fail-closed negotiation, stable history reuse,
+  unknown-item zeroing, Iceberg schema evolution, corrupt Redis reads,
+  full-sequence history identity, score-bounded ZSET reads, and explicit
+  combined-score fallback when official DIN history is unavailable; the
+  degraded path also bypasses recommendation-cache reads and writes.
+  CPU DIN-branch p95 with 10 valid
+  events/action was 26.5 ms at 100 candidates and 48.3 ms at 250 candidates.
+- Follow-up/blocker: the approved +10 ms p95 activation budget is not met on the
+  current CPU image, so DIN remains disabled by default and must not be activated
+  until the production-target benchmark passes or the attention path is further
+  optimized. The dedicated independent reviewer completed final re-review with
+  `Ready to merge: Yes`.
+
 ## 2026-07-12 — Temporal multimodal video ranking and region OCR
 
 - Replaced fixed eight-frame mean-only content features with an adaptive

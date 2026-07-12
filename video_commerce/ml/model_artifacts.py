@@ -53,6 +53,10 @@ class ModelArtifactManager:
         return self.model_config.ranking_model_path
 
     @property
+    def ranking_din_sidecar_local_path(self) -> str:
+        return self.model_config.ranking_din_sidecar_path
+
+    @property
     def two_tower_local_checkpoint_path(self) -> str:
         return self.recommendation_config.cf_index_path.replace(".faiss", ".pt")
 
@@ -135,11 +139,21 @@ class ModelArtifactManager:
             "checkpoint",
             legacy_key="artifact_sha256",
         )
-        await self._sync_path_to_local(
-            record.checkpoint_path,
-            self.ranking_local_path,
-            expected_sha256=checkpoint_sha256,
+        artifact_specs = [
+            (record.checkpoint_path, self.ranking_local_path, checkpoint_sha256)
+        ]
+        din_manifest = (record.payload.get("artifact_manifest") or {}).get(
+            "din_embedding_sidecar"
         )
+        if din_manifest:
+            artifact_specs.append(
+                (
+                    din_manifest["path"],
+                    self.ranking_din_sidecar_local_path,
+                    din_manifest["sha256"],
+                )
+            )
+        await self._sync_paths_to_local_atomically(artifact_specs)
         return record
 
     async def sync_latest_two_tower_artifacts(self) -> Optional[ModelArtifactRecord]:
@@ -318,6 +332,22 @@ class ModelArtifactManager:
             model_version=storage_version,
         )
         record_payload = dict(payload or {})
+        din_local_path = str(
+            record_payload.pop("din_embedding_sidecar_local_path", "") or ""
+        )
+        din_manifest = None
+        if din_local_path:
+            din_sha256 = ObjectStorage.calculate_sha256(din_local_path)
+            din_persisted_path = await self._persist_artifact(
+                local_path=din_local_path,
+                model_name=self.RANKING_MODEL_NAME,
+                model_version=storage_version,
+            )
+            din_manifest = {
+                "path": din_persisted_path,
+                "sha256": din_sha256,
+                "local_cache_path": self.ranking_din_sidecar_local_path,
+            }
         record_payload.update(
             {
                 "local_cache_path": self.ranking_local_path,
@@ -327,7 +357,12 @@ class ModelArtifactManager:
                         "path": persisted_path,
                         "sha256": artifact_sha256,
                         "local_cache_path": self.ranking_local_path,
-                    }
+                    },
+                    **(
+                        {"din_embedding_sidecar": din_manifest}
+                        if din_manifest is not None
+                        else {}
+                    ),
                 },
             }
         )

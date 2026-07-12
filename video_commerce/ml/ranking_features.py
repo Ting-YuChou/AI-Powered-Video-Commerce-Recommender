@@ -5,14 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import OrderedDict
 import threading
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 import numpy as np
 
 from video_commerce.common.feature_history_contracts import (
     RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
 )
 from video_commerce.common.models import CandidateProduct, UserFeatures
+from video_commerce.ml.din import DINBehaviorSequences
 
 if TYPE_CHECKING:
     from video_commerce.ml.ranking import FeatureExtractor
@@ -28,13 +30,22 @@ class FeatureBundle:
     product_metadata: Mapping[str, Any]
     context: Mapping[str, Any]
     candidate: CandidateProduct
+    behavior_sequences: Optional[DINBehaviorSequences] = None
 
     def __post_init__(self) -> None:
-        if self.feature_definition_version != RANKING_LTR_FEATURE_DEFINITION_VERSION:
+        if self.feature_definition_version not in {
+            RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
+        }:
             raise ValueError(
                 "unsupported ranking feature definition version: "
                 f"{self.feature_definition_version}"
             )
+        if (
+            self.feature_definition_version == RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+            and self.behavior_sequences is None
+        ):
+            raise ValueError("DIN ranking feature bundle requires behavior sequences")
         if not np.isfinite(float(self.as_of_ts)) or float(self.as_of_ts) < 0:
             raise ValueError("FeatureBundle as_of_ts must be a finite Unix timestamp")
 

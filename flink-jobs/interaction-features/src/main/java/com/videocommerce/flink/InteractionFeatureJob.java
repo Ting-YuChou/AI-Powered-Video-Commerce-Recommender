@@ -679,10 +679,18 @@ public class InteractionFeatureJob {
 
       String sequenceKey = config.key("uiz:" + snapshot.userId);
       for (SequenceEvent event : snapshot.sequence) {
+        String eventPayload = JSON.writeValueAsString(event.payload());
         commands.zadd(
             bytes(sequenceKey),
             event.occurredAtSeconds,
-            bytes(JSON.writeValueAsString(event.payload())));
+            bytes(eventPayload));
+        String dinAction = dinAction(event.action);
+        if (dinAction != null) {
+          String actionSequenceKey = config.key("uiza:" + dinAction + ":" + snapshot.userId);
+          commands.zadd(bytes(actionSequenceKey), event.occurredAtSeconds, bytes(eventPayload));
+          commands.zremrangebyrank(bytes(actionSequenceKey), 0, -201);
+          commands.expire(bytes(actionSequenceKey), config.sequenceTtlSeconds);
+        }
       }
       commands.zremrangebyrank(bytes(sequenceKey), 0, -1001);
       commands.expire(bytes(sequenceKey), config.sequenceTtlSeconds);
@@ -834,6 +842,19 @@ public class InteractionFeatureJob {
       return 0.0;
     }
     return Math.max(0.0, Math.min(1.0, ((double) numerator) / denominator));
+  }
+
+  static String dinAction(String action) {
+    if ("click".equals(action)) {
+      return "click";
+    }
+    if ("add_to_cart".equals(action) || "cart".equals(action)) {
+      return "cart";
+    }
+    if ("purchase".equals(action)) {
+      return "purchase";
+    }
+    return null;
   }
 
   static String stringValue(Object value) {
