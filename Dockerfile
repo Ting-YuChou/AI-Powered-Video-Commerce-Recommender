@@ -90,8 +90,8 @@ RUN if [ -f setup.py ]; then pip install --no-cache-dir -e .; fi
 ARG DOWNLOAD_MODELS=false
 RUN if [ "$DOWNLOAD_MODELS" = "true" ]; then \
     python -c "from transformers import CLIPModel, CLIPProcessor; \
-    model = CLIPModel.from_pretrained('openai/clip-vit-large-patch14', cache_dir='/app/models'); \
-    processor = CLIPProcessor.from_pretrained('openai/clip-vit-large-patch14', cache_dir='/app/models')"; \
+    model = CLIPModel.from_pretrained('openai/clip-vit-base-patch16', cache_dir='/app/models'); \
+    processor = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch16', cache_dir='/app/models')"; \
     fi
 
 # =============================================================================
@@ -127,6 +127,18 @@ EXPOSE 8000
 
 # Default command
 CMD ["python", "-m", "uvicorn", "video_commerce.services.gateway.api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Content processing carries Paddle only in its dedicated image so online
+# recommendation/ranking services do not pay its image size or import cost.
+FROM production AS content-worker
+USER root
+COPY requirements.ocr.txt /app/requirements.ocr.txt
+RUN python -m venv /opt/paddleocr \
+    && /opt/paddleocr/bin/pip install --no-cache-dir -r /app/requirements.ocr.txt
+ENV PADDLE_OCR_PYTHON=/opt/paddleocr/bin/python
+USER appuser
+HEALTHCHECK NONE
+CMD ["python", "-m", "video_commerce.services.content_worker.video_processor"]
 
 # =============================================================================
 # PIT Orchestrator Runtime (Python application + Flink submission client)

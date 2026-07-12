@@ -12,10 +12,15 @@ try:
 except ImportError:  # pragma: no cover
     from pydantic import BaseModel, Field
 
-from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
+from video_commerce.common.models import (
+    CandidateProduct,
+    ProductRecommendation,
+    UserFeatures,
+)
 
 
 class RankRequest(BaseModel):
+    payload_version: int = Field(1, ge=1, le=3)
     request_id: Optional[str] = Field(None, description="Request id for tracing")
     deadline_unix_seconds: Optional[float] = Field(
         None,
@@ -25,6 +30,7 @@ class RankRequest(BaseModel):
     user_features: UserFeatures
     context: Dict[str, Any] = Field(default_factory=dict)
     product_metadata_map: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    multimodal_context: Dict[str, Any] = Field(default_factory=dict)
     k: int = Field(..., ge=1, le=500)
 
 
@@ -38,6 +44,13 @@ def coerce_rank_payload(raw_payload: Any) -> RankRequest:
         return raw_payload
     if not isinstance(raw_payload, dict):
         raise HTTPException(status_code=400, detail="Rank request must be an object")
+
+    try:
+        payload_version = int(raw_payload.get("payload_version") or 1)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid payload_version") from exc
+    if payload_version not in {1, 2, 3}:
+        raise HTTPException(status_code=400, detail="Invalid payload_version")
 
     try:
         k = int(raw_payload.get("k"))
@@ -54,6 +67,7 @@ def coerce_rank_payload(raw_payload: Any) -> RankRequest:
     candidates = [coerce_candidate(item) for item in raw_candidates]
     context = raw_payload.get("context") or {}
     product_metadata_map = raw_payload.get("product_metadata_map") or {}
+    multimodal_context = raw_payload.get("multimodal_context") or {}
     if not isinstance(context, dict):
         raise HTTPException(status_code=400, detail="context must be an object")
     if not isinstance(product_metadata_map, dict):
@@ -61,14 +75,20 @@ def coerce_rank_payload(raw_payload: Any) -> RankRequest:
             status_code=400,
             detail="product_metadata_map must be an object",
         )
+    if not isinstance(multimodal_context, dict):
+        raise HTTPException(
+            status_code=400, detail="multimodal_context must be an object"
+        )
 
     return RankRequest.construct(
+        payload_version=payload_version,
         request_id=raw_payload.get("request_id"),
         deadline_unix_seconds=optional_float(raw_payload.get("deadline_unix_seconds")),
         candidates=candidates,
         user_features=user_features,
         context=context,
         product_metadata_map=product_metadata_map,
+        multimodal_context=multimodal_context,
         k=k,
     )
 

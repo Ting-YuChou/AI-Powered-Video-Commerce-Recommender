@@ -1,0 +1,4 @@
+# PaddleOCR 3.x local CPU inference. Kept out of the shared serving image.
+paddlepaddle==3.0.0
+paddleocr==3.0.3
+opencv-python-headless==4.10.0.84

@@ -65,10 +65,11 @@ from video_commerce.ml.din import (
     load_din_embedding_sidecar,
     parse_din_behavior_sequences,
 )
+from video_commerce.ml.temporal_multimodal import CandidateMultimodalAttention
 
 logger = logging.getLogger(__name__)
 
-RANKING_FEATURE_SCHEMA_VERSION = "ranking_v2_00_history_embeddings"
+RANKING_FEATURE_SCHEMA_VERSION = "ranking_v3_00_temporal_multimodal"
 RANKING_DIN_FEATURE_SCHEMA_VERSION = "ranking_v3_din"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
 RANKING_OBJECTIVE_VERSION = "business_v1"
@@ -321,6 +322,40 @@ class MultiObjectiveRankingModel(nn.Module):
             "gmv": gmv_pred,
             "ranking_score": ranking_score,
         }
+
+
+class TemporalMultimodalRankingModel(nn.Module):
+    """Candidate-conditioned temporal/OCR ranker requiring a new checkpoint."""
+
+    def __init__(
+        self,
+        base_input_dim: int,
+        config: RankingConfig,
+        *,
+        visual_token_dim: int = 128,
+        clip_dim: int = 512,
+        two_tower_dim: int = 128,
+        multimodal_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        self.multimodal = CandidateMultimodalAttention(
+            visual_input_dim=visual_token_dim,
+            text_input_dim=clip_dim,
+            candidate_embedding_dim=clip_dim,
+            two_tower_dim=two_tower_dim,
+            model_dim=multimodal_dim,
+        )
+        self.ranker = MultiObjectiveRankingModel(
+            base_input_dim + multimodal_dim,
+            config,
+        )
+
+    def forward(self, base_features: torch.Tensor, **multimodal_inputs):
+        attention = self.multimodal(**multimodal_inputs)
+        predictions = self.ranker(torch.cat([base_features, attention.fused], dim=-1))
+        predictions["visual_attention"] = attention.visual_attention
+        predictions["text_attention"] = attention.text_attention
+        return predictions
 
 
 class FeatureExtractor:

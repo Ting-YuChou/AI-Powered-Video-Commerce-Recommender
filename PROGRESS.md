@@ -21,6 +21,8 @@
   jobs.
 - Verification: Docker backend suite 472 passed, 4 skipped; Flink Maven 27
   passed; targeted Black, `docker compose config -q`, and Helm lint passed.
+  After merging the temporal multimodal ranking work from `main`, the combined
+  DIN/batcher/temporal/ranking optimization Docker suite passed 113 tests.
   Independent review findings were fixed for strict checkpoint/sidecar lineage,
   atomic checkpoint writes, v3 fail-closed negotiation, stable history reuse,
   unknown-item zeroing, Iceberg schema evolution, corrupt Redis reads,
@@ -32,7 +34,31 @@
 - Follow-up/blocker: the approved +10 ms p95 activation budget is not met on the
   current CPU image, so DIN remains disabled by default and must not be activated
   until the production-target benchmark passes or the attention path is further
-  optimized. Final independent re-review is pending.
+  optimized. The dedicated independent reviewer completed final re-review with
+  `Ready to merge: Yes`.
+
+## 2026-07-12 — Temporal multimodal video ranking and region OCR
+
+- Replaced fixed eight-frame mean-only content features with an adaptive
+  8–16-frame contract, trainable temporal encoding, and candidate-conditioned
+  visual/OCR attention for a retrained ranking v3 model.
+- Added PaddleOCR v5 mobile detection/recognition in an isolated persistent
+  content-worker subprocess, plus edit-similarity and polygon-IoU temporal OCR
+  tracking that keeps the first occurrence anchor.
+- Preserved the legacy pooled embedding for recall/checkpoint compatibility and
+  added durable Postgres `content_feature_artifacts` beside the Redis serving
+  cache. Ranking runner payload versions 1/2 remain supported alongside v3.
+- Key files: `video_commerce/ml/temporal_multimodal.py`,
+  `video_commerce/ml/video_ocr.py`, `video_commerce/ml/content_processor.py`,
+  `video_commerce/ml/ranking.py`, and
+  `migrations/postgres/007_temporal_multimodal_features.sql`.
+- Verification: focused Docker backend suite `164 passed`; fresh host suites
+  `8 passed` and `66 passed`; dedicated isolated PaddleOCR content-worker image
+  built on linux/arm64; application and OCR virtualenv imports passed; Compose
+  config and `git diff --check` passed. Helm CLI was unavailable locally.
+- Follow-up: apply migration 007, backfill completed durable content jobs, train
+  a fresh v3 checkpoint, and gate activation on offline NDCG/CTR/CVR plus
+  coverage. Paddle model weights should be pre-cached for production startup.
 
 ## 2026-07-09 — Ranking PIT feature-store foundation
 

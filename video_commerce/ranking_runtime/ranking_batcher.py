@@ -111,7 +111,7 @@ def normalize_ranking_batch_payloads(raw_payload: Any) -> List[Dict[str, Any]]:
         requests = raw_payload.get("requests")
         if not isinstance(requests, list):
             return []
-        if raw_payload.get("payload_version") not in (2, 3):
+        if raw_payload.get("payload_version") not in {2, 3}:
             return requests
 
         batch_metadata_map = raw_payload.get("product_metadata_map") or {}
@@ -961,7 +961,7 @@ class RankingBatcher:
                         if key != DIN_SEQUENCE_CONTEXT_KEY
                     }
         return {
-            "payload_version": payload_version,
+            "payload_version": 3 if self._remote_payload_v3_supported() else 2,
             "product_metadata_map": product_metadata_map,
             "requests": requests,
         }

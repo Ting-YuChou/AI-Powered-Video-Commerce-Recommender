@@ -453,10 +453,20 @@ services:
 
   content-worker:
     <<: *common-service
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: content-worker
     command: python -m video_commerce.services.content_worker.video_processor
     environment:
       <<: *common-env
       MODEL_LAZY_LOAD: "false"
+      MODEL_CLIP_MODEL: ${MODEL_CLIP_MODEL:-openai/clip-vit-base-patch16}
+      MODEL_NUM_KEYFRAMES: ${MODEL_NUM_KEYFRAMES:-16}
+      MODEL_MIN_KEYFRAMES: ${MODEL_MIN_KEYFRAMES:-8}
+      MODEL_TEMPORAL_ENCODER_ENABLED: ${MODEL_TEMPORAL_ENCODER_ENABLED:-true}
+      MODEL_OCR_BACKEND: ${MODEL_OCR_BACKEND:-paddle}
+      MODEL_OCR_LANGUAGE: ${MODEL_OCR_LANGUAGE:-en}
       WORKER_TYPE: content_processor
       MONITORING_WORKER_METRICS_PORT: 9101
     expose:
