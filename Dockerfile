@@ -129,6 +129,28 @@ EXPOSE 8000
 CMD ["python", "-m", "uvicorn", "video_commerce.services.gateway.api:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # =============================================================================
+# PIT Orchestrator Runtime (Python application + Flink submission client)
+# =============================================================================
+FROM maven:3.9-eclipse-temurin-17 AS pit-job-build
+
+WORKDIR /src
+COPY flink-jobs/interaction-features/pom.xml .
+RUN mvn -q -DskipTests dependency:go-offline
+COPY flink-jobs/interaction-features/src ./src
+RUN mvn -q -DskipTests package
+
+FROM production AS pit-orchestrator
+
+USER root
+RUN mkdir -p /opt/flink/usrlib
+COPY --from=pit-job-build /src/target/interaction-features-1.0.0.jar /opt/flink/usrlib/interaction-features.jar
+RUN chown -R appuser:appuser /opt/flink
+USER appuser
+
+HEALTHCHECK NONE
+CMD ["python", "-m", "video_commerce.services.pit_dataset_orchestrator.main"]
+
+# =============================================================================
 # Stage 5: Development Build
 # =============================================================================
 FROM app-build as development

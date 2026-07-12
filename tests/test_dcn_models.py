@@ -574,6 +574,7 @@ async def test_ranking_dcn_direct_and_microbatch_inference_outputs_shapes():
     )
     ranking = RankingModel(config)
     await ranking.load_model()
+    ranking.is_trained = True
     feature_matrix = np.zeros(
         (4, ranking.feature_extractor.total_feature_dim), dtype=np.float32
     )

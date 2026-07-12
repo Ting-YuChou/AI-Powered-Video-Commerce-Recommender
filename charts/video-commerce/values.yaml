@@ -21,6 +21,10 @@ images:
     repository: video-commerce-backend
     tag: ci
     pullPolicy: IfNotPresent
+  pitOrchestrator:
+    repository: video-commerce-pit-orchestrator
+    tag: ci
+    pullPolicy: IfNotPresent
   frontend:
     repository: video-commerce-edge
     tag: ci
@@ -111,6 +115,46 @@ external:
     maxAttempts: 3
     checksumAlgorithm: ""
     serverSideEncryption: ""
+  featureLake:
+    enabled: false
+    catalogName: feature_catalog
+    catalogUri: ""
+    warehouseUri: ""
+    namespace: video_commerce
+    trainingSource: legacy
+    pitShadowEnabled: false
+    rankingPitDatasetUri: ""
+    featureDefinitionVersion: ranking_ltr_v1
+    attributionWindowHours: 168
+    allowedLatenessHours: 1
+    catalogOutboxBatchSize: 500
+    catalogOutboxLeaseSeconds: 60
+    catalogOutboxPollSeconds: 1
+    catalogOutboxRetentionDays: 7
+    pitOrchestratorEnabled: false
+    pitScheduleHourUtc: 2
+    pitOrchestratorLeaseSeconds: 7200
+    pitTrainingLeaseSeconds: 21600
+    flinkJobmanager: ""
+    pitExportUri: ""
+    pitJobJarPath: /opt/flink/usrlib/interaction-features.jar
+
+pitOrchestrator:
+  enabled: false
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  backoffLimit: 3
+  activeDeadlineSeconds: 7200
+  env:
+    MONITORING_WORKER_METRICS_PORT: "9105"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
 
 appConfig:
   environment: production
@@ -575,7 +619,9 @@ backend:
         enabled: true
         path: /metrics
     featureWorker:
-      enabled: true
+      # Flink is the production-authoritative writer for official feature keys.
+      # Enable this only for the explicit Python pipeline fallback.
+      enabled: false
       name: feature-worker
       replicaCount: 2
       command: ["python", "-m", "video_commerce.services.feature_worker.feature_updater"]
@@ -601,6 +647,75 @@ backend:
           memory: 512Mi
         limits:
           memory: 1Gi
+      hpa:
+        enabled: false
+      pdb:
+        enabled: false
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    catalogEventPublisher:
+      # Application-only publisher. Kafka, Postgres, S3, REST Catalog, and the
+      # Flink materializer remain externally managed dependencies.
+      enabled: false
+      name: catalog-event-publisher
+      replicaCount: 2
+      command: ["python", "-m", "video_commerce.services.catalog_event_publisher.main"]
+      env:
+        MONITORING_WORKER_METRICS_PORT: "9104"
+      service:
+        enabled: true
+        port: 9104
+        targetPort: 9104
+        portName: metrics
+        annotations: {}
+      probes:
+        type: metrics
+        livenessPath: /metrics
+        initialDelaySeconds: 30
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          memory: 512Mi
+      hpa:
+        enabled: false
+      pdb:
+        enabled: true
+        minAvailable: 1
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    pitStateExporter:
+      enabled: false
+      name: pit-state-exporter
+      replicaCount: 1
+      command: ["python", "-m", "video_commerce.services.pit_state_exporter.main"]
+      env:
+        MONITORING_WORKER_METRICS_PORT: "9106"
+      service:
+        enabled: true
+        port: 9106
+        targetPort: 9106
+        portName: metrics
+        annotations: {}
+      probes:
+        type: metrics
+        livenessPath: /metrics
+        initialDelaySeconds: 15
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: 50m
+          memory: 96Mi
+        limits:
+          memory: 256Mi
       hpa:
         enabled: false
       pdb:
@@ -715,6 +830,27 @@ kafkaTopicInitJob:
       partitions: 3
       replicationFactor: 3
     feature-updates:
+      partitions: 3
+      replicationFactor: 3
+    feature-history-snapshots:
+      partitions: 3
+      replicationFactor: 3
+    catalog-feature-events:
+      partitions: 3
+      replicationFactor: 3
+    user-interactions-backfill:
+      partitions: 6
+      replicationFactor: 3
+    recommendation-events-backfill:
+      partitions: 3
+      replicationFactor: 3
+    feature-updates-backfill:
+      partitions: 3
+      replicationFactor: 3
+    catalog-feature-events-backfill:
+      partitions: 3
+      replicationFactor: 3
+    feature-history-backfill-quarantine:
       partitions: 3
       replicationFactor: 3
     dead-letter-events:

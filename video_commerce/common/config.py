@@ -105,7 +105,8 @@ class ModelConfig(BaseSettings):
     max_video_length: int = Field(300, description="Maximum video length in seconds")
     num_keyframes: int = Field(8, description="Number of keyframes to extract")
     ffmpeg_frame_extraction_enabled: bool = Field(
-        True, description="Use FFmpeg/ffprobe for video metadata and keyframe extraction"
+        True,
+        description="Use FFmpeg/ffprobe for video metadata and keyframe extraction",
     )
     ffmpeg_timeout_seconds: float = Field(
         30.0, description="Timeout for each FFmpeg/ffprobe command"
@@ -140,7 +141,8 @@ class ModelConfig(BaseSettings):
         description="Minimum Laplacian variance for retaining non-blurry keyframes",
     )
     speech_to_text_enabled: bool = Field(
-        False, description="Transcribe uploaded video audio through the internal ASR service"
+        False,
+        description="Transcribe uploaded video audio through the internal ASR service",
     )
     speech_to_text_base_url: str = Field(
         "http://asr-service:8010", description="Internal ASR service base URL"
@@ -384,7 +386,8 @@ class RecommendationConfig(BaseSettings):
         100, description="Maximum positive events per user used for Swing training"
     )
     swing_itemcf_max_items_per_user: int = Field(
-        100, description="Maximum deduplicated positive items per user in Swing training"
+        100,
+        description="Maximum deduplicated positive items per user in Swing training",
     )
     swing_itemcf_max_users_per_item: int = Field(
         500, description="Maximum users retained per item when building Swing pairs"
@@ -515,7 +518,8 @@ class RecommendationConfig(BaseSettings):
         0.2, description="Explicit negative share sourced from no-click impressions"
     )
     tt_ranker_rejected_negative_ratio: float = Field(
-        0.1, description="Explicit negative share sourced from ranker-rejected candidates"
+        0.1,
+        description="Explicit negative share sourced from ranker-rejected candidates",
     )
     tt_hard_negative_weight: float = Field(
         0.35, description="Loss denominator weight for ANN hard negatives"
@@ -1290,6 +1294,23 @@ class KafkaConfig(BaseSettings):
     feature_updates_topic: str = Field(
         "feature-updates", description="Feature updates topic"
     )
+    catalog_feature_events_topic: str = Field(
+        "catalog-feature-events", description="Versioned catalog feature events topic"
+    )
+    user_interactions_backfill_topic: str = Field(
+        "user-interactions-backfill", description="One-time interaction backfill topic"
+    )
+    recommendation_events_backfill_topic: str = Field(
+        "recommendation-events-backfill",
+        description="One-time observation backfill topic",
+    )
+    catalog_feature_events_backfill_topic: str = Field(
+        "catalog-feature-events-backfill", description="Initial catalog snapshot topic"
+    )
+    feature_history_backfill_quarantine_topic: str = Field(
+        "feature-history-backfill-quarantine",
+        description="Legacy records that cannot satisfy the current feature definition",
+    )
 
     # Producer settings
     producer_acks: str = Field("all", description="Producer acknowledgment level")
@@ -1395,6 +1416,125 @@ class FeaturePipelineConfig(BaseSettings):
 
     class Config:
         env_prefix = "FEATURE_PIPELINE_"
+
+
+class FeatureLakeConfig(BaseSettings):
+    """Offline historical feature store and point-in-time training settings."""
+
+    enabled: bool = Field(
+        False,
+        description="Enable the Iceberg-backed offline feature store integration",
+    )
+    catalog_name: str = Field("feature_catalog", description="Iceberg catalog name")
+    catalog_uri: Optional[str] = Field(
+        None,
+        description="Iceberg REST catalog URI",
+    )
+    warehouse_uri: Optional[str] = Field(
+        None,
+        description="S3 warehouse URI used by the Iceberg catalog",
+    )
+    s3_endpoint: Optional[str] = Field(
+        None,
+        description="S3 endpoint passed to externally submitted Flink PIT jobs",
+    )
+    namespace: str = Field("video_commerce", description="Iceberg namespace")
+    training_source: str = Field(
+        "legacy",
+        description="Ranking trainer source: legacy or pit",
+    )
+    pit_shadow_enabled: bool = Field(
+        False,
+        description="Train a non-activating typed PIT shadow artifact beside legacy",
+    )
+    pit_orchestrator_enabled: bool = Field(
+        False,
+        description="Run the leased daily PIT export and manifest orchestrator",
+    )
+    pit_schedule_hour_utc: int = Field(
+        2,
+        ge=0,
+        le=23,
+        description="UTC hour used for deterministic daily PIT run cutoffs",
+    )
+    pit_orchestrator_lease_seconds: int = Field(
+        7200,
+        description="Lease duration for one daily PIT orchestration attempt",
+    )
+    pit_training_lease_seconds: int = Field(
+        21600,
+        description="Lease duration for one PIT training and artifact persistence run",
+    )
+    flink_jobmanager: Optional[str] = Field(
+        None,
+        description="Flink JobManager REST endpoint used by the PIT orchestrator",
+    )
+    pit_export_uri: Optional[str] = Field(
+        None,
+        description="Immutable Parquet and manifest output prefix",
+    )
+    pit_job_jar_path: str = Field(
+        "/opt/flink/usrlib/interaction-features.jar",
+        description="PIT Flink job jar path inside the orchestrator image",
+    )
+    ranking_pit_dataset_uri: Optional[str] = Field(
+        None,
+        description="Versioned PIT training dataset export URI consumed by model-trainer",
+    )
+    feature_definition_version: str = Field(
+        "ranking_ltr_v1",
+        description="Shared online/offline ranking feature definition version",
+    )
+    attribution_window_hours: int = Field(
+        168,
+        description="Maximum feedback attribution window after a ranking impression",
+    )
+    allowed_lateness_hours: int = Field(
+        1,
+        ge=0,
+        description="Additional lateness allowed before PIT observations finalize",
+    )
+    catalog_outbox_batch_size: int = Field(
+        500, description="Catalog outbox rows claimed by one publisher iteration"
+    )
+    catalog_outbox_lease_seconds: int = Field(
+        60, description="Catalog outbox publisher claim lease"
+    )
+    catalog_outbox_poll_seconds: float = Field(
+        1.0, description="Catalog outbox publisher idle polling interval"
+    )
+    catalog_outbox_retention_days: int = Field(
+        7, description="Published catalog outbox retention"
+    )
+
+    @validator("training_source")
+    def validate_training_source(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"legacy", "pit"}:
+            raise ValueError("training_source must be one of: legacy, pit")
+        return normalized
+
+    @validator(
+        "attribution_window_hours",
+        "catalog_outbox_batch_size",
+        "catalog_outbox_lease_seconds",
+        "catalog_outbox_retention_days",
+        "pit_orchestrator_lease_seconds",
+        "pit_training_lease_seconds",
+    )
+    def validate_positive_feature_lake_ints(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("feature lake integer settings must be positive")
+        return value
+
+    @validator("catalog_outbox_poll_seconds")
+    def validate_catalog_outbox_poll_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("catalog_outbox_poll_seconds must be positive")
+        return value
+
+    class Config:
+        env_prefix = "FEATURE_LAKE_"
 
 
 class SecurityConfig(BaseSettings):
@@ -1866,6 +2006,7 @@ class Config:
         self.object_storage_config = ObjectStorageConfig()
         self.kafka_config = KafkaConfig()
         self.feature_pipeline_config = FeaturePipelineConfig()
+        self.feature_lake_config = FeatureLakeConfig()
         self.security_config = SecurityConfig()
         self.service_topology_config = ServiceTopologyConfig()
         self.database_config = DatabaseConfig()
@@ -2069,6 +2210,50 @@ class Config:
             errors.append(
                 "DATABASE_URL or DATABASE_URL_FILE is required when DATABASE_ENABLE=true"
             )
+        if self.feature_lake_config.enabled:
+            if not self.feature_lake_config.catalog_uri:
+                errors.append(
+                    "FEATURE_LAKE_CATALOG_URI is required when FEATURE_LAKE_ENABLED=true"
+                )
+            if not self.feature_lake_config.warehouse_uri:
+                errors.append(
+                    "FEATURE_LAKE_WAREHOUSE_URI is required when FEATURE_LAKE_ENABLED=true"
+                )
+        if self.feature_lake_config.training_source == "pit":
+            if not self.feature_lake_config.enabled:
+                errors.append(
+                    "FEATURE_LAKE_ENABLED=true is required when FEATURE_LAKE_TRAINING_SOURCE=pit"
+                )
+            if not self.feature_lake_config.ranking_pit_dataset_uri:
+                errors.append(
+                    "FEATURE_LAKE_RANKING_PIT_DATASET_URI is required when FEATURE_LAKE_TRAINING_SOURCE=pit"
+                )
+        if self.feature_lake_config.pit_shadow_enabled:
+            if not self.feature_lake_config.enabled:
+                errors.append(
+                    "FEATURE_LAKE_ENABLED=true is required when FEATURE_LAKE_PIT_SHADOW_ENABLED=true"
+                )
+            if not self.feature_lake_config.ranking_pit_dataset_uri:
+                errors.append(
+                    "FEATURE_LAKE_RANKING_PIT_DATASET_URI is required when FEATURE_LAKE_PIT_SHADOW_ENABLED=true"
+                )
+        if self.feature_lake_config.pit_orchestrator_enabled:
+            if not self.feature_lake_config.enabled:
+                errors.append(
+                    "FEATURE_LAKE_ENABLED=true is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
+                )
+            if self.feature_lake_config.training_source != "pit":
+                errors.append(
+                    "FEATURE_LAKE_TRAINING_SOURCE=pit is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
+                )
+            if not self.feature_lake_config.flink_jobmanager:
+                errors.append(
+                    "FEATURE_LAKE_FLINK_JOBMANAGER is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
+                )
+            if not self.feature_lake_config.pit_export_uri:
+                errors.append(
+                    "FEATURE_LAKE_PIT_EXPORT_URI is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
+                )
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":
             if self.security_config.auth_mode == "disabled":

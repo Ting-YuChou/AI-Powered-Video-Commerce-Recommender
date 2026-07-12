@@ -30,6 +30,7 @@ class ModelArtifactManager:
     """Coordinate Postgres metadata with local/object-storage model artifacts."""
 
     RANKING_MODEL_NAME = "ranking_model"
+    RANKING_SHADOW_MODEL_NAME = "ranking_model_pit_shadow"
     TWO_TOWER_MODEL_NAME = "two_tower_retrieval"
     SASREC_MODEL_NAME = "sasrec_retrieval"
     SWING_ITEMCF_MODEL_NAME = "swing_itemcf_recall"
@@ -61,15 +62,25 @@ class ModelArtifactManager:
 
     @property
     def two_tower_local_metadata_path(self) -> str:
-        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_meta.json"))
+        return str(
+            Path(self.recommendation_config.cf_index_path).with_suffix(".cf_meta.json")
+        )
 
     @property
     def two_tower_local_embedding_sidecar_path(self) -> str:
-        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_embeddings.npz"))
+        return str(
+            Path(self.recommendation_config.cf_index_path).with_suffix(
+                ".cf_embeddings.npz"
+            )
+        )
 
     @property
     def two_tower_local_adapter_path(self) -> str:
-        return str(Path(self.recommendation_config.cf_index_path).with_suffix(".cf_adapter.npz"))
+        return str(
+            Path(self.recommendation_config.cf_index_path).with_suffix(
+                ".cf_adapter.npz"
+            )
+        )
 
     @property
     def sasrec_local_checkpoint_path(self) -> str:
@@ -162,7 +173,9 @@ class ModelArtifactManager:
                 (
                     cf_index_path,
                     self.two_tower_local_index_path,
-                    self._extract_artifact_sha256(payload, "cf_index", legacy_key="cf_index_sha256"),
+                    self._extract_artifact_sha256(
+                        payload, "cf_index", legacy_key="cf_index_sha256"
+                    ),
                 )
             )
         if cf_metadata_path:
@@ -188,7 +201,9 @@ class ModelArtifactManager:
                 )
             )
         else:
-            stale_optional_local_paths.append(self.two_tower_local_embedding_sidecar_path)
+            stale_optional_local_paths.append(
+                self.two_tower_local_embedding_sidecar_path
+            )
         adapter_path = payload.get("cf_adapter_path")
         if adapter_path:
             artifact_specs.append(
@@ -233,12 +248,16 @@ class ModelArtifactManager:
             (
                 vocab_path,
                 self.sasrec_local_vocab_path,
-                self._extract_artifact_sha256(payload, "vocab", legacy_key="vocab_sha256"),
+                self._extract_artifact_sha256(
+                    payload, "vocab", legacy_key="vocab_sha256"
+                ),
             ),
             (
                 metadata_path,
                 self.sasrec_local_metadata_path,
-                self._extract_artifact_sha256(payload, "metadata", legacy_key="metadata_sha256"),
+                self._extract_artifact_sha256(
+                    payload, "metadata", legacy_key="metadata_sha256"
+                ),
             ),
         ]
         await self._sync_paths_to_local_atomically(artifact_specs)
@@ -284,10 +303,19 @@ class ModelArtifactManager:
             return None
 
         artifact_sha256 = ObjectStorage.calculate_sha256(local_path)
+        materialization_run_id = str(
+            (payload or {}).get("feature_lake_materialization_run_id") or ""
+        ).strip()
+        storage_version = model_version
+        if materialization_run_id:
+            # A trainer whose lease expires during an in-flight S3 upload must
+            # never overwrite the winner's bytes. Content-address the PIT object
+            # while keeping the externally visible model version deterministic.
+            storage_version = f"{model_version}-{artifact_sha256[:16]}"
         persisted_path = await self._persist_artifact(
             local_path=local_path,
             model_name=self.RANKING_MODEL_NAME,
-            model_version=model_version,
+            model_version=storage_version,
         )
         record_payload = dict(payload or {})
         record_payload.update(
@@ -303,14 +331,99 @@ class ModelArtifactManager:
                 },
             }
         )
-        await self.system_store.record_model_checkpoint(
+        inserted = await self.system_store.record_model_checkpoint(
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
             checkpoint_path=persisted_path,
             payload=record_payload,
         )
+        if inserted is False:
+            if not materialization_run_id:
+                raise RuntimeError("ranking checkpoint record was not persisted")
+            existing = (
+                await self.system_store.get_model_checkpoint_for_materialization_run(
+                    self.RANKING_MODEL_NAME,
+                    materialization_run_id,
+                )
+            )
+            if existing is None:
+                raise RuntimeError(
+                    "PIT ranking checkpoint conflict has no durable winner"
+                )
+            await self._verify_existing_checkpoint(existing)
+            return ModelArtifactRecord(
+                model_name=str(existing["model_name"]),
+                model_version=str(existing["model_version"]),
+                checkpoint_path=str(existing["checkpoint_path"]),
+                payload=dict(existing.get("payload") or {}),
+            )
         return ModelArtifactRecord(
             model_name=self.RANKING_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_path,
+            payload=record_payload,
+        )
+
+    async def _verify_existing_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        path = str(checkpoint.get("checkpoint_path") or "").strip()
+        payload = dict(checkpoint.get("payload") or {})
+        expected_sha256 = str(payload.get("artifact_sha256") or "").strip()
+        if not path or len(expected_sha256) != 64:
+            raise RuntimeError("existing PIT ranking checkpoint is incomplete")
+        if self.object_storage is None:
+            ObjectStorage.verify_sha256(path, expected_sha256)
+            return
+        (
+            local_path,
+            should_delete,
+        ) = await self.object_storage.materialize_for_processing(
+            path, suggested_suffix=Path(path).suffix or ".pt"
+        )
+        try:
+            ObjectStorage.verify_sha256(local_path, expected_sha256)
+        finally:
+            if should_delete and os.path.exists(local_path):
+                os.remove(local_path)
+
+    async def persist_ranking_shadow_checkpoint(
+        self,
+        *,
+        local_path: str,
+        model_version: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ModelArtifactRecord]:
+        """Persist a PIT shadow artifact under a namespace serving never syncs."""
+        if not self.system_store:
+            return None
+        artifact_sha256 = ObjectStorage.calculate_sha256(local_path)
+        persisted_path = await self._persist_artifact(
+            local_path=local_path,
+            model_name=self.RANKING_SHADOW_MODEL_NAME,
+            model_version=model_version,
+        )
+        record_payload = dict(payload or {})
+        record_payload.update(
+            {
+                "shadow": True,
+                "activation_allowed": False,
+                "artifact_sha256": artifact_sha256,
+                "artifact_manifest": {
+                    "checkpoint": {
+                        "path": persisted_path,
+                        "sha256": artifact_sha256,
+                        "local_cache_path": local_path,
+                    }
+                },
+            }
+        )
+        await self.system_store.record_model_checkpoint(
+            model_name=self.RANKING_SHADOW_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_path,
+            payload=record_payload,
+        )
+        return ModelArtifactRecord(
+            model_name=self.RANKING_SHADOW_MODEL_NAME,
             model_version=model_version,
             checkpoint_path=persisted_path,
             payload=record_payload,
@@ -325,6 +438,7 @@ class ModelArtifactManager:
         model_version: str,
         embedding_sidecar_path: Optional[str] = None,
         adapter_path: Optional[str] = None,
+        catalog_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> Optional[ModelArtifactRecord]:
         if not self.system_store:
@@ -433,6 +547,13 @@ class ModelArtifactManager:
                 **optional_payload,
             }
         )
+        catalog_activation_id = None
+        if catalog_metadata is not None:
+            catalog_activation_id = await self.system_store.activate_product_catalog(
+                model_version,
+                catalog_metadata,
+            )
+            record_payload["catalog_activation_id"] = catalog_activation_id
         await self.system_store.record_model_checkpoint(
             model_name=self.TWO_TOWER_MODEL_NAME,
             model_version=model_version,
@@ -678,4 +799,6 @@ class ModelArtifactManager:
             try:
                 Path(path).unlink(missing_ok=True)
             except OSError as exc:
-                logger.warning("Failed to remove stale local artifact %s: %s", path, exc)
+                logger.warning(
+                    "Failed to remove stale local artifact %s: %s", path, exc
+                )

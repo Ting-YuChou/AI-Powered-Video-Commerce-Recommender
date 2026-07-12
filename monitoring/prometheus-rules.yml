@@ -182,3 +182,167 @@ groups:
         annotations:
           summary: Database p95 latency is high
           description: Application-observed Postgres p95 latency is above 500ms.
+
+  - name: video-commerce-feature-lake
+    rules:
+      - alert: FeatureLakeMaterializationLagHigh
+        expr: max by (record_type) ({__name__=~"(.+_)?feature_lake_materialization_lag_seconds",record_type!="window_feature"}) > 120
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Feature lake raw materialization lag is above two minutes
+          description: Kafka to Iceberg history materialization is outside the shadow gate.
+
+      - alert: FeatureLakeWindowLagHigh
+        expr: max by (record_type) ({__name__=~"(.+_)?feature_lake_materialization_lag_seconds",record_type="window_feature"}) > 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Feature lake window snapshot lag is above fifteen minutes
+          description: Window history materialization is outside the shadow gate.
+
+      - alert: FeatureLakeDlqTraffic
+        expr: sum(rate({__name__=~"(.+_)?feature_lake_dlq_total"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Feature lake events are being rejected to DLQ
+          description: Inspect contract validation failures before allowing PIT cutover.
+
+      - alert: CatalogOutboxBacklog
+        expr: catalog_outbox_oldest_age_seconds > 300 or catalog_outbox_pending > 10000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Catalog transactional outbox is backlogged
+          description: The oldest completed-activation event has not reached Kafka within five minutes.
+
+      - alert: FeatureLakeIcebergCommitFailure
+        expr: increase(flink_taskmanager_job_task_operator_iceberg_commit_failed_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Iceberg atomic commit failed
+          description: Pause materialization cutover and inspect the Flink checkpoint/commit failure.
+
+      - alert: PitManifestValidationFailure
+        expr: increase(pit_manifest_validation_failures_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT manifest or Parquet shard validation failed
+          description: Trainer has failed closed and will not fall back to legacy data.
+
+      - alert: PitOnlineOfflineParityLow
+        expr: pit_online_offline_parity_ratio < 0.999
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: Online/offline feature bundle parity is below 99.9 percent
+          description: Training source must remain legacy until parity recovers.
+
+      - alert: PitAssemblerParityLow
+        expr: pit_assembler_vector_parity_ratio < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Shared ranking assembler parity is not exact
+          description: PIT cutover is blocked until identical bundles match within 1e-6.
+
+      - alert: PitLabelReconciliationLow
+        expr: pit_label_reconciliation_ratio < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Typed PIT labels do not reconcile with attribution facts
+          description: PIT cutover is blocked until label reconciliation is complete.
+
+      - alert: PitCurrentStateDependencyDetected
+        expr: pit_current_state_calls > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT training accessed current serving state
+          description: Redis or current catalog access was observed in the fail-closed PIT path.
+
+      - alert: PitInvalidTrainingTensorDetected
+        expr: pit_invalid_feature_or_label_rows > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Invalid PIT feature or label tensor detected
+          description: NaN, infinity, or an invalid typed training row blocks cutover.
+
+      - alert: PitLeakageDetected
+        expr: pit_leakage_rows > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Point-in-time leakage rows detected
+          description: One or more training rows used a future or unavailable feature.
+
+      - alert: PitDailyRunMissing
+        expr: |
+          (pit_orchestrator_last_success_timestamp{job="pit-state-exporter"} == 0
+            and time() - pit_orchestrator_start_timestamp{job="pit-state-exporter"} > 93600)
+          or
+          (pit_orchestrator_last_success_timestamp{job="pit-state-exporter"} > 0
+            and time() - pit_orchestrator_last_success_timestamp{job="pit-state-exporter"} > 93600)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: No successful PIT dataset run for more than 26 hours
+          description: Inspect the durable run state, Flink submission, and manifest publication stages.
+
+      - alert: PitTrainerManifestFailure
+        expr: |
+          increase(video_commerce_worker_training_runs_total{status="error"}[30m]) > 0
+          and on(job) pit_trainer_waiting_for_manifest == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT manifest exists but typed training continues to fail
+          description: The trainer has failed closed; inspect manifest, shard hash, schema, and version errors.
+
+      - alert: PitOrchestratorRunStuck
+        expr: pit_orchestrator_run_in_progress{job="pit-state-exporter"} == 1
+        for: 2h
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT orchestrator run exceeded its lease duration
+          description: The durable run remains active beyond the two-hour lease and requires takeover or investigation.
+
+      - alert: PitOrchestratorLeaseExpired
+        expr: pit_orchestrator_lease_expired{job="pit-state-exporter"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: PIT orchestrator lease expired
+          description: A durable running PIT job has stopped renewing its lease and requires takeover.
+
+      - alert: RankingArtifactFallbackPersisting
+        expr: |
+          sum(increase(video_commerce_worker_training_runs_total{status="success"}[24h])) > 0
+          and sum(rate(ranking_untrained_fallback_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: Serving still uses untrained fallback after PIT artifact creation
+          description: Check artifact activation, checksum sync, and ranking runner reload state.

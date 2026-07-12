@@ -21,6 +21,7 @@ from video_commerce.common.models import (
     UserFeatures,
 )
 from video_commerce.services.model_trainer.main import ModelTrainerService
+from video_commerce.services.model_trainer import main as model_trainer_module
 from video_commerce.services.recommendation import api as recommendation_api_module
 from video_commerce.ml.ranking import (
     RANKING_FEATURE_SCHEMA_VERSION,
@@ -32,6 +33,12 @@ from video_commerce.ml.ranking_history import (
     RankingHistoryConfig,
     build_ranking_history_context,
 )
+from video_commerce.ml.ranking_features import FeatureBundle
+from video_commerce.ml.pit_training_dataset import (
+    PitTrainingDatasetError,
+    PitTrainingDatasetUnavailable,
+)
+from video_commerce.ml.ranking_training import AttributionFacts, RankingTrainingExample
 from video_commerce.ml import ranking as ranking_module
 from video_commerce.services.recommendation.api import (
     _BestEffortTaskQueue,
@@ -114,7 +121,12 @@ def test_build_recommendations_uses_business_score_over_raw_ranking_score():
     candidates = [
         (
             CandidateProduct(product_id=f"p{i}", combined_score=0.1, source="test"),
-            {"title": f"Product {i}", "price": 10.0, "category": "cat", "brand": "brand"},
+            {
+                "title": f"Product {i}",
+                "price": 10.0,
+                "category": "cat",
+                "brand": "brand",
+            },
         )
         for i in range(3)
     ]
@@ -135,7 +147,9 @@ def test_build_recommendations_uses_business_score_over_raw_ranking_score():
     )
 
     assert [item.product_id for item in recommendations] == ["p2", "p0"]
-    assert [item.ranking_score for item in recommendations] == pytest.approx([12.8, 4.05])
+    assert [item.ranking_score for item in recommendations] == pytest.approx(
+        [12.8, 4.05]
+    )
 
 
 def test_mmr_diversifies_high_relevance_duplicate_cluster():
@@ -269,6 +283,45 @@ def test_displayed_item_snapshots_restore_cached_candidate_scores():
     assert snapshots[0]["ranking_score"] == 0.91
 
 
+def test_displayed_item_snapshot_captures_versioned_observation_bundle():
+    user_features = UserFeatures(
+        user_id="u1",
+        total_interactions=3,
+        preferred_categories=["Shoes"],
+    )
+    snapshots = _build_displayed_item_snapshots(
+        [
+            ProductRecommendation(
+                product_id="p1",
+                title="Shoe",
+                price=19.0,
+                category="Shoes",
+                brand="A",
+                ranking_score=0.9,
+                confidence_score=0.8,
+            )
+        ],
+        candidate_by_product={
+            "p1": CandidateProduct(
+                product_id="p1", combined_score=0.7, source="two_tower"
+            )
+        },
+        product_metadata_map={"p1": {"price": 19.0, "stock": 5}},
+        max_items=1,
+        user_id="u1",
+        user_features=user_features,
+        observation_context={"surface": "home"},
+        as_of_ts=100.0,
+    )
+
+    item = snapshots[0]
+    assert item["as_of_ts"] == 100.0
+    assert item["feature_definition_version"] == "ranking_ltr_v1"
+    assert item["feature_bundle_hash"]
+    assert item["feature_snapshot"]["stock"] == 5
+    assert item["item_snapshot_complete"] is True
+
+
 def test_impression_context_snapshot_excludes_realtime_window_features():
     snapshot = _build_impression_context_snapshot(
         {
@@ -363,9 +416,14 @@ def test_realtime_window_features_are_optional_and_zero_filled():
     base = RankingModel(RankingConfig())
     enabled = RankingModel(RankingConfig(realtime_window_features_enabled=True))
     assert base.feature_extractor.total_feature_dim == 28
-    assert enabled.feature_extractor.total_feature_dim > base.feature_extractor.total_feature_dim
+    assert (
+        enabled.feature_extractor.total_feature_dim
+        > base.feature_extractor.total_feature_dim
+    )
 
-    user_features = UserFeatures(user_id="u1", total_interactions=1, last_active=time.time())
+    user_features = UserFeatures(
+        user_id="u1", total_interactions=1, last_active=time.time()
+    )
     candidate = CandidateProduct(product_id="p1", combined_score=0.5, source="test")
     metadata = {"category": "cat", "brand": "brand", "price": 10.0}
 
@@ -379,7 +437,9 @@ def test_realtime_window_features_are_optional_and_zero_filled():
     assert matrix.shape[1] == enabled.feature_extractor.total_feature_dim
     np.testing.assert_allclose(
         matrix[0, -enabled.feature_extractor.realtime_window_feature_dim :],
-        np.zeros(enabled.feature_extractor.realtime_window_feature_dim, dtype=np.float32),
+        np.zeros(
+            enabled.feature_extractor.realtime_window_feature_dim, dtype=np.float32
+        ),
     )
 
 
@@ -387,11 +447,27 @@ def test_history_builder_separates_actions_and_applies_last_n_scale_and_coverage
     now = 10 * 86400.0
     sequence = [
         {"product_id": "old_click", "action": "click", "occurred_at": now - 9 * 86400},
-        {"product_id": "missing_click", "action": "click", "occurred_at": now - 4 * 86400},
+        {
+            "product_id": "missing_click",
+            "action": "click",
+            "occurred_at": now - 4 * 86400,
+        },
         {"product_id": "p_click", "action": "click", "occurred_at": now - 3 * 86400},
-        {"product_id": "p_cart", "action": "add_to_cart", "occurred_at": now - 2 * 86400},
-        {"product_id": "p_purchase_1", "action": "purchase", "occurred_at": now - 2 * 86400},
-        {"product_id": "p_purchase_2", "action": "purchase", "occurred_at": now - 1 * 86400},
+        {
+            "product_id": "p_cart",
+            "action": "add_to_cart",
+            "occurred_at": now - 2 * 86400,
+        },
+        {
+            "product_id": "p_purchase_1",
+            "action": "purchase",
+            "occurred_at": now - 2 * 86400,
+        },
+        {
+            "product_id": "p_purchase_2",
+            "action": "purchase",
+            "occurred_at": now - 1 * 86400,
+        },
     ]
     embeddings = {
         "old_click": np.array([9.0, 9.0], dtype=np.float32),
@@ -469,9 +545,7 @@ def test_history_features_add_expected_v2_dimensions_without_realtime_shift():
     assert history_enabled.feature_extractor.total_feature_dim == 28 + 399
     assert (
         both_enabled.feature_extractor.total_feature_dim
-        == 28
-        + 399
-        + both_enabled.feature_extractor.realtime_window_feature_dim
+        == 28 + 399 + both_enabled.feature_extractor.realtime_window_feature_dim
     )
 
 
@@ -518,7 +592,9 @@ def test_history_feature_vector_uses_candidate_specific_similarity_by_product_id
 
 def test_realtime_window_features_populate_ranking_vector():
     ranking = RankingModel(RankingConfig(realtime_window_features_enabled=True))
-    user_features = UserFeatures(user_id="u1", total_interactions=1, last_active=time.time())
+    user_features = UserFeatures(
+        user_id="u1", total_interactions=1, last_active=time.time()
+    )
     candidate = CandidateProduct(product_id="p1", combined_score=0.5, source="test")
     metadata = {"category": "cat", "brand": "brand", "price": 10.0}
     context = {
@@ -556,9 +632,8 @@ def test_realtime_window_features_populate_ranking_vector():
     tail = matrix[0, -ranking.feature_extractor.realtime_window_feature_dim :]
     assert tail[0] == pytest.approx(0.01)
     assert tail[1] == pytest.approx(0.002)
-    product_offset = (
-        len(ranking.feature_extractor.WINDOW_FEATURE_NAMES)
-        * len(ranking.feature_extractor.WINDOW_FEATURE_METRICS)
+    product_offset = len(ranking.feature_extractor.WINDOW_FEATURE_NAMES) * len(
+        ranking.feature_extractor.WINDOW_FEATURE_METRICS
     )
     assert tail[product_offset] == pytest.approx(0.02)
 
@@ -687,6 +762,46 @@ def test_sasrec_candidate_keeps_existing_ranking_feature_dimension():
     assert ranking.feature_extractor.total_feature_dim == 28
     assert candidate_features.shape == (4,)
     assert candidate_features.tolist() == [0.8, 0.0, 0.0, 0.32]
+
+
+def test_pit_candidate_scores_reach_ranking_feature_vector():
+    ranking = RankingModel(RankingConfig())
+
+    candidate = ranking._training_candidate(
+        {
+            "product_id": "p1",
+            "candidate_scores": {
+                "collaborative_score": 0.8,
+                "content_similarity_score": 0.7,
+                "popularity_score": 0.6,
+                "combined_score": 0.5,
+            },
+        }
+    )
+
+    assert ranking.feature_extractor.extract_candidate_features(candidate).tolist() == [
+        0.8,
+        0.7,
+        0.6,
+        0.5,
+    ]
+
+
+def test_pit_rows_keep_impression_grouping_and_never_need_wall_clock(monkeypatch):
+    ranking = RankingModel(RankingConfig())
+    sample = {
+        "user_id": "u1",
+        "impression_id": "imp-1",
+        "as_of_ts": 3_600.0,
+        "context": {},
+    }
+    monkeypatch.setattr(
+        ranking_module.time, "time", lambda: (_ for _ in ()).throw(AssertionError)
+    )
+
+    assert ranking._training_pairwise_group_key(sample) == "impression:imp-1"
+    sample.pop("impression_id")
+    assert ranking._training_pairwise_group_key(sample) == "user_time:u1:2"
 
 
 def test_ranking_brand_feature_uses_stable_hash_bucket():
@@ -898,6 +1013,7 @@ def test_prepare_training_data_uses_online_equivalent_feature_extractor(monkeypa
         "user_id": "u1",
         "product_id": "p1",
         "action": "click",
+        "event_time": fixed_now,
         "context": {"device": "mobile", "session_position": 2, "time_on_page": 30},
         "collaborative_score": 0.2,
         "content_similarity_score": 0.3,
@@ -1054,9 +1170,15 @@ async def test_ranking_checkpoint_persists_business_objective_metadata(tmp_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     assert checkpoint["config"]["ranking_objective_version"] == "business_v1"
-    assert checkpoint["config"]["value_transform_stats"]["global"]["clip"] == pytest.approx(
-        20.0
+    assert checkpoint["config"]["feature_definition_version"] == "ranking_ltr_v1"
+    assert checkpoint["config"]["label_definition_version"] == "ranking_labels_v1"
+    assert (
+        checkpoint["config"]["feature_assembler_version"]
+        == "ranking_feature_assembler_v1"
     )
+    assert checkpoint["config"]["value_transform_stats"]["global"][
+        "clip"
+    ] == pytest.approx(20.0)
 
 
 def test_training_history_context_uses_only_prior_user_events():
@@ -1182,14 +1304,35 @@ class FakeTrainerSystemStore:
     def __init__(self, *, impression_samples=None, event_samples=None):
         self.impression_samples = impression_samples
         self.event_samples = event_samples
+        self.pit_training_renewals = 0
 
     async def get_training_interactions(self, limit=50000):
         if self.event_samples is not None:
             return self.event_samples
-        return [{"user_id": "u1", "product_id": "p1", "action": "click", "context": {}}]
+        return [
+            {
+                "user_id": "u1",
+                "product_id": "p1",
+                "action": "click",
+                "as_of_ts": 100.0,
+                "context": {},
+            }
+        ]
 
     async def get_ltr_training_impressions(self, *, limit=50000, lookback_days=30):
         return self.impression_samples or []
+
+    async def claim_pit_training_run(self, **_kwargs):
+        return {"claimed": True, "status": "running"}
+
+    async def complete_pit_training_run(self, **result):
+        self.completed_pit_training = result
+
+    async def renew_pit_training_lease(self, **_result):
+        self.pit_training_renewals += 1
+
+    async def fail_pit_training_run(self, **result):
+        self.failed_pit_training = result
 
 
 class FakeTrainerRankingModel:
@@ -1206,20 +1349,51 @@ class FakeTrainerRankingModel:
         self,
         training_data,
         *,
-        user_features_map=None,
-        product_metadata_map=None,
-        item_embedding_map=None,
-        two_tower_model_version=None,
         training_sample_source=None,
+        cancellation_event=None,
     ):
         self.received = {
             "training_data": training_data,
-            "user_features_map": user_features_map,
-            "product_metadata_map": product_metadata_map,
-            "item_embedding_map": item_embedding_map,
-            "two_tower_model_version": two_tower_model_version,
             "training_sample_source": training_sample_source,
         }
+
+    async def save_model(self, model_path):
+        self.loaded_model_path = model_path
+
+
+class FakeTrainerLegacyAdapter:
+    async def build(self, rows, *, training_sample_source):
+        examples = []
+        for index, row in enumerate(rows):
+            context = dict(row.get("context") or {})
+            impression_id = context.get("impression_id") or f"legacy-{index}"
+            examples.append(
+                RankingTrainingExample(
+                    observation_id=f"legacy:{index}",
+                    impression_id=impression_id,
+                    bundle=FeatureBundle(
+                        as_of_ts=float(row.get("as_of_ts") or 100.0),
+                        feature_definition_version="ranking_ltr_v1",
+                        user_features=UserFeatures(
+                            user_id=row.get("user_id", "u1"), total_interactions=7
+                        ),
+                        product_metadata={"price": 12.0},
+                        context=context,
+                        candidate=CandidateProduct(
+                            product_id=row["product_id"],
+                            combined_score=0.0,
+                            source="legacy_test",
+                        ),
+                    ),
+                    attribution=AttributionFacts(
+                        "click" if row.get("action") == "click" else "view",
+                        row.get("action") == "click",
+                        False,
+                    ),
+                    is_slate_sample=bool(context.get("impression_id")),
+                )
+            )
+        return examples
 
 
 class FakeTrainerArtifactManager:
@@ -1230,6 +1404,12 @@ class FakeTrainerArtifactManager:
         self, *, local_path, model_version, payload=None
     ):
         self.payload = payload
+        return SimpleNamespace(model_version=model_version)
+
+    async def persist_ranking_shadow_checkpoint(
+        self, *, local_path, model_version, payload=None
+    ):
+        self.shadow_payload = payload
         return SimpleNamespace(model_version=model_version)
 
 
@@ -1253,6 +1433,7 @@ async def test_model_trainer_passes_real_feature_context_and_checkpoint_metadata
     service.feature_store = FakeTrainerFeatureStore()
     service.system_store = FakeTrainerSystemStore()
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={"p1": {"price": 12.0}})
     service.recommendation_engine = SimpleNamespace(
         loaded_two_tower_version="two-tower-test",
@@ -1266,13 +1447,10 @@ async def test_model_trainer_passes_real_feature_context_and_checkpoint_metadata
 
     await service._train_ranking_model(trigger="test")
 
-    assert (
-        service.ranking_model.received["user_features_map"]["u1"]["total_interactions"]
-        == 7
-    )
-    assert service.ranking_model.received["product_metadata_map"]["p1"]["price"] == 12.0
-    assert set(service.ranking_model.received["item_embedding_map"]) == {"p1", "p2"}
-    assert service.ranking_model.received["two_tower_model_version"] == "two-tower-test"
+    example = service.ranking_model.received["training_data"][0]
+    assert isinstance(example, RankingTrainingExample)
+    assert example.bundle.user_features.total_interactions == 7
+    assert example.bundle.product_metadata["price"] == 12.0
     assert (
         service.artifact_manager.payload["feature_schema_version"]
         == RANKING_FEATURE_SCHEMA_VERSION
@@ -1291,12 +1469,14 @@ async def test_model_trainer_prefers_impression_backed_ltr_samples():
             "user_id": "u1",
             "product_id": "p1",
             "action": "click",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-1"},
         },
         {
             "user_id": "u1",
             "product_id": "p2",
             "action": "view",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-1"},
         },
     ]
@@ -1318,18 +1498,24 @@ async def test_model_trainer_prefers_impression_backed_ltr_samples():
                 "user_id": "u2",
                 "product_id": "p9",
                 "action": "purchase",
+                "as_of_ts": 100.0,
                 "context": {},
             }
         ],
     )
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={})
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"] == impression_samples
+    assert all(
+        isinstance(example, RankingTrainingExample)
+        for example in service.ranking_model.received["training_data"]
+    )
+    assert len(service.ranking_model.received["training_data"]) == 2
     assert (
         service.ranking_model.received["training_sample_source"]
         == "recommendation_impressions"
@@ -1341,18 +1527,451 @@ async def test_model_trainer_prefers_impression_backed_ltr_samples():
 
 
 @pytest.mark.asyncio
+async def test_model_trainer_uses_pit_dataset_without_current_online_feature_maps():
+    class PitReader:
+        async def read(self, dataset_uri):
+            assert dataset_uri == "s3://feature-lake/ranking-pit.jsonl"
+            return SimpleNamespace(
+                dataset_version="iceberg-snapshot-42",
+                materialization_run_id="run-42",
+                feature_definition_version="ranking_ltr_v1",
+                label_definition_version="ranking_labels_v1",
+                manifest_uri="s3://feature-lake/run-42/manifest.json",
+                iceberg_snapshot_id="42",
+                schema_hash="a" * 64,
+                examples=[
+                    RankingTrainingExample(
+                        observation_id="imp-1:p1",
+                        impression_id="imp-1",
+                        bundle=FeatureBundle(
+                            as_of_ts=100.0,
+                            feature_definition_version="ranking_ltr_v1",
+                            user_features=UserFeatures(
+                                user_id="u1", total_interactions=3
+                            ),
+                            product_metadata={"price": 9.0},
+                            context={},
+                            candidate=CandidateProduct(
+                                product_id="p1",
+                                combined_score=0.5,
+                                source="pit_test",
+                            ),
+                        ),
+                        attribution=AttributionFacts("click", True, False),
+                    )
+                ],
+            )
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/ranking-pit.jsonl",
+        ),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = None
+    service.system_store = FakeTrainerSystemStore()
+    service.pit_dataset_reader = PitReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.vector_search = None
+    service.recommendation_engine = None
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="test")
+
+    assert service.ranking_model.received["training_data"][0].bundle.as_of_ts == 100.0
+    assert (
+        service.ranking_model.received["training_sample_source"] == "feature_lake_pit"
+    )
+    assert (
+        service.artifact_manager.payload["feature_lake_dataset_version"]
+        == "iceberg-snapshot-42"
+    )
+    assert (
+        service.artifact_manager.payload["feature_lake_materialization_run_id"]
+        == "run-42"
+    )
+    assert (
+        service.artifact_manager.payload["label_definition_version"]
+        == "ranking_labels_v1"
+    )
+    assert service.artifact_manager.payload["feature_lake_iceberg_snapshot_id"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_waits_when_pit_latest_pointer_is_unavailable():
+    class UnavailableReader:
+        async def read(self, _dataset_uri):
+            raise PitTrainingDatasetUnavailable("PIT latest pointer is unavailable")
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/latest.json",
+        ),
+    )
+    service.feature_store = None
+    service.system_store = None
+    service.pit_dataset_reader = UnavailableReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_ranking_model(trigger="startup")
+
+    assert service.ranking_model.received is None
+    assert service.observability.runs[-1][1] == "waiting_for_pit_manifest"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_clears_waiting_state_for_corrupt_pit_manifest():
+    class CorruptReader:
+        async def read(self, _dataset_uri):
+            raise PitTrainingDatasetError("PIT dataset manifest is not complete")
+
+    class Observability(FakeTrainerObservability):
+        waiting = None
+
+        def set_pit_trainer_waiting_for_manifest(self, waiting):
+            self.waiting = waiting
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/latest.json",
+        ),
+    )
+    service.feature_store = None
+    service.system_store = None
+    service.pit_dataset_reader = CorruptReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.observability = Observability()
+
+    with pytest.raises(PitTrainingDatasetError, match="not complete"):
+        await service._train_ranking_model(trigger="scheduled")
+
+    assert service.observability.waiting is False
+    assert service.observability.runs[-1][1] == "error"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_skips_an_already_trained_pit_manifest():
+    class DuplicateReader:
+        async def read(self, _dataset_uri):
+            return SimpleNamespace(
+                materialization_run_id="run-42",
+                examples=[object()],
+            )
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/latest.json",
+        ),
+    )
+    service.feature_store = None
+    service.system_store = None
+    service.pit_dataset_reader = DuplicateReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.observability = FakeTrainerObservability()
+    service.last_trained_pit_run_id = "run-42"
+
+    await service._train_ranking_model(trigger="scheduled")
+
+    assert service.ranking_model.received is None
+    assert service.observability.runs[-1][1] == "skipped_duplicate_manifest"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_respects_durable_pit_training_claim():
+    class DatasetReader:
+        async def read(self, _dataset_uri):
+            return SimpleNamespace(
+                materialization_run_id="run-42",
+                examples=[object()],
+            )
+
+    class ClaimedStore(FakeTrainerSystemStore):
+        async def claim_pit_training_run(self, **_kwargs):
+            return {"claimed": False, "status": "completed"}
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://feature-lake/latest.json",
+            pit_training_lease_seconds=21600,
+        ),
+    )
+    service.feature_store = None
+    service.system_store = ClaimedStore()
+    service.pit_dataset_reader = DatasetReader()
+    service.ranking_model = FakeTrainerRankingModel()
+    service.observability = FakeTrainerObservability()
+    service.last_trained_pit_run_id = None
+
+    await service._train_ranking_model(trigger="scheduled")
+
+    assert service.ranking_model.received is None
+    assert service.observability.runs[-1][1] == "skipped_duplicate_manifest"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_renews_pit_training_lease_while_training():
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=FeatureBundle(
+            as_of_ts=100.0,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={"price": 9.0},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1", combined_score=0.5, source="pit_test"
+            ),
+        ),
+        attribution=AttributionFacts("click", True, False),
+    )
+
+    class DatasetReader:
+        async def read(self, _dataset_uri):
+            return SimpleNamespace(
+                dataset_version="snapshot-42",
+                materialization_run_id="run-42",
+                feature_definition_version="ranking_ltr_v1",
+                label_definition_version="ranking_labels_v1",
+                manifest_uri="s3://features/run-42/manifest.json",
+                iceberg_snapshot_id="42",
+                schema_hash="a" * 64,
+                quarantine_rows=0,
+                examples=[example],
+            )
+
+    release_training = asyncio.Event()
+
+    class SlowRankingModel(FakeTrainerRankingModel):
+        async def train_model(
+            self,
+            training_data,
+            *,
+            training_sample_source=None,
+            cancellation_event=None,
+        ):
+            self.received = {"training_data": training_data}
+            await release_training.wait()
+
+    store = FakeTrainerSystemStore()
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True, training_min_samples=1
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://features/latest.json",
+            pit_training_lease_seconds=300,
+        ),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = None
+    service.system_store = store
+    service.pit_dataset_reader = DatasetReader()
+    service.ranking_model = SlowRankingModel()
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+    service.instance_id = "trainer-1"
+    service.last_trained_pit_run_id = None
+    service._pit_training_heartbeat_interval_seconds = 0.001
+
+    task = asyncio.create_task(service._train_ranking_model(trigger="scheduled"))
+    for _ in range(100):
+        if store.pit_training_renewals:
+            break
+        await asyncio.sleep(0.001)
+    release_training.set()
+    await task
+
+    assert store.pit_training_renewals >= 1
+    assert store.completed_pit_training["run_id"] == "run-42"
+
+
+@pytest.mark.asyncio
+async def test_model_trainer_stops_before_artifact_when_training_lease_is_lost():
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=FeatureBundle(
+            as_of_ts=100.0,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1", combined_score=0.5, source="pit_test"
+            ),
+        ),
+        attribution=AttributionFacts("click", True, False),
+    )
+
+    class DatasetReader:
+        async def read(self, _dataset_uri):
+            return SimpleNamespace(
+                dataset_version="snapshot-42",
+                materialization_run_id="run-42",
+                feature_definition_version="ranking_ltr_v1",
+                label_definition_version="ranking_labels_v1",
+                manifest_uri="s3://features/run-42/manifest.json",
+                iceberg_snapshot_id="42",
+                schema_hash="a" * 64,
+                quarantine_rows=0,
+                examples=[example],
+            )
+
+    class LeaseLostStore(FakeTrainerSystemStore):
+        async def renew_pit_training_lease(self, **_result):
+            raise RuntimeError("lease expired")
+
+    class NeverFinishesRankingModel(FakeTrainerRankingModel):
+        async def train_model(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    store = LeaseLostStore()
+    artifacts = FakeTrainerArtifactManager()
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True, training_min_samples=1
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://features/latest.json",
+            pit_training_lease_seconds=300,
+        ),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = None
+    service.system_store = store
+    service.pit_dataset_reader = DatasetReader()
+    service.ranking_model = NeverFinishesRankingModel()
+    service.artifact_manager = artifacts
+    service.observability = FakeTrainerObservability()
+    service.instance_id = "trainer-1"
+    service.last_trained_pit_run_id = None
+    service._pit_training_heartbeat_interval_seconds = 0.001
+
+    with pytest.raises(RuntimeError, match="lost its durable lease"):
+        await service._train_ranking_model(trigger="scheduled")
+
+    assert artifacts.payload is None
+    assert store.failed_pit_training["run_id"] == "run-42"
+
+
+@pytest.mark.asyncio
+async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch):
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=FeatureBundle(
+            as_of_ts=100.0,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={"price": 9.0},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1", combined_score=0.5, source="pit_test"
+            ),
+        ),
+        attribution=AttributionFacts("click", True, False),
+    )
+    dataset = SimpleNamespace(
+        examples=[example],
+        dataset_version="iceberg-snapshot-42",
+        materialization_run_id="run-42",
+        manifest_uri="s3://features/run-42/manifest.json",
+        iceberg_snapshot_id="42",
+        schema_hash="a" * 64,
+        feature_definition_version="ranking_ltr_v1",
+        label_definition_version="ranking_labels_v1",
+    )
+
+    class Reader:
+        async def read(self, _uri):
+            return dataset
+
+    class ShadowModel:
+        def __init__(self, _config, *, observability=None):
+            assert observability is service.observability
+            self.loaded_model_path = None
+            self.model_version = "shadow-1"
+            self.feature_assembler = SimpleNamespace(
+                version="ranking_feature_assembler_v1"
+            )
+
+        async def train_model(self, examples, *, training_sample_source):
+            assert examples == [example]
+            assert training_sample_source == "feature_lake_pit_shadow"
+
+    monkeypatch.setattr(model_trainer_module, "RankingModel", ShadowModel)
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        feature_lake_config=SimpleNamespace(ranking_pit_dataset_uri="s3://latest"),
+        ranking_config=SimpleNamespace(training_min_samples=1),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.pit_dataset_reader = Reader()
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_pit_shadow_model(trigger="scheduled")
+
+    assert service.artifact_manager.shadow_payload["activation_allowed"] is False
+    assert (
+        service.artifact_manager.shadow_payload["label_definition_version"]
+        == "ranking_labels_v1"
+    )
+    assert service.observability.runs[-1][1] == "success"
+
+
+@pytest.mark.asyncio
 async def test_model_trainer_prefers_impression_samples_for_listwise_ltr():
     impression_samples = [
         {
             "user_id": "u1",
             "product_id": "p1",
             "action": "click",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-1"},
         },
         {
             "user_id": "u1",
             "product_id": "p2",
             "action": "view",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-1"},
         },
     ]
@@ -1375,18 +1994,24 @@ async def test_model_trainer_prefers_impression_samples_for_listwise_ltr():
                 "user_id": "u2",
                 "product_id": "p9",
                 "action": "purchase",
+                "as_of_ts": 100.0,
                 "context": {},
             }
         ],
     )
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={})
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"] == impression_samples
+    assert all(
+        isinstance(example, RankingTrainingExample)
+        for example in service.ranking_model.received["training_data"]
+    )
+    assert len(service.ranking_model.received["training_data"]) == 2
     assert (
         service.ranking_model.received["training_sample_source"]
         == "recommendation_impressions"
@@ -1400,8 +2025,20 @@ async def test_model_trainer_prefers_impression_samples_for_listwise_ltr():
 @pytest.mark.asyncio
 async def test_model_trainer_falls_back_when_impression_samples_are_insufficient():
     event_samples = [
-        {"user_id": "u2", "product_id": "p9", "action": "click", "context": {}},
-        {"user_id": "u2", "product_id": "p10", "action": "view", "context": {}},
+        {
+            "user_id": "u2",
+            "product_id": "p9",
+            "action": "click",
+            "as_of_ts": 100.0,
+            "context": {},
+        },
+        {
+            "user_id": "u2",
+            "product_id": "p10",
+            "action": "view",
+            "as_of_ts": 100.0,
+            "context": {},
+        },
     ]
     service = object.__new__(ModelTrainerService)
     service.config = SimpleNamespace(
@@ -1426,16 +2063,20 @@ async def test_model_trainer_falls_back_when_impression_samples_are_insufficient
         event_samples=event_samples,
     )
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={})
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"] == event_samples
+    assert len(service.ranking_model.received["training_data"]) == 2
+    assert all(
+        isinstance(row, RankingTrainingExample)
+        for row in service.ranking_model.received["training_data"]
+    )
     assert (
-        service.ranking_model.received["training_sample_source"]
-        == "interaction_events"
+        service.ranking_model.received["training_sample_source"] == "interaction_events"
     )
     assert (
         service.artifact_manager.payload["training_sample_source"]
@@ -1450,12 +2091,14 @@ async def test_model_trainer_listwise_fallback_keeps_event_source():
             "user_id": "u2",
             "product_id": "p9",
             "action": "click",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-fallback"},
         },
         {
             "user_id": "u2",
             "product_id": "p10",
             "action": "view",
+            "as_of_ts": 100.0,
             "context": {"impression_id": "imp-fallback"},
         },
     ]
@@ -1483,16 +2126,20 @@ async def test_model_trainer_listwise_fallback_keeps_event_source():
         event_samples=event_samples,
     )
     service.ranking_model = FakeTrainerRankingModel()
+    service.legacy_training_adapter = FakeTrainerLegacyAdapter()
     service.vector_search = SimpleNamespace(product_metadata={})
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
 
     await service._train_ranking_model(trigger="test")
 
-    assert service.ranking_model.received["training_data"] == event_samples
+    assert len(service.ranking_model.received["training_data"]) == 2
+    assert all(
+        isinstance(row, RankingTrainingExample)
+        for row in service.ranking_model.received["training_data"]
+    )
     assert (
-        service.ranking_model.received["training_sample_source"]
-        == "interaction_events"
+        service.ranking_model.received["training_sample_source"] == "interaction_events"
     )
     assert (
         service.artifact_manager.payload["training_sample_source"]
@@ -1707,7 +2354,9 @@ def test_recommendation_cache_context_changes_when_slate_diversity_is_enabled():
 
 
 @pytest.mark.asyncio
-async def test_attach_ranking_history_embeddings_adds_internal_ranker_context(monkeypatch):
+async def test_attach_ranking_history_embeddings_adds_internal_ranker_context(
+    monkeypatch,
+):
     class FakeFeatureStore:
         def __init__(self):
             self.limit = None
@@ -1766,7 +2415,9 @@ async def test_attach_ranking_history_embeddings_adds_internal_ranker_context(mo
 
 
 @pytest.mark.asyncio
-async def test_attach_ranking_history_embeddings_uses_lazy_embedding_lookup(monkeypatch):
+async def test_attach_ranking_history_embeddings_uses_lazy_embedding_lookup(
+    monkeypatch,
+):
     class FakeFeatureStore:
         async def get_user_sequence(self, user_id, limit=200):
             return [
@@ -1828,9 +2479,12 @@ async def test_attach_ranking_history_embeddings_uses_lazy_embedding_lookup(monk
         {"two_tower_model": "two-tower-test"},
     )
 
-    assert context[RANKING_HISTORY_CONTEXT_KEY]["candidate_similarities"]["candidate"][
-        "click"
-    ] == 1.0
+    assert (
+        context[RANKING_HISTORY_CONTEXT_KEY]["candidate_similarities"]["candidate"][
+            "click"
+        ]
+        == 1.0
+    )
 
 
 @pytest.mark.asyncio
@@ -2203,7 +2857,9 @@ async def test_recommendation_path_does_not_force_empty_interactions_when_swing_
     monkeypatch.setattr(recommendation_api_module, "feature_store", FakeFeatureStore())
     monkeypatch.setattr(recommendation_api_module, "recommendation_engine", engine)
     monkeypatch.setattr(recommendation_api_module, "vector_search", FakeVectorSearch())
-    monkeypatch.setattr(recommendation_api_module, "ranking_batcher", FakeRankingBatcher())
+    monkeypatch.setattr(
+        recommendation_api_module, "ranking_batcher", FakeRankingBatcher()
+    )
     monkeypatch.setattr(
         recommendation_api_module,
         "ranking_model",
@@ -2238,7 +2894,9 @@ async def test_recommendation_admission_rejects_at_inflight_limit(monkeypatch):
             service_topology_config=SimpleNamespace(max_inflight_recommendations=1),
         ),
     )
-    request = SimpleNamespace(state=SimpleNamespace(request_started_at=time.perf_counter()))
+    request = SimpleNamespace(
+        state=SimpleNamespace(request_started_at=time.perf_counter())
+    )
     monkeypatch.setattr(
         recommendation_api_module.app.state,
         "runtime",
@@ -2274,9 +2932,7 @@ async def test_recommendation_local_ranking_path_passes_deadline(monkeypatch):
             deadline_unix_seconds=None,
         ):
             self.deadline_unix_seconds = deadline_unix_seconds
-            return [_recommendation(candidates[0].product_id, 1.0)], {
-                "path": "fake"
-            }
+            return [_recommendation(candidates[0].product_id, 1.0)], {"path": "fake"}
 
     ranking_batcher = CapturingRankingBatcher()
     runtime = SimpleNamespace(
@@ -2480,8 +3136,12 @@ async def test_missing_content_features_skips_candidate_and_recommendation_cache
         recommendation_api_module, "recommendation_engine", FakeRecommendationEngine()
     )
     monkeypatch.setattr(recommendation_api_module, "vector_search", FakeVectorSearch())
-    monkeypatch.setattr(recommendation_api_module, "ranking_batcher", FakeRankingBatcher())
-    monkeypatch.setattr(recommendation_api_module, "ranking_coordinator_client_pool", None)
+    monkeypatch.setattr(
+        recommendation_api_module, "ranking_batcher", FakeRankingBatcher()
+    )
+    monkeypatch.setattr(
+        recommendation_api_module, "ranking_coordinator_client_pool", None
+    )
     monkeypatch.setattr(recommendation_api_module, "ranking_client_pool", None)
     monkeypatch.setattr(
         recommendation_api_module,

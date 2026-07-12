@@ -30,6 +30,29 @@ data:
   KAFKA_DEAD_LETTER_TOPIC: {{ .Values.external.kafka.deadLetterTopic | quote }}
   FEATURE_PIPELINE_MODE: {{ .Values.appConfig.featurePipelineMode | quote }}
   FLINK_FEATURE_OUTPUT_NAMESPACE: {{ .Values.appConfig.flinkFeatureOutputNamespace | quote }}
+  FEATURE_LAKE_ENABLED: {{ .Values.external.featureLake.enabled | quote }}
+  FEATURE_LAKE_CATALOG_NAME: {{ .Values.external.featureLake.catalogName | quote }}
+  FEATURE_LAKE_CATALOG_URI: {{ .Values.external.featureLake.catalogUri | quote }}
+  FEATURE_LAKE_WAREHOUSE_URI: {{ .Values.external.featureLake.warehouseUri | quote }}
+  FEATURE_LAKE_S3_ENDPOINT: {{ .Values.external.objectStorage.endpointUrl | quote }}
+  FEATURE_LAKE_NAMESPACE: {{ .Values.external.featureLake.namespace | quote }}
+  FEATURE_LAKE_TRAINING_SOURCE: {{ .Values.external.featureLake.trainingSource | quote }}
+  FEATURE_LAKE_PIT_SHADOW_ENABLED: {{ .Values.external.featureLake.pitShadowEnabled | quote }}
+  FEATURE_LAKE_RANKING_PIT_DATASET_URI: {{ .Values.external.featureLake.rankingPitDatasetUri | quote }}
+  FEATURE_LAKE_FEATURE_DEFINITION_VERSION: {{ .Values.external.featureLake.featureDefinitionVersion | quote }}
+  FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS: {{ .Values.external.featureLake.attributionWindowHours | quote }}
+  FEATURE_LAKE_ALLOWED_LATENESS_HOURS: {{ .Values.external.featureLake.allowedLatenessHours | quote }}
+  FEATURE_LAKE_CATALOG_OUTBOX_BATCH_SIZE: {{ .Values.external.featureLake.catalogOutboxBatchSize | quote }}
+  FEATURE_LAKE_CATALOG_OUTBOX_LEASE_SECONDS: {{ .Values.external.featureLake.catalogOutboxLeaseSeconds | quote }}
+  FEATURE_LAKE_CATALOG_OUTBOX_POLL_SECONDS: {{ .Values.external.featureLake.catalogOutboxPollSeconds | quote }}
+  FEATURE_LAKE_CATALOG_OUTBOX_RETENTION_DAYS: {{ .Values.external.featureLake.catalogOutboxRetentionDays | quote }}
+  FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED: {{ .Values.external.featureLake.pitOrchestratorEnabled | quote }}
+  FEATURE_LAKE_PIT_SCHEDULE_HOUR_UTC: {{ .Values.external.featureLake.pitScheduleHourUtc | quote }}
+  FEATURE_LAKE_PIT_ORCHESTRATOR_LEASE_SECONDS: {{ .Values.external.featureLake.pitOrchestratorLeaseSeconds | quote }}
+  FEATURE_LAKE_PIT_TRAINING_LEASE_SECONDS: {{ .Values.external.featureLake.pitTrainingLeaseSeconds | quote }}
+  FEATURE_LAKE_FLINK_JOBMANAGER: {{ .Values.external.featureLake.flinkJobmanager | quote }}
+  FEATURE_LAKE_PIT_EXPORT_URI: {{ .Values.external.featureLake.pitExportUri | quote }}
+  FEATURE_LAKE_PIT_JOB_JAR_PATH: {{ .Values.external.featureLake.pitJobJarPath | quote }}
   DATABASE_ENABLE: {{ .Values.external.database.enable | quote }}
   DATABASE_POOL_SIZE: {{ .Values.external.database.poolSize | quote }}
   DATABASE_MAX_OVERFLOW: {{ .Values.external.database.maxOverflow | quote }}

@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 from fastapi import Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from video_commerce.common.config import Config
+from video_commerce.common.event_time import validate_public_event_time
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.kafka_client import close_kafka, init_kafka
 from video_commerce.common.models import UserInteractionRequest
@@ -118,6 +120,11 @@ async def readyz():
 @app.post("/api/interactions")
 async def ingest_interaction(http_request: Request, request: UserInteractionRequest = Body(...)):
     action = request.action.value if hasattr(request.action, "value") else str(request.action)
+    server_received_at = time.time()
+    try:
+        event_time = validate_public_event_time(request.event_time, server_received_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if not kafka_manager or not app.state.runtime.config.kafka_config.enable:
         app.state.runtime.observability.record_interaction_ingest(action, "kafka_unavailable")
@@ -128,7 +135,8 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         product_id=request.product_id,
         action=action,
         context=request.context,
-        timestamp=request.timestamp,
+        event_time=event_time,
+        server_received_at=server_received_at,
         request_id=http_request.state.request_id,
     )
     if not success:

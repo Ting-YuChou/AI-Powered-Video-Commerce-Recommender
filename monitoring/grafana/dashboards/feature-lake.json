@@ -1,0 +1,71 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Materialization lag",
+      "type": "timeseries",
+      "targets": [{"expr": "feature_lake_materialization_lag_seconds", "legendFormat": "{{record_type}}"}]
+    },
+    {
+      "id": 2,
+      "title": "Catalog outbox",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "catalog_outbox_pending", "legendFormat": "pending"},
+        {"expr": "catalog_outbox_oldest_age_seconds", "legendFormat": "oldest seconds"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "PIT safety gates",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "pit_online_offline_parity_ratio", "legendFormat": "parity"},
+        {"expr": "pit_leakage_rows", "legendFormat": "leakage rows"}
+      ]
+    },
+    {
+      "id": 4,
+      "title": "DLQ and manifest failures",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "rate(feature_lake_dlq_total[5m])", "legendFormat": "DLQ/s"},
+        {"expr": "increase(pit_manifest_validation_failures_total[10m])", "legendFormat": "manifest failures"}
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Typed PIT training contract",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "pit_assembler_vector_parity_ratio", "legendFormat": "assembler parity"},
+        {"expr": "pit_label_reconciliation_ratio", "legendFormat": "label reconciliation"},
+        {"expr": "pit_value_mask_coverage_ratio", "legendFormat": "actual value coverage"},
+        {"expr": "pit_current_state_calls", "legendFormat": "forbidden current-state calls"},
+        {"expr": "pit_invalid_feature_or_label_rows", "legendFormat": "invalid tensor rows"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "PIT production rollout state",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "pit_orchestrator_waiting_for_rows", "legendFormat": "orchestrator waiting"},
+        {"expr": "pit_orchestrator_run_in_progress", "legendFormat": "orchestrator running"},
+        {"expr": "pit_orchestrator_lease_expired", "legendFormat": "orchestrator lease expired"},
+        {"expr": "pit_trainer_waiting_for_manifest", "legendFormat": "trainer waiting"},
+        {"expr": "increase(pit_training_duplicate_manifest_skips_total[24h])", "legendFormat": "duplicate manifests skipped"},
+        {"expr": "rate(ranking_untrained_fallback_total[5m])", "legendFormat": "untrained fallback/s"}
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["feature-lake", "pit"],
+  "templating": {"list": []},
+  "time": {"from": "now-24h", "to": "now"},
+  "title": "Feature Lake and PIT Training",
+  "uid": "feature-lake-pit",
+  "version": 1
+}

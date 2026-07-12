@@ -166,7 +166,7 @@ class FeatureUpdaterWorker:
         product_id = value.get('product_id')
         action = value.get('action')
         context = value.get('context', {})
-        timestamp = value.get('timestamp', time.time())
+        timestamp = value.get('event_time', value.get('timestamp', time.time()))
         started_at = time.perf_counter()
         status = "success"
         
@@ -181,7 +181,9 @@ class FeatureUpdaterWorker:
             'action': action,
             'context': context,
             'timestamp': timestamp,
+            'event_time': timestamp,
             'occurred_at': value.get('occurred_at', timestamp),
+            'server_received_at': value.get('server_received_at'),
             'user_id': user_id,
         })
         

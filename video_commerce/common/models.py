@@ -8,9 +8,9 @@ data serialization, and internal data structures throughout the system.
 
 from __future__ import annotations
 try:
-    from pydantic.v1 import BaseModel, Field, validator
+    from pydantic.v1 import BaseModel, Field, root_validator, validator
 except ImportError:
-    from pydantic import BaseModel, Field, validator
+    from pydantic import BaseModel, Field, root_validator, validator
 from typing import List, Dict, Optional, Any, Union, TYPE_CHECKING
 from enum import Enum
 import time
@@ -69,7 +69,30 @@ class UserInteractionRequest(BaseModel):
     product_id: str = Field(..., description="Product identifier")
     action: InteractionType = Field(..., description="Type of interaction")
     context: Dict[str, Any] = Field(default_factory=dict, description="Interaction context")
-    timestamp: Optional[float] = Field(default_factory=time.time, description="Interaction timestamp")
+    event_time: Optional[float] = Field(
+        None,
+        description="Client event time as a Unix timestamp; bounded by the ingest service",
+    )
+    timestamp: Optional[float] = Field(
+        None,
+        description="Deprecated alias for event_time, retained for backwards compatibility",
+    )
+
+    @root_validator
+    def normalize_event_time_aliases(cls, values):
+        event_time = values.get("event_time")
+        timestamp = values.get("timestamp")
+        if event_time is not None and timestamp is not None:
+            if float(event_time) != float(timestamp):
+                raise ValueError("event_time and timestamp must match when both are provided")
+        resolved = event_time if event_time is not None else timestamp
+        if resolved is None:
+            resolved = time.time()
+        resolved = float(resolved)
+        values["event_time"] = resolved
+        # Keep the legacy attribute available to existing internal callers.
+        values["timestamp"] = resolved
+        return values
     
     class Config:
         schema_extra = {

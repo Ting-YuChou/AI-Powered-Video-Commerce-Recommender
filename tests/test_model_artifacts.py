@@ -1,7 +1,11 @@
 import asyncio
 import hashlib
 
-from video_commerce.common.config import ModelConfig, ObjectStorageConfig, RecommendationConfig
+from video_commerce.common.config import (
+    ModelConfig,
+    ObjectStorageConfig,
+    RecommendationConfig,
+)
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
 
@@ -10,8 +14,11 @@ class FakeSystemStore:
     def __init__(self):
         self.latest = {}
         self.recorded = []
+        self.catalog_activations = []
 
-    async def record_model_checkpoint(self, model_name, model_version, checkpoint_path, payload=None):
+    async def record_model_checkpoint(
+        self, model_name, model_version, checkpoint_path, payload=None
+    ):
         record = {
             "model_name": model_name,
             "model_version": model_version,
@@ -21,9 +28,71 @@ class FakeSystemStore:
         }
         self.recorded.append(record)
         self.latest[model_name] = record
+        return True
 
     async def get_latest_model_checkpoint(self, model_name):
         return self.latest.get(model_name)
+
+    async def get_model_checkpoint_for_materialization_run(
+        self, model_name, materialization_run_id
+    ):
+        record = self.latest.get(model_name)
+        if not record:
+            return None
+        if (
+            record["payload"].get("feature_lake_materialization_run_id")
+            != materialization_run_id
+        ):
+            return None
+        return record
+
+    async def activate_product_catalog(self, source_version, metadata_map, **kwargs):
+        self.catalog_activations.append(
+            {
+                "source_version": source_version,
+                "metadata_map": metadata_map,
+                **kwargs,
+            }
+        )
+        return "activation-1"
+
+
+def test_persist_two_tower_artifacts_activates_catalog_after_checkpoint(tmp_path):
+    fake_store = FakeSystemStore()
+    checkpoint = tmp_path / "two_tower.pt"
+    index = tmp_path / "two_tower.faiss"
+    metadata = tmp_path / "two_tower.cf_meta.json"
+    checkpoint.write_bytes(b"checkpoint")
+    index.write_bytes(b"index")
+    metadata.write_text("{}", encoding="utf-8")
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(cf_index_path=str(index)),
+    )
+
+    asyncio.run(
+        manager.persist_two_tower_artifacts(
+            checkpoint_path=str(checkpoint),
+            index_path=str(index),
+            metadata_path=str(metadata),
+            model_version="catalog-v1",
+            catalog_metadata={"product-1": {"price": 10.0}},
+        )
+    )
+
+    assert fake_store.recorded[-1]["model_version"] == "catalog-v1"
+    assert fake_store.catalog_activations == [
+        {
+            "source_version": "catalog-v1",
+            "metadata_map": {"product-1": {"price": 10.0}},
+        }
+    ]
 
 
 def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
@@ -35,10 +104,16 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
-        model_config=ModelConfig(ranking_model_path=str(ranking_path), cache_dir=str(tmp_path / "models")),
-        recommendation_config=RecommendationConfig(cf_index_path=str(tmp_path / "cf.faiss")),
+        model_config=ModelConfig(
+            ranking_model_path=str(ranking_path), cache_dir=str(tmp_path / "models")
+        ),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
     )
 
     record = asyncio.run(
@@ -52,11 +127,95 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
     assert record is not None
     assert fake_store.recorded[-1]["checkpoint_path"] == str(ranking_path)
     assert fake_store.recorded[-1]["payload"]["local_cache_path"] == str(ranking_path)
-    assert fake_store.recorded[-1]["payload"]["artifact_sha256"] == hashlib.sha256(b"ranking").hexdigest()
+    assert (
+        fake_store.recorded[-1]["payload"]["artifact_sha256"]
+        == hashlib.sha256(b"ranking").hexdigest()
+    )
     assert (
         fake_store.recorded[-1]["payload"]["artifact_manifest"]["checkpoint"]["sha256"]
         == hashlib.sha256(b"ranking").hexdigest()
     )
+
+
+def test_pit_checkpoint_conflict_returns_and_verifies_existing_artifact(tmp_path):
+    existing_path = tmp_path / "ranking-existing.pt"
+    existing_path.write_bytes(b"existing-ranking")
+    existing_hash = hashlib.sha256(b"existing-ranking").hexdigest()
+    candidate_path = tmp_path / "ranking-candidate.pt"
+    candidate_path.write_bytes(b"different-ranking")
+
+    class ConflictStore(FakeSystemStore):
+        async def record_model_checkpoint(self, *args, **kwargs):
+            return False
+
+    store = ConflictStore()
+    store.latest[ModelArtifactManager.RANKING_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.RANKING_MODEL_NAME,
+        "model_version": "pit-run-42",
+        "checkpoint_path": str(existing_path),
+        "payload": {
+            "feature_lake_materialization_run_id": "run-42",
+            "artifact_sha256": existing_hash,
+        },
+        "created_at": 1.0,
+    }
+    manager = ModelArtifactManager(
+        system_store=store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
+        ),
+        model_config=ModelConfig(
+            ranking_model_path=str(candidate_path), cache_dir=str(tmp_path / "models")
+        ),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    record = asyncio.run(
+        manager.persist_ranking_checkpoint(
+            local_path=str(candidate_path),
+            model_version="pit-run-42",
+            payload={"feature_lake_materialization_run_id": "run-42"},
+        )
+    )
+
+    assert record.checkpoint_path == str(existing_path)
+    assert record.payload["artifact_sha256"] == existing_hash
+
+
+def test_persist_ranking_shadow_checkpoint_uses_non_activating_model_namespace(
+    tmp_path,
+):
+    fake_store = FakeSystemStore()
+    shadow_path = tmp_path / "ranking.pit-shadow.pt"
+    shadow_path.write_bytes(b"shadow")
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
+        ),
+        model_config=ModelConfig(ranking_model_path=str(tmp_path / "ranking.pt")),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    record = asyncio.run(
+        manager.persist_ranking_shadow_checkpoint(
+            local_path=str(shadow_path),
+            model_version="ranking-shadow-1",
+            payload={"shadow": True},
+        )
+    )
+
+    assert record.model_name == ModelArtifactManager.RANKING_SHADOW_MODEL_NAME
+    assert fake_store.recorded[-1]["model_name"] == "ranking_model_pit_shadow"
+    assert fake_store.latest.get(ModelArtifactManager.RANKING_MODEL_NAME) is None
 
 
 def test_sync_latest_two_tower_artifacts_copies_to_local_cache(tmp_path):
@@ -85,7 +244,9 @@ def test_sync_latest_two_tower_artifacts_copies_to_local_cache(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(
             ranking_model_path=str(tmp_path / "cache" / "ranking.pt"),
@@ -128,7 +289,9 @@ def test_sync_latest_two_tower_artifacts_removes_undeclared_optional_sidecars(tm
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(
             ranking_model_path=str(tmp_path / "cache" / "ranking.pt"),
@@ -180,7 +343,9 @@ def test_sync_latest_two_tower_artifacts_rejects_checksum_mismatch(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(
             ranking_model_path=str(tmp_path / "cache" / "ranking.pt"),
@@ -213,7 +378,9 @@ def test_persist_sasrec_artifacts_records_manifest(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
         recommendation_config=RecommendationConfig(),
@@ -230,7 +397,9 @@ def test_persist_sasrec_artifacts_records_manifest(tmp_path):
     )
 
     assert record is not None
-    assert fake_store.recorded[-1]["model_name"] == ModelArtifactManager.SASREC_MODEL_NAME
+    assert (
+        fake_store.recorded[-1]["model_name"] == ModelArtifactManager.SASREC_MODEL_NAME
+    )
     manifest = fake_store.recorded[-1]["payload"]["artifact_manifest"]
     assert manifest["checkpoint"]["sha256"] == hashlib.sha256(b"checkpoint").hexdigest()
     assert manifest["vocab"]["local_cache_path"].endswith("sasrec_vocab.json")
@@ -262,7 +431,9 @@ def test_sync_latest_sasrec_artifacts_copies_to_local_cache(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
         recommendation_config=RecommendationConfig(),
@@ -272,8 +443,12 @@ def test_sync_latest_sasrec_artifacts_copies_to_local_cache(tmp_path):
 
     assert record is not None
     assert (tmp_path / "cache" / "sasrec_model.pt").read_bytes() == b"checkpoint"
-    assert (tmp_path / "cache" / "sasrec_vocab.json").read_text(encoding="utf-8") == "{}"
-    assert (tmp_path / "cache" / "sasrec_metadata.json").read_text(encoding="utf-8") == "{}"
+    assert (tmp_path / "cache" / "sasrec_vocab.json").read_text(
+        encoding="utf-8"
+    ) == "{}"
+    assert (tmp_path / "cache" / "sasrec_metadata.json").read_text(
+        encoding="utf-8"
+    ) == "{}"
 
 
 def test_sync_latest_sasrec_artifacts_rejects_checksum_mismatch(tmp_path):
@@ -306,7 +481,9 @@ def test_sync_latest_sasrec_artifacts_rejects_checksum_mismatch(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
         recommendation_config=RecommendationConfig(),
@@ -331,7 +508,9 @@ def test_persist_swing_itemcf_artifact_records_manifest(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
         recommendation_config=RecommendationConfig(
@@ -348,7 +527,10 @@ def test_persist_swing_itemcf_artifact_records_manifest(tmp_path):
     )
 
     assert record is not None
-    assert fake_store.recorded[-1]["model_name"] == ModelArtifactManager.SWING_ITEMCF_MODEL_NAME
+    assert (
+        fake_store.recorded[-1]["model_name"]
+        == ModelArtifactManager.SWING_ITEMCF_MODEL_NAME
+    )
     manifest = fake_store.recorded[-1]["payload"]["artifact_manifest"]
     assert manifest["index"]["sha256"] == hashlib.sha256(b"swing-index").hexdigest()
     assert manifest["index"]["local_cache_path"].endswith("swing_itemcf.json.gz")
@@ -374,7 +556,9 @@ def test_sync_latest_swing_itemcf_artifact_copies_to_local_cache(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
         recommendation_config=RecommendationConfig(
@@ -410,7 +594,9 @@ def test_sync_latest_swing_itemcf_artifact_rejects_checksum_mismatch(tmp_path):
     manager = ModelArtifactManager(
         system_store=fake_store,
         object_storage=ObjectStorage(
-            ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
         ),
         model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
         recommendation_config=RecommendationConfig(

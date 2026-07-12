@@ -1,16 +1,40 @@
 package com.videocommerce.flink;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class InteractionFeatureJobTest {
+  private static final ObjectMapper JSON = new ObjectMapper();
+
   @Test
-  void parserUsesOccurredAtAndContextCategory() throws Exception {
+  void javaContractParsesSharedPythonFixtureWithSameCanonicalHash() throws Exception {
+    Map<String, Object> fixture =
+        JSON.readValue(
+            Files.readString(Path.of("../../tests/fixtures/feature_history_contract_v1.json")),
+            new TypeReference<Map<String, Object>>() {});
+    Map<String, Object> event = (Map<String, Object>) fixture.get("event");
+
+    FeatureHistoryContract.Record record = FeatureHistoryContract.parse(event);
+
+    assertEquals(
+        fixture.get("canonical_payload_json"),
+        FeatureHistoryContract.canonicalJson(record.payload));
+    assertEquals(event.get("payload_hash"), FeatureHistoryContract.payloadHash(record.payload));
+  }
+
+  @Test
+  void parserPrefersEventTimeAndContextCategory() throws Exception {
     String raw =
         "{"
             + "\"event_id\":\"e1\","
@@ -19,6 +43,7 @@ class InteractionFeatureJobTest {
             + "\"user_id\":\"u1\","
             + "\"product_id\":\"p1\","
             + "\"action\":\"click\","
+            + "\"event_time\":1.5,"
             + "\"occurred_at\":2.5,"
             + "\"timestamp\":3.0,"
             + "\"context\":{\"product_category\":\"shoes\",\"session_length\":12.5}"
@@ -32,7 +57,7 @@ class InteractionFeatureJobTest {
     assertEquals("p1", event.productId);
     assertEquals("click", event.action);
     assertEquals("shoes", event.productCategory);
-    assertEquals(2500L, event.eventTimeMillis);
+    assertEquals(1500L, event.eventTimeMillis);
     assertEquals(12.5, event.sessionLengthSeconds);
   }
 
@@ -219,6 +244,164 @@ class InteractionFeatureJobTest {
   }
 
   @Test
+  void pitCatalogUsesExplicitS3FileIoEndpointAndPathStyle() {
+    String sql =
+        PointInTimeFeatureJoinJob.buildRestCatalogSql(
+            "feature_catalog",
+            "http://iceberg-rest:8181",
+            "s3://features/warehouse",
+            "http://minio:9000");
+
+    assertTrue(sql.contains("'io-impl'='org.apache.iceberg.aws.s3.S3FileIO'"));
+    assertTrue(sql.contains("'s3.endpoint'='http://minio:9000'"));
+    assertTrue(sql.contains("'s3.path-style-access'='true'"));
+  }
+
+  @Test
+  void pointInTimeJoinSqlEnforcesEventAndAvailabilityCutsAndSevenDayAttribution() {
+    String sql = PointInTimeFeatureJoinJob.buildPointInTimeInsertSql(
+        "video_commerce", "ranking_ltr_v1", 168);
+
+    assertEquals(true, sql.contains("u.event_time_epoch<=o.event_time_epoch"));
+    assertEquals(true, sql.contains("u.available_at_epoch<=o.event_time_epoch"));
+    assertEquals(true, sql.contains("i.event_time_epoch<=o.event_time_epoch"));
+    assertEquals(true, sql.contains("i.available_at_epoch<=o.event_time_epoch"));
+    assertEquals(true, sql.contains("i.event_time_epoch<=o.event_time_epoch+604800"));
+    assertEquals(true, sql.contains("source_event_id DESC"));
+    assertEquals(true, sql.contains("item_snapshot_complete"));
+    assertEquals(true, sql.contains("CAST(1699391600.000 AS DOUBLE)"));
+    assertEquals(true, sql.contains("i.available_at_epoch<=CAST(1700000000.000 AS DOUBLE)"));
+    assertEquals(true, sql.contains("ranking_ltr_v1"));
+    assertEquals(true, sql.startsWith("INSERT INTO"));
+    assertFalse(sql.contains("(materialization_run_id,observation_id,"));
+    assertEquals(false, sql.contains("INSERT OVERWRITE"));
+    assertEquals(true, sql.contains("pit_feature_bundle_hash"));
+    assertEquals(true, sql.contains("o.feature_bundle_hash"));
+    assertTrue(sql.contains("'ranking_labels_v1'"));
+    assertTrue(sql.contains("attributed_action"));
+    assertTrue(sql.contains("attributed_value"));
+    assertTrue(sql.contains("attributed_value_source"));
+    assertTrue(sql.contains("JSON_VALUE(context_json,'$.purchase_value')"));
+    assertTrue(sql.contains("\nWITH eligible_observations"));
+    assertEquals(
+        true,
+        PointInTimeFeatureJoinJob.buildExistingRunSql("video_commerce", "run-1")
+            .contains("ranking_training_pit_quarantine"));
+  }
+
+  @Test
+  void pitSchemaEvolutionAddsTypedLabelColumnsAdditively() {
+    String sql = PointInTimeFeatureJoinJob.buildAddColumnSql(
+        "video_commerce", "attributed_value", "DOUBLE");
+
+    assertEquals(
+        "ALTER TABLE `video_commerce`.`ranking_training_pit` ADD `attributed_value` DOUBLE",
+        sql);
+    assertTrue(PointInTimeFeatureJoinJob.buildTrainingTableSql("video_commerce")
+        .contains("label_definition_version STRING"));
+    assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql("s3://bucket/pit", "run-1")
+        .contains("attributed_action STRING"));
+    assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql(
+        "s3://bucket/pit", "run-1", 2).contains("/runs/run-1/attempts/2/shards"));
+  }
+
+  @Test
+  void pitJobCliArgumentsOverrideEnvironmentDefaults() {
+    Map<String, String> environment = Map.ofEntries(
+        Map.entry("FEATURE_LAKE_CATALOG_URI", "http://catalog:8181"),
+        Map.entry("FEATURE_LAKE_WAREHOUSE_URI", "s3://features/warehouse"),
+        Map.entry("FEATURE_LAKE_S3_ENDPOINT", "http://minio:9000"),
+        Map.entry("FEATURE_LAKE_NAMESPACE", "environment_namespace"),
+        Map.entry("FEATURE_LAKE_MATERIALIZATION_CUTOFF", "100"),
+        Map.entry("FEATURE_LAKE_MATERIALIZATION_RUN_ID", "environment-run"),
+        Map.entry("FEATURE_LAKE_PIT_EXPORT_URI", "s3://features/environment"));
+
+    PointInTimeFeatureJoinJob.JobConfig config = PointInTimeFeatureJoinJob.JobConfig.resolve(
+        new String[] {
+          "--catalog-name", "cli_catalog",
+          "--catalog-uri", "http://cli-catalog:8181",
+          "--warehouse-uri", "s3://cli-features/warehouse",
+          "--s3-endpoint", "http://cli-minio:9000",
+          "--feature-definition-version", "ranking_ltr_v1",
+          "--attribution-window-hours", "168",
+          "--allowed-lateness-hours", "1",
+          "--materialization-run-id", "pit-20260711",
+          "--materialization-cutoff", "1752215200",
+          "--namespace", "video_commerce",
+          "--export-uri", "s3://features/training/ranking-pit",
+          "--export-attempt", "2"
+        },
+        environment);
+
+    assertEquals("pit-20260711", config.runId);
+    assertEquals("cli_catalog", config.catalog);
+    assertEquals("http://cli-catalog:8181", config.catalogUri);
+    assertEquals("s3://cli-features/warehouse", config.warehouseUri);
+    assertEquals("http://cli-minio:9000", config.s3Endpoint);
+    assertEquals(1752215200.0, config.materializationCutoff);
+    assertEquals("video_commerce", config.namespace);
+    assertEquals("s3://features/training/ranking-pit", config.exportPrefix);
+    assertEquals(2, config.exportAttempt);
+  }
+
+  @Test
+  void pitJobRejectsUnknownCliArguments() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> PointInTimeFeatureJoinJob.JobConfig.resolve(
+            new String[] {"--materialization-run-idd", "pit-20260711"}, Map.of()));
+  }
+
+  @Test
+  void pitInsertAdaptsSelectOrderToExistingPhaseTwoSchema() {
+    List<String> phaseTwoThenAddedColumns = List.of(
+        "materialization_run_id", "observation_id", "impression_id", "user_id", "product_id",
+        "action", "as_of_ts", "user_features_json", "product_metadata_json", "context_json",
+        "candidate_features_json", "online_feature_bundle_hash", "feature_bundle_hash",
+        "attributed_click", "attributed_purchase", "feature_definition_version",
+        "materialized_at", "materialization_date", "attributed_action", "attributed_value",
+        "attributed_value_source", "label_definition_version");
+
+    String sql = PointInTimeFeatureJoinJob.buildPointInTimeInsertSql(
+        "video_commerce", "ranking_ltr_v1", 168, 1, 1_700_000_000.0, "run-1",
+        phaseTwoThenAddedColumns);
+
+    assertTrue(sql.contains(
+        "COALESCE(f.attributed_purchase,0),'ranking_ltr_v1',CURRENT_TIMESTAMP,CURRENT_DATE,"
+            + "f.attributed_action,f.attributed_value,f.attributed_value_source,'ranking_labels_v1'"));
+  }
+
+  @Test
+  void pitBundleHashReflectsFinalJoinedFeatures() throws Exception {
+    PointInTimeFeatureJoinJob.PitFeatureBundleHash function =
+        new PointInTimeFeatureJoinJob.PitFeatureBundleHash();
+
+    String first =
+        function.eval(
+            50.0,
+            "u1",
+            "p1",
+            "{\"total_interactions\":3}",
+            "{\"price\":9.0}",
+            "{}",
+            "{\"combined_score\":0.5}",
+            "ranking_ltr_v1");
+    String changed =
+        function.eval(
+            50.0,
+            "u1",
+            "p1",
+            "{\"total_interactions\":4}",
+            "{\"price\":9.0}",
+            "{}",
+            "{\"combined_score\":0.5}",
+            "ranking_ltr_v1");
+
+    assertEquals(64, first.length());
+    assertEquals(false, first.equals(changed));
+  }
+
+  @Test
   void userAccumulatorBuildsSnapshotAndChronologicalSequence() throws Exception {
     InteractionFeatureJob.UserAccumulator accumulator =
         new InteractionFeatureJob.UserAccumulator("u1");
@@ -241,6 +424,18 @@ class InteractionFeatureJobTest {
     assertEquals("p1", snapshot.sequence.get(0).productId);
     assertEquals("p2", snapshot.sequence.get(1).productId);
     assertEquals("e2", snapshot.sequenceToken().get("latest_event_id"));
+
+    snapshot.availableAt = 3.0;
+    Map<String, Object> kafkaEvent =
+        JSON.readValue(
+            new InteractionFeatureJob.FeatureUpdateJsonMapper().map(snapshot),
+            new TypeReference<Map<String, Object>>() {});
+    assertEquals(
+        FeatureHistoryContract.canonicalJson(snapshot.userFeaturePayload()),
+        FeatureHistoryContract.canonicalJson((Map<String, Object>) kafkaEvent.get("payload")));
+    assertEquals("ranking_ltr_v1", kafkaEvent.get("feature_definition_version"));
+    assertEquals(2.0, kafkaEvent.get("event_time"));
+    assertEquals(3.0, kafkaEvent.get("available_at"));
   }
 
   @Test
@@ -257,5 +452,33 @@ class InteractionFeatureJobTest {
     assertEquals(4, counts.totalEvents);
     assertEquals(0.5, InteractionFeatureJob.ratio(counts.clicks, counts.views));
     assertEquals(1.0, InteractionFeatureJob.ratio(counts.purchases, counts.clicks));
+  }
+
+  @Test
+  void windowSnapshotPublishesTheSamePayloadUsedByRedis() throws Exception {
+    InteractionFeatureJob.WindowFeatureSnapshot snapshot =
+        new InteractionFeatureJob.WindowFeatureSnapshot();
+    snapshot.entityType = "user";
+    snapshot.entityId = "u1";
+    snapshot.window = "5m";
+    snapshot.views = 2;
+    snapshot.clicks = 1;
+    snapshot.totalEvents = 3;
+    snapshot.clickThroughRate = 0.5;
+    snapshot.windowStart = 100.0;
+    snapshot.windowEnd = 400.0;
+    snapshot.availableAt = 405.0;
+
+    Map<String, Object> kafkaEvent =
+        JSON.readValue(
+            new InteractionFeatureJob.WindowFeatureUpdateJsonMapper().map(snapshot),
+            new TypeReference<Map<String, Object>>() {});
+
+    assertEquals(
+        FeatureHistoryContract.canonicalJson(snapshot.payload()),
+        FeatureHistoryContract.canonicalJson((Map<String, Object>) kafkaEvent.get("payload")));
+    assertEquals("window_feature", kafkaEvent.get("event_type"));
+    assertEquals(400.0, kafkaEvent.get("event_time"));
+    assertEquals(405.0, kafkaEvent.get("available_at"));
   }
 }

@@ -1,0 +1,42 @@
+# Greenfield PIT-first rollout. Replace every empty external endpoint at deploy time.
+external:
+  kafka:
+    bootstrapServers: ""
+  objectStorage:
+    backend: s3
+    endpointUrl: ""
+    bucket: ""
+  featureLake:
+    enabled: true
+    catalogUri: ""
+    warehouseUri: ""
+    namespace: video_commerce
+    trainingSource: pit
+    pitShadowEnabled: false
+    rankingPitDatasetUri: s3://video-commerce-features/training/ranking-pit/latest.json
+    featureDefinitionVersion: ranking_ltr_v1
+    attributionWindowHours: 168
+    allowedLatenessHours: 1
+    pitOrchestratorEnabled: true
+    pitScheduleHourUtc: 2
+    pitOrchestratorLeaseSeconds: 7200
+    pitTrainingLeaseSeconds: 21600
+    flinkJobmanager: ""
+    pitExportUri: s3://video-commerce-features/training/ranking-pit
+    pitJobJarPath: /opt/flink/usrlib/interaction-features.jar
+
+pitOrchestrator:
+  enabled: true
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+
+backend:
+  workloads:
+    pitStateExporter:
+      enabled: true
+    modelTrainer:
+      enabled: true
+      env:
+        RANKING_ENABLE_PERIODIC_TRAINING: "true"
+        SERVICE_TRAINER_INTERVAL_SECONDS: "3600"
+        MONITORING_WORKER_METRICS_PORT: "9103"

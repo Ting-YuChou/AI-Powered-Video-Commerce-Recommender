@@ -23,7 +23,12 @@ from pathlib import Path
 import threading
 
 # Local imports
-from video_commerce.common.models import UserFeatures, ContentFeatures, CandidateProduct, InteractionType
+from video_commerce.common.models import (
+    UserFeatures,
+    ContentFeatures,
+    CandidateProduct,
+    InteractionType,
+)
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.ml.vector_search import VectorSearchEngine
@@ -1071,8 +1076,7 @@ class TwoTowerRetrievalEngine:
             and list(preferred_categories or []) == []
             and abs(float(user_features.get("price_sensitivity", 0.5) or 0.5) - 0.5)
             < 1e-9
-            and abs(float(user_features.get("click_through_rate", 0.0) or 0.0))
-            < 1e-9
+            and abs(float(user_features.get("click_through_rate", 0.0) or 0.0)) < 1e-9
             and abs(float(user_features.get("conversion_rate", 0.0) or 0.0)) < 1e-9
         )
 
@@ -1095,7 +1099,10 @@ class TwoTowerRetrievalEngine:
             self._unknown_user_candidate_cache[cache_key] = [
                 CandidateProduct(**candidate.dict()) for candidate in candidates
             ]
-            if len(self._unknown_user_candidate_cache) > self._user_embedding_cache_max_size:
+            if (
+                len(self._unknown_user_candidate_cache)
+                > self._user_embedding_cache_max_size
+            ):
                 self._unknown_user_candidate_cache.popitem(last=False)
 
     @staticmethod
@@ -1374,7 +1381,9 @@ class RecommendationEngine:
         self.loaded_swing_itemcf_version: Optional[str] = None
         self.loaded_content_cluster_version: Optional[str] = None
 
-        logger.info("Recommendation engine initialized (Two-Tower + SASRec + Swing retrieval)")
+        logger.info(
+            "Recommendation engine initialized (Two-Tower + SASRec + Swing retrieval)"
+        )
 
     def close(self) -> None:
         self.cf_engine.close()
@@ -1598,7 +1607,9 @@ class RecommendationEngine:
             return False
         product_embeddings = get_embeddings()
         if not product_embeddings:
-            logger.warning("Skipping content cluster build because product embeddings are empty")
+            logger.warning(
+                "Skipping content cluster build because product embeddings are empty"
+            )
             return False
 
         metadata_path, centroids_path = self._content_cluster_artifact_paths()
@@ -1684,6 +1695,7 @@ class RecommendationEngine:
                         model_version=model_version,
                         embedding_sidecar_path=self.artifact_manager.two_tower_local_embedding_sidecar_path,
                         adapter_path=self.artifact_manager.two_tower_local_adapter_path,
+                        catalog_metadata=dict(self.vector_search.product_metadata),
                         payload={
                             "sample_count": len(interactions),
                             "external_negative_count": len(external_negatives),
@@ -1757,7 +1769,9 @@ class RecommendationEngine:
                 vocab_path,
                 metadata_path,
             )
-            model_version = self.sasrec_engine.model_version or f"sasrec-{int(time.time())}"
+            model_version = (
+                self.sasrec_engine.model_version or f"sasrec-{int(time.time())}"
+            )
             artifact_record = await self.artifact_manager.persist_sasrec_artifacts(
                 checkpoint_path=checkpoint_path,
                 vocab_path=vocab_path,
@@ -1804,14 +1818,12 @@ class RecommendationEngine:
         try:
             lookback_days = max(0, int(self.training_sequence_lookback_days or 0))
             since = time.time() - (lookback_days * 86400) if lookback_days > 0 else None
-            sequences = (
-                await self.artifact_manager.system_store.get_user_training_sequences(
-                    max_users=self.config.swing_itemcf_training_max_users,
-                    max_events_per_user=self.config.swing_itemcf_training_max_events_per_user,
-                    min_sequence_length=2,
-                    since=since,
-                    actions=POSITIVE_SEQUENCE_ACTIONS,
-                )
+            sequences = await self.artifact_manager.system_store.get_user_training_sequences(
+                max_users=self.config.swing_itemcf_training_max_users,
+                max_events_per_user=self.config.swing_itemcf_training_max_events_per_user,
+                min_sequence_length=2,
+                since=since,
+                actions=POSITIVE_SEQUENCE_ACTIONS,
             )
             if not sequences:
                 logger.info(
@@ -1832,7 +1844,9 @@ class RecommendationEngine:
                 model_version=model_version,
             )
             if not index.is_trained:
-                logger.info("Skipping Swing ItemCF artifact persistence; index is empty")
+                logger.info(
+                    "Skipping Swing ItemCF artifact persistence; index is empty"
+                )
                 return
 
             artifact_path = self._swing_itemcf_artifact_path()
@@ -1999,7 +2013,9 @@ class RecommendationEngine:
                     "get_product_cluster_id",
                     None,
                 )
-                if self.config.enable_content_cluster_pools and callable(get_cluster_id):
+                if self.config.enable_content_cluster_pools and callable(
+                    get_cluster_id
+                ):
                     cluster_id = get_cluster_id(product_id)
                     if cluster_id is not None:
                         cluster_scored[int(cluster_id)].append((product_id, score))
@@ -2289,13 +2305,11 @@ class RecommendationEngine:
                     )
 
             interaction_task = None
-            sasrec_needs_interactions = (
-                bool(self.config.enable_sasrec)
-                and bool(getattr(self.sasrec_engine, "is_trained", False))
+            sasrec_needs_interactions = bool(self.config.enable_sasrec) and bool(
+                getattr(self.sasrec_engine, "is_trained", False)
             )
-            swing_needs_interactions = (
-                bool(self.config.enable_swing_itemcf)
-                and bool(getattr(self.swing_itemcf_engine, "is_trained", False))
+            swing_needs_interactions = bool(self.config.enable_swing_itemcf) and bool(
+                getattr(self.swing_itemcf_engine, "is_trained", False)
             )
             serving_recent_limit = int(
                 getattr(self.config, "serving_recent_interaction_limit", 0) or 0
@@ -2319,9 +2333,7 @@ class RecommendationEngine:
                     swing_seed_limit = int(
                         getattr(self.config, "swing_itemcf_max_seed_items", 0) or 0
                     )
-                    requested_limits.append(
-                        max(swing_read_limit, swing_seed_limit)
-                    )
+                    requested_limits.append(max(swing_read_limit, swing_seed_limit))
                 if serving_recent_limit > 0:
                     requested_limits.append(serving_recent_limit)
                 if requested_limits:
@@ -2385,7 +2397,9 @@ class RecommendationEngine:
                 resolved_user_interactions,
             )
             profile["preferred_clusters"] = preferred_clusters
-            audio_features = content_features.audio_features if content_features else None
+            audio_features = (
+                content_features.audio_features if content_features else None
+            )
             speech_categories = (
                 list(audio_features.speech_categories)
                 if audio_features is not None
@@ -2396,7 +2410,9 @@ class RecommendationEngine:
             )
             profile["speech_category_candidates_used"] = bool(
                 self.config.speech_category_candidates_enabled
-                and any(category in preferred_categories for category in speech_categories)
+                and any(
+                    category in preferred_categories for category in speech_categories
+                )
             )
             target_candidates = min(
                 max(k_per_source, self.config.candidates_per_source),
@@ -2431,7 +2447,9 @@ class RecommendationEngine:
                     return []
                 return self.swing_itemcf_engine.get_candidates(
                     resolved_user_interactions,
-                    k=min(target_candidates, self.config.max_live_swing_itemcf_candidates),
+                    k=min(
+                        target_candidates, self.config.max_live_swing_itemcf_candidates
+                    ),
                     exclude_items=exclude_items,
                     current_time=time.time(),
                 )

@@ -583,6 +583,127 @@ class ObservabilityManager:
             ["priority", "status"],
             registry=self.registry,
         )
+        self.feature_lake_materialization_lag_seconds = Gauge(
+            "feature_lake_materialization_lag_seconds",
+            "Latest observed feature-lake materialization lag",
+            ["record_type"],
+            registry=self.registry,
+        )
+        self.feature_lake_records_total = Counter(
+            "feature_lake_records_total",
+            "Feature-lake records by type and status",
+            ["record_type", "status"],
+            registry=self.registry,
+        )
+        self.feature_lake_dlq_total = Counter(
+            "feature_lake_dlq_total",
+            "Feature-lake records routed to DLQ",
+            ["source_topic"],
+            registry=self.registry,
+        )
+        self.catalog_outbox_pending = Gauge(
+            "catalog_outbox_pending",
+            "Unpublished catalog outbox rows from completed activations",
+            registry=self.registry,
+        )
+        self.catalog_outbox_oldest_age_seconds = Gauge(
+            "catalog_outbox_oldest_age_seconds",
+            "Age of the oldest unpublished catalog outbox row",
+            registry=self.registry,
+        )
+        self.pit_export_rows = Gauge(
+            "pit_export_rows",
+            "Rows in the latest PIT Parquet export",
+            registry=self.registry,
+        )
+        self.pit_manifest_validation_failures_total = Counter(
+            "pit_manifest_validation_failures_total",
+            "Fail-closed PIT manifest or shard validation failures",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.pit_online_offline_parity_ratio = Gauge(
+            "pit_online_offline_parity_ratio",
+            "Finalized online/offline feature bundle parity ratio",
+            registry=self.registry,
+        )
+        self.pit_leakage_rows = Gauge(
+            "pit_leakage_rows",
+            "Rows violating PIT event-time or availability constraints",
+            registry=self.registry,
+        )
+        self.pit_assembler_vector_parity_ratio = Gauge(
+            "pit_assembler_vector_parity_ratio",
+            "Exact shared-assembler vector parity for identical bundles",
+            registry=self.registry,
+        )
+        self.pit_label_reconciliation_ratio = Gauge(
+            "pit_label_reconciliation_ratio",
+            "Typed labels reconciled with finalized attribution facts",
+            registry=self.registry,
+        )
+        self.pit_current_state_calls = Gauge(
+            "pit_current_state_calls",
+            "Forbidden current Redis/catalog calls observed during PIT training",
+            registry=self.registry,
+        )
+        self.pit_invalid_feature_or_label_rows = Gauge(
+            "pit_invalid_feature_or_label_rows",
+            "PIT rows containing invalid feature or label tensors",
+            registry=self.registry,
+        )
+        self.pit_value_mask_coverage_ratio = Gauge(
+            "pit_value_mask_coverage_ratio",
+            "Purchase rows containing an actual attributed business value",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_runs_total = Counter(
+            "pit_orchestrator_runs_total",
+            "Daily PIT orchestration outcomes",
+            ["status"],
+            registry=self.registry,
+        )
+        self.pit_orchestrator_last_success_timestamp = Gauge(
+            "pit_orchestrator_last_success_timestamp",
+            "Unix timestamp of the latest completed PIT orchestration run",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_start_timestamp = Gauge(
+            "pit_orchestrator_start_timestamp",
+            "Unix timestamp when this PIT orchestrator process started",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_start_timestamp.set(time.time())
+        self.pit_orchestrator_run_in_progress = Gauge(
+            "pit_orchestrator_run_in_progress",
+            "Whether a PIT run currently holds the orchestration lease",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_lease_expired = Gauge(
+            "pit_orchestrator_lease_expired",
+            "Whether a durable PIT run has an expired active lease",
+            registry=self.registry,
+        )
+        self.pit_orchestrator_waiting_for_rows = Gauge(
+            "pit_orchestrator_waiting_for_rows",
+            "Whether the PIT orchestrator is waiting for eligible observations",
+            registry=self.registry,
+        )
+        self.pit_trainer_waiting_for_manifest = Gauge(
+            "pit_trainer_waiting_for_manifest",
+            "Whether the PIT trainer is waiting for the first complete manifest",
+            registry=self.registry,
+        )
+        self.pit_training_duplicate_manifest_skips_total = Counter(
+            "pit_training_duplicate_manifest_skips_total",
+            "Completed PIT manifests skipped because they were already trained",
+            registry=self.registry,
+        )
+        self.ranking_untrained_fallback_total = Counter(
+            "ranking_untrained_fallback_total",
+            "Ranking requests served by combined-score fallback before a valid artifact",
+            registry=self.registry,
+        )
         self._process = psutil.Process()
 
     def record_request(
@@ -678,6 +799,70 @@ class ObservabilityManager:
     def record_training_run(self, trigger: str, status: str, duration: float) -> None:
         self.worker_training_runs_total.labels(trigger=trigger, status=status).inc()
         self.worker_training_duration_seconds.labels(trigger=trigger).observe(duration)
+
+    def update_catalog_outbox(self, *, pending: int, oldest_age_seconds: float) -> None:
+        self.catalog_outbox_pending.set(max(0, int(pending)))
+        self.catalog_outbox_oldest_age_seconds.set(max(0.0, float(oldest_age_seconds)))
+
+    def record_pit_manifest_validation_failure(self, reason: str) -> None:
+        self.pit_manifest_validation_failures_total.labels(reason=reason).inc()
+
+    def record_pit_orchestrator_run(self, status: str) -> None:
+        normalized = str(status or "unknown")
+        self.pit_orchestrator_runs_total.labels(status=normalized).inc()
+        if normalized == "completed":
+            self.pit_orchestrator_last_success_timestamp.set(time.time())
+
+    def set_pit_orchestrator_waiting_for_rows(self, waiting: bool) -> None:
+        self.pit_orchestrator_waiting_for_rows.set(1 if waiting else 0)
+
+    def set_pit_orchestrator_run_in_progress(self, running: bool) -> None:
+        self.pit_orchestrator_run_in_progress.set(1 if running else 0)
+
+    def update_pit_durable_state(
+        self,
+        *,
+        last_success_timestamp: float,
+        waiting_for_rows: bool,
+        run_in_progress: bool,
+        lease_expired: bool,
+    ) -> None:
+        self.pit_orchestrator_last_success_timestamp.set(
+            max(0.0, float(last_success_timestamp))
+        )
+        self.pit_orchestrator_waiting_for_rows.set(1 if waiting_for_rows else 0)
+        self.pit_orchestrator_run_in_progress.set(1 if run_in_progress else 0)
+        self.pit_orchestrator_lease_expired.set(1 if lease_expired else 0)
+
+    def set_pit_trainer_waiting_for_manifest(self, waiting: bool) -> None:
+        self.pit_trainer_waiting_for_manifest.set(1 if waiting else 0)
+
+    def record_pit_duplicate_manifest_skip(self) -> None:
+        self.pit_training_duplicate_manifest_skips_total.inc()
+
+    def record_ranking_untrained_fallback(self) -> None:
+        self.ranking_untrained_fallback_total.inc()
+
+    def update_typed_pit_training_metrics(
+        self,
+        *,
+        assembler_parity_ratio: float,
+        label_reconciliation_ratio: float,
+        current_state_calls: int,
+        invalid_rows: int,
+        value_mask_coverage: float,
+    ) -> None:
+        self.pit_assembler_vector_parity_ratio.set(
+            max(0.0, min(1.0, float(assembler_parity_ratio)))
+        )
+        self.pit_label_reconciliation_ratio.set(
+            max(0.0, min(1.0, float(label_reconciliation_ratio)))
+        )
+        self.pit_current_state_calls.set(max(0, int(current_state_calls)))
+        self.pit_invalid_feature_or_label_rows.set(max(0, int(invalid_rows)))
+        self.pit_value_mask_coverage_ratio.set(
+            max(0.0, min(1.0, float(value_mask_coverage)))
+        )
 
     def record_recommendation(
         self,

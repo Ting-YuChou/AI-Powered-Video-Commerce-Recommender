@@ -214,6 +214,27 @@ x-common-service: &common-service
     OBJECT_STORAGE_MAX_ATTEMPTS: ${OBJECT_STORAGE_MAX_ATTEMPTS:-3}
     OBJECT_STORAGE_CHECKSUM_ALGORITHM: ${OBJECT_STORAGE_CHECKSUM_ALGORITHM:-}
     OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION: ${OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION:-}
+    FEATURE_LAKE_ENABLED: ${FEATURE_LAKE_ENABLED:-false}
+    FEATURE_LAKE_CATALOG_NAME: ${FEATURE_LAKE_CATALOG_NAME:-feature_catalog}
+    FEATURE_LAKE_CATALOG_URI: ${FEATURE_LAKE_CATALOG_URI:-}
+    FEATURE_LAKE_WAREHOUSE_URI: ${FEATURE_LAKE_WAREHOUSE_URI:-}
+    FEATURE_LAKE_NAMESPACE: ${FEATURE_LAKE_NAMESPACE:-video_commerce}
+    FEATURE_LAKE_TRAINING_SOURCE: ${FEATURE_LAKE_TRAINING_SOURCE:-legacy}
+    FEATURE_LAKE_PIT_SHADOW_ENABLED: ${FEATURE_LAKE_PIT_SHADOW_ENABLED:-false}
+    FEATURE_LAKE_RANKING_PIT_DATASET_URI: ${FEATURE_LAKE_RANKING_PIT_DATASET_URI:-}
+    FEATURE_LAKE_FEATURE_DEFINITION_VERSION: ${FEATURE_LAKE_FEATURE_DEFINITION_VERSION:-ranking_ltr_v1}
+    FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS: ${FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS:-168}
+    FEATURE_LAKE_CATALOG_OUTBOX_BATCH_SIZE: ${FEATURE_LAKE_CATALOG_OUTBOX_BATCH_SIZE:-500}
+    FEATURE_LAKE_CATALOG_OUTBOX_LEASE_SECONDS: ${FEATURE_LAKE_CATALOG_OUTBOX_LEASE_SECONDS:-60}
+    FEATURE_LAKE_CATALOG_OUTBOX_POLL_SECONDS: ${FEATURE_LAKE_CATALOG_OUTBOX_POLL_SECONDS:-1}
+    FEATURE_LAKE_CATALOG_OUTBOX_RETENTION_DAYS: ${FEATURE_LAKE_CATALOG_OUTBOX_RETENTION_DAYS:-7}
+    FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED: ${FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED:-false}
+    FEATURE_LAKE_PIT_SCHEDULE_HOUR_UTC: ${FEATURE_LAKE_PIT_SCHEDULE_HOUR_UTC:-2}
+    FEATURE_LAKE_PIT_ORCHESTRATOR_LEASE_SECONDS: ${FEATURE_LAKE_PIT_ORCHESTRATOR_LEASE_SECONDS:-7200}
+    FEATURE_LAKE_PIT_TRAINING_LEASE_SECONDS: ${FEATURE_LAKE_PIT_TRAINING_LEASE_SECONDS:-21600}
+    FEATURE_LAKE_FLINK_JOBMANAGER: ${FEATURE_LAKE_FLINK_JOBMANAGER:-}
+    FEATURE_LAKE_PIT_EXPORT_URI: ${FEATURE_LAKE_PIT_EXPORT_URI:-}
+    FEATURE_LAKE_PIT_JOB_JAR_PATH: ${FEATURE_LAKE_PIT_JOB_JAR_PATH:-/opt/flink/usrlib/interaction-features.jar}
   volumes:
     - models_data:/app/models
     - upload_data:/app/uploads
@@ -512,6 +533,37 @@ services:
           memory: 1G
           cpus: "0.5"
 
+  catalog-event-publisher:
+    <<: *common-service
+    profiles: ["feature-lake"]
+    command: python -m video_commerce.services.catalog_event_publisher.main
+    environment:
+      <<: *common-env
+      FEATURE_LAKE_ENABLED: "true"
+      FEATURE_LAKE_CATALOG_URI: http://iceberg-rest:8181
+      FEATURE_LAKE_WAREHOUSE_URI: s3://video-commerce-features/warehouse
+      FEATURE_LAKE_NAMESPACE: ${FEATURE_LAKE_NAMESPACE:-video_commerce}
+      OBJECT_STORAGE_BACKEND: s3
+      OBJECT_STORAGE_ENDPOINT_URL: http://minio:9000
+      OBJECT_STORAGE_BUCKET: video-commerce-features
+      OBJECT_STORAGE_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      MONITORING_WORKER_METRICS_PORT: 9104
+    expose:
+      - "9104"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_started
+    healthcheck:
+      disable: true
+
   model-trainer:
     <<: *common-service
     command: python -m video_commerce.services.model_trainer.main
@@ -536,6 +588,74 @@ services:
         limits:
           memory: 2G
           cpus: "1.0"
+
+  pit-dataset-orchestrator:
+    <<: *common-service
+    profiles: ["pit-production"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: pit-orchestrator
+      args:
+        PYTHON_VERSION: "3.10"
+        BUILD_ENV: production
+    command: python -m video_commerce.services.pit_dataset_orchestrator.main
+    environment:
+      <<: *common-env
+      FEATURE_LAKE_ENABLED: "true"
+      FEATURE_LAKE_TRAINING_SOURCE: pit
+      FEATURE_LAKE_PIT_SHADOW_ENABLED: "false"
+      FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED: "true"
+      FEATURE_LAKE_CATALOG_URI: http://iceberg-rest:8181
+      FEATURE_LAKE_WAREHOUSE_URI: s3://video-commerce-features/warehouse
+      FEATURE_LAKE_S3_ENDPOINT: http://minio:9000
+      FEATURE_LAKE_FLINK_JOBMANAGER: flink-jobmanager:8081
+      FEATURE_LAKE_PIT_EXPORT_URI: s3://video-commerce-features/training/ranking-pit
+      FEATURE_LAKE_ALLOWED_LATENESS_HOURS: ${FEATURE_LAKE_ALLOWED_LATENESS_HOURS:-1}
+      FEATURE_LAKE_RANKING_PIT_DATASET_URI: s3://video-commerce-features/training/ranking-pit/latest.json
+      OBJECT_STORAGE_BACKEND: s3
+      OBJECT_STORAGE_ENDPOINT_URL: http://minio:9000
+      OBJECT_STORAGE_BUCKET: video-commerce-features
+      OBJECT_STORAGE_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.20.1.jar
+      MONITORING_WORKER_METRICS_PORT: 9105
+    expose:
+      - "9105"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      feature-lake-readiness-gate:
+        condition: service_completed_successfully
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+      iceberg-rest:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+
+  pit-state-exporter:
+    <<: *common-service
+    profiles: ["pit-production"]
+    command: python -m video_commerce.services.pit_state_exporter.main
+    environment:
+      <<: *common-env
+      MONITORING_WORKER_METRICS_PORT: 9106
+    expose:
+      - "9106"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
 
   redis:
     image: redis:7-alpine
@@ -691,27 +811,38 @@ services:
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic video-processing-tasks --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic recommendation-events --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-updates --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-history-snapshots --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic catalog-feature-events --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic user-interactions-backfill --partitions 6 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic recommendation-events-backfill --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-updates-backfill --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic catalog-feature-events-backfill --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-history-backfill-quarantine --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic dead-letter-events --partitions 3 --replication-factor 1
     networks:
       - video-commerce-network
     restart: "no"
 
   flink-volume-init:
-    image: flink:1.19.1-scala_2.12-java11
-    profiles: ["flink"]
+    image: flink:1.20.1-scala_2.12-java17
+    profiles: ["flink", "feature-lake", "feature-lake-pit"]
     user: "0:0"
     entrypoint: ["sh", "-lc"]
     command: >
       "mkdir -p /flink/checkpoints /flink/savepoints
       && { test -d /flink/checkpoints/runtime || mkdir -m 0777 /flink/checkpoints/runtime; }
+      && { test -d /flink/checkpoints/feature-history-materializer || mkdir -m 0777 /flink/checkpoints/feature-history-materializer; }
       && { test -d /flink/savepoints/runtime || mkdir -m 0777 /flink/savepoints/runtime; }"
     volumes:
       - flink_checkpoints:/flink/checkpoints
       - flink_savepoints:/flink/savepoints
 
   flink-jobmanager:
-    image: flink:1.19.1-scala_2.12-java11
-    profiles: ["flink"]
+    image: ${FLINK_FEATURE_IMAGE:-video-commerce-flink-feature:local}
+    build:
+      context: ./flink-jobs/interaction-features
+      dockerfile: Dockerfile
+    profiles: ["flink", "feature-lake", "feature-lake-pit"]
     command: jobmanager
     environment:
       FLINK_PROPERTIES: |
@@ -724,6 +855,12 @@ services:
         execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9249
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.20.1.jar
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
     ports:
       - "127.0.0.1:8081:8081"
     expose:
@@ -741,18 +878,28 @@ services:
     restart: unless-stopped
 
   flink-taskmanager:
-    image: flink:1.19.1-scala_2.12-java11
-    profiles: ["flink"]
+    image: ${FLINK_FEATURE_IMAGE:-video-commerce-flink-feature:local}
+    build:
+      context: ./flink-jobs/interaction-features
+      dockerfile: Dockerfile
+    profiles: ["flink", "feature-lake", "feature-lake-pit"]
     command: taskmanager
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-4}
+        taskmanager.memory.jvm-metaspace.size: ${FLINK_TASKMANAGER_JVM_METASPACE_SIZE:-512m}
         state.backend: rocksdb
         state.checkpoints.dir: ${FLINK_CHECKPOINT_DIR:-file:///flink/checkpoints/runtime}
         state.savepoints.dir: ${FLINK_SAVEPOINT_DIR:-file:///flink/savepoints/runtime}
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9249
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.20.1.jar
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
     expose:
       - "6121"
       - "6122"
@@ -787,7 +934,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_USER_INTERACTIONS_TOPIC: ${KAFKA_USER_INTERACTIONS_TOPIC:-user-interactions}
       KAFKA_RECOMMENDATION_EVENTS_TOPIC: ${KAFKA_RECOMMENDATION_EVENTS_TOPIC:-recommendation-events}
-      KAFKA_FEATURE_UPDATES_TOPIC: ${KAFKA_FEATURE_UPDATES_TOPIC:-feature-updates}
+      KAFKA_FEATURE_UPDATES_TOPIC: ${KAFKA_FEATURE_HISTORY_SNAPSHOTS_TOPIC:-feature-history-snapshots}
       KAFKA_DEAD_LETTER_TOPIC: ${KAFKA_DEAD_LETTER_TOPIC:-dead-letter-events}
       FLINK_INTERACTION_FEATURE_CONSUMER_GROUP: ${FLINK_INTERACTION_FEATURE_CONSUMER_GROUP:-video-commerce-flink-feature-v1}
       FLINK_FEATURE_OUTPUT_NAMESPACE: ${FLINK_FEATURE_OUTPUT_NAMESPACE:-official}
@@ -818,6 +965,147 @@ services:
     volumes:
       - flink_checkpoints:/flink/checkpoints
       - flink_savepoints:/flink/savepoints
+    networks:
+      - video-commerce-network
+    restart: "no"
+
+  flink-feature-history-materializer:
+    profiles: ["feature-lake", "feature-lake-pit"]
+    image: ${FLINK_FEATURE_IMAGE:-video-commerce-flink-feature:local}
+    build:
+      context: ./flink-jobs/interaction-features
+      dockerfile: Dockerfile
+    command:
+      - sh
+      - -lc
+      - |
+        until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
+        flink run -d \
+          -m flink-jobmanager:8081 \
+          -c com.videocommerce.flink.FeatureHistoryMaterializerJob \
+          /opt/flink/usrlib/interaction-features.jar
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_USER_INTERACTIONS_TOPIC: ${KAFKA_USER_INTERACTIONS_TOPIC:-user-interactions}
+      KAFKA_RECOMMENDATION_EVENTS_TOPIC: ${KAFKA_RECOMMENDATION_EVENTS_TOPIC:-recommendation-events}
+      KAFKA_FEATURE_UPDATES_TOPIC: ${KAFKA_FEATURE_HISTORY_SNAPSHOTS_TOPIC:-feature-history-snapshots}
+      KAFKA_CATALOG_FEATURE_EVENTS_TOPIC: ${KAFKA_CATALOG_FEATURE_EVENTS_TOPIC:-catalog-feature-events}
+      KAFKA_DEAD_LETTER_TOPIC: ${KAFKA_DEAD_LETTER_TOPIC:-dead-letter-events}
+      FLINK_KAFKA_TRANSACTION_TIMEOUT_MS: ${FLINK_KAFKA_TRANSACTION_TIMEOUT_MS:-600000}
+      FEATURE_HISTORY_CHECKPOINT_DIR: file:///flink/checkpoints/feature-history-materializer
+      FEATURE_HISTORY_INCLUDE_BACKFILL_TOPICS: ${FEATURE_HISTORY_INCLUDE_BACKFILL_TOPICS:-false}
+      FEATURE_LAKE_REPLAY_RUN_ID: ${FEATURE_LAKE_REPLAY_RUN_ID:-}
+      FEATURE_LAKE_ALLOW_OFFSET_RESET: ${FEATURE_LAKE_ALLOW_OFFSET_RESET:-false}
+      FEATURE_LAKE_CATALOG_URI: http://iceberg-rest:8181
+      FEATURE_LAKE_WAREHOUSE_URI: s3://video-commerce-features/warehouse
+      FEATURE_LAKE_NAMESPACE: ${FEATURE_LAKE_NAMESPACE:-video_commerce}
+      FEATURE_LAKE_S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - flink_checkpoints:/flink/checkpoints
+      - flink_savepoints:/flink/savepoints
+    networks:
+      - video-commerce-network
+    restart: "no"
+
+  flink-ranking-pit-export:
+    profiles: ["feature-lake-pit"]
+    build:
+      context: ./flink-jobs/interaction-features
+      dockerfile: Dockerfile
+    command:
+      - sh
+      - -lc
+      - |
+        until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
+        flink run \
+          -m flink-jobmanager:8081 \
+          -c com.videocommerce.flink.PointInTimeFeatureJoinJob \
+          /opt/flink/usrlib/interaction-features.jar
+    environment:
+      FLINK_PROPERTIES: |
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+      FEATURE_LAKE_CATALOG_URI: http://iceberg-rest:8181
+      FEATURE_LAKE_WAREHOUSE_URI: s3://video-commerce-features/warehouse
+      FEATURE_LAKE_S3_ENDPOINT: http://minio:9000
+      FEATURE_LAKE_NAMESPACE: ${FEATURE_LAKE_NAMESPACE:-video_commerce}
+      FEATURE_LAKE_FEATURE_DEFINITION_VERSION: ranking_ltr_v1
+      FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS: 168
+      FEATURE_LAKE_ALLOWED_LATENESS_HOURS: ${FEATURE_LAKE_ALLOWED_LATENESS_HOURS:-1}
+      FEATURE_LAKE_MATERIALIZATION_CUTOFF: ${FEATURE_LAKE_MATERIALIZATION_CUTOFF:-}
+      FEATURE_LAKE_MATERIALIZATION_RUN_ID: ${FEATURE_LAKE_MATERIALIZATION_RUN_ID:-}
+      FEATURE_LAKE_PIT_EXPORT_URI: s3://video-commerce-features/training/ranking-pit
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.20.1.jar
+    depends_on:
+      feature-lake-readiness-gate:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_started
+    networks:
+      - video-commerce-network
+    restart: "no"
+
+  feature-lake-readiness-gate:
+    <<: *common-service
+    profiles: ["feature-lake-pit", "pit-production"]
+    command: python -m video_commerce.ml.feature_lake_readiness
+    environment:
+      <<: *common-env
+      FLINK_REST_URL: http://flink-jobmanager:8081
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      FEATURE_HISTORY_CONSUMER_GROUP: ${FEATURE_HISTORY_CONSUMER_GROUP:-feature-history-materializer-v1}
+      FEATURE_LAKE_READINESS_TIMEOUT_SECONDS: ${FEATURE_LAKE_READINESS_TIMEOUT_SECONDS:-600}
+    depends_on:
+      flink-feature-history-materializer:
+        condition: service_completed_successfully
+      flink-jobmanager:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - video-commerce-network
+    restart: "no"
+
+  pit-manifest-publisher:
+    <<: *common-service
+    profiles: ["feature-lake-pit"]
+    command: python -m video_commerce.ml.pit_manifest
+    environment:
+      <<: *common-env
+      ENVIRONMENT: ${FEATURE_LAKE_ENVIRONMENT:-development}
+      FEATURE_LAKE_ENABLED: "true"
+      FEATURE_LAKE_CATALOG_URI: http://iceberg-rest:8181
+      FEATURE_LAKE_WAREHOUSE_URI: s3://video-commerce-features/warehouse
+      FEATURE_LAKE_MATERIALIZATION_RUN_ID: ${FEATURE_LAKE_MATERIALIZATION_RUN_ID:-}
+      FEATURE_LAKE_PIT_EXPORT_URI: s3://video-commerce-features/training/ranking-pit
+      FEATURE_LAKE_PIT_ICEBERG_SNAPSHOT_ID: ${FEATURE_LAKE_PIT_ICEBERG_SNAPSHOT_ID:-}
+      FEATURE_LAKE_MATERIALIZATION_CUTOFF: ${FEATURE_LAKE_MATERIALIZATION_CUTOFF:-}
+      OBJECT_STORAGE_BACKEND: s3
+      OBJECT_STORAGE_ENDPOINT_URL: http://minio:9000
+      OBJECT_STORAGE_BUCKET: video-commerce-features
+      OBJECT_STORAGE_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+    depends_on:
+      flink-ranking-pit-export:
+        condition: service_completed_successfully
     networks:
       - video-commerce-network
     restart: "no"
@@ -957,7 +1245,7 @@ services:
 
   minio:
     image: minio/minio:RELEASE.2024-06-29T01-20-47Z
-    profiles: ["object-storage"]
+    profiles: ["object-storage", "feature-lake", "feature-lake-pit"]
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -970,15 +1258,19 @@ services:
     networks:
       - video-commerce-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test:
+        [
+          "CMD-SHELL",
+          "mc alias set local http://127.0.0.1:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" >/dev/null && mc ready local",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
 
   minio-init:
-    image: minio/mc:RELEASE.2024-06-13T22-53-53Z
-    profiles: ["object-storage"]
+    image: minio/mc:RELEASE.2025-04-03T17-07-56Z
+    profiles: ["object-storage", "feature-lake", "feature-lake-pit"]
     depends_on:
       minio:
         condition: service_healthy
@@ -988,9 +1280,30 @@ services:
       - |
         mc alias set local http://minio:9000 "${MINIO_ROOT_USER:-minioadmin}" "${MINIO_ROOT_PASSWORD:-minioadmin}"
         mc mb --ignore-existing "local/${OBJECT_STORAGE_BUCKET:-video-commerce-assets}"
+        mc mb --ignore-existing "local/video-commerce-features"
     networks:
       - video-commerce-network
     restart: "no"
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture@sha256:db8de90b5b7693d4ac334c336f91d9bbe320d7b19f4f514d26de84cdfbcbfe8d
+    profiles: ["feature-lake", "feature-lake-pit"]
+    environment:
+      CATALOG_WAREHOUSE: s3://video-commerce-features/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
+    expose:
+      - "8181"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
 
   backend-tests:
     profiles: ["test"]
