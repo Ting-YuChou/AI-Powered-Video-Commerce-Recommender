@@ -307,6 +307,8 @@ class InteractionFeatureJobTest {
         sql);
     assertTrue(PointInTimeFeatureJoinJob.buildTrainingTableSql("video_commerce")
         .contains("label_definition_version STRING"));
+    assertEquals("STRING",
+        PointInTimeFeatureJoinJob.trainingTableAdditions().get("behavior_sequences_json"));
     assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql("s3://bucket/pit", "run-1")
         .contains("attributed_action STRING"));
     assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql(

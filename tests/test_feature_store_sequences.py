@@ -233,13 +233,24 @@ async def test_get_din_behavior_sequences_reads_action_zsets_in_one_pipeline():
         )
     ]
 
-    sequences = await store.get_din_behavior_sequences(
-        "u1", as_of_ts=30.0, last_n=2
-    )
+    sequences = await store.get_din_behavior_sequences("u1", as_of_ts=30.0, last_n=2)
 
     assert sequences.actions["click"].product_ids == ("", "p1")
     assert sequences.actions["cart"].product_ids == ("", "p2")
     assert sequences.actions["purchase"].mask == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_get_din_behavior_sequences_fails_closed_on_official_corruption():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uiza:click:u1"] = ["not-json"]
+
+    with pytest.raises(RuntimeError, match="invalid data"):
+        await store.get_din_behavior_sequences("u1", as_of_ts=30.0, last_n=2)
+
+    assert store.din_sequence_decode_failures == 1
 
 
 @pytest.mark.asyncio
@@ -509,9 +520,7 @@ async def test_content_feature_snapshot_serves_known_content_from_memory():
             "speech_categories": ["electronics"],
         },
     )
-    fake.data["cf:content-1"] = pack_cache_payload(
-        "content_features", features.dict()
-    )
+    fake.data["cf:content-1"] = pack_cache_payload("content_features", features.dict())
     store.configure_content_feature_snapshot(enabled=True, max_items=100)
 
     count = await store.refresh_content_feature_snapshot()

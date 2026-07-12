@@ -16,13 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-try:
-    if hasattr(torch.backends, "mkldnn"):
-        torch.backends.mkldnn.enabled = False
-except Exception:
-    pass
-
-
 DIN_SEQUENCE_CONTRACT_VERSION = "din_sequence_v1"
 DIN_SEQUENCE_CONTEXT_KEY = "_din_behavior_sequences"
 DIN_ACTIONS = ("click", "cart", "purchase")
@@ -101,7 +94,7 @@ def build_din_batch_inputs(
 ) -> DINBatchInputs:
     """Build candidate tensors while de-duplicating request-level histories."""
     target_device = device or torch.device("cpu")
-    request_keys: Dict[int, int] = {}
+    request_keys: Dict[Tuple[Any, ...], int] = {}
     histories: list[list[list[int]]] = []
     recencies: list[list[list[float]]] = []
     masks: list[list[list[bool]]] = []
@@ -110,7 +103,12 @@ def build_din_batch_inputs(
     candidate_to_request: list[int] = []
     for bundle in bundles:
         sequences = getattr(bundle, "behavior_sequences", None)
-        key = id(sequences)
+        key = (
+            float(bundle.as_of_ts),
+            build_din_freshness_token(sequences)["sequence_hash"]
+            if sequences is not None
+            else "empty",
+        )
         request_index = request_keys.get(key)
         if request_index is None:
             request_index = len(histories)
@@ -120,20 +118,30 @@ def build_din_batch_inputs(
             action_masks: list[list[bool]] = []
             for action in DIN_ACTIONS:
                 sequence = sequences.actions[action] if sequences is not None else None
-                products = list(sequence.product_ids[-sequence_length:]) if sequence else []
-                times = list(sequence.event_times[-sequence_length:]) if sequence else []
+                products = (
+                    list(sequence.product_ids[-sequence_length:]) if sequence else []
+                )
+                times = (
+                    list(sequence.event_times[-sequence_length:]) if sequence else []
+                )
                 present = list(sequence.mask[-sequence_length:]) if sequence else []
                 padding = sequence_length - len(products)
                 products = [""] * padding + products
                 times = [0.0] * padding + times
                 present = [False] * padding + present
-                indices = [int(product_index.get(product_id, 0)) for product_id in products]
-                known_mask = [bool(valid and index != 0) for valid, index in zip(present, indices)]
+                indices = [
+                    int(product_index.get(product_id, 0)) for product_id in products
+                ]
+                known_mask = [
+                    bool(valid and index != 0) for valid, index in zip(present, indices)
+                ]
                 action_indices.append(indices)
                 action_masks.append(known_mask)
                 action_recencies.append(
                     [
-                        math.log1p(max(0.0, float(bundle.as_of_ts) - event_time) / 86400.0)
+                        math.log1p(
+                            max(0.0, float(bundle.as_of_ts) - event_time) / 86400.0
+                        )
                         if valid
                         else 0.0
                         for valid, event_time in zip(known_mask, times)
@@ -151,7 +159,8 @@ def build_din_batch_inputs(
             valid_recencies = [
                 value
                 for value, valid in zip(
-                    recencies[request_index][action_index], masks[request_index][action_index]
+                    recencies[request_index][action_index],
+                    masks[request_index][action_index],
                 )
                 if valid
             ]
@@ -166,13 +175,28 @@ def build_din_batch_inputs(
         candidates.append(int(product_index.get(bundle.candidate.product_id, 0)))
         candidate_to_request.append(request_index)
         summaries.append(row_summary)
+    for index, candidate_index in enumerate(candidates):
+        if candidate_index == 0:
+            summaries[index] = [0.0] * 12
     return DINBatchInputs(
-        candidate_indices=torch.tensor(candidates, dtype=torch.long, device=target_device),
-        request_history_indices=torch.tensor(histories, dtype=torch.long, device=target_device),
-        request_history_recency=torch.tensor(recencies, dtype=torch.float32, device=target_device),
-        request_history_mask=torch.tensor(masks, dtype=torch.bool, device=target_device),
-        candidate_to_request=torch.tensor(candidate_to_request, dtype=torch.long, device=target_device),
-        summary_features=torch.tensor(summaries, dtype=torch.float32, device=target_device),
+        candidate_indices=torch.tensor(
+            candidates, dtype=torch.long, device=target_device
+        ),
+        request_history_indices=torch.tensor(
+            histories, dtype=torch.long, device=target_device
+        ),
+        request_history_recency=torch.tensor(
+            recencies, dtype=torch.float32, device=target_device
+        ),
+        request_history_mask=torch.tensor(
+            masks, dtype=torch.bool, device=target_device
+        ),
+        candidate_to_request=torch.tensor(
+            candidate_to_request, dtype=torch.long, device=target_device
+        ),
+        summary_features=torch.tensor(
+            summaries, dtype=torch.float32, device=target_device
+        ),
     )
 
 
@@ -244,8 +268,7 @@ def build_din_behavior_sequences(
         actions[action] = DINActionSequence(
             product_ids=("",) * padding + tuple(row[2] for row in selected),
             event_times=(0.0,) * padding + tuple(row[0] for row in selected),
-            event_ids=(None,) * padding
-            + tuple(row[1] or None for row in selected),
+            event_ids=(None,) * padding + tuple(row[1] or None for row in selected),
             mask=(False,) * padding + (True,) * len(selected),
         )
     return DINBehaviorSequences(as_of_ts=as_of, actions=actions)
@@ -256,11 +279,15 @@ def build_din_freshness_token(sequences: DINBehaviorSequences) -> Dict[str, Any]
     action_tokens: Dict[str, Dict[str, Any]] = {}
     for action in DIN_ACTIONS:
         sequence = sequences.actions[action]
-        valid_indices = [index for index, present in enumerate(sequence.mask) if present]
+        valid_indices = [
+            index for index, present in enumerate(sequence.mask) if present
+        ]
         latest = valid_indices[-1] if valid_indices else None
         action_tokens[action] = {
             "length": sequence.length,
-            "latest_event_id": sequence.event_ids[latest] if latest is not None else None,
+            "latest_event_id": sequence.event_ids[latest]
+            if latest is not None
+            else None,
             "latest_event_time": (
                 round(sequence.event_times[latest], 6) if latest is not None else 0.0
             ),
@@ -314,19 +341,32 @@ def parse_din_behavior_sequences(
         event_times = raw.get("event_times")
         event_ids = raw.get("event_ids")
         mask = raw.get("mask")
-        if not all(isinstance(values, list) for values in (product_ids, event_times, event_ids, mask)):
+        if not all(
+            isinstance(values, list)
+            for values in (product_ids, event_times, event_ids, mask)
+        ):
             raise ValueError(f"DIN {action} sequence fields must be arrays")
-        if any(len(values) != last_n for values in (product_ids, event_times, event_ids, mask)):
+        if any(
+            len(values) != last_n
+            for values in (product_ids, event_times, event_ids, mask)
+        ):
             raise ValueError(f"DIN {action} sequence fields must have length {last_n}")
         normalized_products = tuple(str(value or "") for value in product_ids)
         normalized_times = tuple(float(value) for value in event_times)
-        normalized_ids = tuple(None if value is None else str(value) for value in event_ids)
+        normalized_ids = tuple(
+            None if value is None else str(value) for value in event_ids
+        )
         normalized_mask = tuple(bool(value) for value in mask)
         saw_valid = False
         previous_time = 0.0
         for index, present in enumerate(normalized_mask):
             if not present:
-                if saw_valid or normalized_products[index] or normalized_times[index] != 0.0 or normalized_ids[index] is not None:
+                if (
+                    saw_valid
+                    or normalized_products[index]
+                    or normalized_times[index] != 0.0
+                    or normalized_ids[index] is not None
+                ):
                     raise ValueError(f"DIN {action} sequence is not left padded")
                 continue
             saw_valid = True
@@ -360,7 +400,9 @@ class Dice(nn.Module):
         mean = flattened.mean(dim=0, keepdim=True)
         variance = (flattened - mean).pow(2).mean(dim=0, keepdim=True)
         probability = torch.sigmoid((flattened - mean) / torch.sqrt(variance + 1e-8))
-        activated = probability * flattened + (1.0 - probability) * self.alpha * flattened
+        activated = (
+            probability * flattened + (1.0 - probability) * self.alpha * flattened
+        )
         return activated.reshape(original_shape).contiguous()
 
 
@@ -470,16 +512,16 @@ class DeepInterestNetwork(nn.Module):
         )
         logits = self.attention_mlp(
             local_features.reshape(-1, local_features.shape[-1])
-        ).reshape(
-            batch_size, len(DIN_ACTIONS), sequence_length
-        )
+        ).reshape(batch_size, len(DIN_ACTIONS), sequence_length)
         mask = history_mask.bool()
         masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
         weights = torch.softmax(masked_logits, dim=-1)
         weights = torch.where(mask, weights, torch.zeros_like(weights))
         weights = torch.nan_to_num(weights, nan=0.0)
         normalizer = weights.sum(dim=-1, keepdim=True)
-        weights = torch.where(normalizer > 0, weights / normalizer.clamp_min(1e-12), weights)
+        weights = torch.where(
+            normalizer > 0, weights / normalizer.clamp_min(1e-12), weights
+        )
         with torch.no_grad():
             entropy = -(weights * torch.log(weights.clamp_min(1e-12))).sum(dim=-1)
             valid_actions = mask.any(dim=-1)
@@ -545,11 +587,17 @@ def load_din_embedding_sidecar(
     data = np.load(path, allow_pickle=False)
     product_ids = [str(value) for value in data["product_ids"]]
     embeddings = np.asarray(data["embeddings"], dtype=np.float32)
-    if not product_ids or product_ids[0] != "" or embeddings.shape != (len(product_ids), 128):
+    if (
+        not product_ids
+        or product_ids[0] != ""
+        or embeddings.shape != (len(product_ids), 128)
+    ):
         raise ValueError("invalid DIN embedding sidecar shape or padding row")
     if not np.allclose(embeddings[0], 0.0) or not np.isfinite(embeddings).all():
         raise ValueError("invalid DIN embedding sidecar values")
-    mapping = {product_id: index for index, product_id in enumerate(product_ids) if product_id}
+    mapping = {
+        product_id: index for index, product_id in enumerate(product_ids) if product_id
+    }
     return (
         torch.from_numpy(embeddings.copy()),
         mapping,

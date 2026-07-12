@@ -332,7 +332,9 @@ class ModelArtifactManager:
             model_version=storage_version,
         )
         record_payload = dict(payload or {})
-        din_local_path = str(record_payload.pop("din_embedding_sidecar_local_path", "") or "")
+        din_local_path = str(
+            record_payload.pop("din_embedding_sidecar_local_path", "") or ""
+        )
         din_manifest = None
         if din_local_path:
             din_sha256 = ObjectStorage.calculate_sha256(din_local_path)

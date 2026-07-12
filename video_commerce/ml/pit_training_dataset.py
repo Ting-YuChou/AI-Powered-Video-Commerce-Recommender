@@ -293,7 +293,10 @@ class PitTrainingDatasetReader:
             raw = normalized.pop(source, None)
             if raw is None:
                 continue
-            if source == "behavior_sequences_json" and len(str(raw).encode("utf-8")) > 512_000:
+            if (
+                source == "behavior_sequences_json"
+                and len(str(raw).encode("utf-8")) > 512_000
+            ):
                 raise PitTrainingDatasetError(
                     "PIT training row has oversized behavior_sequences_json"
                 )
@@ -304,15 +307,15 @@ class PitTrainingDatasetReader:
                     f"PIT training row has invalid {source}: {exc}"
                 ) from exc
         bundle_payload = {
-                "as_of_ts": float(normalized["as_of_ts"]),
-                "candidate_features": normalized.get("candidate_scores") or {},
-                "context": normalized.get("context") or {},
-                "feature_definition_version": definition_version,
-                "product_id": str(normalized.get("product_id") or ""),
-                "product_metadata": normalized.get("product_metadata") or {},
-                "user_features": normalized.get("user_features") or {},
-                "user_id": str(normalized.get("user_id") or ""),
-            }
+            "as_of_ts": float(normalized["as_of_ts"]),
+            "candidate_features": normalized.get("candidate_scores") or {},
+            "context": normalized.get("context") or {},
+            "feature_definition_version": definition_version,
+            "product_id": str(normalized.get("product_id") or ""),
+            "product_metadata": normalized.get("product_metadata") or {},
+            "user_features": normalized.get("user_features") or {},
+            "user_id": str(normalized.get("user_id") or ""),
+        }
         if normalized.get("behavior_sequences") is not None:
             bundle_payload["behavior_sequences"] = normalized["behavior_sequences"]
         expected_bundle_hash = payload_sha256(bundle_payload)

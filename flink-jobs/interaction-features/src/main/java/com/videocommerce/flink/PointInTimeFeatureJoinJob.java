@@ -231,17 +231,23 @@ public final class PointInTimeFeatureJoinJob {
         tables.from("`" + identifier(namespace) + "`.`ranking_training_pit`")
             .getResolvedSchema()
             .getColumnNames();
-    Map<String, String> additions = new LinkedHashMap<>();
-    additions.put("attributed_action", "STRING");
-    additions.put("attributed_value", "DOUBLE");
-    additions.put("attributed_value_source", "STRING");
-    additions.put("label_definition_version", "STRING");
+    Map<String, String> additions = trainingTableAdditions();
     for (Map.Entry<String, String> addition : additions.entrySet()) {
       if (!existing.contains(addition.getKey())) {
         tables.executeSql(
             buildAddColumnSql(namespace, addition.getKey(), addition.getValue()));
       }
     }
+  }
+
+  static Map<String, String> trainingTableAdditions() {
+    Map<String, String> additions = new LinkedHashMap<>();
+    additions.put("attributed_action", "STRING");
+    additions.put("attributed_value", "DOUBLE");
+    additions.put("attributed_value_source", "STRING");
+    additions.put("label_definition_version", "STRING");
+    additions.put("behavior_sequences_json", "STRING");
+    return additions;
   }
 
   static String buildExistingRunSql(String namespace, String runId) {

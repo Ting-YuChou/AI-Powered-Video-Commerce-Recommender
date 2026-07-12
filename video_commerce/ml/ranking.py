@@ -21,6 +21,8 @@ import threading
 import time
 from pathlib import Path
 import pickle
+import os
+import tempfile
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import ndcg_score, roc_auc_score
 
@@ -929,8 +931,60 @@ class RankingModel:
                 f"expected_feature_schema_version={expected_schema}"
             )
 
+    def _validate_din_checkpoint(
+        self,
+        model: MultiObjectiveRankingModel,
+        state_dict: Dict[str, torch.Tensor],
+        checkpoint_config: Dict[str, Any],
+        *,
+        model_path: str,
+    ) -> None:
+        if not getattr(self.config, "din_enabled", False):
+            return
+        expected_config = {
+            "din_enabled": True,
+            "feature_schema_version": RANKING_DIN_FEATURE_SCHEMA_VERSION,
+            "feature_definition_version": RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
+            "feature_assembler_version": "ranking_feature_assembler_v2_din",
+        }
+        for key, expected in expected_config.items():
+            if checkpoint_config.get(key) != expected:
+                raise RuntimeError(
+                    f"DIN checkpoint {model_path} has incompatible {key}"
+                )
+        checkpoint_sidecar = checkpoint_config.get("din_sidecar_metadata") or {}
+        for key in ("sha256", "contract_version", "two_tower_model_version"):
+            if not checkpoint_sidecar.get(key) or checkpoint_sidecar.get(
+                key
+            ) != self.din_sidecar_metadata.get(key):
+                raise RuntimeError(f"DIN checkpoint/sidecar lineage mismatch for {key}")
+        expected_state = model.state_dict()
+        omitted = {"din.item_embedding.weight"}
+        required_keys = set(expected_state) - omitted
+        if set(state_dict) != required_keys:
+            missing = sorted(required_keys - set(state_dict))
+            unexpected = sorted(set(state_dict) - required_keys)
+            raise RuntimeError(
+                "DIN checkpoint trainable state is incomplete: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        invalid_shapes = [
+            key
+            for key in required_keys
+            if tuple(state_dict[key].shape) != tuple(expected_state[key].shape)
+        ]
+        if invalid_shapes:
+            raise RuntimeError(
+                f"DIN checkpoint tensor shapes are incompatible: {invalid_shapes}"
+            )
+
     async def load_model(self, model_path: str = None):
         """Load or initialize the ranking model."""
+        previous_din_state = (
+            self.din_item_embeddings,
+            self.din_product_index,
+            self.din_sidecar_metadata,
+        )
         try:
             if getattr(self.config, "din_enabled", False):
                 sidecar_path = getattr(self.config, "din_embedding_sidecar_path", "")
@@ -969,6 +1023,12 @@ class RankingModel:
                     hidden_dims=checkpoint_config.get("hidden_dims"),
                     cross_layers=checkpoint_config.get("cross_layers"),
                     low_rank_dim=checkpoint_config.get("low_rank_dim"),
+                )
+                self._validate_din_checkpoint(
+                    next_model,
+                    state_dict,
+                    checkpoint_config,
+                    model_path=str(checkpoint_path),
                 )
                 loaded_tensors = self._load_shape_compatible_state_dict_into_model(
                     next_model,
@@ -1022,6 +1082,11 @@ class RankingModel:
             logger.info("Ranking model loaded successfully")
 
         except Exception as e:
+            (
+                self.din_item_embeddings,
+                self.din_product_index,
+                self.din_sidecar_metadata,
+            ) = previous_din_state
             logger.error(f"Error loading ranking model: {e}")
             raise
 
@@ -1246,9 +1311,11 @@ class RankingModel:
                 if din_inputs is None:
                     predictions = inference_model(features_tensor)
                 else:
-                    history_indices, history_recency, history_mask = (
-                        din_inputs.expanded_histories()
-                    )
+                    (
+                        history_indices,
+                        history_recency,
+                        history_mask,
+                    ) = din_inputs.expanded_histories()
                     predictions = inference_model(
                         features_tensor,
                         candidate_indices=din_inputs.candidate_indices,
@@ -1904,7 +1971,11 @@ class RankingModel:
                 predictions = self.model(features)
         ctr_labels = labels["ctr"].detach().cpu().numpy().reshape(-1)
         ctr_scores = predictions["ctr"].detach().cpu().numpy().reshape(-1)
-        auc = float(roc_auc_score(ctr_labels, ctr_scores)) if len(set(ctr_labels)) > 1 else None
+        auc = (
+            float(roc_auc_score(ctr_labels, ctr_scores))
+            if len(set(ctr_labels)) > 1
+            else None
+        )
         scores = predictions["ranking_score"].detach().cpu().numpy().reshape(-1)
         relevance = labels["ranking_relevance"].detach().cpu().numpy().reshape(-1)
         groups = labels["ltr_group"].detach().cpu().numpy().reshape(-1)
@@ -1937,9 +2008,11 @@ class RankingModel:
                 sequence_length=int(getattr(self.config, "din_sequence_last_n", 60)),
                 device=self.device,
             )
-            history_indices, history_recency, history_mask = (
-                din_inputs.expanded_histories()
-            )
+            (
+                history_indices,
+                history_recency,
+                history_mask,
+            ) = din_inputs.expanded_histories()
             labels.update(
                 {
                     "_din_candidate_indices": din_inputs.candidate_indices,
@@ -2893,46 +2966,57 @@ class RankingModel:
 
     async def save_model(self, model_path: str):
         """Save the trained model to disk."""
-        try:
-            if self.model and self.is_trained:
-                Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-                state_dict = self.model.state_dict()
-                if getattr(self.config, "din_enabled", False):
-                    state_dict = {
-                        key: value
-                        for key, value in state_dict.items()
-                        if key != "din.item_embedding.weight"
-                    }
-                checkpoint = {
-                    "model_state_dict": state_dict,
-                    "config": {
-                        "architecture": self.model.architecture,
-                        "cross_layers": self.model.cross_layers,
-                        "low_rank_dim": self.model.low_rank_dim,
-                        "hidden_dims": self.model.hidden_dims,
-                        "input_dim": self.feature_extractor.total_feature_dim,
-                        "feature_schema_version": self.feature_schema_version,
-                        "feature_definition_version": (
-                            RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
-                            if getattr(self.config, "din_enabled", False)
-                            else RANKING_LTR_FEATURE_DEFINITION_VERSION
-                        ),
-                        "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
-                        "feature_assembler_version": self.feature_assembler.version,
-                        "ranking_objective_version": self.ranking_objective_version,
-                        "value_transform_stats": self.value_transform_stats,
-                        "value_bucket_mapping": self.value_bucket_mapping,
-                        "din_enabled": bool(getattr(self.config, "din_enabled", False)),
-                        "din_sidecar_metadata": self.din_sidecar_metadata,
-                    },
+        if self.model and self.is_trained:
+            target = Path(model_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            state_dict = self.model.state_dict()
+            if getattr(self.config, "din_enabled", False):
+                state_dict = {
+                    key: value
+                    for key, value in state_dict.items()
+                    if key != "din.item_embedding.weight"
                 }
-                torch.save(checkpoint, model_path)
-                self.loaded_model_path = model_path
-                self.loaded_checkpoint_mtime = Path(model_path).stat().st_mtime
-                logger.info(f"Model saved to {model_path}")
-
-        except Exception as e:
-            logger.error(f"Error saving model: {e}")
+            checkpoint = {
+                "model_state_dict": state_dict,
+                "config": {
+                    "architecture": self.model.architecture,
+                    "cross_layers": self.model.cross_layers,
+                    "low_rank_dim": self.model.low_rank_dim,
+                    "hidden_dims": self.model.hidden_dims,
+                    "input_dim": self.feature_extractor.total_feature_dim,
+                    "feature_schema_version": self.feature_schema_version,
+                    "feature_definition_version": (
+                        RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+                        if getattr(self.config, "din_enabled", False)
+                        else RANKING_LTR_FEATURE_DEFINITION_VERSION
+                    ),
+                    "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
+                    "feature_assembler_version": self.feature_assembler.version,
+                    "ranking_objective_version": self.ranking_objective_version,
+                    "value_transform_stats": self.value_transform_stats,
+                    "value_bucket_mapping": self.value_bucket_mapping,
+                    "din_enabled": bool(getattr(self.config, "din_enabled", False)),
+                    "din_sidecar_metadata": self.din_sidecar_metadata,
+                },
+            }
+            file_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=target.name + ".", suffix=".tmp", dir=target.parent
+            )
+            try:
+                with os.fdopen(file_descriptor, "wb") as handle:
+                    torch.save(checkpoint, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, target)
+            except Exception:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+                raise
+            self.loaded_model_path = str(target)
+            self.loaded_checkpoint_mtime = target.stat().st_mtime
+            logger.info(f"Model saved to {target}")
+            return str(target)
+        raise RuntimeError("cannot save an untrained ranking model")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get model statistics."""

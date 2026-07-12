@@ -14,7 +14,9 @@ from video_commerce.ml.pit_training_dataset import (
 )
 from video_commerce.ml.pit_manifest import PitManifestPublisher, _is_parquet_shard_uri
 from video_commerce.ml.ranking_features import RANKING_LTR_FEATURE_DEFINITION_VERSION
-from video_commerce.common.feature_history_contracts import RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+from video_commerce.common.feature_history_contracts import (
+    RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
+)
 from video_commerce.ml.ranking_training import RANKING_LABEL_DEFINITION_VERSION
 
 
@@ -78,20 +80,20 @@ def _write_dataset(
     if behavior_sequences is not None:
         row["behavior_sequences_json"] = json.dumps(behavior_sequences)
     bundle_payload = {
-            "as_of_ts": 50.0,
-            "candidate_features": {
-                "collaborative_score": 0.8,
-                "content_similarity_score": 0.7,
-                "popularity_score": 0.6,
-                "combined_score": 0.5,
-            },
-            "context": {},
-            "feature_definition_version": definition_version,
-            "product_id": "p1",
-            "product_metadata": {"price": 9.0},
-            "user_features": {"total_interactions": 3},
-            "user_id": "u1",
-        }
+        "as_of_ts": 50.0,
+        "candidate_features": {
+            "collaborative_score": 0.8,
+            "content_similarity_score": 0.7,
+            "popularity_score": 0.6,
+            "combined_score": 0.5,
+        },
+        "context": {},
+        "feature_definition_version": definition_version,
+        "product_id": "p1",
+        "product_metadata": {"price": 9.0},
+        "user_features": {"total_interactions": 3},
+        "user_id": "u1",
+    }
     if behavior_sequences is not None:
         bundle_payload["behavior_sequences"] = behavior_sequences
     row["feature_bundle_hash"] = payload_sha256(bundle_payload)

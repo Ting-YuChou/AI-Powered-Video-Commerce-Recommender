@@ -370,12 +370,6 @@ def _calculate_mmr_rerank_pool_size(
     multiplier = max(
         1, int(getattr(recommendation_config, "mmr_rerank_pool_multiplier", 5))
     )
-
-
-def _is_din_enabled(runtime: Any) -> bool:
-    config = getattr(runtime, "config", None)
-    ranking_config = getattr(config, "ranking_config", None)
-    return bool(getattr(ranking_config, "din_enabled", False))
     min_pool_size = max(
         1, int(getattr(recommendation_config, "mmr_min_rerank_pool_size", 50))
     )
@@ -385,6 +379,12 @@ def _is_din_enabled(runtime: Any) -> bool:
     )
     desired_pool_size = max(requested_k * multiplier, min_pool_size)
     return min(desired_pool_size, max_pool_size, candidate_count)
+
+
+def _is_din_enabled(runtime: Any) -> bool:
+    config = getattr(runtime, "config", None)
+    ranking_config = getattr(config, "ranking_config", None)
+    return bool(getattr(ranking_config, "din_enabled", False))
 
 
 def _user_feature_cache_token(user_features: UserFeatures) -> Dict[str, Any]:

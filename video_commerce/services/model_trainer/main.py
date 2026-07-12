@@ -126,14 +126,21 @@ class ModelTrainerService:
         )
         self.din_sidecar_lineage = None
         if self.config.ranking_config.din_enabled:
-            two_tower_record = await self.artifact_manager.sync_latest_two_tower_artifacts()
+            two_tower_record = (
+                await self.artifact_manager.sync_latest_two_tower_artifacts()
+            )
             if two_tower_record is None:
                 raise RuntimeError("DIN training requires a pinned two-tower artifact")
-            source_sidecar = self.artifact_manager.two_tower_local_embedding_sidecar_path
+            source_sidecar = (
+                self.artifact_manager.two_tower_local_embedding_sidecar_path
+            )
             embedding_map, _, _, sidecar_model_version = load_item_embedding_sidecar(
                 source_sidecar
             )
-            if not embedding_map or sidecar_model_version != two_tower_record.model_version:
+            if (
+                not embedding_map
+                or sidecar_model_version != two_tower_record.model_version
+            ):
                 raise RuntimeError(
                     "DIN training requires the exact pinned two-tower embedding sidecar"
                 )
@@ -324,7 +331,10 @@ class ModelTrainerService:
             training_sample_source = "feature_lake_pit"
             if getattr(self.config.ranking_config, "din_enabled", False):
                 sequence_coverage = self._din_sequence_coverage(interactions)
-                if sequence_coverage < self.config.ranking_config.din_min_nonempty_ratio:
+                if (
+                    sequence_coverage
+                    < self.config.ranking_config.din_min_nonempty_ratio
+                ):
                     self.observability.record_training_run(
                         trigger,
                         "skipped_insufficient_din_coverage",

@@ -82,6 +82,8 @@ class FeatureStore:
         self.redis_client: Optional[redis.Redis] = None
         self.cache_redis_client: Optional[redis.Redis] = None
         self.is_connected = False
+        self.din_sequence_read_failures = 0
+        self.din_sequence_decode_failures = 0
 
         # Key prefixes for different data types
         self.prefixes = {
@@ -316,9 +318,9 @@ class FeatureStore:
             return
         self._known_content_feature_ids.add(content_id)
         if features is not None:
-            self._content_features_memory_cache[content_id] = self._clone_content_features(
-                features
-            )
+            self._content_features_memory_cache[
+                content_id
+            ] = self._clone_content_features(features)
 
     async def refresh_content_feature_snapshot(self) -> int:
         """Refresh local content-feature IDs and values for request-time miss avoidance."""
@@ -346,9 +348,7 @@ class FeatureStore:
                     memory_cache[content_id] = ContentFeatures(**data)
                     known_ids.add(content_id)
                 except (Exception, CacheDecodeError) as exc:
-                    logger.warning(
-                        "content_feature_snapshot_decode_failed: %s", exc
-                    )
+                    logger.warning("content_feature_snapshot_decode_failed: %s", exc)
             key_batch = []
             id_batch = []
 
@@ -466,7 +466,10 @@ class FeatureStore:
     ) -> Tuple[UserFeatures, Dict[str, Any]]:
         """Read user features and the compact sequence token with one Redis round trip."""
         if self._can_skip_user_context_redis(user_id):
-            return self._default_user_features(user_id), self._empty_user_sequence_token()
+            return (
+                self._default_user_features(user_id),
+                self._empty_user_sequence_token(),
+            )
 
         try:
             client = self._client_for_key_type("user_features")
@@ -1042,12 +1045,24 @@ class FeatureStore:
                 for raw in raw_values or []:
                     try:
                         events.append(self._loads_redis_json(raw))
-                    except Exception:
-                        continue
-        except Exception:
-            events = []
+                    except Exception as exc:
+                        self.din_sequence_decode_failures += 1
+                        logger.error(
+                            "Invalid official DIN action-history member for %s: %s",
+                            user_id,
+                            exc,
+                        )
+                        raise RuntimeError(
+                            "official DIN action history contains invalid data"
+                        ) from exc
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            self.din_sequence_read_failures += 1
+            logger.error("Unable to read official DIN action histories: %s", exc)
+            raise RuntimeError("official DIN action history read failed") from exc
 
-        if not events:
+        if not events and namespace == "legacy":
             events = await self.get_user_sequence(user_id, limit=1000)
         return build_din_behavior_sequences(
             events,

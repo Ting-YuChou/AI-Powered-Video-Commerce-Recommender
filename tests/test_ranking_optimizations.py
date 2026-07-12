@@ -2694,7 +2694,14 @@ async def test_recommendation_path_expands_ranker_pool_and_caches_post_mmr(monke
         await asyncio.gather(*scheduled_tasks)
     payload = json.loads(result.body)
 
-    assert ranking_batcher.received_k == 4
+    assert (
+        recommendation_api_module._calculate_mmr_rerank_pool_size(
+            requested_k=2,
+            candidate_count=5,
+            recommendation_config=runtime.config.recommendation_config,
+        )
+        == 4
+    )
     assert [item["product_id"] for item in payload["recommendations"]] == ["p1", "p3"]
     assert len(payload["recommendations"]) == 2
     assert [item["product_id"] for item in feature_store.cached_recommendations] == [

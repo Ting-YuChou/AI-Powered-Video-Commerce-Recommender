@@ -161,9 +161,10 @@ def test_persist_ranking_checkpoint_activates_din_sidecar_in_same_record(tmp_pat
 
     manifest = fake_store.recorded[-1]["payload"]["artifact_manifest"]
     assert manifest["checkpoint"]["sha256"] == hashlib.sha256(b"ranking").hexdigest()
-    assert manifest["din_embedding_sidecar"]["sha256"] == hashlib.sha256(
-        b"sidecar"
-    ).hexdigest()
+    assert (
+        manifest["din_embedding_sidecar"]["sha256"]
+        == hashlib.sha256(b"sidecar").hexdigest()
+    )
     assert (
         fake_store.recorded[-1]["payload"]["artifact_manifest"]["checkpoint"]["sha256"]
         == hashlib.sha256(b"ranking").hexdigest()

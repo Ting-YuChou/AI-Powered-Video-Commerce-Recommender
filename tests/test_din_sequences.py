@@ -12,11 +12,14 @@ from video_commerce.ml.din import (
     build_din_batch_inputs,
     load_din_embedding_sidecar,
     save_din_embedding_sidecar,
+    parse_din_behavior_sequences,
 )
-from video_commerce.common.feature_history_contracts import RANKING_LTR_FEATURE_DEFINITION_VERSION
+from video_commerce.common.feature_history_contracts import (
+    RANKING_LTR_FEATURE_DEFINITION_VERSION,
+)
 from video_commerce.common.models import CandidateProduct, UserFeatures
 from video_commerce.ml.ranking_features import FeatureBundle
-from video_commerce.ml.ranking import MultiObjectiveRankingModel
+from video_commerce.ml.ranking import MultiObjectiveRankingModel, RankingModel
 
 
 def _event(product_id, action, event_time, *, available_at=None, event_id=None):
@@ -120,7 +123,9 @@ def test_din_attention_masks_padding_and_backpropagates_without_embedding_gradie
     assert model.item_embedding.weight.requires_grad is False
     assert model.item_embedding.weight.grad is None
     assert model.action_embedding.weight.grad is not None
-    assert any(parameter.grad is not None for parameter in model.attention_mlp.parameters())
+    assert any(
+        parameter.grad is not None for parameter in model.attention_mlp.parameters()
+    )
 
 
 def test_din_ranking_config_uses_approved_contract_defaults():
@@ -149,9 +154,15 @@ def test_din_batch_reuses_request_history_and_emits_candidate_mapping():
             product_metadata={"price": 1.0},
             context={},
             candidate=CandidateProduct(product_id=product_id, source="test"),
-            behavior_sequences=sequences,
+            behavior_sequences=(
+                sequences
+                if product_id == "c1"
+                else parse_din_behavior_sequences(
+                    sequences.to_dict(), expected_as_of_ts=as_of, last_n=3
+                )
+            ),
         )
-        for product_id in ("c1", "c2")
+        for product_id in ("c1", "unknown")
     ]
 
     batch = build_din_batch_inputs(
@@ -159,10 +170,11 @@ def test_din_batch_reuses_request_history_and_emits_candidate_mapping():
     )
 
     assert batch.request_history_indices.shape == (1, 3, 3)
-    assert batch.candidate_indices.tolist() == [2, 3]
+    assert batch.candidate_indices.tolist() == [2, 0]
     assert batch.candidate_to_request.tolist() == [0, 0]
     assert batch.summary_features.shape == (2, 12)
     assert batch.summary_features[0, 0].item() == pytest.approx(1.0)
+    assert torch.count_nonzero(batch.summary_features[1]) == 0
 
 
 def test_ranking_model_backpropagates_existing_loss_into_din_attention():
@@ -177,9 +189,7 @@ def test_ranking_model_backpropagates_existing_loss_into_din_attention():
     model = MultiObjectiveRankingModel(7, config, din_item_embeddings=embeddings)
     dense = torch.randn(2, 7)
     candidate_indices = torch.tensor([1, 2])
-    history_indices = torch.tensor(
-        [[[0, 3], [0, 0], [0, 4]], [[0, 3], [0, 0], [0, 4]]]
-    )
+    history_indices = torch.tensor([[[0, 3], [0, 0], [0, 4]], [[0, 3], [0, 0], [0, 4]]])
     mask = history_indices.ne(0)
 
     predictions = model(
@@ -214,3 +224,73 @@ def test_din_embedding_sidecar_has_padding_mapping_and_checksum(tmp_path):
     assert mapping == {"p1": 1, "p2": 2}
     assert metadata["two_tower_model_version"] == "two-tower-7"
     assert metadata["sha256"] == lineage["sha256"]
+
+
+@pytest.mark.asyncio
+async def test_din_checkpoint_rejects_missing_trainable_tensor(tmp_path):
+    sidecar = tmp_path / "din.npz"
+    checkpoint = tmp_path / "ranking.pt"
+    save_din_embedding_sidecar(
+        str(sidecar), {"p1": torch.ones(128).numpy()}, two_tower_model_version="tt-1"
+    )
+    config = RankingConfig(
+        din_enabled=True,
+        din_embedding_sidecar_path=str(sidecar),
+        architecture="mlp",
+        hidden_dims=[8],
+    )
+    source = RankingModel(config)
+    await source.load_model(str(checkpoint))
+    source.is_trained = True
+    await source.save_model(str(checkpoint))
+    payload = torch.load(checkpoint)
+    payload["model_state_dict"].pop("din.attention_mlp.0.weight")
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(RuntimeError, match="trainable state is incomplete"):
+        await RankingModel(config).load_model(str(checkpoint))
+
+
+@pytest.mark.asyncio
+async def test_din_checkpoint_rejects_mismatched_sidecar_lineage(tmp_path):
+    sidecar = tmp_path / "din.npz"
+    checkpoint = tmp_path / "ranking.pt"
+    save_din_embedding_sidecar(
+        str(sidecar), {"p1": torch.ones(128).numpy()}, two_tower_model_version="tt-1"
+    )
+    config = RankingConfig(
+        din_enabled=True,
+        din_embedding_sidecar_path=str(sidecar),
+        architecture="mlp",
+        hidden_dims=[8],
+    )
+    source = RankingModel(config)
+    await source.load_model(str(checkpoint))
+    source.is_trained = True
+    await source.save_model(str(checkpoint))
+    save_din_embedding_sidecar(
+        str(sidecar), {"p2": torch.ones(128).numpy()}, two_tower_model_version="tt-2"
+    )
+
+    with pytest.raises(RuntimeError, match="lineage mismatch"):
+        await RankingModel(config).load_model(str(checkpoint))
+
+
+@pytest.mark.asyncio
+async def test_ranking_checkpoint_save_propagates_failure_without_replacing_target(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "ranking.pt"
+    checkpoint.write_bytes(b"previous")
+    model = RankingModel(RankingConfig(architecture="mlp", hidden_dims=[8]))
+    await model.load_model(str(tmp_path / "missing.pt"))
+    model.is_trained = True
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+    with pytest.raises(OSError, match="disk full"):
+        await model.save_model(str(checkpoint))
+
+    assert checkpoint.read_bytes() == b"previous"
