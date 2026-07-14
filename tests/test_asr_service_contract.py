@@ -33,6 +33,8 @@ async def test_multipart_transcription_contract_cleans_staged_audio():
         "text": "手機 headphones",
         "language": "Chinese",
         "model": api.ASR_MODEL,
+        "alignment_status": "degraded",
+        "segments": [],
     }
     assert fake_model.paths
     assert not fake_model.paths[0].exists()

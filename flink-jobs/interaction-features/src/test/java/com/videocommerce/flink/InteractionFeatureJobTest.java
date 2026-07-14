@@ -18,6 +18,14 @@ class InteractionFeatureJobTest {
   private static final ObjectMapper JSON = new ObjectMapper();
 
   @Test
+  void dinActionAllowlistSeparatesClickCartAndPurchase() {
+    assertEquals("click", InteractionFeatureJob.dinAction("click"));
+    assertEquals("cart", InteractionFeatureJob.dinAction("add_to_cart"));
+    assertEquals("purchase", InteractionFeatureJob.dinAction("purchase"));
+    assertNull(InteractionFeatureJob.dinAction("view"));
+  }
+
+  @Test
   void javaContractParsesSharedPythonFixtureWithSameCanonicalHash() throws Exception {
     Map<String, Object> fixture =
         JSON.readValue(
@@ -299,6 +307,8 @@ class InteractionFeatureJobTest {
         sql);
     assertTrue(PointInTimeFeatureJoinJob.buildTrainingTableSql("video_commerce")
         .contains("label_definition_version STRING"));
+    assertEquals("STRING",
+        PointInTimeFeatureJoinJob.trainingTableAdditions().get("behavior_sequences_json"));
     assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql("s3://bucket/pit", "run-1")
         .contains("attributed_action STRING"));
     assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql(

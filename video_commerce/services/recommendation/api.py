@@ -55,6 +55,7 @@ from video_commerce.ml.ranking_history import (
     history_context_profile,
     ranking_history_config_from_settings,
 )
+from video_commerce.ml.din import DIN_SEQUENCE_CONTEXT_KEY, build_din_freshness_token
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.common.service_common import (
     build_health_response,
@@ -381,6 +382,12 @@ def _calculate_mmr_rerank_pool_size(
     )
     desired_pool_size = max(requested_k * multiplier, min_pool_size)
     return min(desired_pool_size, max_pool_size, candidate_count)
+
+
+def _is_din_enabled(runtime: Any) -> bool:
+    config = getattr(runtime, "config", None)
+    ranking_config = getattr(config, "ranking_config", None)
+    return bool(getattr(ranking_config, "din_enabled", False))
 
 
 def _user_feature_cache_token(user_features: UserFeatures) -> Dict[str, Any]:
@@ -1425,6 +1432,8 @@ async def get_recommendations(
                 name="recommendation-content-processed-at",
             )
 
+        din_sequences = None
+        din_history_failed = False
         stage_started = time.perf_counter()
         user_features, user_sequence_token = await _bounded_hot_path_read(
             runtime,
@@ -1443,6 +1452,14 @@ async def get_recommendations(
             (time.perf_counter() - stage_started) * 1000, 2
         )
         profile["user_sequence_token_ms"] = 0.0
+        if _is_din_enabled(runtime):
+            try:
+                din_sequences = await _read_din_sequences_strict(
+                    runtime, payload.user_id, start_time
+                )
+            except Exception as exc:
+                din_history_failed = True
+                logger.error("din_history_unavailable_combined_score_fallback: %s", exc)
 
         if content_features_task:
             (
@@ -1456,7 +1473,7 @@ async def get_recommendations(
             ) = await content_processed_at_task
         content_cache_writes_allowed = (
             payload.content_id is None or content_features is not None
-        )
+        ) and not din_history_failed
         serving_versions = _serving_version_context(runtime)
         user_feature_token = _user_feature_cache_token(user_features)
         freshness_context = _build_cache_freshness_context(
@@ -1469,6 +1486,10 @@ async def get_recommendations(
                 content_processed_at,
             ),
         )
+        if din_sequences is not None:
+            freshness_context["din_sequence_token"] = build_din_freshness_token(
+                din_sequences
+            )
         cache_key = feature_store.generate_context_hash(
             {
                 **_build_recommendation_cache_context(
@@ -1479,22 +1500,11 @@ async def get_recommendations(
                 **freshness_context,
             }
         )
-        recommendation_cache_task = asyncio.create_task(
-            _timed_awaitable(
-                _bounded_hot_path_read(
-                    runtime,
-                    "cached_recommendations",
-                    feature_store.get_cached_recommendations(
-                        payload.user_id, cache_key
-                    ),
-                    None,
-                )
-            ),
-            name="recommendation-cache",
-        )
-        cached, profile["cache_lookup_ms"] = await _await_recommendation_cache_race(
+        cached, profile["cache_lookup_ms"] = await _read_recommendation_cache(
             runtime,
-            recommendation_cache_task,
+            payload.user_id,
+            cache_key,
+            skip=din_history_failed,
         )
         if cached:
             profile["cache_hit"] = True
@@ -1927,6 +1937,8 @@ async def get_recommendations(
         )
         if artifact_reference is not None:
             ranking_context["content_feature_ref"] = artifact_reference
+        if din_sequences is not None:
+            ranking_context[DIN_SEQUENCE_CONTEXT_KEY] = din_sequences.to_dict()
         if _is_realtime_window_features_enabled(runtime):
             stage_started = time.perf_counter()
             ranking_context = await _attach_realtime_window_features(
@@ -1955,7 +1967,8 @@ async def get_recommendations(
             profile.update(history_profile)
 
         stage_started = time.perf_counter()
-        ranked_recommendations, ranking_profile = await _rank_candidates_for_request(
+        ranked_recommendations, ranking_profile = await _rank_candidates_with_din_guard(
+            din_history_failed=din_history_failed,
             candidates=candidates,
             user_features=user_features,
             context=ranking_context,
@@ -2257,6 +2270,36 @@ def _recommendation_json_response(payload: Dict[str, Any], profile: dict) -> Res
         content=json_dumps(payload),
         media_type="application/json",
         headers=_profile_headers(profile),
+    )
+
+
+async def _rank_candidates_with_din_guard(
+    *,
+    din_history_failed: bool,
+    candidates: List[CandidateProduct],
+    user_features: UserFeatures,
+    context: Dict[str, Any],
+    product_metadata_map: Dict[str, Dict[str, Any]],
+    k: int,
+    http_request: Request,
+    content_features: Optional[ContentFeatures] = None,
+) -> Tuple[List[ProductRecommendation], Dict[str, Any]]:
+    if din_history_failed:
+        recommendations = _combined_score_fallback_recommendations(
+            candidates, product_metadata_map, k
+        )
+        return recommendations, {
+            "path": "fallback_din_history_unavailable",
+            "ranked_count": len(recommendations),
+        }
+    return await _rank_candidates_for_request(
+        candidates=candidates,
+        user_features=user_features,
+        context=context,
+        product_metadata_map=product_metadata_map,
+        k=k,
+        http_request=http_request,
+        content_features=content_features,
     )
 
 
@@ -2637,6 +2680,25 @@ async def _await_candidate_cache_race(
         return None, round((time.perf_counter() - started_at) * 1000, 2)
 
 
+async def _read_recommendation_cache(
+    runtime, user_id: str, cache_key: str, *, skip: bool
+):
+    if skip:
+        return None, 0.0
+    task = asyncio.create_task(
+        _timed_awaitable(
+            _bounded_hot_path_read(
+                runtime,
+                "cached_recommendations",
+                feature_store.get_cached_recommendations(user_id, cache_key),
+                None,
+            )
+        ),
+        name="recommendation-cache",
+    )
+    return await _await_recommendation_cache_race(runtime, task)
+
+
 async def _await_recommendation_cache_race(
     runtime,
     recommendation_cache_task: asyncio.Task,
@@ -2685,6 +2747,54 @@ async def _bounded_hot_path_read(runtime, operation_name: str, awaitable, fallba
     except Exception as exc:
         logger.warning("%s_hot_path_read_failed: %s", operation_name, exc)
         return fallback
+
+
+async def _read_din_sequences_strict(runtime, user_id: str, as_of_ts: float):
+    timeout_seconds = runtime.config.cache_config.hot_path_read_timeout_ms / 1000.0
+    awaitable = feature_store.get_din_behavior_sequences(
+        user_id,
+        as_of_ts=as_of_ts,
+        last_n=runtime.config.ranking_config.din_sequence_last_n,
+    )
+    if timeout_seconds <= 0:
+        return await awaitable
+    return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+
+
+def _combined_score_fallback_recommendations(
+    candidates: List[CandidateProduct],
+    product_metadata_map: Dict[str, Dict[str, Any]],
+    k: int,
+) -> List[ProductRecommendation]:
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: float(candidate.combined_score or 0.0),
+        reverse=True,
+    )[:k]
+    recommendations = []
+    for candidate in ranked:
+        metadata = product_metadata_map.get(candidate.product_id) or {}
+        combined_score = float(candidate.combined_score or 0.0)
+        recommendations.append(
+            ProductRecommendation(
+                product_id=candidate.product_id,
+                title=str(metadata.get("title") or f"Product {candidate.product_id}"),
+                description=metadata.get("description"),
+                price=float(metadata.get("price") or 0.0),
+                currency=str(metadata.get("currency") or "USD"),
+                image_url=metadata.get("image_url"),
+                category=metadata.get("category"),
+                brand=metadata.get("brand"),
+                rating=metadata.get("rating"),
+                confidence_score=max(0.0, min(1.0, combined_score)),
+                ranking_score=combined_score,
+                reason="DIN history unavailable; combined-score fallback",
+                source=candidate.source,
+                candidate_source=candidate.source,
+                candidate_scores={"combined_score": combined_score},
+            )
+        )
+    return recommendations
 
 
 def _default_user_features(user_id: str) -> UserFeatures:

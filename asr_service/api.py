@@ -167,13 +167,26 @@ async def _run_transcription(audio_path: Path):
             status_code=503, detail="ASR inference capacity exhausted"
         ) from exc
     try:
+
+        def transcribe_with_timestamps():
+            try:
+                return app.state.model.transcribe(
+                    audio=str(audio_path),
+                    language=None,
+                    return_time_stamps=True,
+                )
+            except TypeError as exc:
+                if "return_time_stamps" not in str(exc):
+                    raise
+                # Preserve compatibility with older internal/fake ASR clients
+                # while production Qwen ASR receives timestamp alignment.
+                return app.state.model.transcribe(
+                    audio=str(audio_path),
+                    language=None,
+                )
+
         inference_task = asyncio.create_task(
-            asyncio.to_thread(
-                app.state.model.transcribe,
-                audio=str(audio_path),
-                language=None,
-                return_time_stamps=True,
-            )
+            asyncio.to_thread(transcribe_with_timestamps)
         )
         try:
             return await asyncio.shield(inference_task)

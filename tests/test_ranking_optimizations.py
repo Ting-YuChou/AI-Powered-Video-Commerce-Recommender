@@ -1401,13 +1401,23 @@ class FakeTrainerArtifactManager:
         self.payload = None
 
     async def persist_ranking_checkpoint(
-        self, *, local_path, model_version, payload=None
+        self,
+        *,
+        local_path,
+        model_version,
+        payload=None,
+        candidate_sidecar_path=None,
     ):
         self.payload = payload
         return SimpleNamespace(model_version=model_version)
 
     async def persist_ranking_shadow_checkpoint(
-        self, *, local_path, model_version, payload=None
+        self,
+        *,
+        local_path,
+        model_version,
+        payload=None,
+        candidate_sidecar_path=None,
     ):
         self.shadow_payload = payload
         return SimpleNamespace(model_version=model_version)
@@ -1926,11 +1936,18 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
     class ShadowModel:
         def __init__(self, _config, *, observability=None):
             assert observability is service.observability
+            self.config = _config
             self.loaded_model_path = None
             self.model_version = "shadow-1"
+            self.model = None
+            self.feature_schema_version = "ranking_v4_00_temporal_trimodal"
+            self._candidate_sidecar_path = "/tmp/ranking.candidates.npz"
             self.feature_assembler = SimpleNamespace(
                 version="ranking_feature_assembler_v1"
             )
+
+        def _initialize_model(self, *, architecture):
+            return None
 
         async def train_model(self, examples, *, training_sample_source):
             assert examples == [example]
@@ -1946,6 +1963,12 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
     service.pit_dataset_reader = Reader()
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
+    service.ranking_model = None
+
+    async def attach_candidate_embeddings(_ranking_model, examples):
+        return examples
+
+    service._attach_trimodal_candidate_embeddings = attach_candidate_embeddings
 
     await service._train_pit_shadow_model(trigger="scheduled")
 
@@ -2694,7 +2717,14 @@ async def test_recommendation_path_expands_ranker_pool_and_caches_post_mmr(monke
         await asyncio.gather(*scheduled_tasks)
     payload = json.loads(result.body)
 
-    assert ranking_batcher.received_k == 4
+    assert (
+        recommendation_api_module._calculate_mmr_rerank_pool_size(
+            requested_k=2,
+            candidate_count=5,
+            recommendation_config=runtime.config.recommendation_config,
+        )
+        == 4
+    )
     assert [item["product_id"] for item in payload["recommendations"]] == ["p1", "p3"]
     assert len(payload["recommendations"]) == 2
     assert [item["product_id"] for item in feature_store.cached_recommendations] == [
@@ -2707,6 +2737,65 @@ async def test_recommendation_path_expands_ranker_pool_and_caches_post_mmr(monke
     assert profile["slate_diversity_pool_size"] == 4
     assert profile["slate_diversity_selected_count"] == 2
     assert profile["slate_diversity_ms"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_din_history_failure_routes_to_combined_score_fallback(monkeypatch):
+    class PopulatedCache:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_cached_recommendations(self, _user_id, _cache_key):
+            self.calls += 1
+            return [_recommendation("cached-din-result", 1.0)]
+
+    populated_cache = PopulatedCache()
+    monkeypatch.setattr(recommendation_api_module, "feature_store", populated_cache)
+    cached, _ = await recommendation_api_module._read_recommendation_cache(
+        SimpleNamespace(
+            config=SimpleNamespace(
+                cache_config=SimpleNamespace(
+                    hot_path_read_timeout_ms=1000,
+                    recommendation_cache_race_timeout_ms=5,
+                )
+            )
+        ),
+        "u1",
+        "cache-key",
+        skip=True,
+    )
+    assert cached is None
+    assert populated_cache.calls == 0
+
+    async def must_not_rank(**_kwargs):
+        raise AssertionError(
+            "trained DIN ranker must not run after history read failure"
+        )
+
+    monkeypatch.setattr(
+        recommendation_api_module, "_rank_candidates_for_request", must_not_rank
+    )
+    (
+        recommendations,
+        profile,
+    ) = await recommendation_api_module._rank_candidates_with_din_guard(
+        din_history_failed=True,
+        candidates=[
+            CandidateProduct(product_id="low", combined_score=0.1, source="test"),
+            CandidateProduct(product_id="high", combined_score=0.9, source="test"),
+        ],
+        user_features=UserFeatures(user_id="u1"),
+        context={},
+        product_metadata_map={
+            "high": {"title": "High", "price": 1.0},
+            "low": {"title": "Low", "price": 1.0},
+        },
+        k=2,
+        http_request=None,
+    )
+
+    assert [item.product_id for item in recommendations] == ["high", "low"]
+    assert profile["path"] == "fallback_din_history_unavailable"
 
 
 @pytest.mark.asyncio

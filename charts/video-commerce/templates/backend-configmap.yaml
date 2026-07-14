@@ -118,6 +118,12 @@ data:
   RANKING_HISTORY_CLICK_SCALE: {{ .Values.appConfig.ranking.historyClickScale | quote }}
   RANKING_HISTORY_CART_SCALE: {{ .Values.appConfig.ranking.historyCartScale | quote }}
   RANKING_HISTORY_PURCHASE_SCALE: {{ .Values.appConfig.ranking.historyPurchaseScale | quote }}
+  RANKING_DIN_ENABLED: {{ .Values.appConfig.ranking.dinEnabled | quote }}
+  RANKING_DIN_SEQUENCE_LAST_N: {{ .Values.appConfig.ranking.dinSequenceLastN | quote }}
+  RANKING_DIN_SEQUENCE_LOOKBACK_DAYS: {{ .Values.appConfig.ranking.dinSequenceLookbackDays | quote }}
+  RANKING_DIN_MIN_NONEMPTY_RATIO: {{ .Values.appConfig.ranking.dinMinNonemptyRatio | quote }}
+  RANKING_DIN_EMBEDDING_SIDECAR_PATH: {{ .Values.appConfig.ranking.dinEmbeddingSidecarPath | quote }}
+  MODEL_RANKING_DIN_SIDECAR_PATH: {{ .Values.appConfig.ranking.dinEmbeddingSidecarPath | quote }}
   RANKING_RUNNER_PAYLOAD_V2_ENABLED: {{ .Values.appConfig.ranking.runnerPayloadV2Enabled | quote }}
   RANKING_RUNNER_PAYLOAD_MAX_BYTES: {{ .Values.appConfig.ranking.runnerPayloadMaxBytes | quote }}
   RANKING_TORCH_COMPILE_ENABLED: {{ .Values.appConfig.ranking.torchCompileEnabled | quote }}

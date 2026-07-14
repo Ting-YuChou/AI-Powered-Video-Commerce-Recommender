@@ -19,6 +19,19 @@ if torch.backends.mkldnn.is_available():
     torch.backends.mkldnn.enabled = False
 
 
+class _ScalarScore(nn.Module):
+    """Linear scalar projection without the broken ARM oneDNN Mx1 kernel."""
+
+    def __init__(self, input_dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(int(input_dim)))
+        self.bias = nn.Parameter(torch.zeros(()))
+        nn.init.normal_(self.weight, mean=0.0, std=int(input_dim) ** -0.5)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return torch.sum(values * self.weight, dim=-1, keepdim=True) + self.bias
+
+
 def encode_float16_matrix(values: np.ndarray) -> bytes:
     matrix = np.asarray(values, dtype=np.float32)
     if matrix.ndim != 2:
@@ -279,7 +292,7 @@ class TemporalSequenceEncoder(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=int(num_layers))
-        self.pool_score = nn.Linear(self.model_dim, 1)
+        self.pool_score = _ScalarScore(self.model_dim)
         self.mean_residual_logit = nn.Parameter(torch.tensor(-2.0))
 
     def forward(
@@ -397,7 +410,7 @@ class TrimodalCandidateAttention(nn.Module):
             ]
         )
         self.gate_scores = nn.ModuleList(
-            [nn.Linear(self.model_dim, 1) for _ in range(3)]
+            [_ScalarScore(self.model_dim) for _ in range(3)]
         )
         self.residual_gate_logit = nn.Parameter(torch.tensor(-4.0))
 

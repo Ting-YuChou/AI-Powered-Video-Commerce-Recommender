@@ -69,7 +69,7 @@ def test_temporal_encoder_masks_padding_and_returns_normalized_pooling():
 def test_temporal_sequence_encoder_supports_spans_and_fully_missing_rows():
     torch.manual_seed(17)
     encoder = TemporalSequenceEncoder(
-        input_dim=4, model_dim=8, num_layers=1, num_heads=2, dropout=0.0
+        input_dim=4, model_dim=16, num_layers=1, num_heads=2, dropout=0.0
     ).eval()
     output = encoder(
         torch.randn(2, 3, 4),
@@ -78,8 +78,8 @@ def test_temporal_sequence_encoder_supports_spans_and_fully_missing_rows():
         end_timestamps_seconds=torch.tensor([[1.0, 3.5, 4.0], [0.0, 0.0, 0.0]]),
     )
 
-    assert output.tokens.shape == (2, 3, 8)
-    assert output.pooled_embedding.shape == (2, 8)
+    assert output.tokens.shape == (2, 3, 16)
+    assert output.pooled_embedding.shape == (2, 16)
     assert torch.count_nonzero(output.tokens[1]) == 0
     assert torch.count_nonzero(output.pooled_embedding[1]) == 0
     assert torch.isfinite(output.tokens).all()
@@ -88,16 +88,16 @@ def test_temporal_sequence_encoder_supports_spans_and_fully_missing_rows():
 def test_trimodal_attention_masks_absent_modalities_and_backpropagates():
     torch.manual_seed(19)
     module = TrimodalCandidateAttention(
-        model_dim=8,
+        model_dim=16,
         candidate_image_dim=4,
         candidate_text_dim=6,
         candidate_two_tower_dim=3,
         num_heads=2,
         dropout=0.0,
     )
-    visual = torch.randn(2, 2, 8, requires_grad=True)
-    ocr = torch.randn(2, 2, 8, requires_grad=True)
-    asr = torch.randn(2, 2, 8, requires_grad=True)
+    visual = torch.randn(2, 2, 16, requires_grad=True)
+    ocr = torch.randn(2, 2, 16, requires_grad=True)
+    asr = torch.randn(2, 2, 16, requires_grad=True)
     output = module(
         visual_tokens=visual,
         visual_pooled=visual.mean(1),
@@ -114,7 +114,7 @@ def test_trimodal_attention_masks_absent_modalities_and_backpropagates():
         candidate_presence=torch.ones(2, 3, dtype=torch.bool),
     )
 
-    assert output.fused.shape == (2, 8)
+    assert output.fused.shape == (2, 16)
     assert output.modality_gate.shape == (2, 3)
     assert output.modality_gate[0].sum().item() == pytest.approx(1.0)
     assert torch.count_nonzero(output.modality_gate[1]) == 0
@@ -270,7 +270,7 @@ def test_trimodal_ranker_zero_residual_matches_base_and_all_branches_get_gradien
     model = TemporalTrimodalRankingModel(
         6,
         RankingConfig(hidden_dims=[16], architecture="mlp", dropout_rate=0.0),
-        model_dim=8,
+        model_dim=16,
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -340,7 +340,7 @@ def test_rank_payload_rejects_unknown_multimodal_protocol_version():
 
 
 def test_rank_payload_v4_rejects_sequence_over_cap():
-    with pytest.raises(HTTPException, match="visual rows exceed 16"):
+    with pytest.raises(HTTPException) as exc_info:
         coerce_rank_payload(
             {
                 "payload_version": 4,
@@ -360,6 +360,7 @@ def test_rank_payload_v4_rejects_sequence_over_cap():
                 },
             }
         )
+    assert exc_info.value.detail == "visual rows exceed 16"
 
 
 def test_content_features_pack_to_bounded_v4_tensors():

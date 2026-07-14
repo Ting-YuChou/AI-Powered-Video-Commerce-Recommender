@@ -6,16 +6,23 @@ import pytest
 
 from video_commerce.common.cache_codec import json_dumps, json_loads
 from video_commerce.common.config import RankingConfig
-from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
+from video_commerce.common.models import (
+    CandidateProduct,
+    ProductRecommendation,
+    UserFeatures,
+)
 from video_commerce.ml.ranking import RankingModel
 from video_commerce.ml.ranking_history import RANKING_HISTORY_CONTEXT_KEY
+from video_commerce.ml.din import DIN_SEQUENCE_CONTEXT_KEY
 from video_commerce.ranking_runtime.ranking_batcher import (
     RankingBatcher,
     RankingQueueTimeoutError,
     normalize_ranking_batch_payloads,
     run_ranking_batch_payloads,
 )
-from video_commerce.ranking_runtime.ranking_coordinator_client import RankingCoordinatorResponse
+from video_commerce.ranking_runtime.ranking_coordinator_client import (
+    RankingCoordinatorResponse,
+)
 from video_commerce.ranking_runtime.ranking_runner_client import RankingRunnerTimeout
 
 
@@ -661,17 +668,91 @@ def test_ranking_runner_payload_v2_round_trip_and_v1_fallback():
     }
     normalized = normalize_ranking_batch_payloads(v2_payload)
     assert normalized[0]["product_metadata_map"]["p1"]["title"] == "V2 title"
-    assert normalized[0]["context"][RANKING_HISTORY_CONTEXT_KEY]["actions"]["click"][
-        "count"
-    ] == 1
+    assert (
+        normalized[0]["context"][RANKING_HISTORY_CONTEXT_KEY]["actions"]["click"][
+            "count"
+        ]
+        == 1
+    )
 
     result = run_ranking_batch_payloads(FakeRankingModel(), v2_payload)
     assert result["results"][0][1][0]["title"] == "V2 title"
 
     v1_payload = {"requests": normalized}
-    assert normalize_ranking_batch_payloads(v1_payload)[0]["product_metadata_map"][
-        "p1"
-    ]["title"] == "V2 title"
+    assert (
+        normalize_ranking_batch_payloads(v1_payload)[0]["product_metadata_map"]["p1"][
+            "title"
+        ]
+        == "V2 title"
+    )
+
+
+def test_ranking_runner_payload_v3_keeps_history_once_per_request():
+    history = {"contract_version": "din_sequence_v1", "as_of_ts": 50.0, "actions": {}}
+    payload = {
+        "payload_version": 3,
+        "product_metadata_map": {},
+        "requests": [
+            {
+                "index": 0,
+                "candidates": [
+                    {"product_id": "p1", "combined_score": 1.0, "source": "test"},
+                    {"product_id": "p2", "combined_score": 0.5, "source": "test"},
+                ],
+                "product_ids": ["p1", "p2"],
+                "user_features": {"user_id": "u1"},
+                "context": {},
+                "behavior_sequences": history,
+                "k": 2,
+                "batch_wait_ms": 0.0,
+            }
+        ],
+    }
+
+    normalized = normalize_ranking_batch_payloads(payload)
+
+    assert normalized[0]["behavior_sequences"] is history
+    assert "behavior_sequences" not in normalized[0]["candidates"][0]
+
+
+@pytest.mark.asyncio
+async def test_remote_din_batch_negotiates_v3_without_context_duplication():
+    runner_pool = FakeRunnerPool(supported_payload_versions=(1, 2, 3))
+    batcher = RankingBatcher(
+        None,
+        _config(batch_max_requests=1, batch_wait_ms=0.0, din_enabled=True),
+        runner_pool=runner_pool,
+    )
+    history = {"contract_version": "din_sequence_v1", "actions": {}}
+
+    await batcher.start()
+    try:
+        await batcher.rank_candidates(
+            [CandidateProduct(product_id="p1", combined_score=1.0, source="test")],
+            UserFeatures(user_id="u1"),
+            {DIN_SEQUENCE_CONTEXT_KEY: history},
+            product_metadata_map={},
+            k=1,
+            include_profile=True,
+        )
+    finally:
+        await batcher.close()
+
+    body = runner_pool.bodies[0]
+    assert body["payload_version"] == 3
+    assert body["requests"][0]["behavior_sequences"] == history
+    assert DIN_SEQUENCE_CONTEXT_KEY not in body["requests"][0]["context"]
+
+
+def test_remote_din_batch_fails_closed_without_v3_capability():
+    batcher = RankingBatcher(
+        None,
+        _config(din_enabled=True),
+        runner_pool=FakeRunnerPool(supported_payload_versions=(1, 2)),
+    )
+
+    with pytest.raises(RankingQueueTimeoutError, match="payload_v3_required"):
+        batcher._build_remote_batch_payload([], 0.0)
 
 
 @pytest.mark.asyncio

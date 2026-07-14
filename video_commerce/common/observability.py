@@ -706,6 +706,26 @@ class ObservabilityManager:
             "Purchase rows containing an actual attributed business value",
             registry=self.registry,
         )
+        self.din_sequence_coverage_ratio = Gauge(
+            "din_sequence_coverage_ratio",
+            "Training rows containing at least one DIN event",
+            registry=self.registry,
+        )
+        self.din_embedding_coverage_ratio = Gauge(
+            "din_embedding_coverage_ratio",
+            "DIN sequence item references found in the frozen sidecar",
+            registry=self.registry,
+        )
+        self.din_unknown_item_ratio = Gauge(
+            "din_unknown_item_ratio",
+            "DIN candidate and history item references missing from the sidecar",
+            registry=self.registry,
+        )
+        self.din_attention_entropy = Gauge(
+            "din_attention_entropy",
+            "Mean masked DIN attention entropy from the latest training pass",
+            registry=self.registry,
+        )
         self.pit_orchestrator_runs_total = Counter(
             "pit_orchestrator_runs_total",
             "Daily PIT orchestration outcomes",
@@ -942,6 +962,19 @@ class ObservabilityManager:
         self.pit_value_mask_coverage_ratio.set(
             max(0.0, min(1.0, float(value_mask_coverage)))
         )
+
+    def update_din_training_metrics(
+        self,
+        *,
+        sequence_coverage: float,
+        embedding_coverage: float,
+        unknown_item_rate: float,
+        attention_entropy: float,
+    ) -> None:
+        self.din_sequence_coverage_ratio.set(max(0.0, min(1.0, sequence_coverage)))
+        self.din_embedding_coverage_ratio.set(max(0.0, min(1.0, embedding_coverage)))
+        self.din_unknown_item_ratio.set(max(0.0, min(1.0, unknown_item_rate)))
+        self.din_attention_entropy.set(max(0.0, float(attention_entropy)))
 
     def record_recommendation(
         self,

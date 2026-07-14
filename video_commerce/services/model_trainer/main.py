@@ -15,7 +15,7 @@ import socket
 import threading
 import torch
 
-from video_commerce.common.config import Config
+from video_commerce.common.config import Config, RankingConfig
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
@@ -31,12 +31,16 @@ from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.ml.vector_search import VectorSearchEngine
 from video_commerce.ml.text_embeddings import MultilingualTextEmbedder
 from video_commerce.ml.cf_cold_start import load_item_embedding_sidecar
+from video_commerce.ml.din import save_din_embedding_sidecar
 from video_commerce.common.observability import (
     ObservabilityManager,
     configure_logging,
     start_worker_metrics_server,
 )
 from video_commerce.common.telemetry import configure_tracing
+from video_commerce.common.feature_history_contracts import (
+    RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +58,9 @@ class ModelTrainerService:
         ranking_model: RankingModel,
         examples,
     ):
-        if not getattr(ranking_model.config, "trimodal_enabled", False):
+        if not getattr(
+            getattr(ranking_model, "config", None), "trimodal_enabled", False
+        ):
             return examples
         by_product = {}
         for example in examples:
@@ -154,6 +160,17 @@ class ModelTrainerService:
         use_pit_dataset = (
             getattr(feature_lake_config, "training_source", "legacy") == "pit"
         )
+        if self.config.ranking_config.din_enabled:
+            if not use_pit_dataset:
+                raise RuntimeError("DIN ranking training requires training_source=pit")
+            if (
+                feature_lake_config.feature_definition_version
+                != RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+            ):
+                raise RuntimeError(
+                    "DIN ranking training requires feature_definition_version="
+                    + RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+                )
         if not use_pit_dataset:
             self.feature_store = FeatureStore(
                 self.config.redis_config, self.config.cache_config
@@ -192,6 +209,33 @@ class ModelTrainerService:
             model_config=self.config.model_config,
             recommendation_config=self.config.recommendation_config,
         )
+        self.din_sidecar_lineage = None
+        if self.config.ranking_config.din_enabled:
+            two_tower_record = (
+                await self.artifact_manager.sync_latest_two_tower_artifacts()
+            )
+            if two_tower_record is None:
+                raise RuntimeError("DIN training requires a pinned two-tower artifact")
+            source_sidecar = (
+                self.artifact_manager.two_tower_local_embedding_sidecar_path
+            )
+            embedding_map, _, _, sidecar_model_version = load_item_embedding_sidecar(
+                source_sidecar
+            )
+            if (
+                not embedding_map
+                or sidecar_model_version != two_tower_record.model_version
+            ):
+                raise RuntimeError(
+                    "DIN training requires the exact pinned two-tower embedding sidecar"
+                )
+            target_sidecar = self.config.model_config.ranking_din_sidecar_path
+            self.din_sidecar_lineage = save_din_embedding_sidecar(
+                target_sidecar,
+                embedding_map,
+                two_tower_model_version=two_tower_record.model_version,
+            )
+            self.config.ranking_config.din_embedding_sidecar_path = target_sidecar
 
         if not use_pit_dataset or trimodal_shadow:
             self.vector_search = VectorSearchEngine(self.config.vector_config)
@@ -236,6 +280,7 @@ class ModelTrainerService:
                 not (
                     self.config.ranking_config.history_embeddings_enabled
                     or self.config.ranking_config.trimodal_enabled
+                    or self.config.ranking_config.din_enabled
                 )
                 or not self.config.ranking_config.enable_periodic_training
             ):
@@ -389,6 +434,25 @@ class ModelTrainerService:
                 return
             interactions = pit_dataset.examples
             training_sample_source = "feature_lake_pit"
+            if getattr(self.config.ranking_config, "din_enabled", False):
+                sequence_coverage = self._din_sequence_coverage(interactions)
+                if (
+                    sequence_coverage
+                    < self.config.ranking_config.din_min_nonempty_ratio
+                ):
+                    self.observability.record_training_run(
+                        trigger,
+                        "skipped_insufficient_din_coverage",
+                        asyncio.get_running_loop().time() - started_at,
+                    )
+                    logger.warning(
+                        "Skipping DIN training due to insufficient sequence coverage",
+                        extra={
+                            "coverage": sequence_coverage,
+                            "required": self.config.ranking_config.din_min_nonempty_ratio,
+                        },
+                    )
+                    return
         elif (
             getattr(self.config.ranking_config, "ltr_pairwise_enabled", False)
             or getattr(self.config.ranking_config, "ltr_listwise_enabled", False)
@@ -535,6 +599,19 @@ class ModelTrainerService:
             if pit_training_cancel_event is not None:
                 training_kwargs["cancellation_event"] = pit_training_cancel_event
             await self.ranking_model.train_model(training_examples, **training_kwargs)
+            din_metrics = None
+            if getattr(self.config.ranking_config, "din_enabled", False):
+                din_metrics = self._din_training_metrics(
+                    training_examples,
+                    self.ranking_model.din_product_index,
+                    attention_entropy=getattr(
+                        getattr(self.ranking_model.model, "din", None),
+                        "last_attention_entropy",
+                        0.0,
+                    ),
+                )
+                if hasattr(self.observability, "update_din_training_metrics"):
+                    self.observability.update_din_training_metrics(**din_metrics)
             if use_pit_dataset and self.ranking_model.is_trained:
                 self.ranking_model.model_version = (
                     f"pit-{pit_dataset.materialization_run_id}"
@@ -559,6 +636,15 @@ class ModelTrainerService:
                     or self.config.model_config.ranking_model_path,
                     model_version=self.ranking_model.model_version,
                     payload={
+                        **(
+                            {
+                                "din_embedding_sidecar_local_path": self.config.model_config.ranking_din_sidecar_path,
+                                "din_sidecar_lineage": self.din_sidecar_lineage,
+                                "din_training_metrics": din_metrics,
+                            }
+                            if getattr(self.config.ranking_config, "din_enabled", False)
+                            else {}
+                        ),
                         "trigger": trigger,
                         "sample_count": len(interactions),
                         "last_training_time": self.ranking_model.last_training_time,
@@ -610,11 +696,22 @@ class ModelTrainerService:
                         "training_value_mask_coverage": self._value_mask_coverage(
                             training_examples
                         ),
+                        "training_quality_metrics": (
+                            getattr(self.ranking_model, "training_history", [])[-1]
+                            if getattr(self.ranking_model, "training_history", [])
+                            else None
+                        ),
                     },
-                    candidate_sidecar_path=(
-                        self.ranking_model._candidate_sidecar_path
-                        if getattr(self.ranking_model.config, "trimodal_enabled", False)
-                        else None
+                    **(
+                        {
+                            "candidate_sidecar_path": self.ranking_model._candidate_sidecar_path
+                        }
+                        if getattr(
+                            getattr(self.ranking_model, "config", None),
+                            "trimodal_enabled",
+                            False,
+                        )
+                        else {}
                     ),
                 )
                 if record:
@@ -631,9 +728,9 @@ class ModelTrainerService:
                 elif use_pit_dataset:
                     raise RuntimeError("PIT ranking artifact was not persisted")
             if (
-                getattr(self.config.ranking_config, "trimodal_shadow", True)
+                getattr(self.config.ranking_config, "trimodal_shadow", False)
                 and not getattr(self.config.ranking_config, "trimodal_enabled", False)
-                and self.pit_dataset_reader is not None
+                and getattr(self, "pit_dataset_reader", None) is not None
             ):
                 await self._train_pit_shadow_model(trigger=trigger)
             elif not use_pit_dataset and getattr(
@@ -684,6 +781,50 @@ class ModelTrainerService:
             purchases
         )
 
+    @staticmethod
+    def _din_sequence_coverage(training_examples) -> float:
+        if not training_examples:
+            return 0.0
+        nonempty = 0
+        for example in training_examples:
+            sequences = getattr(example.bundle, "behavior_sequences", None)
+            if sequences is not None and any(
+                sequence.length > 0 for sequence in sequences.actions.values()
+            ):
+                nonempty += 1
+        return nonempty / len(training_examples)
+
+    @classmethod
+    def _din_training_metrics(
+        cls, training_examples, product_index, *, attention_entropy: float
+    ):
+        known = 0
+        unknown = 0
+        for example in training_examples:
+            product_ids = [example.bundle.candidate.product_id]
+            sequences = example.bundle.behavior_sequences
+            if sequences is not None:
+                for sequence in sequences.actions.values():
+                    product_ids.extend(
+                        product_id
+                        for product_id, present in zip(
+                            sequence.product_ids, sequence.mask
+                        )
+                        if present
+                    )
+            for product_id in product_ids:
+                if product_id in product_index:
+                    known += 1
+                else:
+                    unknown += 1
+        total = known + unknown
+        return {
+            "sequence_coverage": cls._din_sequence_coverage(training_examples),
+            "embedding_coverage": known / total if total else 0.0,
+            "unknown_item_rate": unknown / total if total else 0.0,
+            "attention_entropy": float(attention_entropy),
+        }
+
     async def _train_pit_shadow_model(self, *, trigger: str) -> None:
         """Train and persist PIT without replacing the serving ranking artifact."""
         if not self.pit_dataset_reader or not self.artifact_manager:
@@ -697,9 +838,14 @@ class ModelTrainerService:
                 f"{trigger}_pit_shadow", "skipped_insufficient_samples", 0.0
             )
             return
-        shadow_config = self.config.ranking_config.copy(
-            update={"trimodal_enabled": True}
-        )
+        if hasattr(self.config.ranking_config, "copy"):
+            shadow_config = self.config.ranking_config.copy(
+                update={"trimodal_enabled": True}
+            )
+        else:
+            shadow_values = dict(vars(self.config.ranking_config))
+            shadow_values["trimodal_enabled"] = True
+            shadow_config = RankingConfig(**shadow_values)
         shadow_model = RankingModel(
             shadow_config,
             observability=self.observability,

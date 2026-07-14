@@ -250,6 +250,11 @@ appConfig:
     historyClickScale: 1.0
     historyCartScale: 1.25
     historyPurchaseScale: 1.75
+    dinEnabled: false
+    dinSequenceLastN: 60
+    dinSequenceLookbackDays: 30
+    dinMinNonemptyRatio: 0.30
+    dinEmbeddingSidecarPath: /tmp/ranking_din_embeddings.npz
     runnerPayloadV2Enabled: true
     runnerPayloadMaxBytes: "33554432"
     torchCompileEnabled: false

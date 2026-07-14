@@ -15,6 +15,7 @@ from video_commerce.common.feature_history_contracts import payload_sha256
 from video_commerce.common.models import CandidateProduct, UserFeatures
 from video_commerce.ml.content_artifacts import load_content_feature_artifact
 from video_commerce.ml.ranking_features import FeatureBundle
+from video_commerce.ml.din import parse_din_behavior_sequences
 from video_commerce.ml.ranking_training import (
     RANKING_LABEL_DEFINITION_VERSION,
     AttributionFacts,
@@ -313,28 +314,37 @@ class PitTrainingDatasetReader:
             ("product_metadata_json", "product_metadata"),
             ("context_json", "context"),
             ("candidate_features_json", "candidate_scores"),
+            ("behavior_sequences_json", "behavior_sequences"),
         ):
             raw = normalized.pop(source, None)
             if raw is None:
                 continue
+            if (
+                source == "behavior_sequences_json"
+                and len(str(raw).encode("utf-8")) > 512_000
+            ):
+                raise PitTrainingDatasetError(
+                    "PIT training row has oversized behavior_sequences_json"
+                )
             try:
                 normalized[target] = json.loads(raw)
             except (TypeError, json.JSONDecodeError) as exc:
                 raise PitTrainingDatasetError(
                     f"PIT training row has invalid {source}: {exc}"
                 ) from exc
-        expected_bundle_hash = payload_sha256(
-            {
-                "as_of_ts": float(normalized["as_of_ts"]),
-                "candidate_features": normalized.get("candidate_scores") or {},
-                "context": normalized.get("context") or {},
-                "feature_definition_version": definition_version,
-                "product_id": str(normalized.get("product_id") or ""),
-                "product_metadata": normalized.get("product_metadata") or {},
-                "user_features": normalized.get("user_features") or {},
-                "user_id": str(normalized.get("user_id") or ""),
-            }
-        )
+        bundle_payload = {
+            "as_of_ts": float(normalized["as_of_ts"]),
+            "candidate_features": normalized.get("candidate_scores") or {},
+            "context": normalized.get("context") or {},
+            "feature_definition_version": definition_version,
+            "product_id": str(normalized.get("product_id") or ""),
+            "product_metadata": normalized.get("product_metadata") or {},
+            "user_features": normalized.get("user_features") or {},
+            "user_id": str(normalized.get("user_id") or ""),
+        }
+        if normalized.get("behavior_sequences") is not None:
+            bundle_payload["behavior_sequences"] = normalized["behavior_sequences"]
+        expected_bundle_hash = payload_sha256(bundle_payload)
         if normalized["feature_bundle_hash"] != expected_bundle_hash:
             raise PitTrainingDatasetError(
                 "PIT training row feature_bundle_hash does not match final bundle"
@@ -395,6 +405,14 @@ class PitTrainingDatasetReader:
                 product_metadata=dict(product_metadata),
                 context=dict(context),
                 candidate=candidate,
+                behavior_sequences=(
+                    parse_din_behavior_sequences(
+                        normalized["behavior_sequences"],
+                        expected_as_of_ts=float(normalized["as_of_ts"]),
+                    )
+                    if normalized.get("behavior_sequences") is not None
+                    else None
+                ),
             )
             return RankingTrainingExample(
                 observation_id=observation_id,
