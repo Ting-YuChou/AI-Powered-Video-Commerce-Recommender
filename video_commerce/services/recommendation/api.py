@@ -28,9 +28,12 @@ from video_commerce.common.feature_history_contracts import (
 )
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.kafka_client import close_kafka, init_kafka
+from video_commerce.ml.content_artifacts import content_artifact_reference
 from video_commerce.ml.model_artifacts import ModelArtifactManager
+from video_commerce.ml.temporal_multimodal import pack_content_features
 from video_commerce.common.models import (
     CandidateProduct,
+    ContentFeatures,
     ProductRecommendation,
     RecommendationRequest,
     UserFeatures,
@@ -1138,7 +1141,9 @@ async def startup_event():
         )
         ranking_checkpoint = None
         if artifact_manager:
-            ranking_checkpoint = await artifact_manager.sync_latest_ranking_checkpoint()
+            ranking_checkpoint = await artifact_manager.sync_latest_ranking_checkpoint(
+                expected_feature_schema_version=ranking_model.feature_schema_version
+            )
         await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
         if ranking_checkpoint:
             ranking_model.model_version = ranking_checkpoint.model_version
@@ -1915,6 +1920,13 @@ async def get_recommendations(
             **dict(payload.context or {}),
             "_feature_as_of_ts": start_time,
         }
+        artifact_reference = (
+            content_artifact_reference(content_features)
+            if content_features is not None
+            else None
+        )
+        if artifact_reference is not None:
+            ranking_context["content_feature_ref"] = artifact_reference
         if _is_realtime_window_features_enabled(runtime):
             stage_started = time.perf_counter()
             ranking_context = await _attach_realtime_window_features(
@@ -1950,6 +1962,7 @@ async def get_recommendations(
             product_metadata_map=product_metadata_map,
             k=ranker_k,
             http_request=http_request,
+            content_features=content_features,
         )
         profile["ranking_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
         profile["ranking_profile"] = ranking_profile
@@ -2255,15 +2268,25 @@ async def _rank_candidates_for_request(
     product_metadata_map: Dict[str, Dict[str, Any]],
     k: int,
     http_request: Request,
+    content_features: Optional[ContentFeatures] = None,
 ) -> Tuple[List[ProductRecommendation], Dict[str, Any]]:
     runtime = app.state.runtime
     deadline_unix_seconds = _ranking_deadline_unix_seconds(runtime)
+    serving_context = dict(context)
+    if content_features is not None and getattr(
+        runtime.config.ranking_config, "trimodal_enabled", False
+    ):
+        packed_context = pack_content_features(content_features)
+        serving_context["temporal_multimodal"] = packed_context
+        runtime.observability.record_trimodal_payload_bytes(
+            len(json_dumps(packed_context))
+        )
     if ranking_coordinator_client_pool:
         try:
             return await _rank_candidates_coordinator(
                 candidates=candidates,
                 user_features=user_features,
-                context=context,
+                context=serving_context,
                 product_metadata_map=product_metadata_map,
                 k=k,
                 http_request=http_request,
@@ -2290,7 +2313,7 @@ async def _rank_candidates_for_request(
             return await _rank_candidates_remote(
                 candidates=candidates,
                 user_features=user_features,
-                context=context,
+                context=serving_context,
                 product_metadata_map=product_metadata_map,
                 k=k,
                 http_request=http_request,
@@ -2315,7 +2338,7 @@ async def _rank_candidates_for_request(
         return await ranking_batcher.rank_candidates(
             candidates=candidates,
             user_features=user_features,
-            context=context,
+            context=serving_context,
             product_metadata_map=product_metadata_map,
             k=k,
             include_profile=True,
@@ -2529,7 +2552,10 @@ def _ranking_request_body(
     request_id: Optional[str],
     deadline_unix_seconds: Optional[float] = None,
 ) -> bytes:
+    context = dict(context)
+    multimodal_context = context.pop("temporal_multimodal", None)
     payload = {
+        "payload_version": 4 if multimodal_context else 1,
         "request_id": request_id,
         "candidates": [
             _recommendation_item_payload(candidate) for candidate in candidates
@@ -2539,6 +2565,8 @@ def _ranking_request_body(
         "product_metadata_map": product_metadata_map,
         "k": k,
     }
+    if multimodal_context:
+        payload["multimodal_context"] = multimodal_context
     if deadline_unix_seconds is not None:
         payload["deadline_unix_seconds"] = float(deadline_unix_seconds)
     return json_dumps(payload)
@@ -2758,7 +2786,9 @@ async def _periodic_ranking_checkpoint_sync(runtime) -> None:
                     latest_ranking
                     and latest_ranking.model_version != last_ranking_version
                 ):
-                    await artifact_manager.sync_latest_ranking_checkpoint()
+                    await artifact_manager.sync_latest_ranking_checkpoint(
+                        expected_feature_schema_version=ranking_model.feature_schema_version
+                    )
                     if await ranking_model.reload_model_if_updated(model_path):
                         ranking_model.model_version = latest_ranking.model_version
                         last_ranking_version = latest_ranking.model_version

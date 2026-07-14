@@ -6,6 +6,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from video_commerce.common.feature_history_contracts import payload_sha256
+from video_commerce.common.models import ContentFeatures
+from video_commerce.ml.content_artifacts import canonical_content_feature_bytes
 from video_commerce.ml.pit_training_dataset import (
     PitTrainingDatasetError,
     PitTrainingDatasetUnavailable,
@@ -41,10 +43,13 @@ async def test_missing_latest_pointer_is_bootstrap_unavailable(tmp_path):
         await reader.read(str(tmp_path / "missing-latest.json"))
 
 
-def _write_dataset(tmp_path, *, status="complete", definition_version=None):
+def _write_dataset(
+    tmp_path, *, status="complete", definition_version=None, context=None
+):
     tmp_path.mkdir(parents=True, exist_ok=True)
     definition_version = definition_version or RANKING_LTR_FEATURE_DEFINITION_VERSION
     shard = tmp_path / "part-00000.parquet"
+    context = context or {}
     row = {
         "observation_id": "imp-1:p1",
         "impression_id": "imp-1",
@@ -61,7 +66,7 @@ def _write_dataset(tmp_path, *, status="complete", definition_version=None):
         "attributed_value_source": None,
         "user_features_json": '{"total_interactions":3}',
         "product_metadata_json": '{"price":9.0}',
-        "context_json": "{}",
+        "context_json": json.dumps(context),
         "candidate_features_json": (
             '{"collaborative_score":0.8,"content_similarity_score":0.7,'
             '"popularity_score":0.6,"combined_score":0.5}'
@@ -77,7 +82,7 @@ def _write_dataset(tmp_path, *, status="complete", definition_version=None):
                 "popularity_score": 0.6,
                 "combined_score": 0.5,
             },
-            "context": {},
+            "context": context,
             "feature_definition_version": definition_version,
             "product_id": "p1",
             "product_metadata": {"price": 9.0},
@@ -127,6 +132,40 @@ def _write_dataset(tmp_path, *, status="complete", definition_version=None):
         encoding="utf-8",
     )
     return latest, manifest, shard
+
+
+@pytest.mark.asyncio
+async def test_pit_reader_resolves_checksum_pinned_content_artifact(tmp_path):
+    features = ContentFeatures(content_id="video-1", visual_embedding=[1.0])
+    artifact_bytes = canonical_content_feature_bytes(features)
+    artifact = tmp_path / "content.json"
+    artifact.write_bytes(artifact_bytes)
+    reference = {
+        "content_id": "video-1",
+        "uri": str(artifact),
+        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "schema_version": "content_feature_artifact_v2",
+        "created_at": features.created_at,
+    }
+    latest, _, _ = _write_dataset(
+        tmp_path / "pit", context={"content_feature_ref": reference}
+    )
+
+    dataset = await PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    ).read(str(latest))
+    assert dataset.examples[0].multimodal_content.content_id == "video-1"
+
+    reference["sha256"] = "0" * 64
+    latest, _, _ = _write_dataset(
+        tmp_path / "bad", context={"content_feature_ref": reference}
+    )
+    with pytest.raises(PitTrainingDatasetError, match="checksum"):
+        await PitTrainingDatasetReader(
+            LocalObjectStorage(),
+            expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        ).read(str(latest))
 
 
 @pytest.mark.asyncio

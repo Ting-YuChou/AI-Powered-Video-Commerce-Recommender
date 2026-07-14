@@ -1923,7 +1923,10 @@ class SystemStore:
         return dict(row.features) if row is not None else None
 
     async def list_content_jobs_missing_feature_artifact(
-        self, *, limit: int = 100
+        self,
+        *,
+        limit: int = 100,
+        expected_schema_version: str = "temporal_multimodal_v2",
     ) -> List[Dict[str, Any]]:
         """Return completed durable uploads not yet backfilled to the new schema."""
         if not self.enabled:
@@ -1937,7 +1940,11 @@ class SystemStore:
             .where(
                 ContentJob.status == "completed",
                 ContentJob.storage_path.is_not(None),
-                ContentFeatureArtifact.content_id.is_(None),
+                or_(
+                    ContentFeatureArtifact.content_id.is_(None),
+                    ContentFeatureArtifact.schema_version
+                    != str(expected_schema_version),
+                ),
             )
             .order_by(ContentJob.created_at, ContentJob.content_id)
             .limit(max(1, int(limit)))

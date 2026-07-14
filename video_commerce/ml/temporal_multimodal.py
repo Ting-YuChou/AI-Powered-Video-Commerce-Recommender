@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -36,6 +37,107 @@ def decode_float16_matrix(payload: bytes, *, rows: int, columns: int) -> np.ndar
             f"float16 matrix byte length {len(payload)} does not match expected {expected}"
         )
     return np.frombuffer(payload, dtype="<f2").reshape(rows, columns).astype(np.float32)
+
+
+def _pack_temporal_records(
+    records: list[tuple[Any, float, float]],
+    *,
+    dimension: int,
+    capacity: int,
+) -> dict[str, Any] | None:
+    records = records[:capacity]
+    if not records:
+        return None
+    matrix = np.asarray([record[0] for record in records], dtype=np.float32)
+    if matrix.shape != (len(records), dimension):
+        raise ValueError(f"temporal embedding dimension must be {dimension}")
+    if not np.isfinite(matrix).all():
+        raise ValueError("temporal embeddings must be finite")
+    starts = [float(record[1]) for record in records]
+    ends = [float(record[2]) for record in records]
+    return {
+        "data": base64.b64encode(encode_float16_matrix(matrix)).decode("ascii"),
+        "rows": len(records),
+        "columns": dimension,
+        "starts": starts,
+        "ends": ends,
+        "mask": [True] * len(records),
+    }
+
+
+def pack_content_features(features: Any) -> dict[str, Any]:
+    """Build the bounded ranking-v4 wire representation without transcript text."""
+    context: dict[str, Any] = {"schema_version": "temporal_multimodal_v2"}
+    visual = _pack_temporal_records(
+        [
+            (embedding, timestamp, timestamp)
+            for embedding, timestamp in zip(
+                list(features.frame_embeddings),
+                list(features.frame_timestamps_seconds),
+            )
+        ],
+        dimension=512,
+        capacity=16,
+    )
+    ocr = _pack_temporal_records(
+        [
+            (
+                track.get("text_embedding") or [],
+                track.get("first_seen_seconds") or 0.0,
+                track.get("last_seen_seconds")
+                if track.get("last_seen_seconds") is not None
+                else track.get("first_seen_seconds") or 0.0,
+            )
+            for track in list(features.ocr_tracks)
+            if track.get("text_embedding")
+        ],
+        dimension=384,
+        capacity=32,
+    )
+    segments = (
+        list(features.audio_features.asr_segments)
+        if features.audio_features is not None
+        else []
+    )
+    asr = _pack_temporal_records(
+        [
+            (
+                segment.get("text_embedding") or [],
+                segment.get("start_seconds") or 0.0,
+                segment.get("end_seconds")
+                if segment.get("end_seconds") is not None
+                else segment.get("start_seconds") or 0.0,
+            )
+            for segment in segments
+            if segment.get("text_embedding")
+        ],
+        dimension=384,
+        capacity=64,
+    )
+    for name, sequence in (("visual", visual), ("ocr", ocr), ("asr", asr)):
+        if sequence is not None:
+            context[name] = sequence
+    return context
+
+
+def unpack_temporal_multimodal_context(
+    context: dict[str, Any]
+) -> dict[str, np.ndarray]:
+    """Decode a validated v4 context into modality arrays and temporal masks."""
+    output: dict[str, np.ndarray] = {}
+    for modality in ("visual", "ocr", "asr"):
+        sequence = context.get(modality)
+        if not isinstance(sequence, dict):
+            continue
+        rows, columns = int(sequence["rows"]), int(sequence["columns"])
+        packed = base64.b64decode(str(sequence["data"]), validate=True)
+        output[f"{modality}_embeddings"] = decode_float16_matrix(
+            packed, rows=rows, columns=columns
+        )
+        output[f"{modality}_starts"] = np.asarray(sequence["starts"], dtype=np.float32)
+        output[f"{modality}_ends"] = np.asarray(sequence["ends"], dtype=np.float32)
+        output[f"{modality}_mask"] = np.asarray(sequence["mask"], dtype=np.bool_)
+    return output
 
 
 @dataclass
@@ -139,6 +241,269 @@ class TemporalContentEncoder(nn.Module):
         pooled = F.normalize((1.0 - gate) * mean + gate * weighted, dim=-1)
         return TemporalEncoderOutput(
             tokens=tokens, pooled_embedding=pooled, attention_weights=weights
+        )
+
+
+class TemporalSequenceEncoder(nn.Module):
+    """Encode one frozen modality sequence with real temporal span features."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        model_dim: int = 128,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        feedforward_dim: int = 256,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.model_dim = int(model_dim)
+        self.input_projection = nn.Sequential(
+            nn.LayerNorm(self.input_dim),
+            nn.Linear(self.input_dim, self.model_dim),
+        )
+        self.time_projection = nn.Sequential(
+            nn.Linear(3, self.model_dim),
+            nn.ReLU(),
+            nn.Linear(self.model_dim, self.model_dim),
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.model_dim,
+            nhead=int(num_heads),
+            dim_feedforward=int(feedforward_dim),
+            dropout=float(dropout),
+            activation="relu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=int(num_layers))
+        self.pool_score = nn.Linear(self.model_dim, 1)
+        self.mean_residual_logit = nn.Parameter(torch.tensor(-2.0))
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        timestamps_seconds: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        end_timestamps_seconds: Optional[torch.Tensor] = None,
+    ) -> TemporalEncoderOutput:
+        if embeddings.ndim != 3 or embeddings.shape[-1] != self.input_dim:
+            raise ValueError("embeddings must have shape [batch, sequence, input_dim]")
+        mask = valid_mask.to(dtype=torch.bool, device=embeddings.device)
+        starts = timestamps_seconds.to(dtype=embeddings.dtype, device=embeddings.device)
+        ends = (
+            end_timestamps_seconds.to(dtype=embeddings.dtype, device=embeddings.device)
+            if end_timestamps_seconds is not None
+            else starts
+        )
+        if mask.shape != embeddings.shape[:2] or starts.shape != mask.shape:
+            raise ValueError("timestamp and mask shapes must match the sequence")
+        if ends.shape != mask.shape:
+            raise ValueError("end timestamp shape must match the sequence")
+
+        starts = starts.masked_fill(~mask, 0.0)
+        ends = torch.maximum(ends.masked_fill(~mask, 0.0), starts)
+        duration = ends.max(dim=1, keepdim=True).values.clamp_min(1.0)
+        deltas = torch.zeros_like(starts)
+        deltas[:, 1:] = (starts[:, 1:] - starts[:, :-1]).clamp_min(0.0)
+        temporal = torch.stack(
+            [
+                starts / duration,
+                torch.log1p(deltas) / torch.log1p(duration),
+                (ends - starts) / duration,
+            ],
+            dim=-1,
+        )
+        tokens = self.input_projection(embeddings) + self.time_projection(temporal)
+
+        # Transformer attention cannot consume a row whose key mask is entirely
+        # padding. Give such rows one temporary zero token, then erase them.
+        safe_mask = mask.clone()
+        missing_rows = ~safe_mask.any(dim=1)
+        if safe_mask.shape[1] == 0:
+            raise ValueError("temporal sequences require at least one padded slot")
+        safe_mask[missing_rows, 0] = True
+        tokens = tokens.masked_fill(~mask.unsqueeze(-1), 0.0)
+        tokens = self.encoder(tokens, src_key_padding_mask=~safe_mask).contiguous()
+        tokens = tokens.masked_fill(~mask.unsqueeze(-1), 0.0)
+
+        scores = self.pool_score(tokens).squeeze(-1).masked_fill(~safe_mask, -torch.inf)
+        weights = torch.softmax(scores, dim=-1).masked_fill(~mask, 0.0)
+        learned = torch.sum(tokens * weights.unsqueeze(-1), dim=1)
+        mask_values = mask.unsqueeze(-1).to(tokens.dtype)
+        mean = torch.sum(tokens * mask_values, dim=1) / mask_values.sum(
+            dim=1
+        ).clamp_min(1.0)
+        residual = torch.sigmoid(self.mean_residual_logit)
+        pooled = (1.0 - residual) * learned + residual * mean
+        pooled = pooled.masked_fill(missing_rows.unsqueeze(-1), 0.0)
+        return TemporalEncoderOutput(tokens, pooled, weights)
+
+
+@dataclass
+class TrimodalAttentionOutput:
+    fused: torch.Tensor
+    modality_gate: torch.Tensor
+    visual_attention: torch.Tensor
+    ocr_attention: torch.Tensor
+    asr_attention: torch.Tensor
+
+
+class TrimodalCandidateAttention(nn.Module):
+    """Candidate-conditioned cross-attention and presence-aware modality gating."""
+
+    def __init__(
+        self,
+        *,
+        model_dim: int = 128,
+        candidate_image_dim: int = 512,
+        candidate_text_dim: int = 384,
+        candidate_two_tower_dim: int = 128,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.model_dim = int(model_dim)
+        self.image_query = nn.Linear(int(candidate_image_dim), self.model_dim)
+        self.text_query = nn.Linear(int(candidate_text_dim), self.model_dim)
+        self.two_tower_query = nn.Linear(int(candidate_two_tower_dim), self.model_dim)
+        self.query_fusion = nn.Sequential(
+            nn.Linear(self.model_dim * 3, self.model_dim),
+            nn.LayerNorm(self.model_dim),
+            nn.ReLU(),
+        )
+        self.attentions = nn.ModuleList(
+            [
+                nn.MultiheadAttention(
+                    self.model_dim,
+                    int(num_heads),
+                    dropout=float(dropout),
+                    batch_first=True,
+                )
+                for _ in range(3)
+            ]
+        )
+        self.modality_fusions = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.model_dim * 2, self.model_dim),
+                    nn.LayerNorm(self.model_dim),
+                    nn.ReLU(),
+                )
+                for _ in range(3)
+            ]
+        )
+        self.gate_scores = nn.ModuleList(
+            [nn.Linear(self.model_dim, 1) for _ in range(3)]
+        )
+        self.residual_gate_logit = nn.Parameter(torch.tensor(-4.0))
+
+    @staticmethod
+    def _attend_present_rows(
+        attention: nn.MultiheadAttention,
+        query: torch.Tensor,
+        tokens: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, sequence, dim = tokens.shape
+        output = tokens.new_zeros((batch, dim))
+        weights = tokens.new_zeros((batch, sequence))
+        present = mask.any(dim=1)
+        if present.any():
+            attended, row_weights = attention(
+                query[present],
+                tokens[present],
+                tokens[present],
+                key_padding_mask=~mask[present],
+                need_weights=True,
+                average_attn_weights=True,
+            )
+            output[present] = attended.squeeze(1)
+            weights[present] = row_weights.squeeze(1).masked_fill(~mask[present], 0.0)
+        return output, weights
+
+    def forward(
+        self,
+        *,
+        visual_tokens: torch.Tensor,
+        visual_pooled: torch.Tensor,
+        visual_mask: torch.Tensor,
+        ocr_tokens: torch.Tensor,
+        ocr_pooled: torch.Tensor,
+        ocr_mask: torch.Tensor,
+        asr_tokens: torch.Tensor,
+        asr_pooled: torch.Tensor,
+        asr_mask: torch.Tensor,
+        candidate_image: torch.Tensor,
+        candidate_text: torch.Tensor,
+        candidate_two_tower: torch.Tensor,
+        candidate_presence: Optional[torch.Tensor] = None,
+    ) -> TrimodalAttentionOutput:
+        masks = [
+            visual_mask.to(dtype=torch.bool, device=visual_tokens.device),
+            ocr_mask.to(dtype=torch.bool, device=visual_tokens.device),
+            asr_mask.to(dtype=torch.bool, device=visual_tokens.device),
+        ]
+        candidates = [candidate_image, candidate_text, candidate_two_tower]
+        if candidate_presence is None:
+            candidate_presence = torch.ones(
+                candidate_image.shape[0],
+                3,
+                dtype=torch.bool,
+                device=visual_tokens.device,
+            )
+        else:
+            candidate_presence = candidate_presence.to(
+                dtype=torch.bool, device=visual_tokens.device
+            )
+        projected = [
+            projection(value) * candidate_presence[:, index : index + 1]
+            for index, (projection, value) in enumerate(
+                zip(
+                    (self.image_query, self.text_query, self.two_tower_query),
+                    candidates,
+                )
+            )
+        ]
+        query = self.query_fusion(torch.cat(projected, dim=-1)).unsqueeze(1)
+        token_groups = [visual_tokens, ocr_tokens, asr_tokens]
+        pooled_groups = [visual_pooled, ocr_pooled, asr_pooled]
+        attended_groups = []
+        attention_weights = []
+        fused_groups = []
+        for attention, fusion, tokens, pooled, mask in zip(
+            self.attentions, self.modality_fusions, token_groups, pooled_groups, masks
+        ):
+            attended, weights = self._attend_present_rows(
+                attention, query, tokens, mask
+            )
+            attended_groups.append(attended)
+            attention_weights.append(weights)
+            fused_groups.append(fusion(torch.cat([pooled, attended], dim=-1)))
+
+        presence = torch.stack([mask.any(dim=1) for mask in masks], dim=1)
+        gate_logits = torch.cat(
+            [score(value) for score, value in zip(self.gate_scores, fused_groups)],
+            dim=1,
+        ).masked_fill(~presence, -torch.inf)
+        all_missing = ~presence.any(dim=1)
+        gate_logits = gate_logits.masked_fill(all_missing.unsqueeze(1), 0.0)
+        modality_gate = torch.softmax(gate_logits, dim=1).masked_fill(~presence, 0.0)
+        fused = sum(
+            value * modality_gate[:, index : index + 1]
+            for index, value in enumerate(fused_groups)
+        )
+        fused = fused * torch.sigmoid(self.residual_gate_logit)
+        fused = fused.masked_fill(all_missing.unsqueeze(1), 0.0)
+        return TrimodalAttentionOutput(
+            fused=fused,
+            modality_gate=modality_gate,
+            visual_attention=attention_weights[0],
+            ocr_attention=attention_weights[1],
+            asr_attention=attention_weights[2],
         )
 
 

@@ -32,6 +32,7 @@ from pytesseract import Output
 # Local imports
 from video_commerce.common.models import AudioFeatures, ContentFeatures
 from video_commerce.common.config import ModelConfig
+from video_commerce.ml.text_embeddings import MultilingualTextEmbedder
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class ContentProcessor:
         self.clip_model = None
         self.clip_processor = None
         self.ocr_region_extractor = None
+        self.text_embedder = None
         self.device = torch.device(self._get_device())
         self.is_initialized = False
         self.lazy_load = os.getenv("MODEL_LAZY_LOAD", "false").lower() == "true"
@@ -213,6 +215,14 @@ class ContentProcessor:
                 self.config.clip_model, cache_dir=self.config.cache_dir
             )
 
+            self.text_embedder = MultilingualTextEmbedder(
+                model_id=self.config.multilingual_text_model,
+                revision=self.config.multilingual_text_revision,
+                device=self.device,
+                cache_dir=self.config.cache_dir,
+            )
+            self.text_embedder.load()
+
             # Set to evaluation mode
             self.clip_model.eval()
 
@@ -304,6 +314,8 @@ class ContentProcessor:
                 frame_embeddings=visual_features.get("individual_embeddings", []),
                 frame_timestamps_seconds=frame_timestamps,
                 ocr_tracks=text_features.get("ocr_tracks", []),
+                text_embedding_model=self.config.multilingual_text_model,
+                text_embedding_revision=self.config.multilingual_text_revision,
                 duration_seconds=video_info.get("duration", 0),
                 detected_objects=detected_objects,
                 extracted_text=text_features.get("text_blocks", []),
@@ -381,13 +393,17 @@ class ContentProcessor:
             )
 
         try:
-            keyframes = await self._extract_scene_adaptive_keyframes_ffmpeg(
+            (
+                keyframes,
+                frame_timestamps,
+            ) = await self._extract_scene_adaptive_keyframes_with_timestamps_ffmpeg(
                 video_path,
                 frame_count,
                 fps,
                 duration,
             )
             if keyframes:
+                video_info["frame_timestamps_seconds"] = frame_timestamps
                 return keyframes, video_info
             logger.warning(
                 "Scene-adaptive FFmpeg extraction returned no usable frames; "
@@ -419,6 +435,11 @@ class ContentProcessor:
         keyframes = await self._extract_ffmpeg_frames_by_index(
             video_path, frame_indices
         )
+        fps = float(video_info.get("fps") or 0.0)
+        video_info["frame_timestamps_seconds"] = [
+            float(index) / fps if fps > 0 else 0.0 for index in frame_indices
+        ]
+        video_info["sampled_frame_indices"] = list(frame_indices)
         return keyframes, video_info
 
     async def _extract_scene_adaptive_keyframes_ffmpeg(
@@ -429,8 +450,24 @@ class ContentProcessor:
         duration: float,
     ) -> List[np.ndarray]:
         """Extract bounded scene-aware keyframes and filter low-value frames."""
+        frames, _ = await self._extract_scene_adaptive_keyframes_with_timestamps_ffmpeg(
+            video_path,
+            frame_count,
+            fps,
+            duration,
+        )
+        return frames
+
+    async def _extract_scene_adaptive_keyframes_with_timestamps_ffmpeg(
+        self,
+        video_path: str,
+        frame_count: int,
+        fps: float,
+        duration: float,
+    ) -> Tuple[List[np.ndarray], List[float]]:
+        """Extract scene-aware frames together with source timestamps."""
         if frame_count <= 0 or fps <= 0 or self.max_keyframes <= 0:
-            return []
+            return [], []
 
         effective_duration = self._effective_keyframe_duration(
             frame_count=frame_count,
@@ -450,13 +487,21 @@ class ContentProcessor:
             max_indices=candidate_limit,
         )
         if not frame_indices:
-            return []
+            return [], []
 
         keyframes = await self._extract_ffmpeg_frames_by_index(
             video_path, frame_indices
         )
-        filtered = self._filter_keyframes_for_quality(keyframes)
-        return self._thin_ordered_items(filtered, self.max_keyframes)
+        retained_positions = self._quality_keyframe_positions(keyframes)
+        sampled = [
+            (keyframes[position], frame_indices[position])
+            for position in retained_positions
+        ]
+        sampled = self._thin_ordered_items(sampled, self.max_keyframes)
+        return (
+            [frame for frame, _ in sampled],
+            [float(index) / fps for _, index in sampled],
+        )
 
     async def _detect_scene_change_times_ffmpeg(
         self,
@@ -621,10 +666,19 @@ class ContentProcessor:
         self,
         keyframes: List[np.ndarray],
     ) -> List[np.ndarray]:
-        filtered: List[np.ndarray] = []
+        return [
+            keyframes[position]
+            for position in self._quality_keyframe_positions(keyframes)
+        ]
+
+    def _quality_keyframe_positions(
+        self,
+        keyframes: List[np.ndarray],
+    ) -> List[int]:
+        retained: List[int] = []
         previous_luma: Optional[np.ndarray] = None
 
-        for frame in keyframes:
+        for position, frame in enumerate(keyframes):
             luma = self._frame_luma(frame)
             if luma.size == 0:
                 continue
@@ -648,10 +702,10 @@ class ContentProcessor:
                 if diff < float(self.config.keyframe_dedupe_luma_diff_threshold):
                     continue
 
-            filtered.append(frame)
+            retained.append(position)
             previous_luma = luma_signature
 
-        return filtered
+        return retained
 
     def _frame_luma(self, frame: np.ndarray) -> np.ndarray:
         if frame.ndim != 3 or frame.shape[2] < 3:
@@ -741,12 +795,15 @@ class ContentProcessor:
             has_audio=has_audio,
             audio_length=float(video_info.get("duration") or 0),
             transcription_status="not_attempted",
+            alignment_status="not_attempted",
         )
         if not has_audio:
             audio_features.transcription_status = "skipped_no_audio"
+            audio_features.alignment_status = "skipped_no_audio"
             return audio_features
         if not self.config.speech_to_text_enabled:
             audio_features.transcription_status = "disabled"
+            audio_features.alignment_status = "disabled"
             return audio_features
 
         audio_features.asr_model = self.config.speech_to_text_model
@@ -754,7 +811,14 @@ class ContentProcessor:
         temp_audio_path: Optional[str] = None
         try:
             temp_audio_path = await self._extract_audio_wav(video_path, video_info)
-            transcript = await self._request_transcription(temp_audio_path)
+            response = await self._request_transcription(temp_audio_path)
+            if isinstance(response, str):
+                response = {
+                    "text": response,
+                    "alignment_status": "degraded" if response.strip() else "no_speech",
+                    "segments": [],
+                }
+            transcript = str(response.get("text") or "")
             transcript = transcript.strip()[
                 : self.config.speech_to_text_max_transcript_chars
             ]
@@ -763,9 +827,57 @@ class ContentProcessor:
             audio_features.transcription_status = (
                 "completed" if transcript else "no_speech"
             )
+            audio_features.alignment_status = str(
+                response.get("alignment_status")
+                or ("degraded" if transcript else "no_speech")
+            )
+            try:
+                raw_segments = list(response.get("segments") or [])[
+                    : int(self.config.max_asr_temporal_tokens)
+                ]
+                normalized_segments = []
+                previous_start = 0.0
+                duration = max(0.0, float(video_info.get("duration") or 0.0))
+                for segment in raw_segments:
+                    start = float(segment.get("start_seconds") or 0.0)
+                    end = float(segment.get("end_seconds") or start)
+                    if not np.isfinite(start) or not np.isfinite(end):
+                        raise ValueError("ASR alignment timestamp is not finite")
+                    if start < previous_start or end < start:
+                        raise ValueError("ASR alignment timestamps are not ordered")
+                    if duration > 0:
+                        start = min(max(0.0, start), duration)
+                        end = min(max(start, end), duration)
+                    normalized_segments.append(
+                        {
+                            "text": str(segment.get("text") or ""),
+                            "start_seconds": start,
+                            "end_seconds": end,
+                        }
+                    )
+                    previous_start = start
+                segment_embeddings = self._encode_multilingual_texts(
+                    [segment["text"] for segment in normalized_segments],
+                    prefix="passage",
+                )
+                audio_features.asr_segments = [
+                    {
+                        **segment,
+                        "text_embedding": segment_embeddings[index],
+                    }
+                    for index, segment in enumerate(normalized_segments)
+                ]
+            except Exception as alignment_exc:
+                audio_features.alignment_status = "degraded"
+                audio_features.asr_segments = []
+                logger.warning(
+                    "ASR alignment unavailable; retaining transcript: %s",
+                    type(alignment_exc).__name__,
+                )
         except Exception as exc:
             audio_features.speech_detected = False
             audio_features.transcription_status = "degraded"
+            audio_features.alignment_status = "degraded"
             logger.warning(
                 "Speech transcription unavailable; preserving other features: %s",
                 type(exc).__name__,
@@ -821,7 +933,7 @@ class ContentProcessor:
             raise
         return audio_path
 
-    async def _request_transcription(self, audio_path: str) -> str:
+    async def _request_transcription(self, audio_path: str) -> Dict[str, Any]:
         """Call the internal OpenAI-compatible ASR endpoint with finite retries."""
         endpoint = (
             self.config.speech_to_text_base_url.rstrip("/") + "/v1/audio/transcriptions"
@@ -842,7 +954,13 @@ class ContentProcessor:
                         )
                 response.raise_for_status()
                 payload = response.json()
-                return str(payload.get("text") or "")
+                return {
+                    "text": str(payload.get("text") or ""),
+                    "alignment_status": str(
+                        payload.get("alignment_status") or "degraded"
+                    ),
+                    "segments": list(payload.get("segments") or []),
+                }
             except httpx.TimeoutException as exc:
                 last_error = exc
                 # A timed-out request may still be running inference on the GPU.
@@ -980,6 +1098,7 @@ class ContentProcessor:
                 "fps": fps,
                 "frame_count": frame_count,
                 "has_audio": True,  # Assume audio exists (basic check)
+                "frame_timestamps_seconds": [],
             }
 
             # Calculate frame indices for uniform sampling
@@ -994,6 +1113,9 @@ class ContentProcessor:
                     # Convert BGR to RGB
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     keyframes.append(frame_rgb)
+                    video_info["frame_timestamps_seconds"].append(
+                        float(frame_idx) / fps if fps > 0 else 0.0
+                    )
                 else:
                     logger.warning(f"Could not read frame {frame_idx}")
 
@@ -1067,10 +1189,17 @@ class ContentProcessor:
         count = len(keyframes)
         if count == 0:
             return []
-        duration = max(0.0, float(video_info.get("duration", 0.0) or 0.0))
-        if count == 1 or duration == 0.0:
-            return [0.0] * count
-        return np.linspace(0.0, duration, count, endpoint=False).astype(float).tolist()
+        extracted = video_info.get("frame_timestamps_seconds") or []
+        if len(extracted) == count:
+            return [float(value) for value in extracted]
+        frame_indices = video_info.get("sampled_frame_indices") or []
+        fps = float(video_info.get("fps", 0.0) or 0.0)
+        if len(frame_indices) == count and fps > 0:
+            return [float(index) / fps for index in frame_indices]
+        logger.warning(
+            "Frame timestamp metadata unavailable; marking sampled timestamps unknown"
+        )
+        return [0.0] * count
 
     async def _extract_text_features(
         self,
@@ -1208,22 +1337,17 @@ class ContentProcessor:
             return {"text_blocks": [], "price_mentions": [], "total_text_regions": 0}
 
     def _encode_ocr_texts(self, texts: List[str]) -> List[List[float]]:
-        """Embed deduplicated OCR strings in the same CLIP space as products."""
-        if not texts or self.clip_model is None or self.clip_processor is None:
+        """Embed OCR strings in the frozen multilingual passage space."""
+        return self._encode_multilingual_texts(texts, prefix="passage")
+
+    def _encode_multilingual_texts(
+        self, texts: List[str], *, prefix: str
+    ) -> List[List[float]]:
+        if not texts:
+            return []
+        if self.text_embedder is None:
             return [[] for _ in texts]
-        embeddings: List[List[float]] = []
-        for offset in range(0, len(texts), self.batch_size):
-            inputs = self.clip_processor(
-                text=texts[offset : offset + self.batch_size],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-            ).to(self.device)
-            with torch.no_grad():
-                values = self.clip_model.get_text_features(**inputs)
-                values = values / values.norm(dim=1, keepdim=True).clamp_min(1e-12)
-            embeddings.extend(values.cpu().numpy().tolist())
-        return embeddings
+        return self.text_embedder.encode(texts, prefix=prefix)
 
     def _is_price_mention(self, text: str) -> bool:
         """Check if text contains price information."""

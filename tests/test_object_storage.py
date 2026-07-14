@@ -70,7 +70,9 @@ def test_local_object_storage_syncs_file_to_fixed_cache_path(tmp_path):
     assert target_file.read_bytes() == b"checkpoint"
 
 
-def test_local_object_storage_rejects_checksum_mismatch_without_replacing_target(tmp_path):
+def test_local_object_storage_rejects_checksum_mismatch_without_replacing_target(
+    tmp_path,
+):
     source_file = tmp_path / "source.pt"
     target_file = tmp_path / "cache" / "ranking.pt"
     source_file.write_bytes(b"new checkpoint")
@@ -91,6 +93,53 @@ def test_local_object_storage_rejects_checksum_mismatch_without_replacing_target
         )
 
     assert target_file.read_bytes() == b"old checkpoint"
+
+
+def test_local_object_storage_persists_content_addressed_bytes_idempotently(tmp_path):
+    storage = ObjectStorage(
+        ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "objects"))
+    )
+
+    uri = asyncio.run(
+        storage.persist_immutable_bytes(
+            b'{"schema":"v2"}',
+            object_name="content-features/content-1/abc.json",
+            content_type="application/json",
+        )
+    )
+    second_uri = asyncio.run(
+        storage.persist_immutable_bytes(
+            b'{"schema":"v2"}',
+            object_name="content-features/content-1/abc.json",
+            content_type="application/json",
+        )
+    )
+
+    assert uri == second_uri
+    assert uri == str(tmp_path / "objects/content-features/content-1/abc.json")
+    assert (
+        tmp_path / "objects/content-features/content-1/abc.json"
+    ).read_bytes() == b'{"schema":"v2"}'
+
+
+def test_local_object_storage_rejects_conflicting_immutable_bytes(tmp_path):
+    storage = ObjectStorage(
+        ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "objects"))
+    )
+    asyncio.run(
+        storage.persist_immutable_bytes(
+            b"first",
+            object_name="content-features/content-1/hash.json",
+        )
+    )
+
+    with pytest.raises(FileExistsError, match="different bytes"):
+        asyncio.run(
+            storage.persist_immutable_bytes(
+                b"second",
+                object_name="content-features/content-1/hash.json",
+            )
+        )
 
 
 def test_remote_object_storage_cleans_temp_file_on_download_failure(tmp_path):

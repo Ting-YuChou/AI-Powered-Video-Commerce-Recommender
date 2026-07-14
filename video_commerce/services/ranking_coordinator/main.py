@@ -110,8 +110,8 @@ class RankingCoordinator:
                 self.config.ranking_config,
                 observability=self.runtime.observability,
             )
-            ranking_checkpoint = (
-                await self.artifact_manager.sync_latest_ranking_checkpoint()
+            ranking_checkpoint = await self.artifact_manager.sync_latest_ranking_checkpoint(
+                expected_feature_schema_version=self.ranking_model.feature_schema_version
             )
             await self.ranking_model.load_model(
                 self.config.model_config.ranking_model_path
@@ -421,7 +421,9 @@ class RankingCoordinator:
                         latest_ranking
                         and latest_ranking.model_version != last_ranking_version
                     ):
-                        await self.artifact_manager.sync_latest_ranking_checkpoint()
+                        await self.artifact_manager.sync_latest_ranking_checkpoint(
+                            expected_feature_schema_version=self.ranking_model.feature_schema_version
+                        )
                         if await self.ranking_model.reload_model_if_updated(model_path):
                             self.ranking_model.model_version = (
                                 latest_ranking.model_version

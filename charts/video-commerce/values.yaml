@@ -180,6 +180,11 @@ appConfig:
     timeoutSeconds: 120
     maxAttempts: 2
     maxTranscriptChars: 4000
+  multilingualText:
+    model: intfloat/multilingual-e5-small
+    revision: 614241f622f53c4eeff9890bdc4f31cfecc418b3
+    maxOcrTemporalTokens: 32
+    maxAsrTemporalTokens: 64
   monitoring:
     logLevel: INFO
     enableMetrics: true
@@ -221,6 +226,9 @@ appConfig:
     impressionLoggingEnabled: true
     impressionMaxItems: 100
   ranking:
+    trimodalEnabled: false
+    trimodalShadow: true
+    trimodalModalityDropout: 0.1
     batchMaxRequests: 64
     batchTargetRequests: 32
     batchWaitMs: 48
@@ -764,6 +772,7 @@ asr:
   name: asr-service
   replicaCount: 1
   model: Qwen/Qwen3-ASR-0.6B
+  alignerModel: Qwen/Qwen3-ForcedAligner-0.6B
   maxAudioBytes: "16777216"
   maxInferenceBatchSize: "1"
   maxNewTokens: "2048"

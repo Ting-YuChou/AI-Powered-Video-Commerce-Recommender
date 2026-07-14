@@ -114,6 +114,11 @@ extracts bounded 16 kHz mono audio and calls the internal ASR service through
 the OpenAI-compatible transcription endpoint. ASR failures are degraded
 content features: CLIP/OCR processing can still complete.
 
+The ASR image also loads `Qwen/Qwen3-ForcedAligner-0.6B`. Successful responses
+include bounded timestamped segments. If forced alignment fails after a valid
+transcription, the transcript is retained and `alignment_status=degraded`; the
+ranker's ASR presence mask remains false for that content item.
+
 `Dockerfile.asr` runs a private multipart adapter around the `qwen-asr`
 Python inference API. Do not replace it with the `qwen-asr-serve` command
 without also updating the content-worker client contract; the upstream server
@@ -149,6 +154,7 @@ appConfig:
 asr:
   enabled: true
   model: Qwen/Qwen3-ASR-0.6B
+  alignerModel: Qwen/Qwen3-ForcedAligner-0.6B
   maxConcurrentTranscriptions: "1"
   queueWaitSeconds: "5"
   modelCache:
@@ -157,8 +163,9 @@ asr:
     accelerator: nvidia-gpu
 ```
 
-After transcript quality and `video_commerce_asr_transcriptions_total` /
-`video_commerce_asr_transcription_duration_seconds` are reviewed, enable
+After transcript/alignment quality and `video_commerce_asr_transcriptions_total`,
+`video_commerce_asr_alignment_total`, alignment latency, and segment-count
+metrics are reviewed, enable
 speech-derived category candidates:
 
 ```yaml

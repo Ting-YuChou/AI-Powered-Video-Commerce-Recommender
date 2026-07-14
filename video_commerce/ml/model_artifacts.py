@@ -53,6 +53,10 @@ class ModelArtifactManager:
         return self.model_config.ranking_model_path
 
     @property
+    def ranking_candidate_sidecar_local_path(self) -> str:
+        return str(Path(self.ranking_local_path).with_suffix(".candidates.npz"))
+
+    @property
     def two_tower_local_checkpoint_path(self) -> str:
         return self.recommendation_config.cf_index_path.replace(".faiss", ".pt")
 
@@ -112,7 +116,6 @@ class ModelArtifactManager:
     ) -> Optional[ModelArtifactRecord]:
         if not self.system_store:
             return None
-
         checkpoint = await self.system_store.get_latest_model_checkpoint(model_name)
         if not checkpoint:
             return None
@@ -125,9 +128,61 @@ class ModelArtifactManager:
             created_at=checkpoint.get("created_at"),
         )
 
-    async def sync_latest_ranking_checkpoint(self) -> Optional[ModelArtifactRecord]:
+    async def sync_latest_ranking_checkpoint(
+        self,
+        *,
+        expected_feature_schema_version: Optional[str] = None,
+    ) -> Optional[ModelArtifactRecord]:
         record = await self.get_latest_model_checkpoint(self.RANKING_MODEL_NAME)
         if not record:
+            return None
+
+        record_schema = str(record.payload.get("feature_schema_version") or "")
+        schema_incompatible = bool(
+            expected_feature_schema_version
+            and (
+                (
+                    expected_feature_schema_version == "ranking_v4_00_temporal_trimodal"
+                    and record_schema != expected_feature_schema_version
+                )
+                or (
+                    bool(record_schema)
+                    and record_schema != expected_feature_schema_version
+                )
+            )
+        )
+        if schema_incompatible:
+            fallback_path = str(record.payload.get("fallback_checkpoint_path") or "")
+            fallback_sha256 = str(
+                record.payload.get("fallback_checkpoint_sha256") or ""
+            )
+            if (
+                expected_feature_schema_version == "ranking_v3_00_temporal_multimodal"
+                and record_schema == "ranking_v4_00_temporal_trimodal"
+                and fallback_path
+                and len(fallback_sha256) == 64
+            ):
+                await self._sync_paths_to_local_atomically(
+                    [(fallback_path, self.ranking_local_path, fallback_sha256)]
+                )
+                self._remove_local_artifacts(
+                    [self.ranking_candidate_sidecar_local_path]
+                )
+                return ModelArtifactRecord(
+                    model_name=self.RANKING_MODEL_NAME,
+                    model_version=str(
+                        record.payload.get("fallback_model_version") or "fallback-v3"
+                    ),
+                    checkpoint_path=fallback_path,
+                    payload={"artifact_sha256": fallback_sha256},
+                )
+            logger.warning(
+                "ranking_checkpoint_schema_incompatible",
+                extra={
+                    "checkpoint_schema": record_schema,
+                    "expected_schema": expected_feature_schema_version,
+                },
+            )
             return None
 
         checkpoint_sha256 = self._extract_artifact_sha256(
@@ -135,11 +190,24 @@ class ModelArtifactManager:
             "checkpoint",
             legacy_key="artifact_sha256",
         )
-        await self._sync_path_to_local(
-            record.checkpoint_path,
-            self.ranking_local_path,
-            expected_sha256=checkpoint_sha256,
-        )
+        specs = [(record.checkpoint_path, self.ranking_local_path, checkpoint_sha256)]
+        sidecar_path = record.payload.get("candidate_sidecar_path")
+        if sidecar_path:
+            specs.append(
+                (
+                    str(sidecar_path),
+                    self.ranking_candidate_sidecar_local_path,
+                    self._extract_artifact_sha256(
+                        record.payload,
+                        "candidate_sidecar",
+                        legacy_key="candidate_sidecar_sha256",
+                    ),
+                )
+            )
+        elif record_schema == "ranking_v4_00_temporal_trimodal":
+            logger.warning("ranking_v4_candidate_sidecar_missing")
+            return None
+        await self._sync_paths_to_local_atomically(specs)
         return record
 
     async def sync_latest_two_tower_artifacts(self) -> Optional[ModelArtifactRecord]:
@@ -298,10 +366,18 @@ class ModelArtifactManager:
         local_path: str,
         model_version: str,
         payload: Optional[Dict[str, Any]] = None,
+        candidate_sidecar_path: Optional[str] = None,
     ) -> Optional[ModelArtifactRecord]:
         if not self.system_store:
             return None
+        if (payload or {}).get(
+            "feature_schema_version"
+        ) == "ranking_v4_00_temporal_trimodal" and not candidate_sidecar_path:
+            raise ValueError("ranking_v4 persistence requires a candidate sidecar")
 
+        previous_record = await self.get_latest_model_checkpoint(
+            self.RANKING_MODEL_NAME
+        )
         artifact_sha256 = ObjectStorage.calculate_sha256(local_path)
         materialization_run_id = str(
             (payload or {}).get("feature_lake_materialization_run_id") or ""
@@ -317,7 +393,38 @@ class ModelArtifactManager:
             model_name=self.RANKING_MODEL_NAME,
             model_version=storage_version,
         )
+        persisted_candidate_sidecar = None
+        candidate_sidecar_sha256 = None
+        if candidate_sidecar_path:
+            candidate_sidecar_sha256 = ObjectStorage.calculate_sha256(
+                candidate_sidecar_path
+            )
+            persisted_candidate_sidecar = await self._persist_artifact(
+                local_path=candidate_sidecar_path,
+                model_name=f"{self.RANKING_MODEL_NAME}_candidates",
+                model_version=storage_version,
+            )
         record_payload = dict(payload or {})
+        if (
+            record_payload.get("feature_schema_version")
+            == "ranking_v4_00_temporal_trimodal"
+            and previous_record is not None
+            and previous_record.payload.get("feature_schema_version")
+            != "ranking_v4_00_temporal_trimodal"
+        ):
+            previous_sha256 = self._extract_artifact_sha256(
+                previous_record.payload,
+                "checkpoint",
+                legacy_key="artifact_sha256",
+            )
+            if previous_sha256:
+                record_payload.update(
+                    {
+                        "fallback_checkpoint_path": previous_record.checkpoint_path,
+                        "fallback_checkpoint_sha256": previous_sha256,
+                        "fallback_model_version": previous_record.model_version,
+                    }
+                )
         record_payload.update(
             {
                 "local_cache_path": self.ranking_local_path,
@@ -327,8 +434,27 @@ class ModelArtifactManager:
                         "path": persisted_path,
                         "sha256": artifact_sha256,
                         "local_cache_path": self.ranking_local_path,
-                    }
+                    },
+                    **(
+                        {
+                            "candidate_sidecar": {
+                                "path": persisted_candidate_sidecar,
+                                "sha256": candidate_sidecar_sha256,
+                                "local_cache_path": self.ranking_candidate_sidecar_local_path,
+                            }
+                        }
+                        if persisted_candidate_sidecar
+                        else {}
+                    ),
                 },
+                **(
+                    {
+                        "candidate_sidecar_path": persisted_candidate_sidecar,
+                        "candidate_sidecar_sha256": candidate_sidecar_sha256,
+                    }
+                    if persisted_candidate_sidecar
+                    else {}
+                ),
             }
         )
         inserted = await self.system_store.record_model_checkpoint(
@@ -391,6 +517,7 @@ class ModelArtifactManager:
         local_path: str,
         model_version: str,
         payload: Optional[Dict[str, Any]] = None,
+        candidate_sidecar_path: Optional[str] = None,
     ) -> Optional[ModelArtifactRecord]:
         """Persist a PIT shadow artifact under a namespace serving never syncs."""
         if not self.system_store:
@@ -401,6 +528,17 @@ class ModelArtifactManager:
             model_name=self.RANKING_SHADOW_MODEL_NAME,
             model_version=model_version,
         )
+        persisted_candidate_sidecar = None
+        candidate_sidecar_sha256 = None
+        if candidate_sidecar_path:
+            candidate_sidecar_sha256 = ObjectStorage.calculate_sha256(
+                candidate_sidecar_path
+            )
+            persisted_candidate_sidecar = await self._persist_artifact(
+                local_path=candidate_sidecar_path,
+                model_name=f"{self.RANKING_SHADOW_MODEL_NAME}_candidates",
+                model_version=model_version,
+            )
         record_payload = dict(payload or {})
         record_payload.update(
             {
@@ -412,8 +550,28 @@ class ModelArtifactManager:
                         "path": persisted_path,
                         "sha256": artifact_sha256,
                         "local_cache_path": local_path,
-                    }
+                    },
+                    **(
+                        {
+                            "candidate_sidecar": {
+                                "path": persisted_candidate_sidecar,
+                                "sha256": candidate_sidecar_sha256,
+                                "local_cache_path": candidate_sidecar_path,
+                            }
+                        }
+                        if persisted_candidate_sidecar
+                        else {}
+                    ),
                 },
+                "feature_schema_version": "ranking_v4_00_temporal_trimodal",
+                **(
+                    {
+                        "candidate_sidecar_path": persisted_candidate_sidecar,
+                        "candidate_sidecar_sha256": candidate_sidecar_sha256,
+                    }
+                    if persisted_candidate_sidecar
+                    else {}
+                ),
             }
         )
         await self.system_store.record_model_checkpoint(

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import math
 import time
 from typing import Any, Dict, List, Optional
 
@@ -20,7 +23,7 @@ from video_commerce.common.models import (
 
 
 class RankRequest(BaseModel):
-    payload_version: int = Field(1, ge=1, le=3)
+    payload_version: int = Field(1, ge=1, le=4)
     request_id: Optional[str] = Field(None, description="Request id for tracing")
     deadline_unix_seconds: Optional[float] = Field(
         None,
@@ -49,7 +52,7 @@ def coerce_rank_payload(raw_payload: Any) -> RankRequest:
         payload_version = int(raw_payload.get("payload_version") or 1)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid payload_version") from exc
-    if payload_version not in {1, 2, 3}:
+    if payload_version not in {1, 2, 3, 4}:
         raise HTTPException(status_code=400, detail="Invalid payload_version")
 
     try:
@@ -79,6 +82,8 @@ def coerce_rank_payload(raw_payload: Any) -> RankRequest:
         raise HTTPException(
             status_code=400, detail="multimodal_context must be an object"
         )
+    if payload_version == 4:
+        _validate_v4_multimodal_context(multimodal_context)
 
     return RankRequest.construct(
         payload_version=payload_version,
@@ -91,6 +96,77 @@ def coerce_rank_payload(raw_payload: Any) -> RankRequest:
         multimodal_context=multimodal_context,
         k=k,
     )
+
+
+def _validate_v4_multimodal_context(context: Dict[str, Any]) -> None:
+    if len(json.dumps(context, separators=(",", ":")).encode("utf-8")) > 256 * 1024:
+        raise HTTPException(
+            status_code=400, detail="multimodal_context exceeds byte limit"
+        )
+    if not context:
+        return
+    if context.get("schema_version") != "temporal_multimodal_v2":
+        raise HTTPException(status_code=400, detail="Invalid multimodal schema_version")
+    caps = {"visual": 16, "ocr": 32, "asr": 64}
+    for modality, cap in caps.items():
+        sequence = context.get(modality)
+        if sequence is None:
+            continue
+        if not isinstance(sequence, dict):
+            raise HTTPException(status_code=400, detail=f"{modality} must be an object")
+        try:
+            rows = int(sequence.get("rows"))
+            columns = int(sequence.get("columns"))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid {modality} shape"
+            ) from exc
+        if rows < 0 or rows > cap:
+            raise HTTPException(status_code=400, detail=f"{modality} rows exceed {cap}")
+        if columns <= 0 or columns > 1024:
+            raise HTTPException(status_code=400, detail=f"Invalid {modality} columns")
+        starts = sequence.get("starts")
+        ends = sequence.get("ends")
+        mask = sequence.get("mask")
+        if not all(
+            isinstance(values, list) and len(values) == rows
+            for values in (starts, ends, mask)
+        ):
+            raise HTTPException(
+                status_code=400, detail=f"Invalid {modality} temporal shape"
+            )
+        previous = 0.0
+        for index, (start, end, present) in enumerate(zip(starts, ends, mask)):
+            try:
+                start_value, end_value = float(start), float(end)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid {modality} timestamp"
+                ) from exc
+            if not math.isfinite(start_value) or not math.isfinite(end_value):
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid {modality} timestamp"
+                )
+            if bool(present) and (
+                start_value < 0
+                or end_value < start_value
+                or (index and start_value < previous)
+            ):
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid {modality} timestamp"
+                )
+            if bool(present):
+                previous = start_value
+        try:
+            packed = base64.b64decode(str(sequence.get("data") or ""), validate=True)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid {modality} packed tensor"
+            ) from exc
+        if len(packed) != rows * columns * 2:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid {modality} packed tensor size"
+            )
 
 
 def coerce_candidate(raw_candidate: Any) -> CandidateProduct:

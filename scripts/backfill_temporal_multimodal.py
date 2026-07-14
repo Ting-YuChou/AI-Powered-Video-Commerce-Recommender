@@ -15,7 +15,10 @@ async def run(*, limit: int, enqueue: bool) -> int:
     await store.initialize()
     kafka = KafkaManager(config.kafka_config) if enqueue else None
     try:
-        jobs = await store.list_content_jobs_missing_feature_artifact(limit=limit)
+        jobs = await store.list_content_jobs_missing_feature_artifact(
+            limit=limit,
+            expected_schema_version="temporal_multimodal_v2",
+        )
         if not enqueue:
             print(json.dumps({"count": len(jobs), "jobs": jobs}, indent=2))
             return 0

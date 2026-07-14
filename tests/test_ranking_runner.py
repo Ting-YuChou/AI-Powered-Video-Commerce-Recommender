@@ -113,8 +113,8 @@ async def test_runner_health_exposes_batch_payload_capabilities():
     status, payload = _decode_runner_response(await runner._handle_health())
 
     assert status == 200
-    assert payload["batch_payload_versions"] == [1, 2, 3]
-    assert payload["capabilities"]["batch_payload_versions"] == [1, 2, 3]
+    assert payload["batch_payload_versions"] == [1, 2, 3, 4]
+    assert payload["capabilities"]["batch_payload_versions"] == [1, 2, 3, 4]
 
 
 @pytest.mark.asyncio

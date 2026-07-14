@@ -369,6 +369,13 @@ class AudioFeatures(BaseModel):
     transcription_status: str = Field(
         "not_attempted", description="ASR processing outcome"
     )
+    alignment_status: str = Field(
+        "not_attempted", description="Forced-alignment processing outcome"
+    )
+    asr_segments: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Timestamped ASR text segments and frozen text embeddings",
+    )
     asr_model: Optional[str] = Field(None, description="ASR model identifier")
     speech_detected: Optional[bool] = Field(
         None, description="Whether non-empty speech was transcribed"
@@ -403,7 +410,25 @@ class ContentFeatures(BaseModel):
         default_factory=list, description="Temporally deduplicated OCR regions"
     )
     multimodal_schema_version: str = Field(
-        "temporal_multimodal_v1", description="Content feature contract version"
+        "temporal_multimodal_v2", description="Content feature contract version"
+    )
+    text_embedding_model: Optional[str] = Field(
+        None, description="Frozen multilingual text embedding model identifier"
+    )
+    text_embedding_revision: Optional[str] = Field(
+        None, description="Pinned multilingual text embedding model revision"
+    )
+    artifact_uri: Optional[str] = Field(
+        None, description="Immutable content feature artifact URI"
+    )
+    artifact_sha256: Optional[str] = Field(
+        None, description="Immutable content feature artifact SHA-256"
+    )
+    artifact_schema_version: Optional[str] = Field(
+        None, description="Immutable artifact encoding schema"
+    )
+    artifact_created_at: Optional[float] = Field(
+        None, description="Immutable artifact creation time"
     )
     audio_features: Optional[AudioFeatures] = Field(
         None, description="Audio analysis features"

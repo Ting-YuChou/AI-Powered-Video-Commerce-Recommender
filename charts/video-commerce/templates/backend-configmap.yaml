@@ -77,6 +77,10 @@ data:
   MODEL_SPEECH_TO_TEXT_TIMEOUT_SECONDS: {{ .Values.appConfig.speechToText.timeoutSeconds | quote }}
   MODEL_SPEECH_TO_TEXT_MAX_ATTEMPTS: {{ .Values.appConfig.speechToText.maxAttempts | quote }}
   MODEL_SPEECH_TO_TEXT_MAX_TRANSCRIPT_CHARS: {{ .Values.appConfig.speechToText.maxTranscriptChars | quote }}
+  MODEL_MULTILINGUAL_TEXT_MODEL: {{ .Values.appConfig.multilingualText.model | quote }}
+  MODEL_MULTILINGUAL_TEXT_REVISION: {{ .Values.appConfig.multilingualText.revision | quote }}
+  MODEL_MAX_OCR_TEMPORAL_TOKENS: {{ .Values.appConfig.multilingualText.maxOcrTemporalTokens | quote }}
+  MODEL_MAX_ASR_TEMPORAL_TOKENS: {{ .Values.appConfig.multilingualText.maxAsrTemporalTokens | quote }}
   OBJECT_STORAGE_BACKEND: {{ .Values.external.objectStorage.backend | quote }}
   OBJECT_STORAGE_ENDPOINT_URL: {{ .Values.external.objectStorage.endpointUrl | quote }}
   OBJECT_STORAGE_REGION: {{ .Values.external.objectStorage.region | quote }}
@@ -91,6 +95,9 @@ data:
   OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION: {{ .Values.external.objectStorage.serverSideEncryption | quote }}
   OBJECT_STORAGE_DOWNLOAD_DIR: {{ .Values.appConfig.objectStorageDownloadDir | quote }}
   RANKING_BATCH_MAX_REQUESTS: {{ .Values.appConfig.ranking.batchMaxRequests | quote }}
+  RANKING_TRIMODAL_ENABLED: {{ .Values.appConfig.ranking.trimodalEnabled | quote }}
+  RANKING_TRIMODAL_SHADOW: {{ .Values.appConfig.ranking.trimodalShadow | quote }}
+  RANKING_TRIMODAL_MODALITY_DROPOUT: {{ .Values.appConfig.ranking.trimodalModalityDropout | quote }}
   RANKING_BATCH_TARGET_REQUESTS: {{ .Values.appConfig.ranking.batchTargetRequests | quote }}
   RANKING_BATCH_WAIT_MS: {{ .Values.appConfig.ranking.batchWaitMs | quote }}
   RANKING_BATCH_QUEUE_SIZE: {{ .Values.appConfig.ranking.batchQueueSize | quote }}

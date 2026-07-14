@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
+from video_commerce.common.models import ContentFeatures
 from video_commerce.ml.ranking_features import FeatureBundle
 
 
@@ -65,6 +66,8 @@ class RankingTrainingExample:
     bundle: FeatureBundle
     attribution: AttributionFacts
     is_slate_sample: bool = True
+    multimodal_content: Optional[ContentFeatures] = None
+    candidate_embeddings: Optional[Mapping[str, Sequence[float]]] = None
 
     def __post_init__(self) -> None:
         if not str(self.observation_id or "").strip():
@@ -202,3 +205,155 @@ class TrainingTensorBuilder:
         ):
             raise ValueError("training tensors contain NaN or infinity")
         return feature_tensor, labels
+
+    def build_trimodal(
+        self,
+        examples: Sequence[RankingTrainingExample],
+        *,
+        apply_modality_dropout: bool = False,
+        modality_dropout_probability: float = 0.1,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        features, labels = self.build(examples)
+        batch_size = len(examples)
+
+        def allocate(capacity: int, dimension: int):
+            return (
+                torch.zeros(batch_size, capacity, dimension, device=self.device),
+                torch.zeros(batch_size, capacity, device=self.device),
+                torch.zeros(batch_size, capacity, device=self.device),
+                torch.zeros(batch_size, capacity, dtype=torch.bool, device=self.device),
+            )
+
+        visual, visual_starts, visual_ends, visual_mask = allocate(16, 512)
+        ocr, ocr_starts, ocr_ends, ocr_mask = allocate(32, 384)
+        asr, asr_starts, asr_ends, asr_mask = allocate(64, 384)
+
+        def copy_row(
+            target: torch.Tensor,
+            starts_target: torch.Tensor,
+            ends_target: torch.Tensor,
+            mask_target: torch.Tensor,
+            row: int,
+            records: Sequence[tuple[Sequence[float], float, float]],
+            expected_dim: int,
+        ) -> None:
+            for index, (embedding, start, end) in enumerate(records[: target.shape[1]]):
+                if len(embedding) != expected_dim:
+                    raise ValueError(
+                        f"temporal embedding dimension must be {expected_dim}"
+                    )
+                start_value, end_value = float(start), float(end)
+                if not math.isfinite(start_value) or not math.isfinite(end_value):
+                    raise ValueError("temporal timestamps must be finite")
+                if start_value < 0 or end_value < start_value:
+                    raise ValueError("temporal timestamp span is invalid")
+                target[row, index] = torch.as_tensor(
+                    embedding, dtype=torch.float32, device=self.device
+                )
+                starts_target[row, index] = start_value
+                ends_target[row, index] = end_value
+                mask_target[row, index] = True
+
+        candidate_image = torch.zeros(batch_size, 512, device=self.device)
+        candidate_text = torch.zeros(batch_size, 384, device=self.device)
+        candidate_two_tower = torch.zeros(batch_size, 128, device=self.device)
+        candidate_presence = torch.zeros(
+            batch_size, 3, dtype=torch.bool, device=self.device
+        )
+        for row, example in enumerate(examples):
+            content = example.multimodal_content
+            if content is not None:
+                frame_records = [
+                    (embedding, timestamp, timestamp)
+                    for embedding, timestamp in zip(
+                        content.frame_embeddings[:16],
+                        content.frame_timestamps_seconds[:16],
+                    )
+                ]
+                copy_row(
+                    visual,
+                    visual_starts,
+                    visual_ends,
+                    visual_mask,
+                    row,
+                    frame_records,
+                    512,
+                )
+                ocr_records = [
+                    (
+                        track.get("text_embedding") or [],
+                        track.get("first_seen_seconds") or 0.0,
+                        track.get("last_seen_seconds")
+                        if track.get("last_seen_seconds") is not None
+                        else track.get("first_seen_seconds") or 0.0,
+                    )
+                    for track in content.ocr_tracks[:32]
+                ]
+                copy_row(ocr, ocr_starts, ocr_ends, ocr_mask, row, ocr_records, 384)
+                asr_records = [
+                    (
+                        segment.get("text_embedding") or [],
+                        segment.get("start_seconds") or 0.0,
+                        segment.get("end_seconds")
+                        if segment.get("end_seconds") is not None
+                        else segment.get("start_seconds") or 0.0,
+                    )
+                    for segment in (
+                        content.audio_features.asr_segments[:64]
+                        if content.audio_features is not None
+                        else []
+                    )
+                ]
+                copy_row(asr, asr_starts, asr_ends, asr_mask, row, asr_records, 384)
+            candidate = dict(example.candidate_embeddings or {})
+            for index, (name, target, dimension) in enumerate(
+                (
+                    ("image", candidate_image, 512),
+                    ("text", candidate_text, 384),
+                    ("two_tower", candidate_two_tower, 128),
+                )
+            ):
+                value = candidate.get(name)
+                if value is None:
+                    continue
+                if len(value) != dimension:
+                    raise ValueError(
+                        f"candidate {name} embedding dimension must be {dimension}"
+                    )
+                target[row] = torch.as_tensor(
+                    value, dtype=torch.float32, device=self.device
+                )
+                candidate_presence[row, index] = True
+
+        if apply_modality_dropout and modality_dropout_probability > 0:
+            for embeddings, starts, ends, mask in (
+                (ocr, ocr_starts, ocr_ends, ocr_mask),
+                (asr, asr_starts, asr_ends, asr_mask),
+            ):
+                dropped = torch.rand(batch_size, device=self.device) < float(
+                    modality_dropout_probability
+                )
+                embeddings[dropped] = 0
+                starts[dropped] = 0
+                ends[dropped] = 0
+                mask[dropped] = False
+
+        multimodal = {
+            "visual_embeddings": visual,
+            "visual_starts": visual_starts,
+            "visual_ends": visual_ends,
+            "visual_mask": visual_mask,
+            "ocr_embeddings": ocr,
+            "ocr_starts": ocr_starts,
+            "ocr_ends": ocr_ends,
+            "ocr_mask": ocr_mask,
+            "asr_embeddings": asr,
+            "asr_starts": asr_starts,
+            "asr_ends": asr_ends,
+            "asr_mask": asr_mask,
+            "candidate_image": candidate_image,
+            "candidate_text": candidate_text,
+            "candidate_two_tower": candidate_two_tower,
+            "candidate_presence": candidate_presence,
+        }
+        return features, labels, multimodal

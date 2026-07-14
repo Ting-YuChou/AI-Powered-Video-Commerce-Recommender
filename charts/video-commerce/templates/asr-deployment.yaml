@@ -52,6 +52,8 @@ spec:
               value: /models/huggingface/hub
             - name: ASR_MODEL
               value: {{ .Values.asr.model | quote }}
+            - name: ASR_ALIGNER_MODEL
+              value: {{ .Values.asr.alignerModel | quote }}
             - name: ASR_DEVICE
               value: "cuda:0"
             - name: ASR_MAX_AUDIO_BYTES

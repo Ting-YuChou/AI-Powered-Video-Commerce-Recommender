@@ -123,7 +123,9 @@ async def startup_event():
     )
     ranking_checkpoint = None
     if artifact_manager:
-        ranking_checkpoint = await artifact_manager.sync_latest_ranking_checkpoint()
+        ranking_checkpoint = await artifact_manager.sync_latest_ranking_checkpoint(
+            expected_feature_schema_version=ranking_model.feature_schema_version
+        )
     await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
     if ranking_checkpoint:
         ranking_model.model_version = ranking_checkpoint.model_version
@@ -441,7 +443,9 @@ async def _periodic_ranking_checkpoint_sync(runtime) -> None:
                     latest_ranking
                     and latest_ranking.model_version != last_ranking_version
                 ):
-                    await artifact_manager.sync_latest_ranking_checkpoint()
+                    await artifact_manager.sync_latest_ranking_checkpoint(
+                        expected_feature_schema_version=ranking_model.feature_schema_version
+                    )
                     if await ranking_model.reload_model_if_updated(model_path):
                         ranking_model.model_version = latest_ranking.model_version
                         last_ranking_version = latest_ranking.model_version
