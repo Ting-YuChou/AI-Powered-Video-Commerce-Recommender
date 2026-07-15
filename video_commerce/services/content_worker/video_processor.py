@@ -30,6 +30,7 @@ from video_commerce.data_plane.kafka_client import (
 )
 from video_commerce.common.config import Config, KafkaConfig
 from video_commerce.ml.content_processor import ContentProcessor
+from video_commerce.ml.content_artifacts import persist_content_features
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.data_plane.system_store import SystemStore
@@ -213,14 +214,13 @@ class VideoProcessorWorker:
                 processing_path, content_id
             )
 
-            # Store features in Redis
-            await self.feature_store.store_content_features(content_id, features)
-            if self.system_store:
-                await self.system_store.upsert_content_feature_artifact(
-                    content_id,
-                    features.dict(),
-                    schema_version=features.multimodal_schema_version,
-                )
+            # Publish immutable training bytes before advancing current pointers.
+            features = await persist_content_features(
+                features,
+                object_storage=self.object_storage,
+                system_store=self.system_store,
+                feature_store=self.feature_store,
+            )
 
             audio_features = features.audio_features
             transcription_status = (
@@ -236,6 +236,12 @@ class VideoProcessorWorker:
                     else 0.0
                 ),
             )
+            if audio_features is not None:
+                self.observability.record_asr_alignment(
+                    audio_features.alignment_status,
+                    float(audio_features.transcription_time_seconds or 0.0),
+                    len(audio_features.asr_segments),
+                )
 
             # Update vector search index
             if features.visual_embedding:

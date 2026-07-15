@@ -6,13 +6,16 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from dataclasses import replace
 import logging
 import os
+from pathlib import Path
 import signal
 import socket
 import threading
+import torch
 
-from video_commerce.common.config import Config
+from video_commerce.common.config import Config, RankingConfig
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
@@ -26,6 +29,7 @@ from video_commerce.ml.pit_training_dataset import (
 from video_commerce.ml.recommender import RecommendationEngine
 from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.ml.vector_search import VectorSearchEngine
+from video_commerce.ml.text_embeddings import MultilingualTextEmbedder
 from video_commerce.ml.cf_cold_start import load_item_embedding_sidecar
 from video_commerce.ml.din import save_din_embedding_sidecar
 from video_commerce.common.observability import (
@@ -48,6 +52,80 @@ class ModelTrainerService:
         self.config = config
         self.feature_store: FeatureStore | None = None
         self.vector_search: VectorSearchEngine | None = None
+
+    async def _attach_trimodal_candidate_embeddings(
+        self,
+        ranking_model: RankingModel,
+        examples,
+    ):
+        if not getattr(
+            getattr(ranking_model, "config", None), "trimodal_enabled", False
+        ):
+            return examples
+        by_product = {}
+        for example in examples:
+            by_product.setdefault(
+                str(example.bundle.candidate.product_id),
+                dict(example.bundle.product_metadata),
+            )
+        product_ids = sorted(by_product)
+        texts = [
+            " ".join(
+                str(by_product[product_id].get(field) or "").strip()
+                for field in ("title", "brand", "category", "description", "tags")
+            ).strip()
+            or product_id
+            for product_id in product_ids
+        ]
+        embedder = MultilingualTextEmbedder(
+            model_id=self.config.model_config.multilingual_text_model,
+            revision=self.config.model_config.multilingual_text_revision,
+            device=ranking_model.device,
+            cache_dir=self.config.model_config.cache_dir,
+        )
+        text_embeddings = await asyncio.to_thread(
+            embedder.encode, texts, prefix="query"
+        )
+        image_embeddings = (
+            self.vector_search.get_all_product_embeddings()
+            if self.vector_search is not None
+            else {}
+        )
+        two_tower_embeddings, _, _, _ = load_item_embedding_sidecar(
+            str(
+                Path(self.config.recommendation_config.cf_index_path).with_suffix(
+                    ".cf_embeddings.npz"
+                )
+            )
+        )
+        records = {}
+        for product_id, text_embedding in zip(product_ids, text_embeddings):
+            record = {"text": text_embedding}
+            image = image_embeddings.get(product_id)
+            if image is not None and len(image) == 512:
+                record["image"] = image
+            two_tower = two_tower_embeddings.get(product_id)
+            if two_tower is not None and len(two_tower) == 128:
+                record["two_tower"] = two_tower
+            records[product_id] = record
+        sidecar_path = str(
+            Path(
+                ranking_model.loaded_model_path
+                or self.config.model_config.ranking_model_path
+            ).with_suffix(".candidates.npz")
+        )
+        ranking_model.configure_candidate_sidecar_for_training(
+            records, path=sidecar_path
+        )
+        return [
+            replace(
+                example,
+                candidate_embeddings=records.get(
+                    str(example.bundle.candidate.product_id)
+                ),
+            )
+            for example in examples
+        ]
         self.recommendation_engine: RecommendationEngine | None = None
         self.ranking_model: RankingModel | None = None
         self.system_store: SystemStore | None = None
@@ -110,7 +188,14 @@ class ModelTrainerService:
 
         self.object_storage = ObjectStorage(self.config.object_storage_config)
         await self.object_storage.initialize()
-        if use_pit_dataset or getattr(feature_lake_config, "pit_shadow_enabled", False):
+        trimodal_shadow = bool(
+            getattr(self.config.ranking_config, "trimodal_shadow", True)
+        )
+        if (
+            use_pit_dataset
+            or getattr(feature_lake_config, "pit_shadow_enabled", False)
+            or trimodal_shadow
+        ):
             self.pit_dataset_reader = PitTrainingDatasetReader(
                 self.object_storage,
                 expected_feature_definition_version=(
@@ -152,10 +237,11 @@ class ModelTrainerService:
             )
             self.config.ranking_config.din_embedding_sidecar_path = target_sidecar
 
-        if not use_pit_dataset:
+        if not use_pit_dataset or trimodal_shadow:
             self.vector_search = VectorSearchEngine(self.config.vector_config)
             await self.vector_search.load_index()
 
+        if not use_pit_dataset:
             self.recommendation_engine = RecommendationEngine(
                 self.feature_store,
                 self.vector_search,
@@ -180,8 +266,8 @@ class ModelTrainerService:
             )
         ranking_checkpoint = None
         if self.artifact_manager:
-            ranking_checkpoint = (
-                await self.artifact_manager.sync_latest_ranking_checkpoint()
+            ranking_checkpoint = await self.artifact_manager.sync_latest_ranking_checkpoint(
+                expected_feature_schema_version=self.ranking_model.feature_schema_version
             )
         loaded_existing_checkpoint = False
         try:
@@ -193,6 +279,7 @@ class ModelTrainerService:
             if (
                 not (
                     self.config.ranking_config.history_embeddings_enabled
+                    or self.config.ranking_config.trimodal_enabled
                     or self.config.ranking_config.din_enabled
                 )
                 or not self.config.ranking_config.enable_periodic_training
@@ -202,9 +289,27 @@ class ModelTrainerService:
                 "ranking_checkpoint_incompatible_for_history_embeddings_fresh_train",
                 extra={"model_path": self.config.model_config.ranking_model_path},
             )
+            previous_state = None
+            model_path = self.config.model_config.ranking_model_path
+            if (
+                self.config.ranking_config.trimodal_enabled
+                and Path(model_path).exists()
+            ):
+                old_checkpoint = torch.load(
+                    model_path, map_location=self.ranking_model.device
+                )
+                previous_state, _, _ = self.ranking_model._checkpoint_state_and_config(
+                    old_checkpoint
+                )
             self.ranking_model._initialize_model(
                 architecture=self.config.ranking_config.architecture
             )
+            if previous_state:
+                loaded = self.ranking_model._load_shape_compatible_state_dict(
+                    previous_state
+                )
+                if loaded == 0:
+                    raise RuntimeError("unable to warm-start trimodal ranker")
             if self.ranking_model.model:
                 self.ranking_model.model.eval()
             self.ranking_model.is_trained = False
@@ -487,6 +592,9 @@ class ModelTrainerService:
                     interactions,
                     training_sample_source=training_sample_source,
                 )
+            training_examples = await self._attach_trimodal_candidate_embeddings(
+                self.ranking_model, training_examples
+            )
             training_kwargs = {"training_sample_source": training_sample_source}
             if pit_training_cancel_event is not None:
                 training_kwargs["cancellation_event"] = pit_training_cancel_event
@@ -594,6 +702,17 @@ class ModelTrainerService:
                             else None
                         ),
                     },
+                    **(
+                        {
+                            "candidate_sidecar_path": self.ranking_model._candidate_sidecar_path
+                        }
+                        if getattr(
+                            getattr(self.ranking_model, "config", None),
+                            "trimodal_enabled",
+                            False,
+                        )
+                        else {}
+                    ),
                 )
                 if record:
                     self.ranking_model.model_version = record.model_version
@@ -608,7 +727,13 @@ class ModelTrainerService:
                         )
                 elif use_pit_dataset:
                     raise RuntimeError("PIT ranking artifact was not persisted")
-            if not use_pit_dataset and getattr(
+            if (
+                getattr(self.config.ranking_config, "trimodal_shadow", False)
+                and not getattr(self.config.ranking_config, "trimodal_enabled", False)
+                and getattr(self, "pit_dataset_reader", None) is not None
+            ):
+                await self._train_pit_shadow_model(trigger=trigger)
+            elif not use_pit_dataset and getattr(
                 feature_lake_config, "pit_shadow_enabled", False
             ):
                 await self._train_pit_shadow_model(trigger=trigger)
@@ -713,17 +838,39 @@ class ModelTrainerService:
                 f"{trigger}_pit_shadow", "skipped_insufficient_samples", 0.0
             )
             return
+        if hasattr(self.config.ranking_config, "copy"):
+            shadow_config = self.config.ranking_config.copy(
+                update={"trimodal_enabled": True}
+            )
+        else:
+            shadow_values = dict(vars(self.config.ranking_config))
+            shadow_values["trimodal_enabled"] = True
+            shadow_config = RankingConfig(**shadow_values)
         shadow_model = RankingModel(
-            self.config.ranking_config,
+            shadow_config,
             observability=self.observability,
         )
+        shadow_model._initialize_model(
+            architecture=getattr(shadow_config, "architecture", "dcn")
+        )
+        if self.ranking_model is not None and self.ranking_model.model is not None:
+            loaded = shadow_model._load_shape_compatible_state_dict(
+                self.ranking_model.model.state_dict()
+            )
+            if loaded == 0:
+                raise RuntimeError(
+                    "unable to warm-start trimodal shadow from base ranker"
+                )
         shadow_path = f"{self.config.model_config.ranking_model_path}.pit-shadow"
         shadow_model.loaded_model_path = shadow_path
         shadow_started = asyncio.get_running_loop().time()
         status = "success"
         try:
+            shadow_examples = await self._attach_trimodal_candidate_embeddings(
+                shadow_model, dataset.examples
+            )
             await shadow_model.train_model(
-                dataset.examples,
+                shadow_examples,
                 training_sample_source="feature_lake_pit_shadow",
             )
             record = await self.artifact_manager.persist_ranking_shadow_checkpoint(
@@ -742,12 +889,14 @@ class ModelTrainerService:
                     "feature_definition_version": dataset.feature_definition_version,
                     "label_definition_version": dataset.label_definition_version,
                     "feature_assembler_version": shadow_model.feature_assembler.version,
+                    "feature_schema_version": shadow_model.feature_schema_version,
                     "training_input_rows": len(dataset.examples),
                     "training_value_mask_coverage": self._value_mask_coverage(
                         dataset.examples
                     ),
                     "activation_allowed": False,
                 },
+                candidate_sidecar_path=shadow_model._candidate_sidecar_path,
             )
             if record is None:
                 raise RuntimeError("PIT shadow artifact was not persisted")

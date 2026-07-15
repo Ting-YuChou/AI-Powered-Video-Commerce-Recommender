@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 
 from video_commerce.common.feature_history_contracts import payload_sha256
 from video_commerce.common.models import CandidateProduct, UserFeatures
+from video_commerce.ml.content_artifacts import load_content_feature_artifact
 from video_commerce.ml.ranking_features import FeatureBundle
 from video_commerce.ml.din import parse_din_behavior_sequences
 from video_commerce.ml.ranking_training import (
@@ -148,6 +149,31 @@ class PitTrainingDatasetReader:
             )
             for row in table.to_pylist()
         ]
+        content_cache: dict[str, Any] = {}
+        resolved_examples = []
+        for example in examples:
+            reference = example.bundle.context.get("content_feature_ref")
+            if reference is None:
+                resolved_examples.append(example)
+                continue
+            if not isinstance(reference, dict):
+                raise PitTrainingDatasetError(
+                    "content artifact reference must be an object"
+                )
+            digest = str(reference.get("sha256") or "")
+            try:
+                content = content_cache.get(digest)
+                if content is None:
+                    content = await load_content_feature_artifact(
+                        self.object_storage, reference
+                    )
+                    content_cache[digest] = content
+            except (OSError, ValueError) as exc:
+                raise PitTrainingDatasetError(
+                    f"unable to resolve PIT content artifact: {exc}"
+                ) from exc
+            resolved_examples.append(replace(example, multimodal_content=content))
+        examples = resolved_examples
         return PitTrainingDataset(
             dataset_version=dataset_version,
             materialization_run_id=run_id,

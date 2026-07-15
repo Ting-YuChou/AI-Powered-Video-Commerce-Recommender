@@ -317,6 +317,25 @@ class ObservabilityManager:
             buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300),
             registry=self.registry,
         )
+        self.asr_alignment_total = Counter(
+            "video_commerce_asr_alignment_total",
+            "Forced alignment attempts by outcome",
+            ["status"],
+            registry=self.registry,
+        )
+        self.asr_alignment_duration_seconds = Histogram(
+            "video_commerce_asr_alignment_duration_seconds",
+            "ASR plus forced-alignment latency in seconds",
+            ["status"],
+            buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300),
+            registry=self.registry,
+        )
+        self.asr_segment_count = Histogram(
+            "video_commerce_asr_segment_count",
+            "Timestamped ASR segments emitted per content item",
+            buckets=(0, 1, 2, 4, 8, 16, 32, 64),
+            registry=self.registry,
+        )
         self.worker_training_runs_total = Counter(
             "video_commerce_worker_training_runs_total",
             "Model trainer runs by trigger and status",
@@ -540,6 +559,36 @@ class ObservabilityManager:
                 16777216,
                 33554432,
             ),
+            registry=self.registry,
+        )
+        self.ranking_trimodal_presence_total = Counter(
+            "video_commerce_ranking_trimodal_presence_total",
+            "Trimodal ranking inputs by modality and presence",
+            ["modality", "present"],
+            registry=self.registry,
+        )
+        self.ranking_trimodal_gate = Histogram(
+            "video_commerce_ranking_trimodal_gate",
+            "Candidate modality gate values",
+            ["modality"],
+            buckets=(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
+            registry=self.registry,
+        )
+        self.ranking_candidate_sidecar_miss_total = Counter(
+            "video_commerce_ranking_candidate_sidecar_miss_total",
+            "Candidate IDs absent from the checkpoint-locked embedding sidecar",
+            registry=self.registry,
+        )
+        self.ranking_trimodal_packed_payload_bytes = Histogram(
+            "video_commerce_ranking_trimodal_packed_payload_bytes",
+            "Bytes in one packed temporal multimodal ranking context",
+            buckets=(1024, 4096, 16384, 32768, 65536, 131072, 262144),
+            registry=self.registry,
+        )
+        self.ranking_trimodal_inference_seconds = Histogram(
+            "video_commerce_ranking_trimodal_inference_seconds",
+            "Trimodal ranking model forward latency",
+            buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1),
             registry=self.registry,
         )
         self.ranking_coordinator_client_errors_total = Counter(
@@ -809,6 +858,36 @@ class ObservabilityManager:
     def record_asr_transcription(self, status: str, duration: float = 0.0) -> None:
         self.asr_transcriptions_total.labels(status=status).inc()
         self.asr_transcription_duration_seconds.labels(status=status).observe(duration)
+
+    def record_asr_alignment(
+        self, status: str, duration: float, segment_count: int
+    ) -> None:
+        self.asr_alignment_total.labels(status=status).inc()
+        self.asr_alignment_duration_seconds.labels(status=status).observe(
+            max(0.0, float(duration))
+        )
+        self.asr_segment_count.observe(max(0, int(segment_count)))
+
+    def record_trimodal_payload_bytes(self, byte_count: int) -> None:
+        self.ranking_trimodal_packed_payload_bytes.observe(max(0, int(byte_count)))
+
+    def record_trimodal_presence(self, modality: str, present: bool) -> None:
+        self.ranking_trimodal_presence_total.labels(
+            modality=str(modality), present=str(bool(present)).lower()
+        ).inc()
+
+    def record_trimodal_gate(self, modality: str, value: float) -> None:
+        self.ranking_trimodal_gate.labels(modality=str(modality)).observe(
+            max(0.0, min(1.0, float(value)))
+        )
+
+    def record_candidate_sidecar_miss(self) -> None:
+        self.ranking_candidate_sidecar_miss_total.inc()
+
+    def record_trimodal_inference(self, duration_seconds: float) -> None:
+        self.ranking_trimodal_inference_seconds.observe(
+            max(0.0, float(duration_seconds))
+        )
 
     def update_worker_heartbeat(self, service: str, instance_id: str) -> None:
         self.worker_heartbeat_timestamp_seconds.labels(

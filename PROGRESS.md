@@ -214,3 +214,37 @@
   1000-request internal fallback load was blocked by local execution quota
   after the direct runtime assertion succeeded. Host-wide Black remains noisy
   on pre-existing formatting; changed-line compile and diff checks passed.
+
+## 2026-07-14 — Three-modal temporal video ranker V4
+
+- Added timestamped Qwen3 forced alignment with degraded transcript-preserving
+  fallback; frozen pinned multilingual E5 embeddings for OCR, ASR, and catalog
+  text; real frame timestamps; and bounded 16/32/64 visual/OCR/ASR sequences.
+- Published canonical immutable `temporal_multimodal_v2` content artifacts and
+  propagated URI/SHA/schema references into PIT examples. The PIT reader now
+  verifies referenced bytes and fails closed on checksum or schema mismatch.
+- Added three temporal encoders, candidate-conditioned cross-attention,
+  presence-aware modality gating, 10% OCR/ASR dropout, V3 warm-start, first
+  epoch base freeze, differential learning rates, and the
+  `ranking_v4_00_temporal_trimodal` checkpoint schema.
+- Added bounded payload V4 support across recommendation, ranking service,
+  coordinator, runner, and local fallback; checksum-locked candidate NPZ
+  sidecars with atomic activation; V1-V3 compatibility; shadow-by-default
+  rollout and V3 checkpoint rollback lineage.
+- Key files: `asr_service/api.py`, `video_commerce/ml/content_processor.py`,
+  `video_commerce/ml/content_artifacts.py`,
+  `video_commerce/ml/temporal_multimodal.py`, `video_commerce/ml/ranking.py`,
+  `video_commerce/ml/ranking_training.py`, and
+  `video_commerce/ml/candidate_embedding_sidecar.py`.
+- Verification: 107 focused host tests and the full Docker backend regression
+  passed after merging current `origin/main` (508 passed, 4 skipped). The merge
+  preserves main's DIN sequence model/sidecar path and allows DIN inputs to run
+  jointly with V4 temporal features. Python compile, Black, diff checks, and
+  `docker compose config -q` passed. The ASR and content-worker production
+  images built successfully, and the ASR image imported `qwen-asr` with the
+  pinned forced-aligner model. Helm/kubeconform could not run because local
+  binaries are unavailable and the sandbox rejected mounting the private repo
+  into the Helm container. GPU 300-second ASR profiling, v3/v4 candidate
+  benchmarks, and offline NDCG/AUC/GMV promotion evaluation require production
+  hardware/data and remain rollout gates. No performance improvement is
+  claimed.

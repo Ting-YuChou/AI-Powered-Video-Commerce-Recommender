@@ -1,15 +1,23 @@
 import numpy as np
+import base64
 import pytest
 import torch
 from fastapi import HTTPException
 
 from video_commerce.common.config import RankingConfig
-from video_commerce.ml.ranking import TemporalMultimodalRankingModel
+from video_commerce.ml.ranking import (
+    TemporalMultimodalRankingModel,
+    TemporalTrimodalRankingModel,
+)
 from video_commerce.ml.temporal_multimodal import (
     CandidateMultimodalAttention,
+    TemporalSequenceEncoder,
+    TrimodalCandidateAttention,
     TemporalContentEncoder,
     decode_float16_matrix,
     encode_float16_matrix,
+    pack_content_features,
+    unpack_temporal_multimodal_context,
 )
 from video_commerce.ml.video_ocr import (
     OCRRegion,
@@ -56,6 +64,65 @@ def test_temporal_encoder_masks_padding_and_returns_normalized_pooling():
     assert torch.linalg.vector_norm(
         output.pooled_embedding, dim=-1
     ).item() == pytest.approx(1.0)
+
+
+def test_temporal_sequence_encoder_supports_spans_and_fully_missing_rows():
+    torch.manual_seed(17)
+    encoder = TemporalSequenceEncoder(
+        input_dim=4, model_dim=16, num_layers=1, num_heads=2, dropout=0.0
+    ).eval()
+    output = encoder(
+        torch.randn(2, 3, 4),
+        torch.tensor([[0.0, 2.0, 4.0], [0.0, 0.0, 0.0]]),
+        torch.tensor([[True, True, False], [False, False, False]]),
+        end_timestamps_seconds=torch.tensor([[1.0, 3.5, 4.0], [0.0, 0.0, 0.0]]),
+    )
+
+    assert output.tokens.shape == (2, 3, 16)
+    assert output.pooled_embedding.shape == (2, 16)
+    assert torch.count_nonzero(output.tokens[1]) == 0
+    assert torch.count_nonzero(output.pooled_embedding[1]) == 0
+    assert torch.isfinite(output.tokens).all()
+
+
+def test_trimodal_attention_masks_absent_modalities_and_backpropagates():
+    torch.manual_seed(19)
+    module = TrimodalCandidateAttention(
+        model_dim=16,
+        candidate_image_dim=4,
+        candidate_text_dim=6,
+        candidate_two_tower_dim=3,
+        num_heads=2,
+        dropout=0.0,
+    )
+    visual = torch.randn(2, 2, 16, requires_grad=True)
+    ocr = torch.randn(2, 2, 16, requires_grad=True)
+    asr = torch.randn(2, 2, 16, requires_grad=True)
+    output = module(
+        visual_tokens=visual,
+        visual_pooled=visual.mean(1),
+        visual_mask=torch.tensor([[True, True], [False, False]]),
+        ocr_tokens=ocr,
+        ocr_pooled=ocr.mean(1),
+        ocr_mask=torch.tensor([[True, False], [False, False]]),
+        asr_tokens=asr,
+        asr_pooled=asr.mean(1),
+        asr_mask=torch.tensor([[True, True], [False, False]]),
+        candidate_image=torch.randn(2, 4),
+        candidate_text=torch.randn(2, 6),
+        candidate_two_tower=torch.randn(2, 3),
+        candidate_presence=torch.ones(2, 3, dtype=torch.bool),
+    )
+
+    assert output.fused.shape == (2, 16)
+    assert output.modality_gate.shape == (2, 3)
+    assert output.modality_gate[0].sum().item() == pytest.approx(1.0)
+    assert torch.count_nonzero(output.modality_gate[1]) == 0
+    assert torch.count_nonzero(output.fused[1]) == 0
+    output.fused[0].sum().backward()
+    assert visual.grad is not None and torch.count_nonzero(visual.grad)
+    assert ocr.grad is not None and torch.count_nonzero(ocr.grad)
+    assert asr.grad is not None and torch.count_nonzero(asr.grad)
 
 
 def test_candidate_attention_is_candidate_specific_and_masks_missing_text():
@@ -198,7 +265,132 @@ def test_temporal_multimodal_ranker_returns_candidate_attention_and_scores():
     assert output["text_attention"].shape == (2, 2)
 
 
+def test_trimodal_ranker_zero_residual_matches_base_and_all_branches_get_gradients():
+    torch.manual_seed(23)
+    model = TemporalTrimodalRankingModel(
+        6,
+        RankingConfig(hidden_dims=[16], architecture="mlp", dropout_rate=0.0),
+        model_dim=16,
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+    )
+    base = torch.randn(2, 6)
+    multimodal = {
+        "visual_embeddings": torch.randn(2, 2, 512),
+        "visual_starts": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "visual_ends": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "visual_mask": torch.ones(2, 2, dtype=torch.bool),
+        "ocr_embeddings": torch.randn(2, 2, 384),
+        "ocr_starts": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "ocr_ends": torch.tensor([[0.5, 1.5], [0.5, 1.5]]),
+        "ocr_mask": torch.ones(2, 2, dtype=torch.bool),
+        "asr_embeddings": torch.randn(2, 2, 384),
+        "asr_starts": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "asr_ends": torch.tensor([[0.5, 1.5], [0.5, 1.5]]),
+        "asr_mask": torch.ones(2, 2, dtype=torch.bool),
+        "candidate_image": torch.randn(2, 512),
+        "candidate_text": torch.randn(2, 384),
+        "candidate_two_tower": torch.randn(2, 128),
+        "candidate_presence": torch.ones(2, 3, dtype=torch.bool),
+    }
+    with torch.no_grad():
+        model.residual_gate_logit.fill_(-100.0)
+        expected = model.ranker(base)["ranking_score"]
+        actual = model(base, **multimodal)["ranking_score"]
+    torch.testing.assert_close(actual, expected)
+
+    model.residual_gate_logit.data.fill_(-2.0)
+    model(base, **multimodal)["ranking_score"].sum().backward()
+    for encoder in (model.visual_encoder, model.ocr_encoder, model.asr_encoder):
+        assert any(
+            parameter.grad is not None and torch.count_nonzero(parameter.grad)
+            for parameter in encoder.parameters()
+        )
+
+
+def test_rank_payload_accepts_bounded_v4_trimodal_context():
+    packed = base64.b64encode(encode_float16_matrix(np.ones((2, 4)))).decode()
+    payload = coerce_rank_payload(
+        {
+            "payload_version": 4,
+            "k": 1,
+            "candidates": [],
+            "user_features": {},
+            "multimodal_context": {
+                "schema_version": "temporal_multimodal_v2",
+                "visual": {
+                    "data": packed,
+                    "rows": 2,
+                    "columns": 4,
+                    "starts": [0.0, 1.0],
+                    "ends": [0.0, 1.0],
+                    "mask": [True, True],
+                },
+            },
+        }
+    )
+    assert payload.payload_version == 4
+
+
 def test_rank_payload_rejects_unknown_multimodal_protocol_version():
     with pytest.raises(HTTPException) as exc_info:
-        coerce_rank_payload({"payload_version": 4, "k": 1, "candidates": []})
+        coerce_rank_payload({"payload_version": 5, "k": 1, "candidates": []})
     assert exc_info.value.detail == "Invalid payload_version"
+
+
+def test_rank_payload_v4_rejects_sequence_over_cap():
+    with pytest.raises(HTTPException) as exc_info:
+        coerce_rank_payload(
+            {
+                "payload_version": 4,
+                "k": 1,
+                "candidates": [],
+                "user_features": {},
+                "multimodal_context": {
+                    "schema_version": "temporal_multimodal_v2",
+                    "visual": {
+                        "data": "",
+                        "rows": 17,
+                        "columns": 512,
+                        "starts": [0.0] * 17,
+                        "ends": [0.0] * 17,
+                        "mask": [True] * 17,
+                    },
+                },
+            }
+        )
+    assert exc_info.value.detail == "visual rows exceed 16"
+
+
+def test_content_features_pack_to_bounded_v4_tensors():
+    from video_commerce.common.models import AudioFeatures, ContentFeatures
+
+    content = ContentFeatures(
+        content_id="v1",
+        visual_embedding=[0.0] * 512,
+        frame_embeddings=[[1.0] * 512] * 20,
+        frame_timestamps_seconds=list(range(20)),
+        ocr_tracks=[
+            {
+                "first_seen_seconds": 1.0,
+                "last_seen_seconds": 2.0,
+                "text_embedding": [1.0] * 384,
+            }
+        ],
+        audio_features=AudioFeatures(
+            asr_segments=[
+                {
+                    "start_seconds": 2.0,
+                    "end_seconds": 3.0,
+                    "text_embedding": [1.0] * 384,
+                }
+            ]
+        ),
+    )
+    packed = pack_content_features(content)
+    assert packed["visual"]["rows"] == 16
+    decoded = unpack_temporal_multimodal_context(packed)
+    assert decoded["visual_embeddings"].shape == (16, 512)
+    assert decoded["ocr_embeddings"].shape == (1, 384)
+    assert decoded["asr_embeddings"].shape == (1, 384)

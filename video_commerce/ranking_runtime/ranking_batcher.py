@@ -111,7 +111,7 @@ def normalize_ranking_batch_payloads(raw_payload: Any) -> List[Dict[str, Any]]:
         requests = raw_payload.get("requests")
         if not isinstance(requests, list):
             return []
-        if raw_payload.get("payload_version") not in {2, 3}:
+        if raw_payload.get("payload_version") not in {2, 3, 4}:
             return requests
 
         batch_metadata_map = raw_payload.get("product_metadata_map") or {}
@@ -277,6 +277,7 @@ def run_ranking_batch_payloads(
         ranking_model,
         feature_matrix,
         value_bucket_ids=value_bucket_ids,
+        multimodal_inputs=_build_batch_trimodal_inputs(ranking_model, prepared),
     )
     stages["inference_total"] = time.perf_counter() - inference_started
     stages["tensor_prep"] = float(inference_profile.get("tensor_prep_ms", 0.0)) / 1000.0
@@ -368,6 +369,7 @@ def _run_inference_batch(
     feature_matrix: Any,
     *,
     value_bucket_ids: Optional[List[Optional[int]]] = None,
+    multimodal_inputs: Optional[Dict[str, Any]] = None,
 ):
     run_inference = ranking_model.run_inference_batch
     try:
@@ -375,8 +377,31 @@ def _run_inference_batch(
     except (TypeError, ValueError):
         signature = None
     if signature is not None and "value_bucket_ids" in signature.parameters:
-        return run_inference(feature_matrix, value_bucket_ids=value_bucket_ids)
+        kwargs = {"value_bucket_ids": value_bucket_ids}
+        if "multimodal_inputs" in signature.parameters:
+            kwargs["multimodal_inputs"] = multimodal_inputs
+        return run_inference(feature_matrix, **kwargs)
     return run_inference(feature_matrix)
+
+
+def _build_batch_trimodal_inputs(
+    ranking_model: RankingModel,
+    prepared: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    build = getattr(ranking_model, "build_serving_trimodal_inputs", None)
+    if not callable(build):
+        return None
+    chunks = [
+        build(item.get("context") or {}, item.get("valid_candidates") or [])
+        for item in prepared
+    ]
+    if not chunks or any(chunk is None for chunk in chunks):
+        return None
+    import torch
+
+    return {
+        key: torch.cat([chunk[key] for chunk in chunks], dim=0) for key in chunks[0]
+    }
 
 
 def _run_ranking_process_batch(batch_payloads: Any) -> Dict[str, Any]:
@@ -961,10 +986,32 @@ class RankingBatcher:
                         if key != DIN_SEQUENCE_CONTEXT_KEY
                     }
         return {
-            "payload_version": 3 if self._remote_payload_v3_supported() else 2,
+            "payload_version": (
+                4
+                if self._remote_payload_v4_supported()
+                else 3
+                if self._remote_payload_v3_supported()
+                else 2
+            ),
             "product_metadata_map": product_metadata_map,
             "requests": requests,
         }
+
+    def _remote_payload_v3_supported(self) -> bool:
+        if self.runner_pool is None:
+            return True
+        supports_version = getattr(
+            self.runner_pool, "supports_batch_payload_version", None
+        )
+        return bool(supports_version and supports_version(3))
+
+    def _remote_payload_v4_supported(self) -> bool:
+        if self.runner_pool is None:
+            return True
+        supports_version = getattr(
+            self.runner_pool, "supports_batch_payload_version", None
+        )
+        return bool(supports_version and supports_version(4))
 
     def _remote_payload_v2_supported(self) -> bool:
         if not self.runner_payload_v2_enabled:

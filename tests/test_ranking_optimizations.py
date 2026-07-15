@@ -1401,13 +1401,23 @@ class FakeTrainerArtifactManager:
         self.payload = None
 
     async def persist_ranking_checkpoint(
-        self, *, local_path, model_version, payload=None
+        self,
+        *,
+        local_path,
+        model_version,
+        payload=None,
+        candidate_sidecar_path=None,
     ):
         self.payload = payload
         return SimpleNamespace(model_version=model_version)
 
     async def persist_ranking_shadow_checkpoint(
-        self, *, local_path, model_version, payload=None
+        self,
+        *,
+        local_path,
+        model_version,
+        payload=None,
+        candidate_sidecar_path=None,
     ):
         self.shadow_payload = payload
         return SimpleNamespace(model_version=model_version)
@@ -1926,11 +1936,18 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
     class ShadowModel:
         def __init__(self, _config, *, observability=None):
             assert observability is service.observability
+            self.config = _config
             self.loaded_model_path = None
             self.model_version = "shadow-1"
+            self.model = None
+            self.feature_schema_version = "ranking_v4_00_temporal_trimodal"
+            self._candidate_sidecar_path = "/tmp/ranking.candidates.npz"
             self.feature_assembler = SimpleNamespace(
                 version="ranking_feature_assembler_v1"
             )
+
+        def _initialize_model(self, *, architecture):
+            return None
 
         async def train_model(self, examples, *, training_sample_source):
             assert examples == [example]
@@ -1946,6 +1963,12 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
     service.pit_dataset_reader = Reader()
     service.artifact_manager = FakeTrainerArtifactManager()
     service.observability = FakeTrainerObservability()
+    service.ranking_model = None
+
+    async def attach_candidate_embeddings(_ranking_model, examples):
+        return examples
+
+    service._attach_trimodal_candidate_embeddings = attach_candidate_embeddings
 
     await service._train_pit_shadow_model(trigger="scheduled")
 

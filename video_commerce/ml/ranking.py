@@ -57,6 +57,16 @@ from video_commerce.ml.ranking_training import (
     RankingTrainingExample,
     TrainingTensorBuilder,
 )
+from video_commerce.ml.temporal_multimodal import (
+    CandidateMultimodalAttention,
+    TemporalSequenceEncoder,
+    TrimodalCandidateAttention,
+    unpack_temporal_multimodal_context,
+)
+from video_commerce.ml.candidate_embedding_sidecar import (
+    CandidateEmbeddingSidecar,
+    write_candidate_embedding_sidecar,
+)
 from video_commerce.ml.din import (
     DIN_SEQUENCE_CONTEXT_KEY,
     DeepInterestNetwork,
@@ -65,11 +75,11 @@ from video_commerce.ml.din import (
     load_din_embedding_sidecar,
     parse_din_behavior_sequences,
 )
-from video_commerce.ml.temporal_multimodal import CandidateMultimodalAttention
 
 logger = logging.getLogger(__name__)
 
 RANKING_FEATURE_SCHEMA_VERSION = "ranking_v3_00_temporal_multimodal"
+RANKING_TRIMODAL_FEATURE_SCHEMA_VERSION = "ranking_v4_00_temporal_trimodal"
 RANKING_DIN_FEATURE_SCHEMA_VERSION = "ranking_v3_din"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
 RANKING_OBJECTIVE_VERSION = "business_v1"
@@ -355,6 +365,142 @@ class TemporalMultimodalRankingModel(nn.Module):
         predictions = self.ranker(torch.cat([base_features, attention.fused], dim=-1))
         predictions["visual_attention"] = attention.visual_attention
         predictions["text_attention"] = attention.text_attention
+        return predictions
+
+
+class TemporalTrimodalRankingModel(nn.Module):
+    """Joint visual/OCR/ASR temporal ranker with a near-zero warm-start residual."""
+
+    def __init__(
+        self,
+        base_input_dim: int,
+        config: RankingConfig,
+        *,
+        model_dim: int = 128,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        architecture: Optional[str] = None,
+        hidden_dims: Optional[List[int]] = None,
+        cross_layers: Optional[int] = None,
+        low_rank_dim: Optional[int] = None,
+        din_item_embeddings: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self.base_input_dim = int(base_input_dim)
+        encoder_options = {
+            "model_dim": int(model_dim),
+            "num_layers": int(num_layers),
+            "num_heads": int(num_heads),
+            "dropout": float(dropout),
+        }
+        self.visual_encoder = TemporalSequenceEncoder(input_dim=512, **encoder_options)
+        self.ocr_encoder = TemporalSequenceEncoder(input_dim=384, **encoder_options)
+        self.asr_encoder = TemporalSequenceEncoder(input_dim=384, **encoder_options)
+        self.candidate_attention = TrimodalCandidateAttention(
+            model_dim=int(model_dim),
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+        )
+        self.residual_projection = nn.Linear(int(model_dim), self.base_input_dim)
+        self.residual_gate_logit = nn.Parameter(torch.tensor(-4.0))
+        self.ranker = MultiObjectiveRankingModel(
+            self.base_input_dim,
+            config,
+            architecture=architecture,
+            hidden_dims=hidden_dims,
+            cross_layers=cross_layers,
+            low_rank_dim=low_rank_dim,
+            din_item_embeddings=din_item_embeddings,
+        )
+        # Preserve the attributes used by checkpoint reload and architecture checks.
+        self.architecture = self.ranker.architecture
+        self.hidden_dims = self.ranker.hidden_dims
+        self.cross_layers = self.ranker.cross_layers
+        self.low_rank_dim = self.ranker.low_rank_dim
+
+    def forward(
+        self,
+        base_features: torch.Tensor,
+        *,
+        visual_embeddings: Optional[torch.Tensor] = None,
+        visual_starts: Optional[torch.Tensor] = None,
+        visual_ends: Optional[torch.Tensor] = None,
+        visual_mask: Optional[torch.Tensor] = None,
+        ocr_embeddings: Optional[torch.Tensor] = None,
+        ocr_starts: Optional[torch.Tensor] = None,
+        ocr_ends: Optional[torch.Tensor] = None,
+        ocr_mask: Optional[torch.Tensor] = None,
+        asr_embeddings: Optional[torch.Tensor] = None,
+        asr_starts: Optional[torch.Tensor] = None,
+        asr_ends: Optional[torch.Tensor] = None,
+        asr_mask: Optional[torch.Tensor] = None,
+        candidate_image: Optional[torch.Tensor] = None,
+        candidate_text: Optional[torch.Tensor] = None,
+        candidate_two_tower: Optional[torch.Tensor] = None,
+        candidate_presence: Optional[torch.Tensor] = None,
+        candidate_indices: Optional[torch.Tensor] = None,
+        history_indices: Optional[torch.Tensor] = None,
+        history_recency: Optional[torch.Tensor] = None,
+        history_mask: Optional[torch.Tensor] = None,
+        summary_features: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        ranker_kwargs = {
+            "candidate_indices": candidate_indices,
+            "history_indices": history_indices,
+            "history_recency": history_recency,
+            "history_mask": history_mask,
+            "summary_features": summary_features,
+        }
+        ranker_kwargs = {
+            key: value for key, value in ranker_kwargs.items() if value is not None
+        }
+        if visual_embeddings is None:
+            return self.ranker(base_features, **ranker_kwargs)
+        visual = self.visual_encoder(
+            visual_embeddings,
+            visual_starts,
+            visual_mask,
+            end_timestamps_seconds=visual_ends,
+        )
+        ocr = self.ocr_encoder(
+            ocr_embeddings,
+            ocr_starts,
+            ocr_mask,
+            end_timestamps_seconds=ocr_ends,
+        )
+        asr = self.asr_encoder(
+            asr_embeddings,
+            asr_starts,
+            asr_mask,
+            end_timestamps_seconds=asr_ends,
+        )
+        attended = self.candidate_attention(
+            visual_tokens=visual.tokens,
+            visual_pooled=visual.pooled_embedding,
+            visual_mask=visual_mask,
+            ocr_tokens=ocr.tokens,
+            ocr_pooled=ocr.pooled_embedding,
+            ocr_mask=ocr_mask,
+            asr_tokens=asr.tokens,
+            asr_pooled=asr.pooled_embedding,
+            asr_mask=asr_mask,
+            candidate_image=candidate_image,
+            candidate_text=candidate_text,
+            candidate_two_tower=candidate_two_tower,
+            candidate_presence=candidate_presence,
+        )
+        residual = self.residual_projection(attended.fused)
+        augmented = base_features + torch.sigmoid(self.residual_gate_logit) * residual
+        predictions = self.ranker(augmented, **ranker_kwargs)
+        predictions.update(
+            {
+                "visual_attention": attended.visual_attention,
+                "ocr_attention": attended.ocr_attention,
+                "asr_attention": attended.asr_attention,
+                "modality_gate": attended.modality_gate,
+            }
+        )
         return predictions
 
 
@@ -670,7 +816,7 @@ class RankingModel:
             self.feature_assembler.version = "ranking_feature_assembler_v2_din"
 
         # Model components
-        self.model: Optional[MultiObjectiveRankingModel] = None
+        self.model: Optional[nn.Module] = None
         self.optimizer: Optional[optim.Optimizer] = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -679,7 +825,9 @@ class RankingModel:
         self.model_version = "1.0.0"
         self.last_training_time = 0
         self.feature_schema_version = (
-            RANKING_DIN_FEATURE_SCHEMA_VERSION
+            RANKING_TRIMODAL_FEATURE_SCHEMA_VERSION
+            if getattr(config, "trimodal_enabled", False)
+            else RANKING_DIN_FEATURE_SCHEMA_VERSION
             if getattr(config, "din_enabled", False)
             else RANKING_FEATURE_SCHEMA_VERSION
         )
@@ -709,6 +857,13 @@ class RankingModel:
         self.torch_compile_last_fallback_error: Optional[str] = None
         self.torch_compile_last_inference_path = "eager"
         self.untrained_fallback_count = 0
+        self.candidate_embedding_sidecar: Optional[CandidateEmbeddingSidecar] = None
+        self.candidate_sidecar_sha256: Optional[str] = None
+        self.candidate_sidecar_model_version: Optional[str] = None
+        self._candidate_sidecar_training_records: Optional[
+            Dict[str, Dict[str, Any]]
+        ] = None
+        self._candidate_sidecar_path: Optional[str] = None
         self.enable_profiling_logs = False
         self.profiling_log_min_duration_ms = 250.0
         self._product_feature_cache_max_size = max(
@@ -728,6 +883,15 @@ class RankingModel:
         )
 
         logger.info(f"RankingModel initialized on device: {self.device}")
+
+    def configure_candidate_sidecar_for_training(
+        self,
+        records: Dict[str, Dict[str, Any]],
+        *,
+        path: str,
+    ) -> None:
+        self._candidate_sidecar_training_records = records
+        self._candidate_sidecar_path = str(path)
 
     def _default_value_transform_stats(self) -> Dict[str, Any]:
         return {
@@ -763,22 +927,50 @@ class RankingModel:
         hidden_dims: Optional[List[int]] = None,
         cross_layers: Optional[int] = None,
         low_rank_dim: Optional[int] = None,
-    ) -> Tuple[MultiObjectiveRankingModel, optim.Optimizer]:
+    ) -> Tuple[nn.Module, optim.Optimizer]:
         input_dim = self.feature_extractor.total_feature_dim
-        model = MultiObjectiveRankingModel(
-            input_dim,
-            self.config,
-            architecture=architecture,
-            hidden_dims=hidden_dims,
-            cross_layers=cross_layers,
-            low_rank_dim=low_rank_dim,
-            din_item_embeddings=self.din_item_embeddings,
-        ).to(self.device)
-        optimizer = optim.Adam(
-            model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=1e-5,
-        )
+        model_options = {
+            "architecture": architecture,
+            "hidden_dims": hidden_dims,
+            "cross_layers": cross_layers,
+            "low_rank_dim": low_rank_dim,
+        }
+        if getattr(self.config, "trimodal_enabled", False):
+            model = TemporalTrimodalRankingModel(
+                input_dim,
+                self.config,
+                din_item_embeddings=self.din_item_embeddings,
+                **model_options,
+            ).to(self.device)
+            base_parameters = list(model.ranker.parameters())
+            base_parameter_ids = {id(parameter) for parameter in base_parameters}
+            new_parameters = [
+                parameter
+                for parameter in model.parameters()
+                if id(parameter) not in base_parameter_ids
+            ]
+            optimizer = optim.Adam(
+                [
+                    {
+                        "params": base_parameters,
+                        "lr": self.config.learning_rate * 0.1,
+                    },
+                    {"params": new_parameters, "lr": self.config.learning_rate},
+                ],
+                weight_decay=1e-5,
+            )
+        else:
+            model = MultiObjectiveRankingModel(
+                input_dim,
+                self.config,
+                din_item_embeddings=self.din_item_embeddings,
+                **model_options,
+            ).to(self.device)
+            optimizer = optim.Adam(
+                model.parameters(),
+                lr=self.config.learning_rate,
+                weight_decay=1e-5,
+            )
         return model, optimizer
 
     def _torch_compile_status(self) -> Dict[str, Any]:
@@ -905,11 +1097,17 @@ class RankingModel:
         compatible: Dict[str, torch.Tensor] = {}
         skipped = []
         for key, value in state_dict.items():
-            current_value = current_state.get(key)
+            target_key = key
+            current_value = current_state.get(target_key)
+            if current_value is None and isinstance(
+                model, TemporalTrimodalRankingModel
+            ):
+                target_key = f"ranker.{key}"
+                current_value = current_state.get(target_key)
             if current_value is not None and tuple(current_value.shape) == tuple(
                 value.shape
             ):
-                compatible[key] = value
+                compatible[target_key] = value
             else:
                 skipped.append(key)
 
@@ -945,10 +1143,12 @@ class RankingModel:
         *,
         model_path: str,
     ) -> None:
-        if not (
+        strict_schema = bool(
             getattr(self.config, "history_embeddings_enabled", False)
+            or getattr(self.config, "trimodal_enabled", False)
             or getattr(self.config, "din_enabled", False)
-        ):
+        )
+        if not strict_schema:
             return
         expected_input_dim = self.feature_extractor.total_feature_dim
         expected_schema = self.feature_schema_version
@@ -958,8 +1158,13 @@ class RankingModel:
             checkpoint_input_dim != expected_input_dim
             or checkpoint_schema != expected_schema
         ):
+            requirement = (
+                "Ranking history embeddings require a freshly trained v2 checkpoint"
+                if getattr(self.config, "history_embeddings_enabled", False)
+                else "Ranking checkpoint feature schema is incompatible"
+            )
             raise RuntimeError(
-                "Ranking history embeddings require a freshly trained v2 checkpoint: "
+                f"{requirement}: "
                 f"path={model_path}, checkpoint_input_dim={checkpoint_input_dim}, "
                 f"expected_input_dim={expected_input_dim}, "
                 f"checkpoint_feature_schema_version={checkpoint_schema}, "
@@ -1076,6 +1281,27 @@ class RankingModel:
                 next_model.eval()
                 self.model = next_model
                 self.optimizer = next_optimizer
+                if getattr(self.config, "trimodal_enabled", False):
+                    sidecar_sha256 = str(
+                        checkpoint_config.get("candidate_sidecar_sha256") or ""
+                    )
+                    sidecar_model_version = str(
+                        checkpoint_config.get("candidate_sidecar_model_version") or ""
+                    )
+                    if len(sidecar_sha256) != 64 or not sidecar_model_version:
+                        raise RuntimeError(
+                            "ranking_v4 checkpoint is missing its candidate sidecar lock"
+                        )
+                    sidecar_path = str(
+                        Path(resolved_model_path).with_suffix(".candidates.npz")
+                    )
+                    self.candidate_embedding_sidecar = CandidateEmbeddingSidecar.load(
+                        sidecar_path,
+                        expected_sha256=sidecar_sha256,
+                        expected_model_version=sidecar_model_version,
+                    )
+                    self.candidate_sidecar_sha256 = sidecar_sha256
+                    self.candidate_sidecar_model_version = sidecar_model_version
                 self.is_trained = True
                 self.ranking_objective_version = str(
                     checkpoint_config.get(
@@ -1283,6 +1509,7 @@ class RankingModel:
                     "k": request.get("k"),
                     "batch_wait_ms": request.get("batch_wait_ms", 0.0),
                     "valid_candidates": valid_candidates,
+                    "context": context,
                     "row_start": row_start,
                     "row_end": row_end,
                     "candidate_count": len(candidates),
@@ -1322,6 +1549,7 @@ class RankingModel:
         self,
         feature_matrix: np.ndarray,
         value_bucket_ids: Optional[Sequence[Optional[int]]] = None,
+        multimodal_inputs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         """Run one Torch forward pass for a feature matrix."""
         model = self.model
@@ -1339,26 +1567,35 @@ class RankingModel:
             )
 
             model_stage_started = time.perf_counter()
-            inference_model = self._compiled_model or model
-            inference_path = "compiled" if self._compiled_model is not None else "eager"
+            inference_model = (
+                model if multimodal_inputs else (self._compiled_model or model)
+            )
+            inference_path = (
+                "eager_trimodal"
+                if multimodal_inputs
+                else "compiled"
+                if self._compiled_model is not None
+                else "eager"
+            )
             try:
                 din_inputs = getattr(feature_matrix, "din_inputs", None)
-                if din_inputs is None:
-                    predictions = inference_model(features_tensor)
-                else:
+                forward_inputs = dict(multimodal_inputs or {})
+                if din_inputs is not None:
                     (
                         history_indices,
                         history_recency,
                         history_mask,
                     ) = din_inputs.expanded_histories()
-                    predictions = inference_model(
-                        features_tensor,
-                        candidate_indices=din_inputs.candidate_indices,
-                        history_indices=history_indices,
-                        history_recency=history_recency,
-                        history_mask=history_mask,
-                        summary_features=din_inputs.summary_features,
+                    forward_inputs.update(
+                        {
+                            "candidate_indices": din_inputs.candidate_indices,
+                            "history_indices": history_indices,
+                            "history_recency": history_recency,
+                            "history_mask": history_mask,
+                            "summary_features": din_inputs.summary_features,
+                        }
                     )
+                predictions = inference_model(features_tensor, **forward_inputs)
             except Exception as exc:
                 if self._compiled_model is None:
                     raise
@@ -1375,20 +1612,18 @@ class RankingModel:
                     },
                 )
                 inference_path = "eager"
-                if din_inputs is None:
-                    predictions = model(features_tensor)
-                else:
-                    predictions = model(
-                        features_tensor,
-                        candidate_indices=din_inputs.candidate_indices,
-                        history_indices=history_indices,
-                        history_recency=history_recency,
-                        history_mask=history_mask,
-                        summary_features=din_inputs.summary_features,
-                    )
+                predictions = model(features_tensor, **forward_inputs)
             model_forward_ms = round(
                 (time.perf_counter() - model_stage_started) * 1000, 2
             )
+            if multimodal_inputs and self.observability is not None:
+                self.observability.record_trimodal_inference(model_forward_ms / 1000.0)
+                gate = predictions.get("modality_gate")
+                if gate is not None and gate.numel():
+                    for index, modality in enumerate(("visual", "ocr", "asr")):
+                        self.observability.record_trimodal_gate(
+                            modality, float(gate[:, index].mean().item())
+                        )
             self.torch_compile_last_inference_path = inference_path
 
         prediction_arrays = {
@@ -1404,6 +1639,80 @@ class RankingModel:
             "model_forward_ms": model_forward_ms,
             "inference_path": inference_path,
         }
+
+    def build_serving_trimodal_inputs(
+        self,
+        context: Dict[str, Any],
+        valid_candidates: Sequence[Tuple[CandidateProduct, Dict[str, Any]]],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not isinstance(self.model, TemporalTrimodalRankingModel):
+            return None
+        packed = context.get("temporal_multimodal")
+        if not isinstance(packed, dict):
+            packed = {}
+        decoded = unpack_temporal_multimodal_context(packed)
+        batch_size = len(valid_candidates)
+        capacities = {"visual": (16, 512), "ocr": (32, 384), "asr": (64, 384)}
+        tensors: Dict[str, torch.Tensor] = {}
+        for modality, (capacity, dimension) in capacities.items():
+            embeddings = np.zeros((capacity, dimension), dtype=np.float32)
+            starts = np.zeros(capacity, dtype=np.float32)
+            ends = np.zeros(capacity, dtype=np.float32)
+            mask = np.zeros(capacity, dtype=np.bool_)
+            source = decoded.get(f"{modality}_embeddings")
+            if source is not None:
+                rows = min(capacity, int(source.shape[0]))
+                if source.shape[1] != dimension:
+                    raise ValueError(
+                        f"{modality} embedding dimension must be {dimension}"
+                    )
+                embeddings[:rows] = source[:rows]
+                starts[:rows] = decoded[f"{modality}_starts"][:rows]
+                ends[:rows] = decoded[f"{modality}_ends"][:rows]
+                mask[:rows] = decoded[f"{modality}_mask"][:rows]
+            if self.observability is not None:
+                self.observability.record_trimodal_presence(modality, bool(mask.any()))
+            tensors[f"{modality}_embeddings"] = torch.as_tensor(
+                np.repeat(embeddings[None, :, :], batch_size, axis=0),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            for name, values, dtype in (
+                ("starts", starts, torch.float32),
+                ("ends", ends, torch.float32),
+                ("mask", mask, torch.bool),
+            ):
+                tensors[f"{modality}_{name}"] = torch.as_tensor(
+                    np.repeat(values[None, :], batch_size, axis=0),
+                    dtype=dtype,
+                    device=self.device,
+                )
+        candidate_image = np.zeros((batch_size, 512), dtype=np.float32)
+        candidate_text = np.zeros((batch_size, 384), dtype=np.float32)
+        candidate_two_tower = np.zeros((batch_size, 128), dtype=np.float32)
+        candidate_presence = np.zeros((batch_size, 3), dtype=np.bool_)
+        if self.candidate_embedding_sidecar is not None:
+            for row, (candidate, _metadata) in enumerate(valid_candidates):
+                embedding = self.candidate_embedding_sidecar.get(candidate.product_id)
+                if embedding is None:
+                    if self.observability is not None:
+                        self.observability.record_candidate_sidecar_miss()
+                    continue
+                candidate_image[row] = embedding["image"]
+                candidate_text[row] = embedding["text"]
+                candidate_two_tower[row] = embedding["two_tower"]
+                candidate_presence[row] = embedding["presence"]
+        elif self.observability is not None:
+            for _candidate in valid_candidates:
+                self.observability.record_candidate_sidecar_miss()
+        for name, values in (
+            ("candidate_image", candidate_image),
+            ("candidate_text", candidate_text),
+            ("candidate_two_tower", candidate_two_tower),
+            ("candidate_presence", candidate_presence),
+        ):
+            tensors[name] = torch.as_tensor(values, device=self.device)
+        return tensors
 
     def _add_business_predictions(
         self,
@@ -1698,6 +2007,9 @@ class RankingModel:
                 value_bucket_ids=self._value_bucket_ids_for_candidates(
                     valid_candidates
                 ),
+                multimodal_inputs=self.build_serving_trimodal_inputs(
+                    context, valid_candidates
+                ),
             )
             profile["tensor_prep_ms"] = inference_profile["tensor_prep_ms"]
             profile["model_forward_ms"] = inference_profile["model_forward_ms"]
@@ -1920,7 +2232,21 @@ class RankingModel:
                 two_tower_model_version=two_tower_model_version,
                 training_sample_source=training_sample_source,
             )
-        features, labels = self._prepare_training_examples(training_data)
+        multimodal_tensors = None
+        if getattr(self.config, "trimodal_enabled", False):
+            (
+                features,
+                labels,
+                multimodal_tensors,
+            ) = self.training_tensor_builder.build_trimodal(
+                training_data,
+                apply_modality_dropout=True,
+                modality_dropout_probability=float(
+                    getattr(self.config, "trimodal_modality_dropout", 0.1)
+                ),
+            )
+        else:
+            features, labels = self._prepare_training_examples(training_data)
 
         if cancellation_event is not None and cancellation_event.is_set():
             raise RankingTrainingCancelled("ranking training was cancelled")
@@ -1938,24 +2264,40 @@ class RankingModel:
             epoch_loss = 0.0
             num_batches = 0
 
-            for batch_features, batch_labels in self._iter_training_batches(
-                features,
-                labels,
-            ):
+            if isinstance(self.model, TemporalTrimodalRankingModel):
+                base_trainable = epoch > 0
+                for parameter in self.model.ranker.parameters():
+                    parameter.requires_grad_(base_trainable)
+                self.model.ranker.train(base_trainable)
+
+            batches = (
+                self._iter_trimodal_training_batches(
+                    features, labels, multimodal_tensors
+                )
+                if multimodal_tensors is not None
+                else (
+                    (batch_features, batch_labels, None)
+                    for batch_features, batch_labels in self._iter_training_batches(
+                        features, labels
+                    )
+                )
+            )
+            for batch_features, batch_labels, batch_multimodal in batches:
                 if cancellation_event is not None and cancellation_event.is_set():
                     raise RankingTrainingCancelled("ranking training was cancelled")
                 self.optimizer.zero_grad()
+                forward_inputs = dict(batch_multimodal or {})
                 if getattr(self.config, "din_enabled", False):
-                    predictions = self.model(
-                        batch_features,
-                        candidate_indices=batch_labels["_din_candidate_indices"],
-                        history_indices=batch_labels["_din_history_indices"],
-                        history_recency=batch_labels["_din_history_recency"],
-                        history_mask=batch_labels["_din_history_mask"],
-                        summary_features=batch_labels["_din_summary_features"],
+                    forward_inputs.update(
+                        {
+                            "candidate_indices": batch_labels["_din_candidate_indices"],
+                            "history_indices": batch_labels["_din_history_indices"],
+                            "history_recency": batch_labels["_din_history_recency"],
+                            "history_mask": batch_labels["_din_history_mask"],
+                            "summary_features": batch_labels["_din_summary_features"],
+                        }
                     )
-                else:
-                    predictions = self.model(batch_features)
+                predictions = self.model(batch_features, **forward_inputs)
                 loss = self._compute_loss(predictions, batch_labels)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -1986,6 +2328,25 @@ class RankingModel:
         self.last_training_time = time.time()
         self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
         self.model_version = f"ranking-{int(self.last_training_time)}"
+        if (
+            isinstance(self.model, TemporalTrimodalRankingModel)
+            and self._candidate_sidecar_training_records is not None
+            and self._candidate_sidecar_path
+        ):
+            self.candidate_sidecar_sha256 = write_candidate_embedding_sidecar(
+                self._candidate_sidecar_path,
+                self._candidate_sidecar_training_records,
+                model_version=self.model_version,
+            )
+            self.candidate_sidecar_model_version = self.model_version
+            self.candidate_embedding_sidecar = CandidateEmbeddingSidecar.load(
+                self._candidate_sidecar_path,
+                expected_sha256=self.candidate_sidecar_sha256,
+                expected_model_version=self.model_version,
+            )
+        if isinstance(self.model, TemporalTrimodalRankingModel):
+            for parameter in self.model.ranker.parameters():
+                parameter.requires_grad_(True)
         self._compile_model_for_inference()
 
         logger.info("Model training completed")
@@ -2076,53 +2437,69 @@ class RankingModel:
         features: torch.Tensor,
         labels: Dict[str, torch.Tensor],
     ):
+        for index_tensor in self._iter_training_batch_indices(features, labels):
+            yield features.index_select(0, index_tensor), {
+                key: value.index_select(0, index_tensor)
+                for key, value in labels.items()
+            }
+
+    def _iter_trimodal_training_batches(
+        self,
+        features: torch.Tensor,
+        labels: Dict[str, torch.Tensor],
+        multimodal: Dict[str, torch.Tensor],
+    ):
+        for index_tensor in self._iter_training_batch_indices(features, labels):
+            yield (
+                features.index_select(0, index_tensor),
+                {
+                    key: value.index_select(0, index_tensor)
+                    for key, value in labels.items()
+                },
+                {
+                    key: value.index_select(0, index_tensor)
+                    for key, value in multimodal.items()
+                },
+            )
+
+    def _iter_training_batch_indices(
+        self,
+        features: torch.Tensor,
+        labels: Dict[str, torch.Tensor],
+    ):
         batch_size = max(1, int(getattr(self.config, "batch_size", 1) or 1))
         row_count = int(features.size(0))
         if row_count <= 0:
             return
-
         group_tensor = labels.get("pairwise_group")
         if (
             not self._ltr_grouped_training_enabled()
             or group_tensor is None
             or int(group_tensor.numel()) != row_count
         ):
-            for i in range(0, row_count, batch_size):
-                yield features[i : i + batch_size], {
-                    key: value[i : i + batch_size] for key, value in labels.items()
-                }
-            return
-
-        grouped_indices: "OrderedDict[int, List[int]]" = OrderedDict()
-        for index, group_id in enumerate(group_tensor.detach().cpu().reshape(-1)):
-            grouped_indices.setdefault(int(group_id.item()), []).append(index)
-
-        pending_indices: List[int] = []
-        for indices in grouped_indices.values():
-            if pending_indices and len(pending_indices) + len(indices) > batch_size:
-                index_tensor = torch.tensor(
-                    pending_indices,
+            for start in range(0, row_count, batch_size):
+                yield torch.arange(
+                    start,
+                    min(start + batch_size, row_count),
                     dtype=torch.long,
                     device=features.device,
                 )
-                yield features.index_select(0, index_tensor), {
-                    key: value.index_select(0, index_tensor)
-                    for key, value in labels.items()
-                }
+            return
+        grouped_indices: "OrderedDict[int, List[int]]" = OrderedDict()
+        for index, group_id in enumerate(group_tensor.detach().cpu().reshape(-1)):
+            grouped_indices.setdefault(int(group_id.item()), []).append(index)
+        pending_indices: List[int] = []
+        for indices in grouped_indices.values():
+            if pending_indices and len(pending_indices) + len(indices) > batch_size:
+                yield torch.tensor(
+                    pending_indices, dtype=torch.long, device=features.device
+                )
                 pending_indices = []
-
             pending_indices.extend(indices)
-
         if pending_indices:
-            index_tensor = torch.tensor(
-                pending_indices,
-                dtype=torch.long,
-                device=features.device,
+            yield torch.tensor(
+                pending_indices, dtype=torch.long, device=features.device
             )
-            yield features.index_select(0, index_tensor), {
-                key: value.index_select(0, index_tensor)
-                for key, value in labels.items()
-            }
 
     def _prepare_training_data(
         self,
@@ -3032,6 +3409,10 @@ class RankingModel:
                     "value_bucket_mapping": self.value_bucket_mapping,
                     "din_enabled": bool(getattr(self.config, "din_enabled", False)),
                     "din_sidecar_metadata": self.din_sidecar_metadata,
+                    "candidate_sidecar_sha256": self.candidate_sidecar_sha256,
+                    "candidate_sidecar_model_version": (
+                        self.candidate_sidecar_model_version
+                    ),
                 },
             }
             file_descriptor, temporary_path = tempfile.mkstemp(

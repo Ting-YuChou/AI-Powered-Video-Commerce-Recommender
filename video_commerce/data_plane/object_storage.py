@@ -113,12 +113,86 @@ class ObjectStorage:
                         **extra_args,
                     )
                 finally:
-                    self._client.meta.events.unregister(
-                        event_name, unique_id=event_id
-                    )
+                    self._client.meta.events.unregister(event_name, unique_id=event_id)
 
         await asyncio.to_thread(_put)
         return f"s3://{self.config.bucket}/{object_name}"
+
+    async def persist_immutable_bytes(
+        self,
+        payload: bytes,
+        *,
+        object_name: str,
+        content_type: Optional[str] = None,
+    ) -> str:
+        """Persist content-addressed bytes without allowing conflicting rewrites."""
+        if (
+            not object_name
+            or Path(object_name).is_absolute()
+            or ".." in Path(object_name).parts
+        ):
+            raise ValueError("immutable object name must be a safe relative path")
+        if not self.is_remote:
+            target = Path(self.config.download_dir) / object_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                descriptor = os.open(
+                    target,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                if target.read_bytes() != payload:
+                    raise FileExistsError(
+                        f"immutable object already exists with different bytes: {target}"
+                    )
+                return str(target)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            return str(target)
+
+        descriptor, staged_path = tempfile.mkstemp(
+            dir=self.config.download_dir
+            if os.path.isdir(self.config.download_dir)
+            else None,
+            suffix=Path(object_name).suffix,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+            try:
+                return await self.persist_staged_file_create_only(
+                    staged_path,
+                    object_name=object_name,
+                    content_type=content_type,
+                )
+            except Exception as exc:
+                response = getattr(exc, "response", {}) or {}
+                metadata = response.get("ResponseMetadata", {}) or {}
+                status_code = metadata.get("HTTPStatusCode")
+                error_code = str((response.get("Error", {}) or {}).get("Code") or "")
+                if status_code == 412 or error_code in {
+                    "PreconditionFailed",
+                    "ConditionalRequestConflict",
+                }:
+                    return f"s3://{self.config.bucket}/{object_name}"
+                raise
+        finally:
+            if os.path.exists(staged_path):
+                os.remove(staged_path)
+
+    def build_content_feature_object_name(self, *, content_id: str, sha256: str) -> str:
+        prefix = self.config.prefix.strip("/")
+        safe_content_id = self._sanitize_path_segment(content_id)
+        safe_sha256 = self._sanitize_path_segment(sha256)
+        path = f"content-features/{safe_content_id}/{safe_sha256}.json"
+        return f"{prefix}/{path}" if prefix else path
 
     async def materialize_for_processing(
         self,

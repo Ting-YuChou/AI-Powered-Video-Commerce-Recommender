@@ -87,7 +87,9 @@ async def test_ffprobe_metadata_parses_duration_fps_frame_count_and_audio(monkey
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_extraction_parses_rgb_frames_and_respects_keyframe_count(monkeypatch):
+async def test_ffmpeg_extraction_parses_rgb_frames_and_respects_keyframe_count(
+    monkeypatch,
+):
     processor = _processor(keyframe_sampling_strategy="uniform")
     ffmpeg_commands = []
     frames = [
@@ -110,6 +112,7 @@ async def test_ffmpeg_extraction_parses_rgb_frames_and_respects_keyframe_count(m
     assert video_info["fps"] == 5.0
     assert video_info["frame_count"] == 10
     assert video_info["has_audio"] is False
+    assert video_info["frame_timestamps_seconds"] == pytest.approx([0.0, 0.8, 1.8])
     assert len(keyframes) == 3
     assert keyframes[0].shape == (1, 2, 3)
     assert keyframes[0].tolist() == [[[255, 0, 0], [0, 255, 0]]]
@@ -157,10 +160,10 @@ async def test_scene_adaptive_extraction_merges_scene_and_floor_candidates(monke
 
     assert video_info["duration"] == 10.0
     assert len(keyframes) == 4
+    assert video_info["frame_timestamps_seconds"] == pytest.approx([0.0, 1.0, 6.2, 9.9])
     command = ffmpeg_commands[0]
     assert any(
-        "select=eq(n\\,0)+eq(n\\,10)+eq(n\\,40)+eq(n\\,62)+eq(n\\,80)+eq(n\\,99)"
-        in arg
+        "select=eq(n\\,0)+eq(n\\,10)+eq(n\\,40)+eq(n\\,62)+eq(n\\,80)+eq(n\\,99)" in arg
         for arg in command
     )
 
@@ -318,6 +321,46 @@ def test_quality_filter_drops_dark_blurry_and_duplicate_frames():
     np.testing.assert_array_equal(filtered[1], _rgb_from_luma(inverse))
 
 
+def test_frame_timestamps_prefer_extraction_metadata_over_synthetic_spacing():
+    frames = [np.zeros((1, 1, 3), dtype=np.uint8) for _ in range(3)]
+
+    timestamps = ContentProcessor._frame_timestamps(
+        frames,
+        {
+            "duration": 10.0,
+            "frame_timestamps_seconds": [0.0, 1.25, 9.5],
+        },
+    )
+
+    assert timestamps == [0.0, 1.25, 9.5]
+
+
+def test_frame_timestamps_derive_from_real_frame_indices_when_available():
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(3)]
+
+    timestamps = ContentProcessor._frame_timestamps(
+        frames,
+        {
+            "fps": 4.0,
+            "sampled_frame_indices": [0, 5, 38],
+            "duration": 10.0,
+        },
+    )
+
+    assert timestamps == pytest.approx([0.0, 1.25, 9.5])
+
+
+def test_frame_timestamps_do_not_synthesize_spacing_without_source_metadata():
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(3)]
+
+    timestamps = ContentProcessor._frame_timestamps(
+        frames,
+        {"duration": 10.0},
+    )
+
+    assert timestamps == [0.0, 0.0, 0.0]
+
+
 @pytest.mark.asyncio
 async def test_scene_adaptive_zero_usable_frames_falls_back_to_uniform(monkeypatch):
     processor = _processor(
@@ -410,8 +453,7 @@ async def test_scene_adaptive_real_ffmpeg_smoke(tmp_path):
 
     assert 1 <= len(keyframes) <= 4
     mean_colors = {
-        tuple(np.round(np.mean(frame, axis=(0, 1))).astype(int))
-        for frame in keyframes
+        tuple(np.round(np.mean(frame, axis=(0, 1))).astype(int)) for frame in keyframes
     }
     assert len(mean_colors) > 1
 
@@ -488,7 +530,9 @@ async def test_ffmpeg_empty_frames_falls_back_to_opencv(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_speech_to_text_success_retains_transcript_and_model(monkeypatch, tmp_path):
+async def test_speech_to_text_success_retains_transcript_and_model(
+    monkeypatch, tmp_path
+):
     processor = _processor(
         speech_to_text_enabled=True,
         speech_to_text_model="Qwen/Qwen3-ASR-0.6B",
@@ -515,6 +559,56 @@ async def test_speech_to_text_success_retains_transcript_and_model(monkeypatch, 
     assert features.asr_model == "Qwen/Qwen3-ASR-0.6B"
     assert features.transcription_time_seconds is not None
     assert not audio_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_speech_to_text_retains_aligned_segments_and_embeddings(
+    monkeypatch, tmp_path
+):
+    processor = _processor(speech_to_text_enabled=True)
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"wav")
+
+    async def fake_extract_audio(_video_path, _video_info):
+        return str(audio_file)
+
+    async def fake_request(_audio_path):
+        return {
+            "text": "新品手機",
+            "alignment_status": "completed",
+            "segments": [
+                {"text": "新品", "start_seconds": 0.0, "end_seconds": 1.0},
+                {"text": "手機", "start_seconds": 1.1, "end_seconds": 2.0},
+            ],
+        }
+
+    monkeypatch.setattr(processor, "_extract_audio_wav", fake_extract_audio)
+    monkeypatch.setattr(processor, "_request_transcription", fake_request)
+    monkeypatch.setattr(
+        processor,
+        "_encode_multilingual_texts",
+        lambda texts, prefix: [[float(index), 1.0] for index, _ in enumerate(texts)],
+    )
+
+    features = await processor._extract_audio_features(
+        "video.mp4", {"has_audio": True, "duration": 4.0}
+    )
+
+    assert features.alignment_status == "completed"
+    assert features.asr_segments == [
+        {
+            "text": "新品",
+            "start_seconds": 0.0,
+            "end_seconds": 1.0,
+            "text_embedding": [0.0, 1.0],
+        },
+        {
+            "text": "手機",
+            "start_seconds": 1.1,
+            "end_seconds": 2.0,
+            "text_embedding": [1.0, 1.0],
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -648,4 +742,24 @@ def test_bilingual_speech_and_ocr_map_to_canonical_categories():
 
     assert commerce["speech_categories"] == ["electronics"]
     assert commerce["ocr_categories"] == ["beauty"]
-    assert commerce["category_scores"]["electronics"] > commerce["category_scores"]["beauty"]
+    assert (
+        commerce["category_scores"]["electronics"]
+        > commerce["category_scores"]["beauty"]
+    )
+
+
+def test_ocr_embeddings_use_multilingual_passage_encoder():
+    processor = _processor()
+    calls = []
+
+    class FakeEmbedder:
+        def encode(self, texts, *, prefix):
+            calls.append((list(texts), prefix))
+            return [[1.0, 0.0] for _ in texts]
+
+    processor.text_embedder = FakeEmbedder()
+
+    result = processor._encode_ocr_texts(["新品手機", "new phone"])
+
+    assert calls == [(["新品手機", "new phone"], "passage")]
+    assert result == [[1.0, 0.0], [1.0, 0.0]]

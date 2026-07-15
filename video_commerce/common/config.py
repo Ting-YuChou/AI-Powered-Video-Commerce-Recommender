@@ -178,6 +178,19 @@ class ModelConfig(BaseSettings):
     speech_to_text_max_transcript_chars: int = Field(
         4000, description="Maximum transcript characters retained in content features"
     )
+    multilingual_text_model: str = Field(
+        "intfloat/multilingual-e5-small",
+        description="Frozen multilingual encoder for OCR, ASR, and candidate text",
+    )
+    multilingual_text_revision: str = Field(
+        "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+        description="Pinned Hugging Face revision for multilingual text embeddings",
+    )
+    multilingual_text_embedding_dim: int = Field(
+        384, description="Multilingual text embedding width"
+    )
+    max_ocr_temporal_tokens: int = Field(32, ge=1)
+    max_asr_temporal_tokens: int = Field(64, ge=1)
 
     # Performance settings
     enable_quantization: bool = Field(False, description="Enable model quantization")
@@ -807,6 +820,18 @@ class RankingConfig(BaseSettings):
     )
     dropout_rate: float = Field(0.2, description="Dropout rate")
     learning_rate: float = Field(0.001, description="Learning rate")
+    trimodal_enabled: bool = Field(
+        False,
+        description="Enable ranking_v4 visual/OCR/ASR temporal model training and serving",
+    )
+    trimodal_shadow: bool = Field(
+        True,
+        description="Train ranking_v4 as a non-serving shadow artifact",
+    )
+    trimodal_modality_dropout: float = Field(
+        0.1,
+        description="Per-example OCR/ASR modality dropout probability",
+    )
     enable_async_batching: bool = Field(
         True,
         description="Enable micro-batching queue for ranking inference",
@@ -1075,6 +1100,12 @@ class RankingConfig(BaseSettings):
     def validate_value_clip_quantile(cls, value: float) -> float:
         if not 0.0 < float(value) <= 1.0:
             raise ValueError("value_clip_quantile must be in (0, 1]")
+        return float(value)
+
+    @validator("trimodal_modality_dropout")
+    def validate_trimodal_modality_dropout(cls, value: float) -> float:
+        if not 0.0 <= float(value) < 1.0:
+            raise ValueError("trimodal_modality_dropout must be in [0, 1)")
         return float(value)
 
     @validator("cross_layers")
