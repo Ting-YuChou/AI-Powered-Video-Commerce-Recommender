@@ -244,14 +244,17 @@
   rollout and V3 checkpoint rollback lineage. V4 activation now rejects
   incomplete state dictionaries, shadow config is fully revalidated, and the
   post-holdout training partition must still satisfy the sample threshold.
+  Artifact publication is gated by an explicit per-attempt training result, so
+  a skipped main or shadow run cannot republish previously loaded weights with
+  new PIT lineage.
 - Key files: `asr_service/api.py`, `video_commerce/ml/content_processor.py`,
   `video_commerce/ml/content_artifacts.py`,
   `video_commerce/ml/temporal_multimodal.py`, `video_commerce/ml/ranking.py`,
   `video_commerce/ml/ranking_training.py`, and
   `video_commerce/ml/candidate_embedding_sidecar.py`.
 - Verification: after the training-correctness review fixes, the expanded
-  temporal/training/PIT/ranking Docker suite passed 229 tests with 3 skips; the
-  complete backend suite passed 522 tests with 8 skips. Python compile, scoped
+  temporal/training/PIT/ranking Docker suite passed 231 tests with 3 skips; the
+  complete backend suite passed 524 tests with 8 skips. Python compile, scoped
   Black, diff checks, `docker compose config -q`, Helm lint, and strict
   kubeconform passed for both default (33 resources) and PIT production
   (36 resources) renders. GPU 300-second ASR profiling, v3/v4 candidate

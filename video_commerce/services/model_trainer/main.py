@@ -664,7 +664,26 @@ class ModelTrainerService:
             training_kwargs = {"training_sample_source": training_sample_source}
             if pit_training_cancel_event is not None:
                 training_kwargs["cancellation_event"] = pit_training_cancel_event
-            await self.ranking_model.train_model(training_examples, **training_kwargs)
+            trained_this_attempt = await self.ranking_model.train_model(
+                training_examples, **training_kwargs
+            )
+            if not trained_this_attempt:
+                status = "skipped_insufficient_training_split"
+                logger.info(
+                    "Skipping ranking artifact publication because this training "
+                    "attempt did not retain enough post-holdout samples",
+                    extra={
+                        "trigger": trigger,
+                        "training_sample_source": training_sample_source,
+                    },
+                )
+                if pit_training_claimed:
+                    await self.system_store.fail_pit_training_run(
+                        run_id=pit_dataset.materialization_run_id,
+                        worker_id=getattr(self, "instance_id", "model-trainer"),
+                    )
+                    pit_training_claimed = False
+                return
             din_metrics = None
             if getattr(self.config.ranking_config, "din_enabled", False):
                 din_metrics = self._din_training_metrics(
@@ -937,10 +956,13 @@ class ModelTrainerService:
             shadow_examples = await self._attach_trimodal_candidate_embeddings(
                 shadow_model, dataset.examples
             )
-            await shadow_model.train_model(
+            trained_this_attempt = await shadow_model.train_model(
                 shadow_examples,
                 training_sample_source="feature_lake_pit_shadow",
             )
+            if not trained_this_attempt:
+                status = "skipped_insufficient_training_split"
+                return
             record = await self.artifact_manager.persist_ranking_shadow_checkpoint(
                 local_path=shadow_model.loaded_model_path,
                 model_version=shadow_model.model_version,

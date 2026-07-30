@@ -2196,7 +2196,7 @@ class RankingModel:
         *,
         training_sample_source: str = "interaction_events",
         cancellation_event: Optional[threading.Event] = None,
-    ):
+    ) -> bool:
         """Train from validated typed examples only."""
         if not all(isinstance(row, RankingTrainingExample) for row in training_data):
             raise TypeError("RankingModel.train_model requires typed training examples")
@@ -2211,8 +2211,10 @@ class RankingModel:
         )
         try:
             saved_model_path = await asyncio.shield(training_task)
-            if saved_model_path:
-                await self.save_model(saved_model_path)
+            if not saved_model_path:
+                return False
+            await self.save_model(saved_model_path)
+            return True
         except asyncio.CancelledError:
             # asyncio cannot terminate a to_thread worker. Signal the sync loop
             # and wait for it to stop before the caller releases a durable

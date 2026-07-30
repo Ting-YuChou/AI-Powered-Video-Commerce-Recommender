@@ -37,7 +37,10 @@
   `FeatureBundle.as_of_ts`; one impression never crosses the split. Validation
   reuses the value transform fitted on training data and receives neither OCR
   nor ASR dropout. The training partition must still meet
-  `training_min_samples` after the split or the run publishes no checkpoint.
+  `training_min_samples` after the split or the attempt returns an explicit
+  skipped result. Model-trainer and shadow paths publish artifacts only for a
+  successful current attempt; a previously loaded checkpoint cannot be
+  relabeled with the skipped PIT run's lineage.
 - During warm-up the base ranker is frozen. Early stopping is not eligible
   until at least one joint fine-tuning epoch has run. The best validation state
   is restored before checkpoint publication.
