@@ -52,6 +52,9 @@ data:
   FEATURE_LAKE_PIT_TRAINING_LEASE_SECONDS: {{ .Values.external.featureLake.pitTrainingLeaseSeconds | quote }}
   FEATURE_LAKE_FLINK_JOBMANAGER: {{ .Values.external.featureLake.flinkJobmanager | quote }}
   FEATURE_LAKE_PIT_EXPORT_URI: {{ .Values.external.featureLake.pitExportUri | quote }}
+  FEATURE_LAKE_CANDIDATE_SIDECAR_URI: {{ .Values.external.featureLake.candidateSidecarUri | quote }}
+  FEATURE_LAKE_CANDIDATE_SIDECAR_SHA256: {{ .Values.external.featureLake.candidateSidecarSha256 | quote }}
+  FEATURE_LAKE_CANDIDATE_SIDECAR_MODEL_VERSION: {{ .Values.external.featureLake.candidateSidecarModelVersion | quote }}
   FEATURE_LAKE_PIT_JOB_JAR_PATH: {{ .Values.external.featureLake.pitJobJarPath | quote }}
   DATABASE_ENABLE: {{ .Values.external.database.enable | quote }}
   DATABASE_POOL_SIZE: {{ .Values.external.database.poolSize | quote }}

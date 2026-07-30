@@ -73,14 +73,21 @@ run:
 ```bash
 FEATURE_LAKE_MATERIALIZATION_RUN_ID=shadow-2026-07-09 \
 FEATURE_LAKE_PIT_ICEBERG_SNAPSHOT_ID=<exact-snapshot-id> \
+FEATURE_LAKE_CANDIDATE_SIDECAR_URI=<immutable-npz-uri> \
+FEATURE_LAKE_CANDIDATE_SIDECAR_SHA256=<64-character-sha256> \
+FEATURE_LAKE_CANDIDATE_SIDECAR_MODEL_VERSION=<source-version> \
 docker compose --profile feature-lake-pit up --abort-on-container-exit \
   --exit-code-from pit-manifest-publisher
 ```
 
 The manifest publisher verifies every shard schema, row count, byte size, and
-SHA-256 before writing `manifest.json`; `latest.json` is written last. The
-trainer resolves `latest.json` once per training run and fails closed on any
-manifest, shard, schema, hash, or feature-definition mismatch.
+SHA-256 plus the candidate sidecar checksum/schema/model version before writing
+`manifest.json`; `latest.json` is written last. The three candidate variables
+are an all-or-nothing contract. Trimodal PIT training requires the reference,
+loads candidate image/text/two-tower embeddings from that pinned NPZ, and never
+rebuilds them from current catalog, FAISS, or CF state. The trainer resolves
+`latest.json` once per training run and fails closed on any manifest, shard,
+sidecar, schema, hash, or feature-definition mismatch.
 
 New Phase 3 manifests must also declare `label_definition_version` as
 `ranking_labels_v1`. Their shards contain finalized attribution facts rather

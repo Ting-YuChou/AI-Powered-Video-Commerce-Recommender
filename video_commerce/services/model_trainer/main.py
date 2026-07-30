@@ -52,6 +52,18 @@ class ModelTrainerService:
         self.config = config
         self.feature_store: FeatureStore | None = None
         self.vector_search: VectorSearchEngine | None = None
+        self.recommendation_engine: RecommendationEngine | None = None
+        self.ranking_model: RankingModel | None = None
+        self.system_store: SystemStore | None = None
+        self.object_storage: ObjectStorage | None = None
+        self.artifact_manager: ModelArtifactManager | None = None
+        self.pit_dataset_reader: PitTrainingDatasetReader | None = None
+        self.last_trained_pit_run_id: str | None = None
+        self.legacy_training_adapter: LegacyTrainingDatasetAdapter | None = None
+        self.observability = ObservabilityManager()
+        self.running = False
+        self._heartbeat_task: asyncio.Task | None = None
+        self.instance_id = f"model-trainer-{socket.gethostname()}-{os.getpid()}"
 
     async def _attach_trimodal_candidate_embeddings(
         self,
@@ -61,6 +73,29 @@ class ModelTrainerService:
         if not getattr(
             getattr(ranking_model, "config", None), "trimodal_enabled", False
         ):
+            return examples
+        if examples and all(
+            example.candidate_embeddings is not None for example in examples
+        ):
+            records = {}
+            for example in examples:
+                product_id = str(example.bundle.candidate.product_id)
+                candidate_embeddings = dict(example.candidate_embeddings or {})
+                previous = records.setdefault(product_id, candidate_embeddings)
+                if previous != candidate_embeddings:
+                    raise RuntimeError(
+                        "PIT candidate embeddings conflict for one product"
+                    )
+            sidecar_path = str(
+                Path(
+                    ranking_model.loaded_model_path
+                    or self.config.model_config.ranking_model_path
+                ).with_suffix(".candidates.npz")
+            )
+            ranking_model.configure_candidate_sidecar_for_training(
+                records,
+                path=sidecar_path,
+            )
             return examples
         by_product = {}
         for example in examples:
@@ -126,18 +161,6 @@ class ModelTrainerService:
             )
             for example in examples
         ]
-        self.recommendation_engine: RecommendationEngine | None = None
-        self.ranking_model: RankingModel | None = None
-        self.system_store: SystemStore | None = None
-        self.object_storage: ObjectStorage | None = None
-        self.artifact_manager: ModelArtifactManager | None = None
-        self.pit_dataset_reader: PitTrainingDatasetReader | None = None
-        self.last_trained_pit_run_id: str | None = None
-        self.legacy_training_adapter: LegacyTrainingDatasetAdapter | None = None
-        self.observability = ObservabilityManager()
-        self.running = False
-        self._heartbeat_task: asyncio.Task | None = None
-        self.instance_id = f"model-trainer-{socket.gethostname()}-{os.getpid()}"
 
     def _ensure_heartbeat_task(self) -> None:
         if self._heartbeat_task is None or self._heartbeat_task.done():
@@ -200,6 +223,13 @@ class ModelTrainerService:
                 self.object_storage,
                 expected_feature_definition_version=(
                     feature_lake_config.feature_definition_version
+                ),
+                require_candidate_sidecar=bool(
+                    (
+                        use_pit_dataset
+                        or getattr(feature_lake_config, "pit_shadow_enabled", False)
+                    )
+                    and getattr(self.config.ranking_config, "trimodal_enabled", False)
                 ),
                 observability=self.observability,
             )
@@ -677,6 +707,15 @@ class ModelTrainerService:
                             if pit_dataset
                             else None
                         ),
+                        "candidate_embedding_source": (
+                            getattr(
+                                pit_dataset,
+                                "candidate_embedding_sidecar",
+                                None,
+                            )
+                            if pit_dataset
+                            else None
+                        ),
                         "label_definition_version": (
                             getattr(pit_dataset, "label_definition_version", None)
                             if pit_dataset
@@ -886,6 +925,11 @@ class ModelTrainerService:
                     "feature_lake_manifest_uri": dataset.manifest_uri,
                     "feature_lake_iceberg_snapshot_id": dataset.iceberg_snapshot_id,
                     "feature_lake_schema_hash": dataset.schema_hash,
+                    "candidate_embedding_source": getattr(
+                        dataset,
+                        "candidate_embedding_sidecar",
+                        None,
+                    ),
                     "feature_definition_version": dataset.feature_definition_version,
                     "label_definition_version": dataset.label_definition_version,
                     "feature_assembler_version": shadow_model.feature_assembler.version,

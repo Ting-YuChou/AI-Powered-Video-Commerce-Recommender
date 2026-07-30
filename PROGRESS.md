@@ -224,9 +224,18 @@
   propagated URI/SHA/schema references into PIT examples. The PIT reader now
   verifies referenced bytes and fails closed on checksum or schema mismatch.
 - Added three temporal encoders, candidate-conditioned cross-attention,
-  presence-aware modality gating, 10% OCR/ASR dropout, V3 warm-start, first
-  epoch base freeze, differential learning rates, and the
-  `ranking_v4_00_temporal_trimodal` checkpoint schema.
+  presence-aware modality gating, batch-local 10% OCR/ASR dropout, V3
+  warm-start, configurable base-freeze warm-up, differential learning rates,
+  time-based impression validation, best-state restoration, and the
+  `ranking_v4_01_temporal_trimodal` checkpoint schema. DIN and trimodal tensors
+  now share one structured training-batch contract and loss-contract errors
+  fail fast.
+- PIT manifests now pin and verify candidate sidecar URI, SHA-256, schema, and
+  source model version. The PIT reader attaches only present candidate
+  modalities and the trainer reuses them without reading current FAISS/CF
+  state. Training history records modality/candidate coverage, gate means,
+  temporal-attention entropy, encoder gradient norms, validation loss, and
+  completed epochs.
 - Added bounded payload V4 support across recommendation, ranking service,
   coordinator, runner, and local fallback; checksum-locked candidate NPZ
   sidecars with atomic activation; V1-V3 compatibility; shadow-by-default
@@ -236,15 +245,11 @@
   `video_commerce/ml/temporal_multimodal.py`, `video_commerce/ml/ranking.py`,
   `video_commerce/ml/ranking_training.py`, and
   `video_commerce/ml/candidate_embedding_sidecar.py`.
-- Verification: 107 focused host tests and the full Docker backend regression
-  passed after merging current `origin/main` (508 passed, 4 skipped). The merge
-  preserves main's DIN sequence model/sidecar path and allows DIN inputs to run
-  jointly with V4 temporal features. Python compile, Black, diff checks, and
-  `docker compose config -q` passed. The ASR and content-worker production
-  images built successfully, and the ASR image imported `qwen-asr` with the
-  pinned forced-aligner model. Helm/kubeconform could not run because local
-  binaries are unavailable and the sandbox rejected mounting the private repo
-  into the Helm container. GPU 300-second ASR profiling, v3/v4 candidate
-  benchmarks, and offline NDCG/AUC/GMV promotion evaluation require production
-  hardware/data and remain rollout gates. No performance improvement is
-  claimed.
+- Verification: the combined temporal/training/PIT/ranking focused Docker suite
+  passed 142 tests; the complete backend suite passed 516 tests with 8 skips.
+  Python compile, scoped Black, diff checks, `docker compose config -q`, Helm
+  lint, and strict kubeconform passed for both default (33 resources) and PIT
+  production (36 resources) renders. GPU 300-second ASR profiling, v3/v4
+  candidate benchmarks, and offline NDCG/AUC/GMV promotion evaluation require
+  production hardware/data and remain rollout gates. No performance
+  improvement is claimed.

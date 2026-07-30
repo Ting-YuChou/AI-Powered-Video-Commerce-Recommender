@@ -8,13 +8,21 @@ import pytest
 from video_commerce.common.feature_history_contracts import payload_sha256
 from video_commerce.common.models import ContentFeatures
 from video_commerce.ml.content_artifacts import canonical_content_feature_bytes
+from video_commerce.ml.candidate_embedding_sidecar import (
+    CANDIDATE_SIDECAR_SCHEMA_VERSION,
+    write_candidate_embedding_sidecar,
+)
 from video_commerce.ml.pit_training_dataset import (
     PitTrainingDatasetError,
     PitTrainingDatasetUnavailable,
     PitTrainingDatasetReader,
     arrow_schema_sha256,
 )
-from video_commerce.ml.pit_manifest import PitManifestPublisher, _is_parquet_shard_uri
+from video_commerce.ml.pit_manifest import (
+    PitManifestPublisher,
+    _candidate_sidecar_reference_from_environment,
+    _is_parquet_shard_uri,
+)
 from video_commerce.ml.ranking_features import RANKING_LTR_FEATURE_DEFINITION_VERSION
 from video_commerce.common.feature_history_contracts import (
     RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
@@ -53,6 +61,7 @@ def _write_dataset(
     definition_version=None,
     context=None,
     behavior_sequences=None,
+    candidate_embedding_sidecar=None,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     definition_version = definition_version or (
@@ -109,33 +118,31 @@ def _write_dataset(
     pq.write_table(table, shard)
     shard_bytes = shard.read_bytes()
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(
-        json.dumps(
+    manifest_payload = {
+        "status": status,
+        "dataset_version": "iceberg-snapshot-42",
+        "materialization_run_id": "run-42",
+        "iceberg_table_id": "video_commerce.ranking_training_pit",
+        "iceberg_snapshot_id": "42",
+        "feature_definition_version": definition_version,
+        "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
+        "schema_hash": arrow_schema_sha256(table.schema),
+        "attribution_cutoff": 1_700_000_000.0,
+        "row_count": 1,
+        "quarantine_row_count": 0,
+        "min_as_of_ts": 50.0,
+        "max_as_of_ts": 50.0,
+        "shards": [
             {
-                "status": status,
-                "dataset_version": "iceberg-snapshot-42",
-                "materialization_run_id": "run-42",
-                "iceberg_table_id": "video_commerce.ranking_training_pit",
-                "iceberg_snapshot_id": "42",
-                "feature_definition_version": definition_version,
-                "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
-                "schema_hash": arrow_schema_sha256(table.schema),
-                "attribution_cutoff": 1_700_000_000.0,
-                "row_count": 1,
-                "quarantine_row_count": 0,
-                "min_as_of_ts": 50.0,
-                "max_as_of_ts": 50.0,
-                "shards": [
-                    {
-                        "uri": str(shard),
-                        "byte_size": len(shard_bytes),
-                        "sha256": hashlib.sha256(shard_bytes).hexdigest(),
-                    }
-                ],
+                "uri": str(shard),
+                "byte_size": len(shard_bytes),
+                "sha256": hashlib.sha256(shard_bytes).hexdigest(),
             }
-        ),
-        encoding="utf-8",
-    )
+        ],
+    }
+    if candidate_embedding_sidecar is not None:
+        manifest_payload["candidate_embedding_sidecar"] = candidate_embedding_sidecar
+    manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
     latest = tmp_path / "latest.json"
     latest.write_text(
         json.dumps(
@@ -205,6 +212,58 @@ async def test_pit_reader_resolves_checksum_pinned_content_artifact(tmp_path):
         await PitTrainingDatasetReader(
             LocalObjectStorage(),
             expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        ).read(str(latest))
+
+
+@pytest.mark.asyncio
+async def test_pit_reader_requires_and_loads_pinned_candidate_sidecar(tmp_path):
+    sidecar = tmp_path / "candidate-source.npz"
+    sidecar_sha256 = write_candidate_embedding_sidecar(
+        sidecar,
+        {"p1": {"text": [1.0] * 384}},
+        model_version="candidate-source-42",
+    )
+    reference = {
+        "uri": str(sidecar),
+        "sha256": sidecar_sha256,
+        "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
+        "model_version": "candidate-source-42",
+    }
+    latest, manifest_path, _ = _write_dataset(
+        tmp_path / "pit",
+        candidate_embedding_sidecar=reference,
+    )
+
+    dataset = await PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        require_candidate_sidecar=True,
+    ).read(str(latest))
+
+    assert dataset.candidate_embedding_sidecar == reference
+    assert set(dataset.examples[0].candidate_embeddings) == {"text"}
+    assert len(dataset.examples[0].candidate_embeddings["text"]) == 384
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["candidate_embedding_sidecar"]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(PitTrainingDatasetError, match="candidate sidecar checksum"):
+        await PitTrainingDatasetReader(
+            LocalObjectStorage(),
+            expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            require_candidate_sidecar=True,
+        ).read(str(latest))
+
+
+@pytest.mark.asyncio
+async def test_pit_reader_rejects_missing_required_candidate_sidecar(tmp_path):
+    latest, _, _ = _write_dataset(tmp_path)
+
+    with pytest.raises(PitTrainingDatasetError, match="candidate sidecar"):
+        await PitTrainingDatasetReader(
+            LocalObjectStorage(),
+            expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            require_candidate_sidecar=True,
         ).read(str(latest))
 
 
@@ -404,11 +463,85 @@ async def test_manifest_publisher_writes_manifest_before_latest_pointer(tmp_path
     assert pointer_after_older_run["materialization_run_id"] == "run-99"
 
 
+@pytest.mark.asyncio
+async def test_manifest_publisher_pins_verified_candidate_sidecar(tmp_path):
+    _, _, shard = _write_dataset(tmp_path / "source")
+    sidecar = tmp_path / "candidate-source.npz"
+    sidecar_sha256 = write_candidate_embedding_sidecar(
+        sidecar,
+        {"p1": {"text": [1.0] * 384}},
+        model_version="candidate-source-42",
+    )
+    reference = {
+        "uri": str(sidecar),
+        "sha256": sidecar_sha256,
+        "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
+        "model_version": "candidate-source-42",
+    }
+    output = tmp_path / "published"
+
+    await PitManifestPublisher(LocalObjectStorage()).publish(
+        shard_uris=[str(shard)],
+        output_prefix=str(output),
+        materialization_run_id="run-candidate-1",
+        iceberg_table_id="video_commerce.ranking_training_pit",
+        iceberg_snapshot_id="42",
+        feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
+        attribution_cutoff=1_700_000_000.0,
+        candidate_embedding_sidecar=reference,
+    )
+
+    manifest = json.loads(
+        (output / "runs/run-candidate-1/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["candidate_embedding_sidecar"] == reference
+
+    bad_reference = dict(reference, sha256="0" * 64)
+    with pytest.raises(PitTrainingDatasetError, match="candidate sidecar checksum"):
+        await PitManifestPublisher(LocalObjectStorage()).publish(
+            shard_uris=[str(shard)],
+            output_prefix=str(tmp_path / "bad"),
+            materialization_run_id="run-candidate-2",
+            iceberg_table_id="video_commerce.ranking_training_pit",
+            iceberg_snapshot_id="42",
+            feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
+            attribution_cutoff=1_700_000_000.0,
+            candidate_embedding_sidecar=bad_reference,
+        )
+
+
 def test_manifest_discovers_flink_parquet_part_files_without_extension():
     assert _is_parquet_shard_uri("s3://features/run/shards/part-abc-task-0-file-0")
     assert _is_parquet_shard_uri("s3://features/run/shards/part-abc.parquet")
     assert not _is_parquet_shard_uri("s3://features/run/shards/_SUCCESS")
     assert not _is_parquet_shard_uri("s3://features/run/shards/.staging/file")
+
+
+def test_candidate_sidecar_reference_from_environment_is_all_or_nothing(
+    monkeypatch,
+):
+    assert _candidate_sidecar_reference_from_environment() is None
+
+    monkeypatch.setenv(
+        "FEATURE_LAKE_CANDIDATE_SIDECAR_URI",
+        "s3://features/candidates/source-42.npz",
+    )
+    with pytest.raises(PitTrainingDatasetError, match="candidate sidecar"):
+        _candidate_sidecar_reference_from_environment()
+
+    monkeypatch.setenv("FEATURE_LAKE_CANDIDATE_SIDECAR_SHA256", "a" * 64)
+    monkeypatch.setenv(
+        "FEATURE_LAKE_CANDIDATE_SIDECAR_MODEL_VERSION",
+        "candidate-source-42",
+    )
+    assert _candidate_sidecar_reference_from_environment() == {
+        "uri": "s3://features/candidates/source-42.npz",
+        "sha256": "a" * 64,
+        "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
+        "model_version": "candidate-source-42",
+    }
 
 
 @pytest.mark.asyncio

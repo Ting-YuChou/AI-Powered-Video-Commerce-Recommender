@@ -309,6 +309,44 @@ def test_trimodal_ranker_zero_residual_matches_base_and_all_branches_get_gradien
         )
 
 
+def test_trimodal_ranker_uses_base_only_when_all_candidate_embeddings_are_missing():
+    torch.manual_seed(29)
+    model = TemporalTrimodalRankingModel(
+        6,
+        RankingConfig(hidden_dims=[16], architecture="mlp", dropout_rate=0.0),
+        model_dim=16,
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+    ).eval()
+    base = torch.randn(2, 6)
+    multimodal = {
+        "visual_embeddings": torch.randn(2, 2, 512),
+        "visual_starts": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "visual_ends": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "visual_mask": torch.ones(2, 2, dtype=torch.bool),
+        "ocr_embeddings": torch.randn(2, 2, 384),
+        "ocr_starts": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "ocr_ends": torch.tensor([[0.5, 1.5], [0.5, 1.5]]),
+        "ocr_mask": torch.ones(2, 2, dtype=torch.bool),
+        "asr_embeddings": torch.randn(2, 2, 384),
+        "asr_starts": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "asr_ends": torch.tensor([[0.5, 1.5], [0.5, 1.5]]),
+        "asr_mask": torch.ones(2, 2, dtype=torch.bool),
+        "candidate_image": torch.zeros(2, 512),
+        "candidate_text": torch.zeros(2, 384),
+        "candidate_two_tower": torch.zeros(2, 128),
+        "candidate_presence": torch.zeros(2, 3, dtype=torch.bool),
+    }
+    with torch.no_grad():
+        model.residual_gate_logit.fill_(10.0)
+        expected = model.ranker(base)
+        actual = model(base, **multimodal)
+
+    for key in ("ctr", "cvr", "ctcvr", "gmv", "ranking_score"):
+        torch.testing.assert_close(actual[key], expected[key])
+
+
 def test_rank_payload_accepts_bounded_v4_trimodal_context():
     packed = base64.b64encode(encode_float16_matrix(np.ones((2, 4)))).decode()
     payload = coerce_rank_payload(

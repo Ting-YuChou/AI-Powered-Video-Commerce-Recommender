@@ -1940,7 +1940,7 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
             self.loaded_model_path = None
             self.model_version = "shadow-1"
             self.model = None
-            self.feature_schema_version = "ranking_v4_00_temporal_trimodal"
+            self.feature_schema_version = "ranking_v4_01_temporal_trimodal"
             self._candidate_sidecar_path = "/tmp/ranking.candidates.npz"
             self.feature_assembler = SimpleNamespace(
                 version="ranking_feature_assembler_v1"

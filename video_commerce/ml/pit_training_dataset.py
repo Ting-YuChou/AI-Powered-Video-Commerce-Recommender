@@ -14,6 +14,10 @@ import pyarrow.parquet as pq
 from video_commerce.common.feature_history_contracts import payload_sha256
 from video_commerce.common.models import CandidateProduct, UserFeatures
 from video_commerce.ml.content_artifacts import load_content_feature_artifact
+from video_commerce.ml.candidate_embedding_sidecar import (
+    CANDIDATE_SIDECAR_SCHEMA_VERSION,
+    CandidateEmbeddingSidecar,
+)
 from video_commerce.ml.ranking_features import FeatureBundle
 from video_commerce.ml.din import parse_din_behavior_sequences
 from video_commerce.ml.ranking_training import (
@@ -42,6 +46,7 @@ class PitTrainingDataset:
     schema_hash: str
     quarantine_rows: int
     examples: List[RankingTrainingExample]
+    candidate_embedding_sidecar: Dict[str, Any] | None = None
 
 
 def arrow_schema_sha256(schema: pa.Schema) -> str:
@@ -57,11 +62,13 @@ class PitTrainingDatasetReader:
         *,
         expected_feature_definition_version: str,
         expected_label_definition_version: str = RANKING_LABEL_DEFINITION_VERSION,
+        require_candidate_sidecar: bool = False,
         observability=None,
     ):
         self.object_storage = object_storage
         self.expected_feature_definition_version = expected_feature_definition_version
         self.expected_label_definition_version = expected_label_definition_version
+        self.require_candidate_sidecar = require_candidate_sidecar
         self.observability = observability
 
     async def read(self, dataset_uri: str) -> PitTrainingDataset:
@@ -174,6 +181,69 @@ class PitTrainingDatasetReader:
                 ) from exc
             resolved_examples.append(replace(example, multimodal_content=content))
         examples = resolved_examples
+        candidate_sidecar_reference = manifest.get("candidate_embedding_sidecar")
+        if candidate_sidecar_reference is None:
+            if self.require_candidate_sidecar:
+                raise PitTrainingDatasetError(
+                    "PIT dataset manifest is missing candidate sidecar"
+                )
+        else:
+            if not isinstance(candidate_sidecar_reference, dict):
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar reference must be an object"
+                )
+            uri = str(candidate_sidecar_reference.get("uri") or "").strip()
+            sha256 = str(candidate_sidecar_reference.get("sha256") or "").strip()
+            schema_version = str(
+                candidate_sidecar_reference.get("schema_version") or ""
+            ).strip()
+            model_version = str(
+                candidate_sidecar_reference.get("model_version") or ""
+            ).strip()
+            if (
+                not uri
+                or len(sha256) != 64
+                or schema_version != CANDIDATE_SIDECAR_SCHEMA_VERSION
+                or not model_version
+            ):
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar reference is incomplete or incompatible"
+                )
+            try:
+                (
+                    sidecar_path,
+                    should_delete,
+                ) = await self.object_storage.materialize_for_processing(
+                    uri,
+                    suggested_suffix=".npz",
+                )
+                try:
+                    sidecar = CandidateEmbeddingSidecar.load(
+                        sidecar_path,
+                        expected_sha256=sha256,
+                        expected_model_version=model_version,
+                    )
+                finally:
+                    if should_delete and os.path.exists(sidecar_path):
+                        os.remove(sidecar_path)
+            except (OSError, ValueError) as exc:
+                raise PitTrainingDatasetError(
+                    f"unable to resolve PIT candidate sidecar: {exc}"
+                ) from exc
+
+            pinned_examples = []
+            for example in examples:
+                values = sidecar.get(example.bundle.candidate.product_id)
+                embeddings: Dict[str, Any] = {}
+                if values is not None:
+                    presence = values.pop("presence")
+                    for index, modality in enumerate(("image", "text", "two_tower")):
+                        if bool(presence[index]):
+                            embeddings[modality] = values[modality].tolist()
+                pinned_examples.append(
+                    replace(example, candidate_embeddings=embeddings)
+                )
+            examples = pinned_examples
         return PitTrainingDataset(
             dataset_version=dataset_version,
             materialization_run_id=run_id,
@@ -184,6 +254,7 @@ class PitTrainingDatasetReader:
             schema_hash=expected_schema_hash,
             quarantine_rows=max(0, int(manifest.get("quarantine_row_count", 0))),
             examples=examples,
+            candidate_embedding_sidecar=candidate_sidecar_reference,
         )
 
     async def _read_json_uri(self, uri: str, *, kind: str) -> Dict[str, Any]:

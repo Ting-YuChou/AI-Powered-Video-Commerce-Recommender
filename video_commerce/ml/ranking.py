@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import asyncio
+import copy
 import hashlib
 import logging
 from collections import OrderedDict
@@ -54,7 +55,9 @@ from video_commerce.common.feature_history_contracts import (
 from video_commerce.ml.ranking_features import FeatureBundle, RankingFeatureAssembler
 from video_commerce.ml.ranking_training import (
     RANKING_LABEL_DEFINITION_VERSION,
+    RankingTrainingBatch,
     RankingTrainingExample,
+    RankingTrainingTensors,
     TrainingTensorBuilder,
 )
 from video_commerce.ml.temporal_multimodal import (
@@ -79,7 +82,7 @@ from video_commerce.ml.din import (
 logger = logging.getLogger(__name__)
 
 RANKING_FEATURE_SCHEMA_VERSION = "ranking_v3_00_temporal_multimodal"
-RANKING_TRIMODAL_FEATURE_SCHEMA_VERSION = "ranking_v4_00_temporal_trimodal"
+RANKING_TRIMODAL_FEATURE_SCHEMA_VERSION = "ranking_v4_01_temporal_trimodal"
 RANKING_DIN_FEATURE_SCHEMA_VERSION = "ranking_v3_din"
 RANKING_TRAINING_DATA_SOURCE = "interaction_events_online_equivalent_features"
 RANKING_OBJECTIVE_VERSION = "business_v1"
@@ -402,7 +405,11 @@ class TemporalTrimodalRankingModel(nn.Module):
             num_heads=int(num_heads),
             dropout=float(dropout),
         )
-        self.residual_projection = nn.Linear(int(model_dim), self.base_input_dim)
+        self.residual_projection = nn.Linear(
+            int(model_dim),
+            self.base_input_dim,
+            bias=False,
+        )
         self.residual_gate_logit = nn.Parameter(torch.tensor(-4.0))
         self.ranker = MultiObjectiveRankingModel(
             self.base_input_dim,
@@ -2232,21 +2239,22 @@ class RankingModel:
                 two_tower_model_version=two_tower_model_version,
                 training_sample_source=training_sample_source,
             )
-        multimodal_tensors = None
-        if getattr(self.config, "trimodal_enabled", False):
-            (
-                features,
-                labels,
-                multimodal_tensors,
-            ) = self.training_tensor_builder.build_trimodal(
-                training_data,
-                apply_modality_dropout=True,
-                modality_dropout_probability=float(
-                    getattr(self.config, "trimodal_modality_dropout", 0.1)
-                ),
+        training_examples, validation_examples = self._split_training_examples_by_time(
+            training_data
+        )
+        training_tensors = self._prepare_training_tensors(
+            training_examples,
+            fit_value_transform=True,
+        )
+        validation_tensors = (
+            self._prepare_training_tensors(
+                validation_examples,
+                fit_value_transform=False,
             )
-        else:
-            features, labels = self._prepare_training_examples(training_data)
+            if validation_examples
+            else None
+        )
+        features = training_tensors.base_features
 
         if cancellation_event is not None and cancellation_event.is_set():
             raise RankingTrainingCancelled("ranking training was cancelled")
@@ -2258,6 +2266,22 @@ class RankingModel:
         self._clear_compiled_model()
         self.model.train()
 
+        avg_loss = 0.0
+        validation_loss: Optional[float] = None
+        best_validation_loss = float("inf")
+        best_state_dict = None
+        epochs_without_improvement = 0
+        epochs_completed = 0
+        warmup_epochs = (
+            int(getattr(self.config, "trimodal_warmup_epochs", 1))
+            if isinstance(self.model, TemporalTrimodalRankingModel)
+            else 0
+        )
+        minimum_epochs = max(
+            int(getattr(self.config, "training_min_epochs", 1)),
+            warmup_epochs + 1,
+        )
+
         for epoch in range(self.config.epochs):
             if cancellation_event is not None and cancellation_event.is_set():
                 raise RankingTrainingCancelled("ranking training was cancelled")
@@ -2265,40 +2289,32 @@ class RankingModel:
             num_batches = 0
 
             if isinstance(self.model, TemporalTrimodalRankingModel):
-                base_trainable = epoch > 0
+                base_trainable = epoch >= warmup_epochs
                 for parameter in self.model.ranker.parameters():
                     parameter.requires_grad_(base_trainable)
                 self.model.ranker.train(base_trainable)
 
-            batches = (
-                self._iter_trimodal_training_batches(
-                    features, labels, multimodal_tensors
-                )
-                if multimodal_tensors is not None
-                else (
-                    (batch_features, batch_labels, None)
-                    for batch_features, batch_labels in self._iter_training_batches(
-                        features, labels
-                    )
-                )
+            dropout_generator = torch.Generator(device=self.device.type)
+            dropout_generator.manual_seed(
+                int(getattr(self.config, "training_seed", 42)) + epoch
             )
-            for batch_features, batch_labels, batch_multimodal in batches:
+            for batch in self._iter_structured_training_batches(training_tensors):
                 if cancellation_event is not None and cancellation_event.is_set():
                     raise RankingTrainingCancelled("ranking training was cancelled")
                 self.optimizer.zero_grad()
-                forward_inputs = dict(batch_multimodal or {})
-                if getattr(self.config, "din_enabled", False):
-                    forward_inputs.update(
-                        {
-                            "candidate_indices": batch_labels["_din_candidate_indices"],
-                            "history_indices": batch_labels["_din_history_indices"],
-                            "history_recency": batch_labels["_din_history_recency"],
-                            "history_mask": batch_labels["_din_history_mask"],
-                            "summary_features": batch_labels["_din_summary_features"],
-                        }
-                    )
-                predictions = self.model(batch_features, **forward_inputs)
-                loss = self._compute_loss(predictions, batch_labels)
+                trimodal_inputs = self._apply_trimodal_modality_dropout(
+                    batch.trimodal_inputs,
+                    probability=float(
+                        getattr(self.config, "trimodal_modality_dropout", 0.1)
+                    ),
+                    generator=dropout_generator,
+                )
+                forward_inputs = {
+                    **trimodal_inputs,
+                    **batch.din_inputs,
+                }
+                predictions = self.model(batch.base_features, **forward_inputs)
+                loss = self._compute_loss(predictions, batch.labels)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
@@ -2310,19 +2326,57 @@ class RankingModel:
                 raise RankingTrainingCancelled("ranking training was cancelled")
 
             avg_loss = epoch_loss / max(num_batches, 1)
+            epochs_completed = epoch + 1
 
             if epoch % 10 == 0:
                 logger.info(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}")
 
-            if avg_loss < 0.01:
-                logger.info(f"Early stopping at epoch {epoch}")
-                break
+            if validation_tensors is not None:
+                validation_loss = self._evaluate_training_loss(validation_tensors)
+                self.model.train()
+                if isinstance(self.model, TemporalTrimodalRankingModel):
+                    self.model.ranker.train(epoch >= warmup_epochs)
+
+                if epoch >= warmup_epochs:
+                    minimum_delta = float(
+                        getattr(self.config, "early_stopping_min_delta", 1e-4)
+                    )
+                    if validation_loss < best_validation_loss - minimum_delta:
+                        best_validation_loss = validation_loss
+                        best_state_dict = copy.deepcopy(self.model.state_dict())
+                        epochs_without_improvement = 0
+                    else:
+                        epochs_without_improvement += 1
+
+                    patience = max(
+                        1,
+                        int(getattr(self.config, "early_stopping_patience", 10)),
+                    )
+                    if (
+                        epochs_completed >= minimum_epochs
+                        and epochs_without_improvement >= patience
+                    ):
+                        logger.info(
+                            "Early stopping at epoch %s after %s validation "
+                            "epochs without improvement",
+                            epoch,
+                            epochs_without_improvement,
+                        )
+                        break
 
         if cancellation_event is not None and cancellation_event.is_set():
             raise RankingTrainingCancelled("ranking training was cancelled")
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
+            validation_loss = best_validation_loss
         self.model.eval()
         self.training_history.append(
-            self._training_quality_metrics(features, labels, loss=avg_loss)
+            self._training_quality_metrics(
+                validation_tensors or training_tensors,
+                loss=avg_loss,
+                validation_loss=validation_loss,
+                epochs_completed=epochs_completed,
+            )
         )
         self.is_trained = True
         self.last_training_time = time.time()
@@ -2352,19 +2406,21 @@ class RankingModel:
         logger.info("Model training completed")
         return self.loaded_model_path
 
-    def _training_quality_metrics(self, features, labels, *, loss: float):
+    def _training_quality_metrics(
+        self,
+        tensors: RankingTrainingTensors,
+        *,
+        loss: float,
+        validation_loss: Optional[float] = None,
+        epochs_completed: int = 0,
+    ):
         with torch.no_grad():
-            if getattr(self.config, "din_enabled", False):
-                predictions = self.model(
-                    features,
-                    candidate_indices=labels["_din_candidate_indices"],
-                    history_indices=labels["_din_history_indices"],
-                    history_recency=labels["_din_history_recency"],
-                    history_mask=labels["_din_history_mask"],
-                    summary_features=labels["_din_summary_features"],
-                )
-            else:
-                predictions = self.model(features)
+            predictions = self.model(
+                tensors.base_features,
+                **tensors.trimodal_inputs,
+                **tensors.din_inputs,
+            )
+        labels = tensors.labels
         ctr_labels = labels["ctr"].detach().cpu().numpy().reshape(-1)
         ctr_scores = predictions["ctr"].detach().cpu().numpy().reshape(-1)
         auc = (
@@ -2382,43 +2438,227 @@ class RankingModel:
                 group_ndcg.append(
                     float(ndcg_score([relevance[selected]], [scores[selected]]))
                 )
+        modality_coverage = {}
+        for modality in ("visual", "ocr", "asr"):
+            mask = tensors.trimodal_inputs.get(f"{modality}_mask")
+            if mask is not None:
+                modality_coverage[modality] = float(
+                    mask.any(dim=1).float().mean().item()
+                )
+        candidate_modality_coverage = {}
+        candidate_presence = tensors.trimodal_inputs.get("candidate_presence")
+        if candidate_presence is not None:
+            for index, modality in enumerate(("image", "text", "two_tower")):
+                candidate_modality_coverage[modality] = float(
+                    candidate_presence[:, index].float().mean().item()
+                )
+        modality_gate_mean = {}
+        modality_gate = predictions.get("modality_gate")
+        if modality_gate is not None:
+            for index, modality in enumerate(("visual", "ocr", "asr")):
+                modality_gate_mean[modality] = float(
+                    modality_gate[:, index].mean().item()
+                )
+        temporal_attention_entropy = {}
+        for modality in ("visual", "ocr", "asr"):
+            weights = predictions.get(f"{modality}_attention")
+            if weights is None:
+                continue
+            probabilities = weights.clamp_min(1e-12)
+            entropy = -(probabilities * probabilities.log()).sum(dim=1)
+            present = weights.sum(dim=1) > 0
+            temporal_attention_entropy[modality] = (
+                float(entropy[present].mean().item()) if present.any() else 0.0
+            )
+        encoder_gradient_norms = {}
+        if isinstance(self.model, TemporalTrimodalRankingModel):
+            for modality in ("visual", "ocr", "asr"):
+                encoder = getattr(self.model, f"{modality}_encoder")
+                squared_norm = sum(
+                    float(parameter.grad.detach().norm().item()) ** 2
+                    for parameter in encoder.parameters()
+                    if parameter.grad is not None
+                )
+                encoder_gradient_norms[modality] = squared_norm**0.5
         return {
             "loss": float(loss),
+            "validation_loss": (
+                float(validation_loss) if validation_loss is not None else None
+            ),
+            "epochs_completed": int(epochs_completed),
             "auc": auc,
             "ndcg": float(np.mean(group_ndcg)) if group_ndcg else None,
+            "modality_coverage": modality_coverage,
+            "candidate_modality_coverage": candidate_modality_coverage,
+            "modality_gate_mean": modality_gate_mean,
+            "temporal_attention_entropy": temporal_attention_entropy,
+            "encoder_gradient_norms": encoder_gradient_norms,
             "attention_entropy": getattr(
-                getattr(self.model, "din", None), "last_attention_entropy", None
+                getattr(
+                    getattr(self.model, "ranker", self.model),
+                    "din",
+                    None,
+                ),
+                "last_attention_entropy",
+                None,
             ),
         }
 
-    def _prepare_training_examples(
-        self, training_data: Sequence[RankingTrainingExample]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        features, labels = self.training_tensor_builder.build(training_data)
+    def _prepare_training_tensors(
+        self,
+        training_data: Sequence[RankingTrainingExample],
+        *,
+        fit_value_transform: bool = True,
+    ) -> RankingTrainingTensors:
+        trimodal_inputs: Dict[str, torch.Tensor] = {}
+        if getattr(self.config, "trimodal_enabled", False):
+            (
+                features,
+                labels,
+                trimodal_inputs,
+            ) = self.training_tensor_builder.build_trimodal(
+                training_data,
+                apply_modality_dropout=False,
+                fit_value_transform=fit_value_transform,
+            )
+        else:
+            features, labels = self.training_tensor_builder.build(
+                training_data,
+                fit_value_transform=fit_value_transform,
+            )
+
+        din_inputs: Dict[str, torch.Tensor] = {}
         if getattr(self.config, "din_enabled", False):
             if self.din_item_embeddings is None:
                 raise RuntimeError("DIN ranking embedding sidecar is not loaded")
-            din_inputs = build_din_batch_inputs(
+            built = build_din_batch_inputs(
                 [example.bundle for example in training_data],
                 self.din_product_index,
                 sequence_length=int(getattr(self.config, "din_sequence_last_n", 60)),
                 device=self.device,
             )
-            (
-                history_indices,
-                history_recency,
-                history_mask,
-            ) = din_inputs.expanded_histories()
-            labels.update(
-                {
-                    "_din_candidate_indices": din_inputs.candidate_indices,
-                    "_din_history_indices": history_indices,
-                    "_din_history_recency": history_recency,
-                    "_din_history_mask": history_mask,
-                    "_din_summary_features": din_inputs.summary_features,
-                }
+            history_indices, history_recency, history_mask = built.expanded_histories()
+            din_inputs = {
+                "candidate_indices": built.candidate_indices,
+                "history_indices": history_indices,
+                "history_recency": history_recency,
+                "history_mask": history_mask,
+                "summary_features": built.summary_features,
+            }
+        return RankingTrainingTensors(
+            base_features=features,
+            labels=labels,
+            trimodal_inputs=trimodal_inputs,
+            din_inputs=din_inputs,
+        )
+
+    def _split_training_examples_by_time(
+        self,
+        training_data: Sequence[RankingTrainingExample],
+    ) -> Tuple[List[RankingTrainingExample], List[RankingTrainingExample]]:
+        validation_fraction = float(getattr(self.config, "validation_fraction", 0.0))
+        if validation_fraction <= 0.0:
+            return list(training_data), []
+
+        grouped: Dict[str, List[RankingTrainingExample]] = {}
+        group_timestamps: Dict[str, float] = {}
+        for example in training_data:
+            grouped.setdefault(example.impression_id, []).append(example)
+            group_timestamps[example.impression_id] = max(
+                group_timestamps.get(example.impression_id, float("-inf")),
+                float(example.bundle.as_of_ts),
             )
-        return features, labels
+        if len(grouped) < 2:
+            return list(training_data), []
+
+        ordered_groups = sorted(
+            grouped,
+            key=lambda group_id: (group_timestamps[group_id], group_id),
+        )
+        validation_group_count = min(
+            len(ordered_groups) - 1,
+            max(1, int(len(ordered_groups) * validation_fraction)),
+        )
+        validation_group_ids = set(ordered_groups[-validation_group_count:])
+        return (
+            [
+                example
+                for example in training_data
+                if example.impression_id not in validation_group_ids
+            ],
+            [
+                example
+                for example in training_data
+                if example.impression_id in validation_group_ids
+            ],
+        )
+
+    def _apply_trimodal_modality_dropout(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        *,
+        probability: float,
+        generator: torch.Generator,
+    ) -> Dict[str, torch.Tensor]:
+        if not inputs or probability <= 0.0:
+            return dict(inputs)
+
+        dropped_inputs = dict(inputs)
+        for modality in ("ocr", "asr"):
+            mask_key = f"{modality}_mask"
+            mask = inputs.get(mask_key)
+            if mask is None:
+                continue
+            if probability >= 1.0:
+                dropped_rows = torch.ones(
+                    mask.size(0),
+                    dtype=torch.bool,
+                    device=mask.device,
+                )
+            else:
+                dropped_rows = (
+                    torch.rand(
+                        mask.size(0),
+                        device=mask.device,
+                        generator=generator,
+                    )
+                    < probability
+                )
+            for suffix in ("embeddings", "starts", "ends", "mask"):
+                key = f"{modality}_{suffix}"
+                value = inputs.get(key)
+                if value is None:
+                    continue
+                dropped_value = value.clone()
+                dropped_value[dropped_rows] = False if suffix == "mask" else 0
+                dropped_inputs[key] = dropped_value
+        return dropped_inputs
+
+    def _evaluate_training_loss(
+        self,
+        tensors: RankingTrainingTensors,
+    ) -> float:
+        self.model.eval()
+        weighted_loss = 0.0
+        row_count = 0
+        with torch.no_grad():
+            for batch in self._iter_structured_training_batches(tensors):
+                predictions = self.model(
+                    batch.base_features,
+                    **batch.trimodal_inputs,
+                    **batch.din_inputs,
+                )
+                loss = self._compute_loss(predictions, batch.labels)
+                batch_rows = int(batch.base_features.size(0))
+                weighted_loss += float(loss.item()) * batch_rows
+                row_count += batch_rows
+        return weighted_loss / max(row_count, 1)
+
+    def _prepare_training_examples(
+        self, training_data: Sequence[RankingTrainingExample]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        tensors = self._prepare_training_tensors(training_data)
+        return tensors.base_features, tensors.labels
 
     def _ltr_grouped_training_enabled(self) -> bool:
         return bool(
@@ -2442,6 +2682,16 @@ class RankingModel:
                 key: value.index_select(0, index_tensor)
                 for key, value in labels.items()
             }
+
+    def _iter_structured_training_batches(
+        self,
+        tensors: RankingTrainingTensors,
+    ):
+        for index_tensor in self._iter_training_batch_indices(
+            tensors.base_features,
+            tensors.labels,
+        ):
+            yield tensors.select(index_tensor)
 
     def _iter_trimodal_training_batches(
         self,
@@ -3090,81 +3340,75 @@ class RankingModel:
         self, predictions: Dict[str, torch.Tensor], labels: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """Compute multi-objective loss."""
-        try:
-            # CTR loss (binary cross-entropy)
-            ctr_loss = nn.BCELoss()(predictions["ctr"], labels["ctr"])
+        # Training contracts fail closed. A missing prediction or label must stop
+        # the run rather than silently publishing a checkpoint trained on zero loss.
+        ctr_loss = nn.BCELoss()(predictions["ctr"], labels["ctr"])
 
-            # CVR loss is conditional on click; unclicked rows do not contribute.
-            cvr_loss = self._masked_binary_cross_entropy(
-                predictions["cvr"],
-                labels["cvr"],
-                labels.get("cvr_mask"),
-            )
-            ctcvr_predictions = predictions.get(
-                "ctcvr",
-                predictions["ctr"] * predictions["cvr"],
-            )
-            ctcvr_targets = labels.get("ctcvr", labels["cvr"])
-            ctcvr_loss = self._binary_cross_entropy_with_pos_weight(
-                ctcvr_predictions,
-                ctcvr_targets,
-                getattr(self.config, "ctcvr_pos_weight", None),
-            )
+        # CVR loss is conditional on click; unclicked rows do not contribute.
+        cvr_loss = self._masked_binary_cross_entropy(
+            predictions["cvr"],
+            labels["cvr"],
+            labels.get("cvr_mask"),
+        )
+        ctcvr_predictions = predictions.get(
+            "ctcvr",
+            predictions["ctr"] * predictions["cvr"],
+        )
+        ctcvr_targets = labels.get("ctcvr", labels["cvr"])
+        ctcvr_loss = self._binary_cross_entropy_with_pos_weight(
+            ctcvr_predictions,
+            ctcvr_targets,
+            getattr(self.config, "ctcvr_pos_weight", None),
+        )
 
-            # Value loss is purchase-conditional on normalized business value.
-            gmv_loss = self._masked_value_loss(
-                predictions["gmv"],
-                labels.get("value", labels.get("gmv")),
-                labels.get("value_mask"),
-            )
+        # Value loss is purchase-conditional on normalized business value.
+        gmv_loss = self._masked_value_loss(
+            predictions["gmv"],
+            labels.get("value", labels.get("gmv")),
+            labels.get("value_mask"),
+        )
 
-            # Combined loss with weights
+        # Combined loss with weights
+        total_loss = (
+            self.config.ctr_weight * ctr_loss
+            + float(getattr(self.config, "direct_cvr_weight", self.config.cvr_weight))
+            * cvr_loss
+            + float(getattr(self.config, "ctcvr_weight", 0.0)) * ctcvr_loss
+            + self.config.gmv_weight * gmv_loss
+        )
+
+        if (
+            getattr(self.config, "ltr_pairwise_enabled", False)
+            and getattr(self.config, "ltr_pairwise_weight", 0.0) > 0
+        ):
+            pairwise_loss = self._compute_pairwise_ltr_loss(
+                predictions["ranking_score"],
+                labels.get("ranking_relevance"),
+                labels.get("pairwise_group"),
+            )
             total_loss = (
-                self.config.ctr_weight * ctr_loss
-                + float(
-                    getattr(self.config, "direct_cvr_weight", self.config.cvr_weight)
-                )
-                * cvr_loss
-                + float(getattr(self.config, "ctcvr_weight", 0.0)) * ctcvr_loss
-                + self.config.gmv_weight * gmv_loss
+                total_loss
+                + float(getattr(self.config, "ltr_pairwise_weight", 0.0))
+                * pairwise_loss
             )
 
-            if (
-                getattr(self.config, "ltr_pairwise_enabled", False)
-                and getattr(self.config, "ltr_pairwise_weight", 0.0) > 0
-            ):
-                pairwise_loss = self._compute_pairwise_ltr_loss(
-                    predictions["ranking_score"],
-                    labels.get("ranking_relevance"),
-                    labels.get("pairwise_group"),
-                )
-                total_loss = (
-                    total_loss
-                    + float(getattr(self.config, "ltr_pairwise_weight", 0.0))
-                    * pairwise_loss
-                )
+        if (
+            getattr(self.config, "ltr_listwise_enabled", False)
+            and getattr(self.config, "ltr_listwise_weight", 0.0) > 0
+        ):
+            listwise_loss = self._compute_listwise_ltr_loss(
+                predictions["ranking_score"],
+                labels.get("ranking_relevance"),
+                labels.get("ltr_group"),
+                labels.get("ltr_is_slate_sample"),
+            )
+            total_loss = (
+                total_loss
+                + float(getattr(self.config, "ltr_listwise_weight", 0.0))
+                * listwise_loss
+            )
 
-            if (
-                getattr(self.config, "ltr_listwise_enabled", False)
-                and getattr(self.config, "ltr_listwise_weight", 0.0) > 0
-            ):
-                listwise_loss = self._compute_listwise_ltr_loss(
-                    predictions["ranking_score"],
-                    labels.get("ranking_relevance"),
-                    labels.get("ltr_group"),
-                    labels.get("ltr_is_slate_sample"),
-                )
-                total_loss = (
-                    total_loss
-                    + float(getattr(self.config, "ltr_listwise_weight", 0.0))
-                    * listwise_loss
-                )
-
-            return total_loss
-
-        except Exception as e:
-            logger.error(f"Error computing loss: {e}")
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        return total_loss
 
     def _binary_cross_entropy_with_pos_weight(
         self,
