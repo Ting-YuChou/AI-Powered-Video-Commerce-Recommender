@@ -12,6 +12,17 @@ from video_commerce.data_plane.object_storage import ObjectStorage
 
 
 CONTENT_ARTIFACT_SCHEMA_VERSION = "content_feature_artifact_v2"
+CONTENT_ARTIFACT_SCHEMA_VERSION_V3 = "content_feature_artifact_v3"
+SUPPORTED_CONTENT_ARTIFACT_SCHEMA_VERSIONS = {
+    CONTENT_ARTIFACT_SCHEMA_VERSION,
+    CONTENT_ARTIFACT_SCHEMA_VERSION_V3,
+}
+
+
+def _artifact_schema_version(features: ContentFeatures) -> str:
+    if features.multimodal_schema_version == "temporal_multimodal_v3":
+        return CONTENT_ARTIFACT_SCHEMA_VERSION_V3
+    return CONTENT_ARTIFACT_SCHEMA_VERSION
 
 
 def content_artifact_reference(features: ContentFeatures) -> dict[str, Any] | None:
@@ -46,7 +57,7 @@ async def load_content_feature_artifact(
     if (
         not uri
         or len(expected_sha256) != 64
-        or expected_schema != CONTENT_ARTIFACT_SCHEMA_VERSION
+        or expected_schema not in SUPPORTED_CONTENT_ARTIFACT_SCHEMA_VERSIONS
         or not expected_content_id
     ):
         raise ValueError("content artifact reference is incomplete or incompatible")
@@ -95,7 +106,7 @@ def canonical_content_feature_bytes(features: ContentFeatures) -> bytes:
     ):
         payload_features[field] = None
     payload: dict[str, Any] = {
-        "schema_version": CONTENT_ARTIFACT_SCHEMA_VERSION,
+        "schema_version": _artifact_schema_version(features),
         "created_at": float(features.created_at),
         "features": payload_features,
     }
@@ -126,7 +137,7 @@ async def publish_content_feature_artifact(
     published = features.copy(deep=True)
     published.artifact_uri = uri
     published.artifact_sha256 = digest
-    published.artifact_schema_version = CONTENT_ARTIFACT_SCHEMA_VERSION
+    published.artifact_schema_version = _artifact_schema_version(features)
     published.artifact_created_at = float(features.created_at)
     return published
 

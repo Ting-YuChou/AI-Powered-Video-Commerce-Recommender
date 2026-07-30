@@ -136,6 +136,12 @@ class ProductRecommendation(BaseModel):
     price: float = Field(..., ge=0, description="Product price")
     currency: str = Field("USD", description="Currency code")
     image_url: Optional[str] = Field(None, description="Product image URL")
+    image_storage_uri: Optional[str] = Field(
+        None, description="Internal durable object-storage URI for product imagery"
+    )
+    image_sha256: Optional[str] = Field(
+        None, description="SHA-256 of the durable product image object"
+    )
     category: Optional[str] = Field(None, description="Product category")
     brand: Optional[str] = Field(None, description="Product brand")
     rating: Optional[float] = Field(
@@ -405,6 +411,22 @@ class ContentFeatures(BaseModel):
     )
     frame_timestamps_seconds: List[float] = Field(
         default_factory=list, description="Timestamp aligned with each frame embedding"
+    )
+    retrieval_visual_embedding: List[float] = Field(
+        default_factory=list,
+        description="Attention-pooled visual query in the frozen CLIP image space",
+    )
+    retrieval_model_version: Optional[str] = Field(
+        None, description="Visual retrieval attention checkpoint version"
+    )
+    retrieval_product_index_version: Optional[str] = Field(
+        None, description="Compatible product CLIP index version"
+    )
+    retrieval_clip_model: Optional[str] = Field(
+        None, description="Frozen CLIP model used for the retrieval query"
+    )
+    retrieval_clip_revision: Optional[str] = Field(
+        None, description="Pinned CLIP revision used for the retrieval query"
     )
     ocr_tracks: List[Dict[str, Any]] = Field(
         default_factory=list, description="Temporally deduplicated OCR regions"

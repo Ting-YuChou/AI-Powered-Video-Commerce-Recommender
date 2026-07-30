@@ -34,6 +34,8 @@ class ModelArtifactManager:
     TWO_TOWER_MODEL_NAME = "two_tower_retrieval"
     SASREC_MODEL_NAME = "sasrec_retrieval"
     SWING_ITEMCF_MODEL_NAME = "swing_itemcf_recall"
+    VISUAL_RETRIEVAL_MODEL_NAME = "visual_retrieval_attention"
+    VISUAL_PRODUCT_INDEX_MODEL_NAME = "visual_product_clip_index"
 
     def __init__(
         self,
@@ -883,6 +885,172 @@ class ModelArtifactManager:
             checkpoint_path=persisted_index,
             payload=record_payload,
         )
+
+    async def persist_visual_retrieval_checkpoint(
+        self,
+        *,
+        local_path: str,
+        model_version: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ModelArtifactRecord]:
+        if not self.system_store:
+            return None
+        artifact_sha256 = ObjectStorage.calculate_sha256(local_path)
+        persisted_path = await self._persist_artifact(
+            local_path=local_path,
+            model_name=self.VISUAL_RETRIEVAL_MODEL_NAME,
+            model_version=model_version,
+        )
+        record_payload = dict(payload or {})
+        record_payload.update(
+            {
+                "artifact_sha256": artifact_sha256,
+                "local_cache_path": self.model_config.retrieval_visual_checkpoint_path,
+                "activation_allowed": False,
+                "artifact_manifest": {
+                    "checkpoint": {
+                        "path": persisted_path,
+                        "sha256": artifact_sha256,
+                        "local_cache_path": (
+                            self.model_config.retrieval_visual_checkpoint_path
+                        ),
+                    }
+                },
+            }
+        )
+        await self.system_store.record_model_checkpoint(
+            model_name=self.VISUAL_RETRIEVAL_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_path,
+            payload=record_payload,
+        )
+        return ModelArtifactRecord(
+            model_name=self.VISUAL_RETRIEVAL_MODEL_NAME,
+            model_version=model_version,
+            checkpoint_path=persisted_path,
+            payload=record_payload,
+        )
+
+    async def persist_visual_product_index_bundle(
+        self,
+        *,
+        manifest_path: str,
+    ) -> Optional[ModelArtifactRecord]:
+        """Persist all index files before recording the activation manifest."""
+        if not self.system_store:
+            return None
+        from video_commerce.ml.visual_product_index import (
+            load_visual_product_index_bundle,
+        )
+
+        bundle = load_visual_product_index_bundle(manifest_path)
+        manifest = bundle.manifest
+        version = str(manifest["model_version"])
+        source_manifest = Path(manifest_path)
+        artifact_manifest = {}
+        for name in ("index", "embeddings", "metadata"):
+            reference = manifest["artifacts"][name]
+            local_path = source_manifest.parent / reference["path"]
+            remote_path = await self._persist_artifact(
+                local_path=str(local_path),
+                model_name=self.VISUAL_PRODUCT_INDEX_MODEL_NAME,
+                model_version=version,
+            )
+            artifact_manifest[name] = {
+                "path": remote_path,
+                "sha256": reference["sha256"],
+                "filename": local_path.name,
+            }
+        persisted_manifest = await self._persist_artifact(
+            local_path=manifest_path,
+            model_name=self.VISUAL_PRODUCT_INDEX_MODEL_NAME,
+            model_version=version,
+            content_type="application/json",
+        )
+        manifest_sha256 = ObjectStorage.calculate_sha256(manifest_path)
+        payload = {
+            "schema_version": manifest["schema_version"],
+            "clip_model_id": manifest["clip_model_id"],
+            "clip_revision": manifest["clip_revision"],
+            "catalog_activation_id": manifest["catalog_activation_id"],
+            "catalog_available_at": manifest["catalog_available_at"],
+            "coverage": manifest["coverage"],
+            "manifest_sha256": manifest_sha256,
+            "local_manifest_path": (
+                self.model_config.retrieval_visual_product_index_manifest_path
+            ),
+            "artifact_manifest": {
+                **artifact_manifest,
+                "manifest": {
+                    "path": persisted_manifest,
+                    "sha256": manifest_sha256,
+                    "filename": source_manifest.name,
+                },
+            },
+            "activation_allowed": bool(float(manifest["coverage"]) >= 0.95),
+        }
+        await self.system_store.record_model_checkpoint(
+            model_name=self.VISUAL_PRODUCT_INDEX_MODEL_NAME,
+            model_version=version,
+            checkpoint_path=persisted_manifest,
+            payload=payload,
+        )
+        return ModelArtifactRecord(
+            model_name=self.VISUAL_PRODUCT_INDEX_MODEL_NAME,
+            model_version=version,
+            checkpoint_path=persisted_manifest,
+            payload=payload,
+        )
+
+    async def sync_latest_visual_product_index(
+        self,
+        *,
+        expected_clip_model_id: str,
+        expected_clip_revision: str,
+    ) -> Optional[ModelArtifactRecord]:
+        record = await self.get_latest_model_checkpoint(
+            self.VISUAL_PRODUCT_INDEX_MODEL_NAME
+        )
+        if record is None:
+            return None
+        payload = record.payload
+        if (
+            payload.get("clip_model_id") != expected_clip_model_id
+            or payload.get("clip_revision") != expected_clip_revision
+            or payload.get("activation_allowed") is not True
+        ):
+            return None
+        local_manifest_value = str(
+            self.model_config.retrieval_visual_product_index_manifest_path or ""
+        ).strip()
+        if not local_manifest_value:
+            return None
+        local_manifest = Path(local_manifest_value)
+        specs = []
+        artifacts = payload.get("artifact_manifest") or {}
+        for name in ("index", "embeddings", "metadata", "manifest"):
+            reference = artifacts.get(name) or {}
+            filename = str(reference.get("filename") or "")
+            if (
+                not filename
+                or Path(filename).name != filename
+                or len(str(reference.get("sha256") or "")) != 64
+            ):
+                raise ValueError("visual product index artifact record is incomplete")
+            target = (
+                local_manifest
+                if name == "manifest"
+                else local_manifest.parent / filename
+            )
+            specs.append(
+                (
+                    str(reference["path"]),
+                    str(target),
+                    str(reference["sha256"]),
+                )
+            )
+        await self._sync_paths_to_local_atomically(specs)
+        return record
 
     async def _persist_artifact(
         self,

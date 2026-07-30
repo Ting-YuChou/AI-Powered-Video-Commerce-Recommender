@@ -9,6 +9,7 @@ import types
 import httpx
 import pytest
 import numpy as np
+import torch
 
 if importlib.util.find_spec("pytesseract") is None:
     pytesseract_stub = types.ModuleType("pytesseract")
@@ -22,6 +23,7 @@ if importlib.util.find_spec("pytesseract") is None:
 
 from video_commerce.common.config import ModelConfig
 from video_commerce.ml.content_processor import ContentProcessor
+from video_commerce.ml.visual_retrieval import VisualRetrievalOutput
 
 
 def _processor(**overrides):
@@ -43,6 +45,34 @@ def _ppm_frame(width, height, values):
         f"P6\n{width} {height}\n255\n".encode("ascii")
         + np.array(values, dtype=np.uint8).reshape(height, width, 3).tobytes()
     )
+
+
+def test_retrieval_pooling_upgrades_content_to_v3_without_reencoding_video():
+    processor = _processor(
+        retrieval_visual_model_version="retrieval-7",
+        retrieval_visual_product_index_version="products-42",
+    )
+
+    class Pooler:
+        def __call__(self, frames, starts, mask):
+            assert frames.shape == (1, 2, 512)
+            return VisualRetrievalOutput(
+                embedding=torch.nn.functional.normalize(
+                    torch.tensor([[0.0, 1.0] + [0.0] * 510]), dim=-1
+                ),
+                attention_weights=torch.tensor([[0.25, 0.75]]),
+            )
+
+    processor.retrieval_pooler = Pooler()
+    fields = processor._retrieval_visual_fields(
+        [[1.0] * 512, [0.5] * 512],
+        [0.0, 3.0],
+    )
+
+    assert fields["multimodal_schema_version"] == "temporal_multimodal_v3"
+    assert fields["retrieval_visual_embedding"][1] == pytest.approx(1.0)
+    assert fields["retrieval_model_version"] == "retrieval-7"
+    assert fields["retrieval_product_index_version"] == "products-42"
 
 
 def _ffprobe_payload(*, duration="12.5", fps="30000/1001", frames="300", audio=True):
