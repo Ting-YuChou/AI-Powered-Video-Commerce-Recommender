@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import numpy as np
 
 from video_commerce.common.config import (
     ModelConfig,
@@ -8,6 +9,9 @@ from video_commerce.common.config import (
 )
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
+from video_commerce.ml.visual_product_index import (
+    publish_visual_product_index_bundle,
+)
 
 
 class FakeSystemStore:
@@ -131,6 +135,41 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
         fake_store.recorded[-1]["payload"]["artifact_sha256"]
         == hashlib.sha256(b"ranking").hexdigest()
     )
+
+
+def test_persist_visual_product_index_records_complete_atomic_bundle(tmp_path):
+    manifest = publish_visual_product_index_bundle(
+        tmp_path,
+        product_embeddings={"p1": np.array([1.0, 0.0], dtype=np.float32)},
+        product_metadata={"p1": {"category": "shoes"}},
+        expected_product_count=1,
+        clip_model_id="clip-test",
+        clip_revision="revision-1",
+        catalog_activation_id="catalog-42",
+        model_version="products-42",
+    )
+    store = FakeSystemStore()
+    manager = ModelArtifactManager(
+        system_store=store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(
+            retrieval_visual_product_index_manifest_path=str(manifest)
+        ),
+        recommendation_config=RecommendationConfig(),
+    )
+
+    record = asyncio.run(
+        manager.persist_visual_product_index_bundle(manifest_path=str(manifest))
+    )
+
+    assert record.model_name == ModelArtifactManager.VISUAL_PRODUCT_INDEX_MODEL_NAME
+    assert record.payload["activation_allowed"] is True
+    assert set(record.payload["artifact_manifest"]) == {
+        "index",
+        "embeddings",
+        "metadata",
+        "manifest",
+    }
 
 
 def test_persist_ranking_checkpoint_activates_din_sidecar_in_same_record(tmp_path):

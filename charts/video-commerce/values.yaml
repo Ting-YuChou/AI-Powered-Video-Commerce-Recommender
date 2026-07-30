@@ -168,6 +168,7 @@ appConfig:
   featurePipelineMode: flink
   flinkFeatureOutputNamespace: official
   modelCacheDir: /app/models
+  clipRevision: 57c216476eefef5ab752ec549e440a49ae4ae5f3
   vectorIndexPath: /app/models/vector_index.faiss
   recommendationCfIndexPath: /app/models/cf_vector_index.faiss
   recommendationSwingItemcfIndexPath: /app/models/swing_itemcf.json.gz
@@ -189,6 +190,21 @@ appConfig:
     revision: 614241f622f53c4eeff9890bdc4f31cfecc418b3
     maxOcrTemporalTokens: 32
     maxAsrTemporalTokens: 64
+  visualRetrieval:
+    shadow: true
+    enabled: false
+    canaryPercent: 0
+    checkpointPath: /app/models/visual_retrieval_attention.pt
+    checkpointSha256: ""
+    modelVersion: ""
+    productIndexVersion: ""
+    productIndexManifestPath: ""
+    trainingEpochs: 3
+    trainingBatchSize: 64
+    trainingLearningRate: 0.0001
+    trainingTemperature: 0.07
+    trainingMinSamples: 100
+    trainingValidationFraction: 0.2
   monitoring:
     logLevel: INFO
     enableMetrics: true

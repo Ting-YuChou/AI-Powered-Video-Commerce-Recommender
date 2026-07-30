@@ -85,6 +85,21 @@ data:
   MODEL_MULTILINGUAL_TEXT_REVISION: {{ .Values.appConfig.multilingualText.revision | quote }}
   MODEL_MAX_OCR_TEMPORAL_TOKENS: {{ .Values.appConfig.multilingualText.maxOcrTemporalTokens | quote }}
   MODEL_MAX_ASR_TEMPORAL_TOKENS: {{ .Values.appConfig.multilingualText.maxAsrTemporalTokens | quote }}
+  MODEL_CLIP_REVISION: {{ .Values.appConfig.clipRevision | quote }}
+  RETRIEVAL_VISUAL_ATTENTION_SHADOW: {{ .Values.appConfig.visualRetrieval.shadow | quote }}
+  RETRIEVAL_VISUAL_ATTENTION_ENABLED: {{ .Values.appConfig.visualRetrieval.enabled | quote }}
+  RETRIEVAL_VISUAL_CANARY_PERCENT: {{ .Values.appConfig.visualRetrieval.canaryPercent | quote }}
+  RETRIEVAL_VISUAL_CHECKPOINT_PATH: {{ .Values.appConfig.visualRetrieval.checkpointPath | quote }}
+  RETRIEVAL_VISUAL_CHECKPOINT_SHA256: {{ .Values.appConfig.visualRetrieval.checkpointSha256 | quote }}
+  RETRIEVAL_VISUAL_MODEL_VERSION: {{ .Values.appConfig.visualRetrieval.modelVersion | quote }}
+  RETRIEVAL_VISUAL_PRODUCT_INDEX_VERSION: {{ .Values.appConfig.visualRetrieval.productIndexVersion | quote }}
+  RETRIEVAL_VISUAL_PRODUCT_INDEX_MANIFEST_PATH: {{ .Values.appConfig.visualRetrieval.productIndexManifestPath | quote }}
+  RETRIEVAL_VISUAL_TRAINING_EPOCHS: {{ .Values.appConfig.visualRetrieval.trainingEpochs | quote }}
+  RETRIEVAL_VISUAL_TRAINING_BATCH_SIZE: {{ .Values.appConfig.visualRetrieval.trainingBatchSize | quote }}
+  RETRIEVAL_VISUAL_TRAINING_LEARNING_RATE: {{ .Values.appConfig.visualRetrieval.trainingLearningRate | quote }}
+  RETRIEVAL_VISUAL_TRAINING_TEMPERATURE: {{ .Values.appConfig.visualRetrieval.trainingTemperature | quote }}
+  RETRIEVAL_VISUAL_TRAINING_MIN_SAMPLES: {{ .Values.appConfig.visualRetrieval.trainingMinSamples | quote }}
+  RETRIEVAL_VISUAL_TRAINING_VALIDATION_FRACTION: {{ .Values.appConfig.visualRetrieval.trainingValidationFraction | quote }}
   OBJECT_STORAGE_BACKEND: {{ .Values.external.objectStorage.backend | quote }}
   OBJECT_STORAGE_ENDPOINT_URL: {{ .Values.external.objectStorage.endpointUrl | quote }}
   OBJECT_STORAGE_REGION: {{ .Values.external.objectStorage.region | quote }}

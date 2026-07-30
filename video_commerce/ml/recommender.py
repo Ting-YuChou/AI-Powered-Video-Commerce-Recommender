@@ -52,6 +52,9 @@ from video_commerce.ml.content_clusters import (
     build_content_cluster_artifact,
     save_content_cluster_artifact,
 )
+from video_commerce.ml.visual_retrieval import (
+    select_content_retrieval_embedding,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2457,7 +2460,28 @@ class RecommendationEngine:
             async def fetch_content_candidates() -> List[CandidateProduct]:
                 if not content_features or not content_features.visual_embedding:
                     return []
-                query_embedding = np.array(content_features.visual_embedding)
+                selected_embedding, _ = select_content_retrieval_embedding(
+                    content_features,
+                    enabled=bool(
+                        self.config.retrieval_visual_attention_enabled
+                        and getattr(
+                            self.vector_search,
+                            "visual_product_index_version",
+                            None,
+                        )
+                        == self.config.retrieval_visual_product_index_version
+                    ),
+                    canary_percent=float(
+                        self.config.retrieval_visual_canary_percent
+                    ),
+                    expected_model_version=(
+                        self.config.retrieval_visual_model_version
+                    ),
+                    expected_product_index_version=(
+                        self.config.retrieval_visual_product_index_version
+                    ),
+                )
+                query_embedding = np.array(selected_embedding)
                 content_k = min(
                     target_candidates,
                     self.config.max_live_content_candidates,

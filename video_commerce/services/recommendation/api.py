@@ -1127,6 +1127,30 @@ async def startup_event():
 
     vector_search = VectorSearchEngine(runtime.config.vector_config)
     await vector_search.load_index()
+    visual_index_manifest = str(
+        runtime.config.model_config.retrieval_visual_product_index_manifest_path
+        or ""
+    ).strip()
+    if visual_index_manifest and artifact_manager is not None:
+        await artifact_manager.sync_latest_visual_product_index(
+            expected_clip_model_id=runtime.config.model_config.clip_model,
+            expected_clip_revision=runtime.config.model_config.clip_revision,
+        )
+    if visual_index_manifest:
+        vector_search.activate_visual_product_index(
+            visual_index_manifest,
+            expected_clip_model_id=runtime.config.model_config.clip_model,
+            expected_clip_revision=runtime.config.model_config.clip_revision,
+        )
+    if (
+        runtime.config.recommendation_config.retrieval_visual_attention_enabled
+        and vector_search.visual_product_index_version
+        != runtime.config.recommendation_config.retrieval_visual_product_index_version
+    ):
+        raise RuntimeError(
+            "visual attention recall cannot activate against an incompatible "
+            "product CLIP index"
+        )
     feature_store.prime_product_metadata_memory_cache(vector_search.product_metadata)
     if runtime.config.recommendation_config.preload_product_metadata_on_startup:
         await feature_store.store_product_metadata_batch(vector_search.product_metadata)

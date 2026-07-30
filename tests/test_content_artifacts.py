@@ -126,3 +126,29 @@ def test_load_content_feature_artifact_verifies_checksum_and_schema(tmp_path):
     reference["sha256"] = "0" * 64
     with pytest.raises(ValueError, match="checksum"):
         asyncio.run(load_content_feature_artifact(storage, reference))
+
+
+def test_content_artifact_v3_round_trip_preserves_retrieval_lineage(tmp_path):
+    storage = ObjectStorage(
+        ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "objects"))
+    )
+    features = ContentFeatures(
+        content_id="content-v3",
+        visual_embedding=[1.0, 0.0],
+        frame_embeddings=[[1.0, 0.0]],
+        frame_timestamps_seconds=[0.0],
+        retrieval_visual_embedding=[0.0, 1.0],
+        retrieval_model_version="retrieval-7",
+        retrieval_product_index_version="products-42",
+        multimodal_schema_version="temporal_multimodal_v3",
+        created_at=10.0,
+    )
+
+    published = asyncio.run(publish_content_feature_artifact(storage, features))
+    reference = content_artifact_reference(published)
+    loaded = asyncio.run(load_content_feature_artifact(storage, reference))
+
+    assert published.artifact_schema_version == "content_feature_artifact_v3"
+    assert loaded.retrieval_visual_embedding == [0.0, 1.0]
+    assert loaded.retrieval_model_version == "retrieval-7"
+    assert loaded.retrieval_product_index_version == "products-42"

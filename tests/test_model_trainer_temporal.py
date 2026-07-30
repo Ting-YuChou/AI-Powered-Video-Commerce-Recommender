@@ -105,3 +105,38 @@ async def test_model_trainer_reuses_pit_pinned_candidate_embeddings(tmp_path):
     assert attached == examples
     assert ranking_model.records == {"p1": {"text": [1.0] * 384}}
     assert ranking_model.path.endswith(".candidates.npz")
+
+
+@pytest.mark.asyncio
+async def test_visual_retrieval_shadow_retries_until_its_own_run_succeeds(
+    monkeypatch,
+):
+    service = ModelTrainerService(
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                retrieval_visual_attention_shadow=True,
+            )
+        )
+    )
+    dataset = SimpleNamespace(
+        materialization_run_id="run-42",
+        manifest_uri="s3://pit/run-42/manifest.json",
+    )
+    attempts = []
+
+    async def train(_dataset):
+        attempts.append(_dataset.materialization_run_id)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary storage failure")
+        return True
+
+    monkeypatch.setattr(service, "_train_visual_retrieval_shadow", train)
+
+    await service._maybe_train_visual_retrieval_shadow(dataset)
+    assert service.last_trained_visual_pit_run_id is None
+
+    await service._maybe_train_visual_retrieval_shadow(dataset)
+    await service._maybe_train_visual_retrieval_shadow(dataset)
+
+    assert attempts == ["run-42", "run-42"]
+    assert service.last_trained_visual_pit_run_id == "run-42"

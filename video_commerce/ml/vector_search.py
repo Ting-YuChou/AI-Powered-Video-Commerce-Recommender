@@ -56,6 +56,8 @@ class VectorSearchEngine:
         self.content_cluster_assignments: Dict[str, int] = {}
         self.content_cluster_centroids: Optional[np.ndarray] = None
         self.content_cluster_metadata: Dict[str, Any] = {}
+        self.visual_product_index_version: Optional[str] = None
+        self.visual_product_index_manifest: Dict[str, Any] = {}
         
         # Index management
         self.index_lock = threading.RLock()
@@ -71,6 +73,41 @@ class VectorSearchEngine:
         }
         
         logger.info(f"VectorSearchEngine initialized with embedding_dim={self.embedding_dim}")
+
+    def activate_visual_product_index(
+        self,
+        manifest_path: str | Path,
+        *,
+        expected_clip_model_id: Optional[str] = None,
+        expected_clip_revision: Optional[str] = None,
+        expected_catalog_activation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Validate a complete bundle before atomically swapping live references."""
+        from video_commerce.ml.visual_product_index import (
+            load_visual_product_index_bundle,
+        )
+
+        bundle = load_visual_product_index_bundle(
+            manifest_path,
+            expected_clip_model_id=expected_clip_model_id,
+            expected_clip_revision=expected_clip_revision,
+            expected_catalog_activation_id=expected_catalog_activation_id,
+        )
+        if int(bundle.index.d) != self.embedding_dim:
+            raise ValueError("visual product index embedding dimension mismatch")
+        with self.index_lock:
+            self.index = bundle.index
+            self.product_index_map = bundle.product_index_map
+            self.product_embeddings = bundle.product_embeddings
+            self.product_metadata = bundle.product_metadata
+            self.visual_product_index_version = str(
+                bundle.manifest["model_version"]
+            )
+            self.visual_product_index_manifest = dict(bundle.manifest)
+            self.catalog_version = int(time.time() * 1000)
+            self.last_updated = time.time()
+            self.is_loaded = True
+        return dict(bundle.manifest)
     
     async def load_index(self, force_rebuild: bool = False):
         """Load or build the FAISS index."""
