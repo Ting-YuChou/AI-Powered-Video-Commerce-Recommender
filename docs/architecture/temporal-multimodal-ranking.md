@@ -36,7 +36,8 @@
 - The newest configured fraction of impressions is reserved for validation by
   `FeatureBundle.as_of_ts`; one impression never crosses the split. Validation
   reuses the value transform fitted on training data and receives neither OCR
-  nor ASR dropout.
+  nor ASR dropout. The training partition must still meet
+  `training_min_samples` after the split or the run publishes no checkpoint.
 - During warm-up the base ranker is frozen. Early stopping is not eligible
   until at least one joint fine-tuning epoch has run. The best validation state
   is restored before checkpoint publication.
@@ -56,15 +57,20 @@
   fp16 tensors plus timestamps and masks in `multimodal_context`; it never
   sends transcript text. V1-v3 remain parseable and retain base ranking.
 - Candidate image/text/two-tower embeddings are stored in a checksummed NPZ
-  sidecar. The PIT manifest pins its URI, checksum, schema, and source model
-  version; the ranking checkpoint locks the derived serving sidecar checksum
-  and model version. Missing modalities use presence masks; missing products
-  never receive random fallback embeddings. PIT training never regenerates
-  candidate inputs from current FAISS or CF state.
+  sidecar. Each product may have multiple `available_at` versions, and every
+  observation resolves the newest version that was available at its
+  `as_of_ts`. The PIT manifest pins URI, checksum, schema, source model version,
+  and source-model training cutoff; the cutoff must not exceed the earliest
+  observation. The ranking checkpoint locks the derived serving sidecar
+  checksum and model version. Missing modalities use presence masks; missing
+  products never receive random fallback embeddings. PIT and trimodal-shadow
+  training never regenerate candidate inputs from current FAISS or CF state.
 - `RANKING_TRIMODAL_SHADOW=true` and `RANKING_TRIMODAL_ENABLED=false` are the
   initial rollout defaults. Shadow training warm-starts the base ranker, freezes
   it for epoch one, then fine-tunes it at 0.1 times the new-layer learning rate.
-  Serving only activates V4 when checkpoint, sidecar, and feature schemas match.
+  Shadow configuration is revalidated before training. Serving only activates
+  V4 when the complete checkpoint state, sidecar, and feature schemas match;
+  partial state loading is restricted to explicit V3-to-V4 warm-start.
 - Apply `migrations/postgres/007_temporal_multimodal_features.sql` before
   enabling content backfill. Preview with
   `python scripts/backfill_temporal_multimodal.py --limit 100`; add `--enqueue`

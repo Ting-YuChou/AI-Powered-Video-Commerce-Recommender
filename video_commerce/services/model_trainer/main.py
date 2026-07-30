@@ -77,15 +77,23 @@ class ModelTrainerService:
         if examples and all(
             example.candidate_embeddings is not None for example in examples
         ):
-            records = {}
+            versions_by_product = {}
             for example in examples:
                 product_id = str(example.bundle.candidate.product_id)
                 candidate_embeddings = dict(example.candidate_embeddings or {})
-                previous = records.setdefault(product_id, candidate_embeddings)
+                available_at = float(candidate_embeddings.get("available_at", 0.0))
+                versions = versions_by_product.setdefault(product_id, {})
+                previous = versions.setdefault(available_at, candidate_embeddings)
                 if previous != candidate_embeddings:
                     raise RuntimeError(
-                        "PIT candidate embeddings conflict for one product"
+                        "PIT candidate embeddings conflict for one product version"
                     )
+            records = {
+                product_id: [
+                    versions[available_at] for available_at in sorted(versions)
+                ]
+                for product_id, versions in versions_by_product.items()
+            }
             sidecar_path = str(
                 Path(
                     ranking_model.loaded_model_path
@@ -93,7 +101,10 @@ class ModelTrainerService:
                 ).with_suffix(".candidates.npz")
             )
             ranking_model.configure_candidate_sidecar_for_training(
-                records,
+                {
+                    product_id: versions[0] if len(versions) == 1 else versions
+                    for product_id, versions in records.items()
+                },
                 path=sidecar_path,
             )
             return examples
@@ -162,6 +173,28 @@ class ModelTrainerService:
             for example in examples
         ]
 
+    @staticmethod
+    def _requires_pinned_candidate_sidecar(
+        *,
+        use_pit_dataset: bool,
+        pit_shadow_enabled: bool,
+        trimodal_enabled: bool,
+        trimodal_shadow: bool,
+    ) -> bool:
+        return bool(
+            trimodal_shadow
+            or ((use_pit_dataset or pit_shadow_enabled) and trimodal_enabled)
+        )
+
+    def _build_trimodal_shadow_config(self) -> RankingConfig:
+        ranking_config = self.config.ranking_config
+        if hasattr(ranking_config, "dict"):
+            values = ranking_config.dict()
+        else:
+            values = dict(vars(ranking_config))
+        values["trimodal_enabled"] = True
+        return RankingConfig(**values)
+
     def _ensure_heartbeat_task(self) -> None:
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = asyncio.create_task(self._publish_heartbeat())
@@ -224,12 +257,15 @@ class ModelTrainerService:
                 expected_feature_definition_version=(
                     feature_lake_config.feature_definition_version
                 ),
-                require_candidate_sidecar=bool(
-                    (
-                        use_pit_dataset
-                        or getattr(feature_lake_config, "pit_shadow_enabled", False)
-                    )
-                    and getattr(self.config.ranking_config, "trimodal_enabled", False)
+                require_candidate_sidecar=self._requires_pinned_candidate_sidecar(
+                    use_pit_dataset=use_pit_dataset,
+                    pit_shadow_enabled=bool(
+                        getattr(feature_lake_config, "pit_shadow_enabled", False)
+                    ),
+                    trimodal_enabled=bool(
+                        getattr(self.config.ranking_config, "trimodal_enabled", False)
+                    ),
+                    trimodal_shadow=trimodal_shadow,
                 ),
                 observability=self.observability,
             )
@@ -877,14 +913,7 @@ class ModelTrainerService:
                 f"{trigger}_pit_shadow", "skipped_insufficient_samples", 0.0
             )
             return
-        if hasattr(self.config.ranking_config, "copy"):
-            shadow_config = self.config.ranking_config.copy(
-                update={"trimodal_enabled": True}
-            )
-        else:
-            shadow_values = dict(vars(self.config.ranking_config))
-            shadow_values["trimodal_enabled"] = True
-            shadow_config = RankingConfig(**shadow_values)
+        shadow_config = self._build_trimodal_shadow_config()
         shadow_model = RankingModel(
             shadow_config,
             observability=self.observability,

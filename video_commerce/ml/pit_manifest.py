@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -165,14 +166,26 @@ class PitManifestPublisher:
             sha256 = str(reference.get("sha256") or "").strip()
             schema_version = str(reference.get("schema_version") or "").strip()
             model_version = str(reference.get("model_version") or "").strip()
+            try:
+                training_cutoff = float(reference.get("training_cutoff"))
+            except (TypeError, ValueError) as exc:
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar training cutoff is invalid"
+                ) from exc
             if (
                 not uri
                 or len(sha256) != 64
                 or schema_version != CANDIDATE_SIDECAR_SCHEMA_VERSION
                 or not model_version
+                or not math.isfinite(training_cutoff)
+                or training_cutoff < 0.0
             ):
                 raise PitTrainingDatasetError(
                     "PIT candidate sidecar reference is incomplete or incompatible"
+                )
+            if min_as_of is not None and training_cutoff > min_as_of:
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar training cutoff exceeds dataset history"
                 )
             try:
                 (
@@ -187,6 +200,7 @@ class PitManifestPublisher:
                         sidecar_path,
                         expected_sha256=sha256,
                         expected_model_version=model_version,
+                        expected_training_cutoff=training_cutoff,
                     )
                 finally:
                     if should_delete and os.path.exists(sidecar_path):
@@ -377,24 +391,42 @@ def _is_parquet_shard_uri(uri: str) -> bool:
     return Path(urlparse(str(uri)).path).name.startswith("part-")
 
 
-def _candidate_sidecar_reference_from_environment() -> Dict[str, str] | None:
+def _candidate_sidecar_reference_from_environment() -> Dict[str, Any] | None:
     uri = os.environ.get("FEATURE_LAKE_CANDIDATE_SIDECAR_URI", "").strip()
     sha256 = os.environ.get("FEATURE_LAKE_CANDIDATE_SIDECAR_SHA256", "").strip()
     model_version = os.environ.get(
         "FEATURE_LAKE_CANDIDATE_SIDECAR_MODEL_VERSION",
         "",
     ).strip()
-    if not uri and not sha256 and not model_version:
+    training_cutoff_raw = os.environ.get(
+        "FEATURE_LAKE_CANDIDATE_SIDECAR_TRAINING_CUTOFF",
+        "",
+    ).strip()
+    if not uri and not sha256 and not model_version and not training_cutoff_raw:
         return None
-    if not uri or len(sha256) != 64 or not model_version:
+    try:
+        training_cutoff = float(training_cutoff_raw)
+    except ValueError as exc:
         raise PitTrainingDatasetError(
-            "candidate sidecar URI, SHA256, and model version must be set together"
+            "candidate sidecar training cutoff must be numeric"
+        ) from exc
+    if (
+        not uri
+        or len(sha256) != 64
+        or not model_version
+        or not math.isfinite(training_cutoff)
+        or training_cutoff < 0.0
+    ):
+        raise PitTrainingDatasetError(
+            "candidate sidecar URI, SHA256, model version, and training cutoff "
+            "must be set together"
         )
     return {
         "uri": uri,
         "sha256": sha256,
         "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
         "model_version": model_version,
+        "training_cutoff": training_cutoff,
     }
 
 

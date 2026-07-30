@@ -230,26 +230,31 @@
   `ranking_v4_01_temporal_trimodal` checkpoint schema. DIN and trimodal tensors
   now share one structured training-batch contract and loss-contract errors
   fail fast.
-- PIT manifests now pin and verify candidate sidecar URI, SHA-256, schema, and
-  source model version. The PIT reader attaches only present candidate
-  modalities and the trainer reuses them without reading current FAISS/CF
-  state. Training history records modality/candidate coverage, gate means,
-  temporal-attention entropy, encoder gradient norms, validation loss, and
-  completed epochs.
+- PIT manifests now pin and verify candidate sidecar URI, SHA-256, schema,
+  source model version, and source-model training cutoff. Candidate embeddings
+  are versioned by `available_at` and resolved per observation, preventing
+  later item versions from leaking into earlier samples. PIT and default
+  trimodal-shadow training require pinned sidecars and do not read current
+  FAISS/CF state. Training history records modality/candidate coverage, gate
+  means, temporal-attention entropy, encoder gradient norms, validation loss,
+  and completed epochs.
 - Added bounded payload V4 support across recommendation, ranking service,
   coordinator, runner, and local fallback; checksum-locked candidate NPZ
   sidecars with atomic activation; V1-V3 compatibility; shadow-by-default
-  rollout and V3 checkpoint rollback lineage.
+  rollout and V3 checkpoint rollback lineage. V4 activation now rejects
+  incomplete state dictionaries, shadow config is fully revalidated, and the
+  post-holdout training partition must still satisfy the sample threshold.
 - Key files: `asr_service/api.py`, `video_commerce/ml/content_processor.py`,
   `video_commerce/ml/content_artifacts.py`,
   `video_commerce/ml/temporal_multimodal.py`, `video_commerce/ml/ranking.py`,
   `video_commerce/ml/ranking_training.py`, and
   `video_commerce/ml/candidate_embedding_sidecar.py`.
-- Verification: the combined temporal/training/PIT/ranking focused Docker suite
-  passed 142 tests; the complete backend suite passed 516 tests with 8 skips.
-  Python compile, scoped Black, diff checks, `docker compose config -q`, Helm
-  lint, and strict kubeconform passed for both default (33 resources) and PIT
-  production (36 resources) renders. GPU 300-second ASR profiling, v3/v4
-  candidate benchmarks, and offline NDCG/AUC/GMV promotion evaluation require
-  production hardware/data and remain rollout gates. No performance
-  improvement is claimed.
+- Verification: after the training-correctness review fixes, the expanded
+  temporal/training/PIT/ranking Docker suite passed 229 tests with 3 skips; the
+  complete backend suite passed 522 tests with 8 skips. Python compile, scoped
+  Black, diff checks, `docker compose config -q`, Helm lint, and strict
+  kubeconform passed for both default (33 resources) and PIT production
+  (36 resources) renders. GPU 300-second ASR profiling, v3/v4 candidate
+  benchmarks, and offline NDCG/AUC/GMV promotion evaluation require production
+  hardware/data and remain rollout gates. No performance improvement is
+  claimed.

@@ -8,6 +8,7 @@ import json
 import os
 from typing import Any, Dict, List
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -200,14 +201,29 @@ class PitTrainingDatasetReader:
             model_version = str(
                 candidate_sidecar_reference.get("model_version") or ""
             ).strip()
+            try:
+                training_cutoff = float(
+                    candidate_sidecar_reference.get("training_cutoff")
+                )
+            except (TypeError, ValueError) as exc:
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar training cutoff is invalid"
+                ) from exc
             if (
                 not uri
                 or len(sha256) != 64
                 or schema_version != CANDIDATE_SIDECAR_SCHEMA_VERSION
                 or not model_version
+                or not np.isfinite(training_cutoff)
+                or training_cutoff < 0.0
             ):
                 raise PitTrainingDatasetError(
                     "PIT candidate sidecar reference is incomplete or incompatible"
+                )
+            minimum_as_of = min(float(example.bundle.as_of_ts) for example in examples)
+            if training_cutoff > minimum_as_of:
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar training cutoff exceeds dataset history"
                 )
             try:
                 (
@@ -222,6 +238,7 @@ class PitTrainingDatasetReader:
                         sidecar_path,
                         expected_sha256=sha256,
                         expected_model_version=model_version,
+                        expected_training_cutoff=training_cutoff,
                     )
                 finally:
                     if should_delete and os.path.exists(sidecar_path):
@@ -233,13 +250,17 @@ class PitTrainingDatasetReader:
 
             pinned_examples = []
             for example in examples:
-                values = sidecar.get(example.bundle.candidate.product_id)
+                values = sidecar.get(
+                    example.bundle.candidate.product_id,
+                    as_of_ts=example.bundle.as_of_ts,
+                )
                 embeddings: Dict[str, Any] = {}
                 if values is not None:
                     presence = values.pop("presence")
                     for index, modality in enumerate(("image", "text", "two_tower")):
                         if bool(presence[index]):
                             embeddings[modality] = values[modality].tolist()
+                    embeddings["available_at"] = float(values["available_at"])
                 pinned_examples.append(
                     replace(example, candidate_embeddings=embeddings)
                 )

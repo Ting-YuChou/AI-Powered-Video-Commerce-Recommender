@@ -420,7 +420,7 @@ async def test_trimodal_training_cannot_stop_before_joint_finetuning(tmp_path):
 
     config = RankingConfig(
         trimodal_enabled=True,
-        training_min_samples=4,
+        training_min_samples=2,
         epochs=3,
         batch_size=2,
         training_min_epochs=2,
@@ -498,3 +498,98 @@ async def test_trimodal_training_cannot_stop_before_joint_finetuning(tmp_path):
         "ocr": pytest.approx(0.0),
         "asr": pytest.approx(0.0),
     }
+
+
+@pytest.mark.asyncio
+async def test_training_rechecks_minimum_samples_after_time_holdout(tmp_path):
+    from video_commerce.common.config import RankingConfig
+    from video_commerce.ml.ranking import RankingModel
+
+    ranking = RankingModel(
+        RankingConfig(
+            training_min_samples=4,
+            epochs=1,
+            training_min_epochs=1,
+            validation_fraction=0.5,
+            batch_size=2,
+            hidden_dims=[8],
+            architecture="mlp",
+        )
+    )
+    ranking.loaded_model_path = str(tmp_path / "ranking.pt")
+    examples = []
+    for impression_id, as_of_ts, row_count in (
+        ("old", 100.0, 1),
+        ("new", 200.0, 3),
+    ):
+        bundle = FeatureBundle(
+            as_of_ts=as_of_ts,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={"price": 9.0},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1",
+                combined_score=0.5,
+                source="pit",
+            ),
+        )
+        for row in range(row_count):
+            examples.append(
+                RankingTrainingExample(
+                    observation_id=f"{impression_id}:{row}",
+                    impression_id=impression_id,
+                    bundle=bundle,
+                    attribution=AttributionFacts("view", False, False),
+                )
+            )
+
+    await ranking.train_model(examples)
+
+    assert ranking.is_trained is False
+    assert ranking.training_history == []
+    assert not (tmp_path / "ranking.pt").exists()
+
+
+@pytest.mark.asyncio
+async def test_trimodal_activation_rejects_incomplete_checkpoint_state(tmp_path):
+    from video_commerce.common.config import RankingConfig
+    from video_commerce.ml.candidate_embedding_sidecar import (
+        write_candidate_embedding_sidecar,
+    )
+    from video_commerce.ml.ranking import RankingModel
+
+    config = RankingConfig(
+        trimodal_enabled=True,
+        epochs=2,
+        trimodal_warmup_epochs=1,
+        training_min_epochs=2,
+        hidden_dims=[8],
+        architecture="mlp",
+    )
+    checkpoint_path = tmp_path / "ranking.pt"
+    sidecar_path = checkpoint_path.with_suffix(".candidates.npz")
+    sidecar_sha256 = write_candidate_embedding_sidecar(
+        sidecar_path,
+        {"p1": {"text": [1.0] * 384}},
+        model_version="ranking-v1",
+    )
+    ranking = RankingModel(config)
+    ranking._initialize_model(architecture="mlp")
+    ranking.is_trained = True
+    ranking.candidate_sidecar_sha256 = sidecar_sha256
+    ranking.candidate_sidecar_model_version = "ranking-v1"
+    await ranking.save_model(str(checkpoint_path))
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    missing_key = next(
+        key
+        for key in checkpoint["model_state_dict"]
+        if key.startswith("visual_encoder.")
+    )
+    checkpoint["model_state_dict"].pop(missing_key)
+    torch.save(checkpoint, checkpoint_path)
+
+    loader = RankingModel(config.copy(deep=True))
+    with pytest.raises(RuntimeError, match="incomplete"):
+        await loader.load_model(str(checkpoint_path))

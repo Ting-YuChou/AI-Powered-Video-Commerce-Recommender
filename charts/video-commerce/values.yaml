@@ -140,6 +140,7 @@ external:
     candidateSidecarUri: ""
     candidateSidecarSha256: ""
     candidateSidecarModelVersion: ""
+    candidateSidecarTrainingCutoff: ""
     pitJobJarPath: /opt/flink/usrlib/interaction-features.jar
 
 pitOrchestrator:

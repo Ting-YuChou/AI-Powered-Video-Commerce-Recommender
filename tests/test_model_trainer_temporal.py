@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from video_commerce.common.config import RankingConfig
 from video_commerce.common.models import CandidateProduct, UserFeatures
 from video_commerce.ml.ranking_features import FeatureBundle
 from video_commerce.ml.ranking_training import (
@@ -23,6 +24,36 @@ def test_model_trainer_initializes_runtime_state():
     assert service.observability is not None
     assert service.running is False
     assert service.instance_id.startswith("model-trainer-")
+
+
+def test_trimodal_shadow_requires_pit_pinned_candidate_sidecar():
+    assert ModelTrainerService._requires_pinned_candidate_sidecar(
+        use_pit_dataset=False,
+        pit_shadow_enabled=False,
+        trimodal_enabled=False,
+        trimodal_shadow=True,
+    )
+    assert not ModelTrainerService._requires_pinned_candidate_sidecar(
+        use_pit_dataset=True,
+        pit_shadow_enabled=False,
+        trimodal_enabled=False,
+        trimodal_shadow=False,
+    )
+
+
+def test_shadow_config_revalidates_joint_finetuning_schedule():
+    service = ModelTrainerService(
+        SimpleNamespace(
+            ranking_config=RankingConfig(
+                trimodal_enabled=False,
+                epochs=1,
+                trimodal_warmup_epochs=1,
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="joint fine-tuning"):
+        service._build_trimodal_shadow_config()
 
 
 @pytest.mark.asyncio

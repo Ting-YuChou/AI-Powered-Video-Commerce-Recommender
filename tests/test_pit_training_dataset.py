@@ -222,12 +222,14 @@ async def test_pit_reader_requires_and_loads_pinned_candidate_sidecar(tmp_path):
         sidecar,
         {"p1": {"text": [1.0] * 384}},
         model_version="candidate-source-42",
+        training_cutoff=0.0,
     )
     reference = {
         "uri": str(sidecar),
         "sha256": sidecar_sha256,
         "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
         "model_version": "candidate-source-42",
+        "training_cutoff": 0.0,
     }
     latest, manifest_path, _ = _write_dataset(
         tmp_path / "pit",
@@ -241,7 +243,10 @@ async def test_pit_reader_requires_and_loads_pinned_candidate_sidecar(tmp_path):
     ).read(str(latest))
 
     assert dataset.candidate_embedding_sidecar == reference
-    assert set(dataset.examples[0].candidate_embeddings) == {"text"}
+    assert set(dataset.examples[0].candidate_embeddings) == {
+        "text",
+        "available_at",
+    }
     assert len(dataset.examples[0].candidate_embeddings["text"]) == 384
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -265,6 +270,71 @@ async def test_pit_reader_rejects_missing_required_candidate_sidecar(tmp_path):
             expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
             require_candidate_sidecar=True,
         ).read(str(latest))
+
+
+@pytest.mark.asyncio
+async def test_pit_reader_resolves_candidate_version_without_future_leakage(tmp_path):
+    early = [0.0] * 384
+    early[0] = 1.0
+    late = [0.0] * 384
+    late[1] = 1.0
+    sidecar = tmp_path / "candidate-versions.npz"
+    sidecar_sha256 = write_candidate_embedding_sidecar(
+        sidecar,
+        {
+            "p1": [
+                {"available_at": 40.0, "text": early},
+                {"available_at": 60.0, "text": late},
+            ]
+        },
+        model_version="candidate-source-pit",
+        training_cutoff=30.0,
+    )
+    reference = {
+        "uri": str(sidecar),
+        "sha256": sidecar_sha256,
+        "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
+        "model_version": "candidate-source-pit",
+        "training_cutoff": 30.0,
+    }
+    latest, _, _ = _write_dataset(
+        tmp_path / "pit-versioned",
+        candidate_embedding_sidecar=reference,
+    )
+
+    dataset = await PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        require_candidate_sidecar=True,
+    ).read(str(latest))
+
+    assert dataset.examples[0].candidate_embeddings["text"][0] == pytest.approx(1.0)
+    assert dataset.examples[0].candidate_embeddings["text"][1] == pytest.approx(0.0)
+
+    leaking_sidecar = tmp_path / "candidate-leaking.npz"
+    leaking_sha256 = write_candidate_embedding_sidecar(
+        leaking_sidecar,
+        {"p1": {"available_at": 40.0, "text": early}},
+        model_version="candidate-source-leaking",
+        training_cutoff=51.0,
+    )
+    leaking_reference = {
+        "uri": str(leaking_sidecar),
+        "sha256": leaking_sha256,
+        "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
+        "model_version": "candidate-source-leaking",
+        "training_cutoff": 51.0,
+    }
+    leaking_latest, _, _ = _write_dataset(
+        tmp_path / "pit-leaking",
+        candidate_embedding_sidecar=leaking_reference,
+    )
+    with pytest.raises(PitTrainingDatasetError, match="training cutoff"):
+        await PitTrainingDatasetReader(
+            LocalObjectStorage(),
+            expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            require_candidate_sidecar=True,
+        ).read(str(leaking_latest))
 
 
 @pytest.mark.asyncio
@@ -471,12 +541,14 @@ async def test_manifest_publisher_pins_verified_candidate_sidecar(tmp_path):
         sidecar,
         {"p1": {"text": [1.0] * 384}},
         model_version="candidate-source-42",
+        training_cutoff=0.0,
     )
     reference = {
         "uri": str(sidecar),
         "sha256": sidecar_sha256,
         "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
         "model_version": "candidate-source-42",
+        "training_cutoff": 0.0,
     }
     output = tmp_path / "published"
 
@@ -496,6 +568,20 @@ async def test_manifest_publisher_pins_verified_candidate_sidecar(tmp_path):
         (output / "runs/run-candidate-1/manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["candidate_embedding_sidecar"] == reference
+
+    future_trained_reference = dict(reference, training_cutoff=51.0)
+    with pytest.raises(PitTrainingDatasetError, match="exceeds dataset history"):
+        await PitManifestPublisher(LocalObjectStorage()).publish(
+            shard_uris=[str(shard)],
+            output_prefix=str(tmp_path / "future-trained"),
+            materialization_run_id="run-candidate-future",
+            iceberg_table_id="video_commerce.ranking_training_pit",
+            iceberg_snapshot_id="42",
+            feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            label_definition_version=RANKING_LABEL_DEFINITION_VERSION,
+            attribution_cutoff=1_700_000_000.0,
+            candidate_embedding_sidecar=future_trained_reference,
+        )
 
     bad_reference = dict(reference, sha256="0" * 64)
     with pytest.raises(PitTrainingDatasetError, match="candidate sidecar checksum"):
@@ -536,11 +622,13 @@ def test_candidate_sidecar_reference_from_environment_is_all_or_nothing(
         "FEATURE_LAKE_CANDIDATE_SIDECAR_MODEL_VERSION",
         "candidate-source-42",
     )
+    monkeypatch.setenv("FEATURE_LAKE_CANDIDATE_SIDECAR_TRAINING_CUTOFF", "42.0")
     assert _candidate_sidecar_reference_from_environment() == {
         "uri": "s3://features/candidates/source-42.npz",
         "sha256": "a" * 64,
         "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
         "model_version": "candidate-source-42",
+        "training_cutoff": 42.0,
     }
 
 

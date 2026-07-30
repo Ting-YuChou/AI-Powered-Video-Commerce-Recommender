@@ -867,9 +867,7 @@ class RankingModel:
         self.candidate_embedding_sidecar: Optional[CandidateEmbeddingSidecar] = None
         self.candidate_sidecar_sha256: Optional[str] = None
         self.candidate_sidecar_model_version: Optional[str] = None
-        self._candidate_sidecar_training_records: Optional[
-            Dict[str, Dict[str, Any]]
-        ] = None
+        self._candidate_sidecar_training_records: Optional[Dict[str, Any]] = None
         self._candidate_sidecar_path: Optional[str] = None
         self.enable_profiling_logs = False
         self.profiling_log_min_duration_ms = 250.0
@@ -893,7 +891,7 @@ class RankingModel:
 
     def configure_candidate_sidecar_for_training(
         self,
-        records: Dict[str, Dict[str, Any]],
+        records: Dict[str, Any],
         *,
         path: str,
     ) -> None:
@@ -1206,7 +1204,9 @@ class RankingModel:
             ) != self.din_sidecar_metadata.get(key):
                 raise RuntimeError(f"DIN checkpoint/sidecar lineage mismatch for {key}")
         expected_state = model.state_dict()
-        omitted = {"din.item_embedding.weight"}
+        omitted = {
+            key for key in expected_state if key.endswith("din.item_embedding.weight")
+        }
         required_keys = set(expected_state) - omitted
         if set(state_dict) != required_keys:
             missing = sorted(required_keys - set(state_dict))
@@ -1223,6 +1223,46 @@ class RankingModel:
         if invalid_shapes:
             raise RuntimeError(
                 f"DIN checkpoint tensor shapes are incompatible: {invalid_shapes}"
+            )
+
+    def _validate_trimodal_checkpoint(
+        self,
+        model: MultiObjectiveRankingModel,
+        state_dict: Dict[str, torch.Tensor],
+        checkpoint_config: Dict[str, Any],
+        *,
+        model_path: str,
+    ) -> None:
+        if not getattr(self.config, "trimodal_enabled", False):
+            return
+        if checkpoint_config.get("trimodal_enabled") is not True:
+            raise RuntimeError(
+                f"trimodal checkpoint {model_path} is missing its activation contract"
+            )
+        expected_state = model.state_dict()
+        omitted = (
+            {key for key in expected_state if key.endswith("din.item_embedding.weight")}
+            if getattr(self.config, "din_enabled", False)
+            else set()
+        )
+        required_keys = set(expected_state) - omitted
+        checkpoint_keys = set(state_dict)
+        if checkpoint_keys != required_keys:
+            missing = sorted(required_keys - checkpoint_keys)
+            unexpected = sorted(checkpoint_keys - required_keys)
+            raise RuntimeError(
+                "trimodal checkpoint state is incomplete or incompatible: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        invalid_shapes = [
+            key
+            for key in required_keys
+            if tuple(state_dict[key].shape) != tuple(expected_state[key].shape)
+        ]
+        if invalid_shapes:
+            raise RuntimeError(
+                "trimodal checkpoint tensor shapes are incompatible: "
+                f"{invalid_shapes}"
             )
 
     async def load_model(self, model_path: str = None):
@@ -1272,6 +1312,12 @@ class RankingModel:
                     low_rank_dim=checkpoint_config.get("low_rank_dim"),
                 )
                 self._validate_din_checkpoint(
+                    next_model,
+                    state_dict,
+                    checkpoint_config,
+                    model_path=str(checkpoint_path),
+                )
+                self._validate_trimodal_checkpoint(
                     next_model,
                     state_dict,
                     checkpoint_config,
@@ -2242,6 +2288,14 @@ class RankingModel:
         training_examples, validation_examples = self._split_training_examples_by_time(
             training_data
         )
+        if len(training_examples) < int(self.config.training_min_samples):
+            logger.warning(
+                "Skipping ranking training because the time-based training split "
+                "contains fewer than the configured minimum samples: "
+                f"training_rows={len(training_examples)}, "
+                f"minimum={self.config.training_min_samples}"
+            )
+            return None
         training_tensors = self._prepare_training_tensors(
             training_examples,
             fit_value_transform=True,
@@ -3630,7 +3684,7 @@ class RankingModel:
                 state_dict = {
                     key: value
                     for key, value in state_dict.items()
-                    if key != "din.item_embedding.weight"
+                    if not key.endswith("din.item_embedding.weight")
                 }
             checkpoint = {
                 "model_state_dict": state_dict,
@@ -3651,6 +3705,9 @@ class RankingModel:
                     "ranking_objective_version": self.ranking_objective_version,
                     "value_transform_stats": self.value_transform_stats,
                     "value_bucket_mapping": self.value_bucket_mapping,
+                    "trimodal_enabled": bool(
+                        getattr(self.config, "trimodal_enabled", False)
+                    ),
                     "din_enabled": bool(getattr(self.config, "din_enabled", False)),
                     "din_sidecar_metadata": self.din_sidecar_metadata,
                     "candidate_sidecar_sha256": self.candidate_sidecar_sha256,
