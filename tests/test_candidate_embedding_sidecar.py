@@ -38,3 +38,34 @@ def test_candidate_sidecar_rejects_wrong_embedding_dimensions(tmp_path):
         write_candidate_embedding_sidecar(
             tmp_path / "bad.npz", {"p1": {"image": [1.0]}}, model_version="v1"
         )
+
+
+def test_candidate_sidecar_resolves_latest_point_in_time_version(tmp_path):
+    path = tmp_path / "versioned-candidates.npz"
+    early = np.zeros(384, dtype=np.float32)
+    early[0] = 1.0
+    late = np.zeros(384, dtype=np.float32)
+    late[1] = 1.0
+    digest = write_candidate_embedding_sidecar(
+        path,
+        {
+            "p1": [
+                {"available_at": 10.0, "text": early},
+                {"available_at": 20.0, "text": late},
+            ]
+        },
+        model_version="candidate-v2",
+        training_cutoff=5.0,
+    )
+
+    sidecar = CandidateEmbeddingSidecar.load(
+        path,
+        expected_sha256=digest,
+        expected_model_version="candidate-v2",
+        expected_training_cutoff=5.0,
+    )
+
+    assert sidecar.get("p1", as_of_ts=5.0) is None
+    np.testing.assert_allclose(sidecar.get("p1", as_of_ts=15.0)["text"], early)
+    np.testing.assert_allclose(sidecar.get("p1", as_of_ts=25.0)["text"], late)
+    np.testing.assert_allclose(sidecar.get("p1")["text"], late)

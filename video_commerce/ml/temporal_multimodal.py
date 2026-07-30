@@ -412,7 +412,6 @@ class TrimodalCandidateAttention(nn.Module):
         self.gate_scores = nn.ModuleList(
             [_ScalarScore(self.model_dim) for _ in range(3)]
         )
-        self.residual_gate_logit = nn.Parameter(torch.tensor(-4.0))
 
     @staticmethod
     def _attend_present_rows(
@@ -472,6 +471,7 @@ class TrimodalCandidateAttention(nn.Module):
             candidate_presence = candidate_presence.to(
                 dtype=torch.bool, device=visual_tokens.device
             )
+        candidate_available = candidate_presence.any(dim=1)
         projected = [
             projection(value) * candidate_presence[:, index : index + 1]
             for index, (projection, value) in enumerate(
@@ -509,8 +509,10 @@ class TrimodalCandidateAttention(nn.Module):
             value * modality_gate[:, index : index + 1]
             for index, value in enumerate(fused_groups)
         )
-        fused = fused * torch.sigmoid(self.residual_gate_logit)
-        fused = fused.masked_fill(all_missing.unsqueeze(1), 0.0)
+        fused = fused.masked_fill(
+            (all_missing | ~candidate_available).unsqueeze(1),
+            0.0,
+        )
         return TrimodalAttentionOutput(
             fused=fused,
             modality_gate=modality_gate,

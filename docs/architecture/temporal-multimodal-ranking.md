@@ -27,22 +27,53 @@
    presence-aware modality gate and injected as a near-zero residual into the
    existing multi-objective ranker.
 
+## Training contract
+
+- `RankingTrainingTensors` carries supervised labels, trimodal tensors, and DIN
+  tensors as separate fields. One impression-aware batch iterator slices all
+  fields, so base-only, DIN-only, trimodal-only, and DIN plus trimodal use the
+  same optimizer path.
+- The newest configured fraction of impressions is reserved for validation by
+  `FeatureBundle.as_of_ts`; one impression never crosses the split. Validation
+  reuses the value transform fitted on training data and receives neither OCR
+  nor ASR dropout. The training partition must still meet
+  `training_min_samples` after the split or the attempt returns an explicit
+  skipped result. Model-trainer and shadow paths publish artifacts only for a
+  successful current attempt; a previously loaded checkpoint cannot be
+  relabeled with the skipped PIT run's lineage.
+- During warm-up the base ranker is frozen. Early stopping is not eligible
+  until at least one joint fine-tuning epoch has run. The best validation state
+  is restored before checkpoint publication.
+- OCR and ASR dropout is sampled per batch and epoch from the configured
+  training seed. Visual inputs are retained. Evaluation records modality and
+  candidate coverage, modality-gate means, temporal-attention entropy, and
+  encoder gradient norms.
+- Loss-contract violations fail the training run. They never publish a
+  checkpoint through a synthetic zero-loss fallback.
+
 ## Version and rollout contract
 
 - Content schema: `temporal_multimodal_v2`; immutable envelope schema:
   `content_feature_artifact_v2`.
-- Ranking feature schema: `ranking_v4_00_temporal_trimodal`.
+- Ranking feature schema: `ranking_v4_01_temporal_trimodal`.
 - Ranking runtime supports payload versions 1 through 4. V4 carries bounded
   fp16 tensors plus timestamps and masks in `multimodal_context`; it never
   sends transcript text. V1-v3 remain parseable and retain base ranking.
 - Candidate image/text/two-tower embeddings are stored in a checksummed NPZ
-  sidecar. Its checksum and model version are locked inside the ranking
-  checkpoint. Missing modalities use presence masks; missing products never
-  receive random fallback embeddings.
+  sidecar. Each product may have multiple `available_at` versions, and every
+  observation resolves the newest version that was available at its
+  `as_of_ts`. The PIT manifest pins URI, checksum, schema, source model version,
+  and source-model training cutoff; the cutoff must not exceed the earliest
+  observation. The ranking checkpoint locks the derived serving sidecar
+  checksum and model version. Missing modalities use presence masks; missing
+  products never receive random fallback embeddings. PIT and trimodal-shadow
+  training never regenerate candidate inputs from current FAISS or CF state.
 - `RANKING_TRIMODAL_SHADOW=true` and `RANKING_TRIMODAL_ENABLED=false` are the
   initial rollout defaults. Shadow training warm-starts the base ranker, freezes
   it for epoch one, then fine-tunes it at 0.1 times the new-layer learning rate.
-  Serving only activates V4 when checkpoint, sidecar, and feature schemas match.
+  Shadow configuration is revalidated before training. Serving only activates
+  V4 when the complete checkpoint state, sidecar, and feature schemas match;
+  partial state loading is restricted to explicit V3-to-V4 warm-start.
 - Apply `migrations/postgres/007_temporal_multimodal_features.sql` before
   enabling content backfill. Preview with
   `python scripts/backfill_temporal_multimodal.py --limit 100`; add `--enqueue`

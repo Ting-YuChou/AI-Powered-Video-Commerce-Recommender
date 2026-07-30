@@ -17,6 +17,7 @@ import httpx
 
 from video_commerce.ml.pit_manifest import (
     PitManifestPublisher,
+    _candidate_sidecar_reference_from_environment,
     _is_parquet_shard_uri,
     load_pinned_iceberg_run,
 )
@@ -281,6 +282,9 @@ class IcebergPitPublisher:
             attribution_cutoff=cutoff_ts,
             quarantine_row_count=quarantine_count,
             expected_iceberg_row_count=row_count,
+            candidate_embedding_sidecar=(
+                _candidate_sidecar_reference_from_environment()
+            ),
         )
         return PitPublicationResult(
             row_count=row_count,

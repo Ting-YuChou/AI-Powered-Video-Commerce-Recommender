@@ -146,7 +146,7 @@ class ModelArtifactManager:
             expected_feature_schema_version
             and (
                 (
-                    expected_feature_schema_version == "ranking_v4_00_temporal_trimodal"
+                    expected_feature_schema_version == "ranking_v4_01_temporal_trimodal"
                     and record_schema != expected_feature_schema_version
                 )
                 or (
@@ -162,7 +162,7 @@ class ModelArtifactManager:
             )
             if (
                 expected_feature_schema_version == "ranking_v3_00_temporal_multimodal"
-                and record_schema == "ranking_v4_00_temporal_trimodal"
+                and record_schema == "ranking_v4_01_temporal_trimodal"
                 and fallback_path
                 and len(fallback_sha256) == 64
             ):
@@ -210,7 +210,7 @@ class ModelArtifactManager:
                     ),
                 )
             )
-        elif record_schema == "ranking_v4_00_temporal_trimodal":
+        elif record_schema == "ranking_v4_01_temporal_trimodal":
             logger.warning("ranking_v4_candidate_sidecar_missing")
             return None
         din_manifest = (record.payload.get("artifact_manifest") or {}).get(
@@ -389,7 +389,7 @@ class ModelArtifactManager:
             return None
         if (payload or {}).get(
             "feature_schema_version"
-        ) == "ranking_v4_00_temporal_trimodal" and not candidate_sidecar_path:
+        ) == "ranking_v4_01_temporal_trimodal" and not candidate_sidecar_path:
             raise ValueError("ranking_v4 persistence requires a candidate sidecar")
 
         previous_record = await self.get_latest_model_checkpoint(
@@ -424,10 +424,10 @@ class ModelArtifactManager:
         record_payload = dict(payload or {})
         if (
             record_payload.get("feature_schema_version")
-            == "ranking_v4_00_temporal_trimodal"
+            == "ranking_v4_01_temporal_trimodal"
             and previous_record is not None
             and previous_record.payload.get("feature_schema_version")
-            != "ranking_v4_00_temporal_trimodal"
+            != "ranking_v4_01_temporal_trimodal"
         ):
             previous_sha256 = self._extract_artifact_sha256(
                 previous_record.payload,
@@ -601,7 +601,7 @@ class ModelArtifactManager:
                         else {}
                     ),
                 },
-                "feature_schema_version": "ranking_v4_00_temporal_trimodal",
+                "feature_schema_version": "ranking_v4_01_temporal_trimodal",
                 **(
                     {
                         "candidate_sidecar_path": persisted_candidate_sidecar,

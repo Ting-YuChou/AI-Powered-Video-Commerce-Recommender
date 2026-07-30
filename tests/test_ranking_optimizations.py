@@ -1356,6 +1356,7 @@ class FakeTrainerRankingModel:
             "training_data": training_data,
             "training_sample_source": training_sample_source,
         }
+        return True
 
     async def save_model(self, model_path):
         self.loaded_model_path = model_path
@@ -1794,6 +1795,7 @@ async def test_model_trainer_renews_pit_training_lease_while_training():
         ):
             self.received = {"training_data": training_data}
             await release_training.wait()
+            return True
 
     store = FakeTrainerSystemStore()
     service = object.__new__(ModelTrainerService)
@@ -1940,7 +1942,7 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
             self.loaded_model_path = None
             self.model_version = "shadow-1"
             self.model = None
-            self.feature_schema_version = "ranking_v4_00_temporal_trimodal"
+            self.feature_schema_version = "ranking_v4_01_temporal_trimodal"
             self._candidate_sidecar_path = "/tmp/ranking.candidates.npz"
             self.feature_assembler = SimpleNamespace(
                 version="ranking_feature_assembler_v1"
@@ -1952,6 +1954,7 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
         async def train_model(self, examples, *, training_sample_source):
             assert examples == [example]
             assert training_sample_source == "feature_lake_pit_shadow"
+            return True
 
     monkeypatch.setattr(model_trainer_module, "RankingModel", ShadowModel)
     service = object.__new__(ModelTrainerService)
@@ -1978,6 +1981,149 @@ async def test_pit_shadow_training_persists_non_activating_artifact(monkeypatch)
         == "ranking_labels_v1"
     )
     assert service.observability.runs[-1][1] == "success"
+
+
+@pytest.mark.asyncio
+async def test_pit_training_skip_does_not_republish_loaded_checkpoint():
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=FeatureBundle(
+            as_of_ts=100.0,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={"price": 9.0},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1", combined_score=0.5, source="pit_test"
+            ),
+        ),
+        attribution=AttributionFacts("click", True, False),
+    )
+    dataset = SimpleNamespace(
+        examples=[example],
+        dataset_version="iceberg-snapshot-42",
+        materialization_run_id="run-42",
+        manifest_uri="s3://features/run-42/manifest.json",
+        iceberg_snapshot_id="42",
+        schema_hash="a" * 64,
+        quarantine_rows=0,
+        feature_definition_version="ranking_ltr_v1",
+        label_definition_version="ranking_labels_v1",
+    )
+
+    class Reader:
+        async def read(self, _uri):
+            return dataset
+
+    class SkippedRankingModel(FakeTrainerRankingModel):
+        async def train_model(self, training_data, **_kwargs):
+            self.received = {"training_data": training_data}
+            return False
+
+    store = FakeTrainerSystemStore()
+    artifacts = FakeTrainerArtifactManager()
+    ranking_model = SkippedRankingModel()
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            enable_periodic_training=True,
+            training_min_samples=1,
+        ),
+        feature_lake_config=SimpleNamespace(
+            training_source="pit",
+            ranking_pit_dataset_uri="s3://features/latest.json",
+            pit_training_lease_seconds=300,
+        ),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.feature_store = None
+    service.system_store = store
+    service.pit_dataset_reader = Reader()
+    service.ranking_model = ranking_model
+    service.artifact_manager = artifacts
+    service.observability = FakeTrainerObservability()
+    service.instance_id = "trainer-1"
+    service.last_trained_pit_run_id = None
+
+    await service._train_ranking_model(trigger="scheduled")
+
+    assert artifacts.payload is None
+    assert not hasattr(store, "completed_pit_training")
+    assert store.failed_pit_training["run_id"] == "run-42"
+    assert ranking_model.model_version == "ranking-test"
+    assert service.observability.runs[-1][1] == "skipped_insufficient_training_split"
+
+
+@pytest.mark.asyncio
+async def test_pit_shadow_skip_does_not_persist_old_warm_start(monkeypatch):
+    example = RankingTrainingExample(
+        observation_id="imp-1:p1",
+        impression_id="imp-1",
+        bundle=FeatureBundle(
+            as_of_ts=100.0,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1"),
+            product_metadata={"price": 9.0},
+            context={},
+            candidate=CandidateProduct(
+                product_id="p1", combined_score=0.5, source="pit_test"
+            ),
+        ),
+        attribution=AttributionFacts("click", True, False),
+    )
+    dataset = SimpleNamespace(
+        examples=[example],
+        dataset_version="iceberg-snapshot-42",
+        materialization_run_id="run-42",
+        manifest_uri="s3://features/run-42/manifest.json",
+        iceberg_snapshot_id="42",
+        schema_hash="a" * 64,
+        feature_definition_version="ranking_ltr_v1",
+        label_definition_version="ranking_labels_v1",
+    )
+
+    class Reader:
+        async def read(self, _uri):
+            return dataset
+
+    class SkippedShadowModel:
+        def __init__(self, config, *, observability=None):
+            self.config = config
+            self.loaded_model_path = None
+            self.model_version = "old-shadow"
+            self.model = None
+            self.feature_schema_version = "ranking_v4_01_temporal_trimodal"
+            self._candidate_sidecar_path = "/tmp/ranking.candidates.npz"
+            self.feature_assembler = SimpleNamespace(version="assembler-v1")
+
+        def _initialize_model(self, *, architecture):
+            return None
+
+        async def train_model(self, *_args, **_kwargs):
+            return False
+
+    monkeypatch.setattr(model_trainer_module, "RankingModel", SkippedShadowModel)
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        feature_lake_config=SimpleNamespace(ranking_pit_dataset_uri="s3://latest"),
+        ranking_config=SimpleNamespace(training_min_samples=1),
+        model_config=SimpleNamespace(ranking_model_path="/tmp/ranking.pt"),
+    )
+    service.pit_dataset_reader = Reader()
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+    service.ranking_model = None
+
+    async def attach_candidate_embeddings(_ranking_model, examples):
+        return examples
+
+    service._attach_trimodal_candidate_embeddings = attach_candidate_embeddings
+
+    await service._train_pit_shadow_model(trigger="scheduled")
+
+    assert not hasattr(service.artifact_manager, "shadow_payload")
+    assert service.observability.runs[-1][1] == "skipped_insufficient_training_split"
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -18,6 +19,10 @@ from video_commerce.ml.pit_training_dataset import (
     arrow_schema_sha256,
 )
 from video_commerce.ml.ranking_training import RANKING_LABEL_DEFINITION_VERSION
+from video_commerce.ml.candidate_embedding_sidecar import (
+    CANDIDATE_SIDECAR_SCHEMA_VERSION,
+    CandidateEmbeddingSidecar,
+)
 
 
 class PitManifestPublisher:
@@ -37,6 +42,7 @@ class PitManifestPublisher:
         attribution_cutoff: float,
         quarantine_row_count: int = 0,
         expected_iceberg_row_count: int | None = None,
+        candidate_embedding_sidecar: Dict[str, Any] | None = None,
     ) -> str:
         run_id = str(materialization_run_id or "").strip()
         if not run_id:
@@ -154,6 +160,55 @@ class PitManifestPublisher:
             raise PitTrainingDatasetError(
                 "PIT Parquet row count does not match the pinned Iceberg run"
             )
+        if candidate_embedding_sidecar is not None:
+            reference = dict(candidate_embedding_sidecar)
+            uri = str(reference.get("uri") or "").strip()
+            sha256 = str(reference.get("sha256") or "").strip()
+            schema_version = str(reference.get("schema_version") or "").strip()
+            model_version = str(reference.get("model_version") or "").strip()
+            try:
+                training_cutoff = float(reference.get("training_cutoff"))
+            except (TypeError, ValueError) as exc:
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar training cutoff is invalid"
+                ) from exc
+            if (
+                not uri
+                or len(sha256) != 64
+                or schema_version != CANDIDATE_SIDECAR_SCHEMA_VERSION
+                or not model_version
+                or not math.isfinite(training_cutoff)
+                or training_cutoff < 0.0
+            ):
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar reference is incomplete or incompatible"
+                )
+            if min_as_of is not None and training_cutoff > min_as_of:
+                raise PitTrainingDatasetError(
+                    "PIT candidate sidecar training cutoff exceeds dataset history"
+                )
+            try:
+                (
+                    sidecar_path,
+                    should_delete,
+                ) = await self.object_storage.materialize_for_processing(
+                    uri,
+                    suggested_suffix=".npz",
+                )
+                try:
+                    CandidateEmbeddingSidecar.load(
+                        sidecar_path,
+                        expected_sha256=sha256,
+                        expected_model_version=model_version,
+                        expected_training_cutoff=training_cutoff,
+                    )
+                finally:
+                    if should_delete and os.path.exists(sidecar_path):
+                        os.remove(sidecar_path)
+            except (OSError, ValueError) as exc:
+                raise PitTrainingDatasetError(
+                    f"unable to verify PIT candidate sidecar: {exc}"
+                ) from exc
 
         manifest_uri = self._join_uri(output_prefix, f"runs/{run_id}/manifest.json")
         latest_uri = self._join_uri(output_prefix, "latest.json")
@@ -174,6 +229,8 @@ class PitManifestPublisher:
             "max_as_of_ts": max_as_of,
             "shards": shards,
         }
+        if candidate_embedding_sidecar is not None:
+            manifest["candidate_embedding_sidecar"] = dict(candidate_embedding_sidecar)
         existing_manifest = await self._read_json_if_exists(manifest_uri)
         latest_pointer = {
             "manifest_uri": manifest_uri,
@@ -334,6 +391,45 @@ def _is_parquet_shard_uri(uri: str) -> bool:
     return Path(urlparse(str(uri)).path).name.startswith("part-")
 
 
+def _candidate_sidecar_reference_from_environment() -> Dict[str, Any] | None:
+    uri = os.environ.get("FEATURE_LAKE_CANDIDATE_SIDECAR_URI", "").strip()
+    sha256 = os.environ.get("FEATURE_LAKE_CANDIDATE_SIDECAR_SHA256", "").strip()
+    model_version = os.environ.get(
+        "FEATURE_LAKE_CANDIDATE_SIDECAR_MODEL_VERSION",
+        "",
+    ).strip()
+    training_cutoff_raw = os.environ.get(
+        "FEATURE_LAKE_CANDIDATE_SIDECAR_TRAINING_CUTOFF",
+        "",
+    ).strip()
+    if not uri and not sha256 and not model_version and not training_cutoff_raw:
+        return None
+    try:
+        training_cutoff = float(training_cutoff_raw)
+    except ValueError as exc:
+        raise PitTrainingDatasetError(
+            "candidate sidecar training cutoff must be numeric"
+        ) from exc
+    if (
+        not uri
+        or len(sha256) != 64
+        or not model_version
+        or not math.isfinite(training_cutoff)
+        or training_cutoff < 0.0
+    ):
+        raise PitTrainingDatasetError(
+            "candidate sidecar URI, SHA256, model version, and training cutoff "
+            "must be set together"
+        )
+    return {
+        "uri": uri,
+        "sha256": sha256,
+        "schema_version": CANDIDATE_SIDECAR_SCHEMA_VERSION,
+        "model_version": model_version,
+        "training_cutoff": training_cutoff,
+    }
+
+
 async def _main() -> None:
     from video_commerce.common.config import Config
     from video_commerce.data_plane.object_storage import ObjectStorage
@@ -380,6 +476,7 @@ async def _main() -> None:
         attribution_cutoff=float(cutoff),
         quarantine_row_count=quarantine_row_count,
         expected_iceberg_row_count=iceberg_row_count,
+        candidate_embedding_sidecar=(_candidate_sidecar_reference_from_environment()),
     )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -76,6 +76,39 @@ class RankingTrainingExample:
             raise ValueError("PIT ranking training example requires impression_id")
 
 
+@dataclass(frozen=True)
+class RankingTrainingBatch:
+    """One aligned ranking batch with model inputs kept separate from labels."""
+
+    base_features: torch.Tensor
+    labels: Dict[str, torch.Tensor]
+    trimodal_inputs: Dict[str, torch.Tensor] = field(default_factory=dict)
+    din_inputs: Dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RankingTrainingTensors:
+    """Full training tensors before deterministic impression-aware batching."""
+
+    base_features: torch.Tensor
+    labels: Dict[str, torch.Tensor]
+    trimodal_inputs: Dict[str, torch.Tensor] = field(default_factory=dict)
+    din_inputs: Dict[str, torch.Tensor] = field(default_factory=dict)
+
+    def select(self, indices: torch.Tensor) -> RankingTrainingBatch:
+        def select_group(values: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            return {
+                key: value.index_select(0, indices) for key, value in values.items()
+            }
+
+        return RankingTrainingBatch(
+            base_features=self.base_features.index_select(0, indices),
+            labels=select_group(self.labels),
+            trimodal_inputs=select_group(self.trimodal_inputs),
+            din_inputs=select_group(self.din_inputs),
+        )
+
+
 class RankingLabelBuilder:
     """Produce model targets exclusively from finalized attribution facts."""
 
@@ -137,7 +170,10 @@ class TrainingTensorBuilder:
         self.transform_value = transform_value or (lambda value, _bucket: value)
 
     def build(
-        self, examples: Sequence[RankingTrainingExample]
+        self,
+        examples: Sequence[RankingTrainingExample],
+        *,
+        fit_value_transform: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if not examples:
             return torch.empty(0, device=self.device), {}
@@ -154,7 +190,8 @@ class TrainingTensorBuilder:
             for label, bucket_id in zip(built_labels, bucket_ids)
             if label.value_mask > 0.0
         ]
-        self.fit_value_transform(value_records)
+        if fit_value_transform:
+            self.fit_value_transform(value_records)
         normalized_values = [
             self.transform_value(label.business_value, bucket_id)
             if label.value_mask > 0.0
@@ -212,8 +249,12 @@ class TrainingTensorBuilder:
         *,
         apply_modality_dropout: bool = False,
         modality_dropout_probability: float = 0.1,
+        fit_value_transform: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        features, labels = self.build(examples)
+        features, labels = self.build(
+            examples,
+            fit_value_transform=fit_value_transform,
+        )
         batch_size = len(examples)
 
         def allocate(capacity: int, dimension: int):

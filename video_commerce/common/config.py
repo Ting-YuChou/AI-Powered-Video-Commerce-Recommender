@@ -1060,6 +1060,32 @@ class RankingConfig(BaseSettings):
     epochs: int = Field(100, description="Training epochs")
     batch_size: int = Field(1024, description="Training batch size")
     early_stopping_patience: int = Field(10, description="Early stopping patience")
+    early_stopping_min_delta: float = Field(
+        1e-4,
+        ge=0.0,
+        description="Minimum validation-loss improvement that resets patience",
+    )
+    training_min_epochs: int = Field(
+        2,
+        ge=1,
+        description="Minimum epochs completed before early stopping is eligible",
+    )
+    trimodal_warmup_epochs: int = Field(
+        1,
+        ge=0,
+        description="Epochs that train new trimodal layers with the base ranker frozen",
+    )
+    validation_fraction: float = Field(
+        0.2,
+        ge=0.0,
+        lt=1.0,
+        description="Newest impression fraction reserved for ranking validation",
+    )
+    training_seed: int = Field(
+        42,
+        ge=0,
+        description="Deterministic ranking split and modality-dropout seed",
+    )
     enable_periodic_training: bool = Field(
         False,
         description="Enable background retraining of the ranking model checkpoint",
@@ -1190,6 +1216,18 @@ class RankingConfig(BaseSettings):
             raise ValueError(
                 "DIN replaces averaged ranking history embeddings; enable only one"
             )
+        if values.get("trimodal_enabled"):
+            epochs = int(values.get("epochs", 0))
+            warmup_epochs = int(values.get("trimodal_warmup_epochs", 0))
+            if epochs <= warmup_epochs:
+                raise ValueError(
+                    "trimodal training requires at least one joint fine-tuning "
+                    "epoch after warm-up"
+                )
+            if int(values.get("training_min_epochs", 1)) > epochs:
+                raise ValueError(
+                    "training_min_epochs cannot exceed epochs for trimodal training"
+                )
         return values
 
     @validator("runner_payload_max_bytes")

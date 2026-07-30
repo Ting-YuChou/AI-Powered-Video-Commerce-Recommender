@@ -52,6 +52,18 @@ class ModelTrainerService:
         self.config = config
         self.feature_store: FeatureStore | None = None
         self.vector_search: VectorSearchEngine | None = None
+        self.recommendation_engine: RecommendationEngine | None = None
+        self.ranking_model: RankingModel | None = None
+        self.system_store: SystemStore | None = None
+        self.object_storage: ObjectStorage | None = None
+        self.artifact_manager: ModelArtifactManager | None = None
+        self.pit_dataset_reader: PitTrainingDatasetReader | None = None
+        self.last_trained_pit_run_id: str | None = None
+        self.legacy_training_adapter: LegacyTrainingDatasetAdapter | None = None
+        self.observability = ObservabilityManager()
+        self.running = False
+        self._heartbeat_task: asyncio.Task | None = None
+        self.instance_id = f"model-trainer-{socket.gethostname()}-{os.getpid()}"
 
     async def _attach_trimodal_candidate_embeddings(
         self,
@@ -61,6 +73,40 @@ class ModelTrainerService:
         if not getattr(
             getattr(ranking_model, "config", None), "trimodal_enabled", False
         ):
+            return examples
+        if examples and all(
+            example.candidate_embeddings is not None for example in examples
+        ):
+            versions_by_product = {}
+            for example in examples:
+                product_id = str(example.bundle.candidate.product_id)
+                candidate_embeddings = dict(example.candidate_embeddings or {})
+                available_at = float(candidate_embeddings.get("available_at", 0.0))
+                versions = versions_by_product.setdefault(product_id, {})
+                previous = versions.setdefault(available_at, candidate_embeddings)
+                if previous != candidate_embeddings:
+                    raise RuntimeError(
+                        "PIT candidate embeddings conflict for one product version"
+                    )
+            records = {
+                product_id: [
+                    versions[available_at] for available_at in sorted(versions)
+                ]
+                for product_id, versions in versions_by_product.items()
+            }
+            sidecar_path = str(
+                Path(
+                    ranking_model.loaded_model_path
+                    or self.config.model_config.ranking_model_path
+                ).with_suffix(".candidates.npz")
+            )
+            ranking_model.configure_candidate_sidecar_for_training(
+                {
+                    product_id: versions[0] if len(versions) == 1 else versions
+                    for product_id, versions in records.items()
+                },
+                path=sidecar_path,
+            )
             return examples
         by_product = {}
         for example in examples:
@@ -126,18 +172,28 @@ class ModelTrainerService:
             )
             for example in examples
         ]
-        self.recommendation_engine: RecommendationEngine | None = None
-        self.ranking_model: RankingModel | None = None
-        self.system_store: SystemStore | None = None
-        self.object_storage: ObjectStorage | None = None
-        self.artifact_manager: ModelArtifactManager | None = None
-        self.pit_dataset_reader: PitTrainingDatasetReader | None = None
-        self.last_trained_pit_run_id: str | None = None
-        self.legacy_training_adapter: LegacyTrainingDatasetAdapter | None = None
-        self.observability = ObservabilityManager()
-        self.running = False
-        self._heartbeat_task: asyncio.Task | None = None
-        self.instance_id = f"model-trainer-{socket.gethostname()}-{os.getpid()}"
+
+    @staticmethod
+    def _requires_pinned_candidate_sidecar(
+        *,
+        use_pit_dataset: bool,
+        pit_shadow_enabled: bool,
+        trimodal_enabled: bool,
+        trimodal_shadow: bool,
+    ) -> bool:
+        return bool(
+            trimodal_shadow
+            or ((use_pit_dataset or pit_shadow_enabled) and trimodal_enabled)
+        )
+
+    def _build_trimodal_shadow_config(self) -> RankingConfig:
+        ranking_config = self.config.ranking_config
+        if hasattr(ranking_config, "dict"):
+            values = ranking_config.dict()
+        else:
+            values = dict(vars(ranking_config))
+        values["trimodal_enabled"] = True
+        return RankingConfig(**values)
 
     def _ensure_heartbeat_task(self) -> None:
         if self._heartbeat_task is None or self._heartbeat_task.done():
@@ -200,6 +256,16 @@ class ModelTrainerService:
                 self.object_storage,
                 expected_feature_definition_version=(
                     feature_lake_config.feature_definition_version
+                ),
+                require_candidate_sidecar=self._requires_pinned_candidate_sidecar(
+                    use_pit_dataset=use_pit_dataset,
+                    pit_shadow_enabled=bool(
+                        getattr(feature_lake_config, "pit_shadow_enabled", False)
+                    ),
+                    trimodal_enabled=bool(
+                        getattr(self.config.ranking_config, "trimodal_enabled", False)
+                    ),
+                    trimodal_shadow=trimodal_shadow,
                 ),
                 observability=self.observability,
             )
@@ -598,7 +664,26 @@ class ModelTrainerService:
             training_kwargs = {"training_sample_source": training_sample_source}
             if pit_training_cancel_event is not None:
                 training_kwargs["cancellation_event"] = pit_training_cancel_event
-            await self.ranking_model.train_model(training_examples, **training_kwargs)
+            trained_this_attempt = await self.ranking_model.train_model(
+                training_examples, **training_kwargs
+            )
+            if not trained_this_attempt:
+                status = "skipped_insufficient_training_split"
+                logger.info(
+                    "Skipping ranking artifact publication because this training "
+                    "attempt did not retain enough post-holdout samples",
+                    extra={
+                        "trigger": trigger,
+                        "training_sample_source": training_sample_source,
+                    },
+                )
+                if pit_training_claimed:
+                    await self.system_store.fail_pit_training_run(
+                        run_id=pit_dataset.materialization_run_id,
+                        worker_id=getattr(self, "instance_id", "model-trainer"),
+                    )
+                    pit_training_claimed = False
+                return
             din_metrics = None
             if getattr(self.config.ranking_config, "din_enabled", False):
                 din_metrics = self._din_training_metrics(
@@ -674,6 +759,15 @@ class ModelTrainerService:
                         ),
                         "feature_lake_schema_hash": (
                             getattr(pit_dataset, "schema_hash", None)
+                            if pit_dataset
+                            else None
+                        ),
+                        "candidate_embedding_source": (
+                            getattr(
+                                pit_dataset,
+                                "candidate_embedding_sidecar",
+                                None,
+                            )
                             if pit_dataset
                             else None
                         ),
@@ -838,14 +932,7 @@ class ModelTrainerService:
                 f"{trigger}_pit_shadow", "skipped_insufficient_samples", 0.0
             )
             return
-        if hasattr(self.config.ranking_config, "copy"):
-            shadow_config = self.config.ranking_config.copy(
-                update={"trimodal_enabled": True}
-            )
-        else:
-            shadow_values = dict(vars(self.config.ranking_config))
-            shadow_values["trimodal_enabled"] = True
-            shadow_config = RankingConfig(**shadow_values)
+        shadow_config = self._build_trimodal_shadow_config()
         shadow_model = RankingModel(
             shadow_config,
             observability=self.observability,
@@ -869,10 +956,13 @@ class ModelTrainerService:
             shadow_examples = await self._attach_trimodal_candidate_embeddings(
                 shadow_model, dataset.examples
             )
-            await shadow_model.train_model(
+            trained_this_attempt = await shadow_model.train_model(
                 shadow_examples,
                 training_sample_source="feature_lake_pit_shadow",
             )
+            if not trained_this_attempt:
+                status = "skipped_insufficient_training_split"
+                return
             record = await self.artifact_manager.persist_ranking_shadow_checkpoint(
                 local_path=shadow_model.loaded_model_path,
                 model_version=shadow_model.model_version,
@@ -886,6 +976,11 @@ class ModelTrainerService:
                     "feature_lake_manifest_uri": dataset.manifest_uri,
                     "feature_lake_iceberg_snapshot_id": dataset.iceberg_snapshot_id,
                     "feature_lake_schema_hash": dataset.schema_hash,
+                    "candidate_embedding_source": getattr(
+                        dataset,
+                        "candidate_embedding_sidecar",
+                        None,
+                    ),
                     "feature_definition_version": dataset.feature_definition_version,
                     "label_definition_version": dataset.label_definition_version,
                     "feature_assembler_version": shadow_model.feature_assembler.version,

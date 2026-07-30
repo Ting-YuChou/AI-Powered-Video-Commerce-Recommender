@@ -137,6 +137,10 @@ external:
     pitTrainingLeaseSeconds: 21600
     flinkJobmanager: ""
     pitExportUri: ""
+    candidateSidecarUri: ""
+    candidateSidecarSha256: ""
+    candidateSidecarModelVersion: ""
+    candidateSidecarTrainingCutoff: ""
     pitJobJarPath: /opt/flink/usrlib/interaction-features.jar
 
 pitOrchestrator:
