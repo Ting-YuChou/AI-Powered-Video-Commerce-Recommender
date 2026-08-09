@@ -817,7 +817,12 @@ def test_remote_din_batch_fails_closed_without_v3_capability():
 
 @pytest.mark.asyncio
 async def test_untrained_microbatch_uses_combined_score_fallback():
-    ranking = RankingModel(RankingConfig())
+    ranking = RankingModel(
+        RankingConfig(
+            allow_untrained_fallback=True,
+            require_verified_artifact=False,
+        )
+    )
     await ranking.load_model()
     assert ranking.is_trained is False
 

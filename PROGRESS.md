@@ -27,7 +27,10 @@
 - Verification: Docker backend suite `551 passed, 8 skipped`; ranking
   fail-closed/capacity focused suite `54 passed`; `docker compose config -q`; Helm
   lint/template; kubeconform strict `33 valid`; Prometheus rule tests; k6
-  script inspection; Black and `git diff --check`.
+  script inspection; Black and `git diff --check`. PR CI later exposed three
+  legacy shape/fallback tests whose Compose-provided local fallback setting had
+  hidden their test-only dependency; those tests now opt into unverified or
+  untrained inference explicitly while production defaults remain fail closed.
 - Follow-up/blocker: the repository and current Compose state contain no
   trained, verified ranking checkpoint, so the 1/2/4-runner matrix and the
   1,500/2,000/2,500 QPS soak, overload, and rolling-restart acceptance runs
