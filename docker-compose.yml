@@ -97,17 +97,19 @@ x-common-service: &common-service
     RANKING_TRIMODAL_ENABLED: ${RANKING_TRIMODAL_ENABLED:-false}
     RANKING_TRIMODAL_SHADOW: ${RANKING_TRIMODAL_SHADOW:-true}
     RANKING_TRIMODAL_MODALITY_DROPOUT: ${RANKING_TRIMODAL_MODALITY_DROPOUT:-0.1}
+    RANKING_ALLOW_UNTRAINED_FALLBACK: ${RANKING_ALLOW_UNTRAINED_FALLBACK:-true}
+    RANKING_REQUIRE_VERIFIED_ARTIFACT: ${RANKING_REQUIRE_VERIFIED_ARTIFACT:-false}
     RANKING_BATCH_MAX_REQUESTS: ${RANKING_BATCH_MAX_REQUESTS:-64}
     RANKING_BATCH_TARGET_REQUESTS: ${RANKING_BATCH_TARGET_REQUESTS:-32}
-    RANKING_BATCH_WAIT_MS: ${RANKING_BATCH_WAIT_MS:-48}
-    RANKING_BATCH_QUEUE_SIZE: ${RANKING_BATCH_QUEUE_SIZE:-32768}
-    RANKING_BATCH_RUNNER_COUNT: ${RANKING_BATCH_RUNNER_COUNT:-16}
+    RANKING_BATCH_WAIT_MS: ${RANKING_BATCH_WAIT_MS:-16}
+    RANKING_BATCH_QUEUE_SIZE: ${RANKING_BATCH_QUEUE_SIZE:-2048}
+    RANKING_BATCH_RUNNER_COUNT: ${RANKING_BATCH_RUNNER_COUNT:-4}
     RANKING_COORDINATOR_DISPATCH_CONCURRENCY: ${RANKING_COORDINATOR_DISPATCH_CONCURRENCY:-16}
     RANKING_RUNNER_QUEUE_SIZE: ${RANKING_RUNNER_QUEUE_SIZE:-0}
     RANKING_RUNNER_BATCH_CONCURRENCY: ${RANKING_RUNNER_BATCH_CONCURRENCY:-1}
     RANKING_INFERENCE_EXECUTOR_WORKERS: ${RANKING_INFERENCE_EXECUTOR_WORKERS:-16}
     RANKING_INFERENCE_PROCESS_WORKERS: ${RANKING_INFERENCE_PROCESS_WORKERS:-0}
-    RANKING_MAX_QUEUE_WAIT_MS: ${RANKING_MAX_QUEUE_WAIT_MS:-150}
+    RANKING_MAX_QUEUE_WAIT_MS: ${RANKING_MAX_QUEUE_WAIT_MS:-100}
     RANKING_PRODUCT_FEATURE_CACHE_SIZE: ${RANKING_PRODUCT_FEATURE_CACHE_SIZE:-50000}
     RANKING_REALTIME_WINDOW_FEATURES_ENABLED: ${RANKING_REALTIME_WINDOW_FEATURES_ENABLED:-false}
     RANKING_HISTORY_EMBEDDINGS_ENABLED: ${RANKING_HISTORY_EMBEDDINGS_ENABLED:-false}
@@ -191,6 +193,7 @@ x-common-service: &common-service
     SERVICE_RANKING_RUNNER_DNS_REFRESH_SECONDS: ${SERVICE_RANKING_RUNNER_DNS_REFRESH_SECONDS:-5}
     SERVICE_RANKING_RUNNER_ENDPOINT_MISSING_REFRESHES: ${SERVICE_RANKING_RUNNER_ENDPOINT_MISSING_REFRESHES:-3}
     SERVICE_RANKING_RUNNER_ENDPOINT_MISSING_GRACE_SECONDS: ${SERVICE_RANKING_RUNNER_ENDPOINT_MISSING_GRACE_SECONDS:-30}
+    SERVICE_RANKING_MIN_HEALTHY_RUNNERS: ${SERVICE_RANKING_MIN_HEALTHY_RUNNERS:-2}
     SERVICE_INTERACTION_INGEST_SERVICE_URL: http://interaction-ingest-service:8002
     SERVICE_MAX_INFLIGHT_RECOMMENDATIONS: ${SERVICE_MAX_INFLIGHT_RECOMMENDATIONS:-40}
     SERVICE_RANKING_SERVICE_FALLBACK_ENABLED: ${SERVICE_RANKING_SERVICE_FALLBACK_ENABLED:-false}
@@ -366,13 +369,13 @@ services:
       kafka-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os,socket; s=socket.create_connection(('localhost', int(os.getenv('SERVICE_RANKING_RUNNER_PORT','8014'))), 2); s.close()\""]
+      test: ["CMD", "python", "-m", "video_commerce.ranking_runtime.runner_healthcheck", "--host", "127.0.0.1", "--port", "8014", "--operation", "health", "--timeout-seconds", "5", "--allow-degraded"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 180s
     deploy:
-      replicas: ${RANKING_RUNNER_REPLICAS:-16}
+      replicas: ${RANKING_RUNNER_REPLICAS:-4}
 
   ranking-coordinator:
     <<: *common-service
@@ -393,7 +396,7 @@ services:
       ranking-runner:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os,socket; s=socket.create_connection(('localhost', int(os.getenv('SERVICE_RANKING_COORDINATOR_PORT','8013'))), 2); s.close()\""]
+      test: ["CMD", "python", "-m", "video_commerce.ranking_runtime.runner_healthcheck", "--host", "127.0.0.1", "--port", "8013", "--operation", "health", "--timeout-seconds", "5", "--allow-degraded"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -406,12 +409,12 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-4} --no-access-log
+      - python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-2} --no-access-log
     environment:
       <<: *common-env
       API_PORT: 8003
       SERVICE_RANKING_PORT: 8003
-      SERVICE_RANKING_WORKERS: ${SERVICE_RANKING_WORKERS:-4}
+      SERVICE_RANKING_WORKERS: ${SERVICE_RANKING_WORKERS:-2}
     expose:
       - "8003"
     depends_on:

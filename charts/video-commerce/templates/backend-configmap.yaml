@@ -99,6 +99,8 @@ data:
   OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION: {{ .Values.external.objectStorage.serverSideEncryption | quote }}
   OBJECT_STORAGE_DOWNLOAD_DIR: {{ .Values.appConfig.objectStorageDownloadDir | quote }}
   RANKING_BATCH_MAX_REQUESTS: {{ .Values.appConfig.ranking.batchMaxRequests | quote }}
+  RANKING_ALLOW_UNTRAINED_FALLBACK: {{ .Values.appConfig.ranking.allowUntrainedFallback | quote }}
+  RANKING_REQUIRE_VERIFIED_ARTIFACT: {{ .Values.appConfig.ranking.requireVerifiedArtifact | quote }}
   RANKING_TRIMODAL_ENABLED: {{ .Values.appConfig.ranking.trimodalEnabled | quote }}
   RANKING_TRIMODAL_SHADOW: {{ .Values.appConfig.ranking.trimodalShadow | quote }}
   RANKING_TRIMODAL_MODALITY_DROPOUT: {{ .Values.appConfig.ranking.trimodalModalityDropout | quote }}
@@ -218,6 +220,7 @@ data:
   SERVICE_RANKING_RUNNER_DNS_REFRESH_SECONDS: {{ .Values.appConfig.service.rankingRunnerDnsRefreshSeconds | quote }}
   SERVICE_RANKING_RUNNER_ENDPOINT_MISSING_REFRESHES: {{ .Values.appConfig.service.rankingRunnerEndpointMissingRefreshes | quote }}
   SERVICE_RANKING_RUNNER_ENDPOINT_MISSING_GRACE_SECONDS: {{ .Values.appConfig.service.rankingRunnerEndpointMissingGraceSeconds | quote }}
+  SERVICE_RANKING_MIN_HEALTHY_RUNNERS: {{ .Values.appConfig.service.rankingMinHealthyRunners | quote }}
   SERVICE_INTERACTION_INGEST_SERVICE_URL: {{ printf "http://%s:8002" (include "video-commerce.componentName" (dict "root" . "name" "interaction-ingest-service")) | quote }}
   SERVICE_MAX_INFLIGHT_RECOMMENDATIONS: {{ .Values.appConfig.service.maxInflightRecommendations | quote }}
   SERVICE_RANKING_SERVICE_FALLBACK_ENABLED: {{ .Values.appConfig.service.rankingServiceFallbackEnabled | quote }}

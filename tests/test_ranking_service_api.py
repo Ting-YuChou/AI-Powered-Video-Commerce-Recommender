@@ -6,10 +6,19 @@ import numpy as np
 import pytest
 
 from video_commerce.services.ranking_service import api as ranking_service_api
-from video_commerce.common.models import CandidateProduct, ProductRecommendation, UserFeatures
+from video_commerce.common.models import (
+    CandidateProduct,
+    ProductRecommendation,
+    UserFeatures,
+)
 from video_commerce.ranking_runtime.ranking_batcher import RankingBatcher
-from video_commerce.ranking_runtime.ranking_coordinator_client import RankingCoordinatorResponse
-from video_commerce.ranking_runtime.ranking_payloads import RankRequest, coerce_rank_payload
+from video_commerce.ranking_runtime.ranking_coordinator_client import (
+    RankingCoordinatorResponse,
+)
+from video_commerce.ranking_runtime.ranking_payloads import (
+    RankRequest,
+    coerce_rank_payload,
+)
 
 
 class FakeRankingModel:
@@ -339,3 +348,37 @@ async def test_ranking_service_proxy_forwards_raw_body_to_single_coordinator(
     assert fake_client.body == b'{"request_id":"req-proxy","candidates":[]}'
     assert response.status_code == 200
     assert json.loads(response.body)["profile"]["path"] == "coordinator"
+
+
+@pytest.mark.asyncio
+async def test_ranking_service_proxy_preserves_overload_shape_and_retry_after(
+    monkeypatch,
+):
+    class OverloadedCoordinatorClient:
+        async def rank(self, body):
+            return RankingCoordinatorResponse(
+                status_code=429,
+                content_type="application/json",
+                body=b'{"detail":"ranking_overloaded","retry_after_seconds":1}',
+            )
+
+    monkeypatch.setattr(
+        ranking_service_api,
+        "ranking_coordinator_client",
+        OverloadedCoordinatorClient(),
+    )
+
+    class FakeRequest:
+        state = SimpleNamespace(request_id="req-overload")
+
+        async def body(self):
+            return b'{"request_id":"req-overload","candidates":[]}'
+
+    response = await ranking_service_api.rank(FakeRequest())
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "1"
+    assert json.loads(response.body) == {
+        "detail": "ranking_overloaded",
+        "retry_after_seconds": 1,
+    }

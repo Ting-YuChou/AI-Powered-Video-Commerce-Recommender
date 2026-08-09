@@ -459,6 +459,27 @@ class ObservabilityManager:
             "Ranking batches currently executing",
             registry=self.registry,
         )
+        self.ranking_effective_runner_capacity = Gauge(
+            "video_commerce_ranking_effective_runner_capacity",
+            "Dispatchable ranking runner batch slots known to the coordinator",
+            registry=self.registry,
+        )
+        self.ranking_healthy_runners = Gauge(
+            "video_commerce_ranking_healthy_runners",
+            "Protocol-ready ranking runners with verified trained models",
+            registry=self.registry,
+        )
+        self.ranking_draining_runners = Gauge(
+            "video_commerce_ranking_draining_runners",
+            "Ranking runners draining and excluded from new dispatch",
+            registry=self.registry,
+        )
+        self.ranking_admission_rejections_total = Counter(
+            "video_commerce_ranking_admission_rejections_total",
+            "Ranking requests rejected before dispatch by admission reason",
+            ["reason"],
+            registry=self.registry,
+        )
         self.ranking_cancelled_total = Counter(
             "video_commerce_ranking_cancelled_total",
             "Ranking requests cancelled or expired before inference",
@@ -997,6 +1018,18 @@ class ObservabilityManager:
 
     def set_ranking_queue_depth(self, depth: int) -> None:
         self.ranking_batch_queue_depth.set(max(0, int(depth)))
+
+    def set_ranking_effective_runner_capacity(self, capacity: int) -> None:
+        self.ranking_effective_runner_capacity.set(max(0, int(capacity)))
+
+    def set_ranking_healthy_runners(self, count: int) -> None:
+        self.ranking_healthy_runners.set(max(0, int(count)))
+
+    def set_ranking_draining_runners(self, count: int) -> None:
+        self.ranking_draining_runners.set(max(0, int(count)))
+
+    def record_ranking_admission_rejection(self, reason: str) -> None:
+        self.ranking_admission_rejections_total.labels(reason=str(reason)).inc()
 
     def record_ranking_batch(
         self,

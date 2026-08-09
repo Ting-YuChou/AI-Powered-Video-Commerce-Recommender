@@ -691,6 +691,8 @@ async def _proxy_json_request(
         response_headers[request_id_header] = upstream.headers[request_id_header]
     elif request and getattr(request.state, "request_id", None):
         response_headers[request_id_header] = request.state.request_id
+    if "retry-after" in upstream.headers:
+        response_headers["Retry-After"] = upstream.headers["retry-after"]
 
     return Response(
         content=upstream.content,

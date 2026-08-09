@@ -18,9 +18,10 @@ from video_commerce.common.cache_codec import json_dumps, json_loads
 from video_commerce.common.config import Config
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
-from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.ranking import RankingModel, RankingModelNotReadyError
 from video_commerce.ranking_runtime.ranking_batcher import (
     RankingBatcher,
+    RankingOverloadedError,
     RankingQueueFullError,
     RankingQueueTimeoutError,
 )
@@ -128,7 +129,7 @@ async def startup_event():
         )
     await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
     if ranking_checkpoint:
-        ranking_model.model_version = ranking_checkpoint.model_version
+        ranking_model.mark_artifact_record_verified(ranking_checkpoint)
     ranking_model.enable_profiling_logs = (
         runtime.config.monitoring_config.enable_profiling_logs
     )
@@ -222,6 +223,7 @@ async def readyz():
                 content=upstream.body,
                 media_type=upstream.content_type,
                 status_code=upstream.status_code,
+                headers={"Retry-After": "1"} if upstream.status_code == 429 else None,
             )
         except RankingCoordinatorError as exc:
             return build_readiness_response(
@@ -263,6 +265,7 @@ async def health_check():
                 content=upstream.body,
                 media_type=upstream.content_type,
                 status_code=upstream.status_code,
+                headers={"Retry-After": "1"} if upstream.status_code == 429 else None,
             )
         except RankingCoordinatorError as exc:
             return build_health_response(
@@ -330,6 +333,7 @@ async def rank(request: Request):
                 content=upstream.body,
                 media_type=upstream.content_type,
                 status_code=upstream.status_code,
+                headers={"Retry-After": "1"} if upstream.status_code == 429 else None,
             )
         except RankingCoordinatorError as exc:
             raise HTTPException(
@@ -357,8 +361,16 @@ async def rank(request: Request):
             include_profile=True,
             deadline_unix_seconds=payload.deadline_unix_seconds,
         )
+    except RankingOverloadedError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={"detail": "ranking_overloaded", "retry_after_seconds": 1},
+            headers={"Retry-After": "1"},
+        ) from exc
     except (RankingQueueFullError, RankingQueueTimeoutError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RankingModelNotReadyError as exc:
+        raise HTTPException(status_code=503, detail="ranking_model_not_ready") from exc
 
     profile = {
         **profile,
@@ -443,11 +455,12 @@ async def _periodic_ranking_checkpoint_sync(runtime) -> None:
                     latest_ranking
                     and latest_ranking.model_version != last_ranking_version
                 ):
-                    await artifact_manager.sync_latest_ranking_checkpoint(
+                    synced_ranking = await artifact_manager.sync_latest_ranking_checkpoint(
                         expected_feature_schema_version=ranking_model.feature_schema_version
                     )
                     if await ranking_model.reload_model_if_updated(model_path):
-                        ranking_model.model_version = latest_ranking.model_version
+                        if synced_ranking:
+                            ranking_model.mark_artifact_record_verified(synced_ranking)
                         last_ranking_version = latest_ranking.model_version
         except asyncio.CancelledError:
             break

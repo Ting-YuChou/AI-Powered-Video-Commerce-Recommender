@@ -230,20 +230,22 @@ appConfig:
     impressionLoggingEnabled: true
     impressionMaxItems: 100
   ranking:
+    allowUntrainedFallback: false
+    requireVerifiedArtifact: true
     trimodalEnabled: false
     trimodalShadow: true
     trimodalModalityDropout: 0.1
     batchMaxRequests: 64
     batchTargetRequests: 32
-    batchWaitMs: 48
-    batchQueueSize: 32768
-    batchRunnerCount: 16
+    batchWaitMs: 16
+    batchQueueSize: 2048
+    batchRunnerCount: 4
     coordinatorDispatchConcurrency: 16
     runnerQueueSize: 0
     runnerBatchConcurrency: 1
     inferenceExecutorWorkers: 16
     inferenceProcessWorkers: 0
-    maxQueueWaitMs: 150
+    maxQueueWaitMs: 100
     productFeatureCacheSize: 50000
     realtimeWindowFeaturesEnabled: false
     historyEmbeddingsEnabled: false
@@ -304,6 +306,7 @@ appConfig:
     rankingRunnerDnsRefreshSeconds: 5
     rankingRunnerEndpointMissingRefreshes: 3
     rankingRunnerEndpointMissingGraceSeconds: 30
+    rankingMinHealthyRunners: 2
     trainerIntervalSeconds: 3600
   security:
     authMode: api_key
@@ -447,11 +450,11 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-4} --no-access-log'
+        - 'python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-2} --no-access-log'
       env:
         API_PORT: "8003"
         SERVICE_RANKING_PORT: "8003"
-        SERVICE_RANKING_WORKERS: "4"
+        SERVICE_RANKING_WORKERS: "2"
       service:
         enabled: true
         port: 8003
@@ -476,7 +479,8 @@ backend:
         enabled: true
         minReplicas: 2
         maxReplicas: 8
-        targetCPUUtilizationPercentage: 70
+        targetCPUUtilizationPercentage: 75
+        scaleDownStabilizationSeconds: 300
       pdb:
         enabled: true
         minAvailable: 1
@@ -501,6 +505,20 @@ backend:
         annotations: {}
       probes:
         type: tcp
+        livenessType: tcp
+        readinessType: exec
+        readinessCommand:
+          - python
+          - -m
+          - video_commerce.ranking_runtime.runner_healthcheck
+          - --host
+          - 127.0.0.1
+          - --port
+          - "8013"
+          - --operation
+          - health
+          - --timeout-seconds
+          - "5"
         initialDelaySeconds: 30
         periodSeconds: 10
         timeoutSeconds: 5
@@ -537,6 +555,20 @@ backend:
         annotations: {}
       probes:
         type: tcp
+        livenessType: tcp
+        readinessType: exec
+        readinessCommand:
+          - python
+          - -m
+          - video_commerce.ranking_runtime.runner_healthcheck
+          - --host
+          - 127.0.0.1
+          - --port
+          - "8014"
+          - --operation
+          - health
+          - --timeout-seconds
+          - "5"
         initialDelaySeconds: 120
         periodSeconds: 10
         timeoutSeconds: 5
@@ -552,9 +584,28 @@ backend:
         minReplicas: 4
         maxReplicas: 32
         targetCPUUtilizationPercentage: 75
+        scaleDownStabilizationSeconds: 300
       pdb:
         enabled: true
-        minAvailable: 1
+        minAvailable: 3
+      strategy:
+        maxUnavailable: 1
+        maxSurge: 1
+      lifecycle:
+        preStop:
+          exec:
+            command:
+              - python
+              - -m
+              - video_commerce.ranking_runtime.runner_healthcheck
+              - --host
+              - 127.0.0.1
+              - --port
+              - "8014"
+              - --operation
+              - drain
+              - --timeout-seconds
+              - "35"
       serviceMonitor:
         enabled: false
         path: /metrics

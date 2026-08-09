@@ -93,6 +93,10 @@ class RankingTrainingCancelled(RuntimeError):
     """Raised by the synchronous trainer after cooperative cancellation."""
 
 
+class RankingModelNotReadyError(RuntimeError):
+    """Raised when production-safe ranking readiness requirements are unmet."""
+
+
 class RankingFeatureMatrix(np.ndarray):
     """Dense candidate matrix carrying non-duplicated structured DIN tensors."""
 
@@ -830,6 +834,9 @@ class RankingModel:
         # Training state
         self.is_trained = False
         self.model_version = "1.0.0"
+        self.artifact_verified = False
+        self.artifact_sha256: Optional[str] = None
+        self.artifact_metadata: Dict[str, Any] = {}
         self.last_training_time = 0
         self.feature_schema_version = (
             RANKING_TRIMODAL_FEATURE_SCHEMA_VERSION
@@ -1959,6 +1966,17 @@ class RankingModel:
             product_metadata_map,
         )
 
+    def ensure_ready_for_inference(self) -> None:
+        """Reject every inference entrypoint unless its serving state is allowed."""
+        readiness_reason = self.readiness_failure_reason()
+        fallback_allowed = (
+            readiness_reason in {"model_not_loaded", "model_untrained"}
+            and not self.is_trained
+            and bool(getattr(self.config, "allow_untrained_fallback", False))
+        )
+        if readiness_reason and not fallback_allowed:
+            raise RankingModelNotReadyError("ranking_model_not_ready")
+
     def _rank_candidates_sync(
         self,
         candidates: List[CandidateProduct],
@@ -1980,6 +1998,8 @@ class RankingModel:
         Returns:
             Ranked list of product recommendations
         """
+        self.ensure_ready_for_inference()
+
         if not candidates:
             logger.warning("No candidates to rank")
             return []
@@ -3742,6 +3762,9 @@ class RankingModel:
         stats = {
             "is_trained": self.is_trained,
             "model_version": self.model_version,
+            "artifact_verified": self.artifact_verified,
+            "artifact_sha256": self.artifact_sha256,
+            "feature_schema_version": self.feature_schema_version,
             "last_training_time": self.last_training_time,
             "loaded_model_path": self.loaded_model_path,
             "loaded_checkpoint_mtime": self.loaded_checkpoint_mtime,
@@ -3763,13 +3786,95 @@ class RankingModel:
         stats.update(self._torch_compile_status())
         return stats
 
-    def health_check(self) -> Dict[str, Any]:
+    def mark_artifact_verified(
+        self,
+        *,
+        model_version: str,
+        artifact_sha256: str,
+        feature_schema_version: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Record lineage only after the artifact manager has verified local bytes."""
+        if not model_version or len(str(artifact_sha256)) != 64:
+            raise ValueError("verified ranking artifact metadata is incomplete")
+        if feature_schema_version != self.feature_schema_version:
+            raise ValueError("verified ranking artifact schema is incompatible")
+        if not isinstance(metadata, dict) or not metadata:
+            raise ValueError("verified ranking artifact metadata is required")
+        self.model_version = str(model_version)
+        self.artifact_sha256 = str(artifact_sha256)
+        self.artifact_metadata = dict(metadata)
+        self.artifact_verified = True
+
+    def mark_artifact_record_verified(self, record: Any) -> bool:
+        """Activate checksum/schema lineage from a successfully synced record."""
+        payload = getattr(record, "payload", None)
+        if not isinstance(payload, dict):
+            self.clear_artifact_verification()
+            return False
+        manifest = payload.get("artifact_manifest") or {}
+        checkpoint_manifest = (
+            manifest.get("checkpoint") if isinstance(manifest, dict) else {}
+        ) or {}
+        artifact_sha256 = str(
+            checkpoint_manifest.get("sha256") or payload.get("artifact_sha256") or ""
+        )
+        feature_schema_version = str(payload.get("feature_schema_version") or "")
+        try:
+            self.mark_artifact_verified(
+                model_version=str(getattr(record, "model_version", "") or ""),
+                artifact_sha256=artifact_sha256,
+                feature_schema_version=feature_schema_version,
+                metadata=payload,
+            )
+        except ValueError:
+            self.clear_artifact_verification()
+            return False
+        return True
+
+    def clear_artifact_verification(self) -> None:
+        self.artifact_verified = False
+        self.artifact_sha256 = None
+        self.artifact_metadata = {}
+
+    def readiness_failure_reason(self) -> Optional[str]:
+        if self.model is None:
+            return "model_not_loaded"
+        if not self.is_trained:
+            return "model_untrained"
+        if not self.torch_inference_available:
+            return "torch_inference_unavailable"
+        if (
+            bool(getattr(self.config, "require_verified_artifact", True))
+            and not self.artifact_verified
+        ):
+            return "artifact_unverified"
+        return None
+
+    def health_check(self, *, run_inference_test: bool = False) -> Dict[str, Any]:
         """Perform health check on the ranking model."""
         try:
+            failure_reason = self.readiness_failure_reason()
+            allow_untrained_fallback = bool(
+                getattr(self.config, "allow_untrained_fallback", False)
+            )
+            status_name = "healthy"
+            if failure_reason:
+                status_name = (
+                    "degraded"
+                    if failure_reason == "model_untrained" and allow_untrained_fallback
+                    else "unhealthy"
+                )
             status = {
-                "status": "healthy" if self.model else "unhealthy",
+                "status": status_name,
                 "model_loaded": self.model is not None,
                 "is_trained": self.is_trained,
+                "artifact_verified": self.artifact_verified,
+                "artifact_sha256": self.artifact_sha256,
+                "artifact_metadata_present": bool(self.artifact_metadata),
+                "model_version": self.model_version if self.artifact_verified else None,
+                "feature_schema_version": self.feature_schema_version,
+                "failure_reason": failure_reason,
                 "loaded_model_path": self.loaded_model_path,
                 "loaded_checkpoint_mtime": self.loaded_checkpoint_mtime,
                 "checkpoint_reload_count": self.checkpoint_reload_count,
@@ -3787,7 +3892,7 @@ class RankingModel:
             status.update(self._torch_compile_status())
 
             # Test inference if model is loaded
-            if self.model:
+            if self.model and run_inference_test:
                 try:
                     dummy_features = torch.randn(
                         1, self.feature_extractor.total_feature_dim
@@ -3801,6 +3906,8 @@ class RankingModel:
                 except Exception as test_error:
                     status["inference_test_passed"] = False
                     status["test_error"] = str(test_error)
+                    status["status"] = "unhealthy"
+                    status["failure_reason"] = "inference_test_failed"
 
             return status
 

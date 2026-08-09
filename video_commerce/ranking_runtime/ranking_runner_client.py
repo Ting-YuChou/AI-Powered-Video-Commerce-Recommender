@@ -33,8 +33,16 @@ class RankingRunnerUnavailable(RuntimeError):
     """Raised when no ranking runner can accept a batch."""
 
 
+class RankingRunnerOverloaded(RankingRunnerUnavailable):
+    """Raised when every dispatchable runner rejects work for capacity."""
+
+
 class RankingRunnerTimeout(RankingRunnerUnavailable):
     """Raised when an accepted runner batch does not complete before timeout."""
+
+
+class RankingRunnerRequestUncertain(RankingRunnerUnavailable):
+    """Raised when a sent batch loses its response and must not be replayed."""
 
 
 @dataclass
@@ -52,6 +60,7 @@ class RankingRunnerEndpoint:
     missing_since: float = 0.0
     missing_refresh_count: int = 0
     draining: bool = False
+    drain_reason: str = ""
     batch_payload_versions: Tuple[int, ...] = (1,)
     connections: Optional[asyncio.Queue["_RunnerConnection"]] = field(
         default=None, init=False, repr=False
@@ -91,12 +100,14 @@ class _RunnerConnection:
             if timeout_seconds is None
             else max(0.001, float(timeout_seconds))
         )
+        frame_sent = False
         try:
             self.writer.write(encode_request(operation, body))
             await asyncio.wait_for(
                 self.writer.drain(),
                 timeout=request_timeout_seconds,
             )
+            frame_sent = True
             response_frame = await asyncio.wait_for(
                 read_frame(self.reader),
                 timeout=request_timeout_seconds,
@@ -107,22 +118,30 @@ class _RunnerConnection:
             raise RankingRunnerTimeout(
                 f"ranking runner request timeout: {self.endpoint.label}"
             ) from exc
-        except Exception:
+        except Exception as exc:
             await self.close()
+            if frame_sent:
+                raise RankingRunnerRequestUncertain(
+                    f"ranking runner response lost after batch send: {self.endpoint.label}"
+                ) from exc
             raise
 
     async def _ensure_connected(self) -> None:
         if self.writer is not None and not self.writer.is_closing():
             return
-        try:
-            self.reader, self.writer = await asyncio.wait_for(
-                asyncio.open_connection(self.endpoint.host, self.endpoint.port),
-                timeout=self.connect_timeout_seconds,
-            )
-        except Exception as exc:
-            raise RankingRunnerUnavailable(
-                f"ranking runner unavailable: {self.endpoint.label}"
-            ) from exc
+        last_error: Optional[BaseException] = None
+        for _ in range(2):
+            try:
+                self.reader, self.writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.endpoint.host, self.endpoint.port),
+                    timeout=self.connect_timeout_seconds,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+        raise RankingRunnerUnavailable(
+            f"ranking runner unavailable: {self.endpoint.label}"
+        ) from last_error
 
     async def close(self) -> None:
         writer = self.writer
@@ -307,13 +326,21 @@ class RankingRunnerClientPool:
         ]
 
     @property
-    def capacity(self) -> int:
+    def effective_capacity(self) -> int:
+        now = time.monotonic()
         endpoint_capacity = sum(
             max(1, endpoint.max_inflight_batches)
             for endpoint in self.endpoints
             if not endpoint.draining
+            and endpoint.failed_until <= now
+            and endpoint.overloaded_until <= now
         )
-        return max(1, min(self.dispatch_concurrency, endpoint_capacity))
+        return min(self.dispatch_concurrency, endpoint_capacity)
+
+    @property
+    def capacity(self) -> int:
+        """Backward-compatible alias for dispatchable remote capacity."""
+        return self.effective_capacity
 
     def has_available_endpoint(self) -> bool:
         now = time.monotonic()
@@ -381,10 +408,16 @@ class RankingRunnerClientPool:
                     )
                     setattr(response, "runner_slot_wait_seconds", slot_wait_seconds)
                     if response.status_code == RUNNER_OVERLOADED_STATUS:
-                        self._mark_overloaded(endpoint)
-                        last_error = RankingRunnerUnavailable(
-                            f"ranking runner overloaded: {endpoint.label}"
+                        detail = self._response_detail(response)
+                        if detail == "ranking_runner_draining":
+                            self._mark_draining(endpoint)
+                        else:
+                            self._mark_overloaded(endpoint)
+                        last_error = RankingRunnerOverloaded(
+                            f"ranking runner {'draining' if detail == 'ranking_runner_draining' else 'overloaded'}: {endpoint.label}"
                         )
+                        if self.effective_capacity <= 0:
+                            raise last_error
                         continue
                     if response.status_code >= 500:
                         detail = self._response_detail(response)
@@ -409,6 +442,9 @@ class RankingRunnerClientPool:
                     last_error = exc
                     self._mark_slow_timeout(endpoint)
                     raise
+                except RankingRunnerRequestUncertain:
+                    self._mark_failed(endpoint)
+                    raise
                 except RankingCoordinatorProtocolError as exc:
                     last_error = exc
                     self._mark_failed(endpoint)
@@ -422,6 +458,8 @@ class RankingRunnerClientPool:
             if last_error:
                 if isinstance(last_error, RankingRunnerTimeout):
                     raise last_error
+                if isinstance(last_error, RankingRunnerOverloaded):
+                    raise last_error
                 raise RankingRunnerUnavailable(str(last_error)) from last_error
             raise RankingRunnerUnavailable("no ranking runner dispatch capacity")
 
@@ -432,6 +470,7 @@ class RankingRunnerClientPool:
             return_exceptions=True,
         )
         healthy = 0
+        degraded = 0
         details = []
         for endpoint, check in zip(self.endpoints, checks):
             if isinstance(check, Exception):
@@ -448,21 +487,36 @@ class RankingRunnerClientPool:
                 continue
             if check.status_code == 200:
                 self._update_endpoint_capabilities(endpoint, check)
-                healthy += 1
+                health_payload = self._response_payload(check)
+                endpoint_status = str(health_payload.get("status") or "ready")
+                if endpoint_status == "degraded":
+                    degraded += 1
+                else:
+                    healthy += 1
                 details.append(
                     {
                         "endpoint": endpoint.label,
-                        "status": "healthy",
+                        "status": "degraded"
+                        if endpoint_status == "degraded"
+                        else "healthy",
                         "state": self._endpoint_state(endpoint),
                         "inflight_batches": endpoint.inflight_batches,
                         "max_inflight_batches": endpoint.max_inflight_batches,
                         "missing_refresh_count": endpoint.missing_refresh_count,
-                        "batch_payload_versions": list(
-                            endpoint.batch_payload_versions
+                        "batch_payload_versions": list(endpoint.batch_payload_versions),
+                        "is_trained": health_payload.get("is_trained"),
+                        "artifact_verified": health_payload.get("artifact_verified"),
+                        "model_version": health_payload.get("model_version"),
+                        "feature_schema_version": health_payload.get(
+                            "feature_schema_version"
                         ),
+                        "failure_reason": health_payload.get("failure_reason"),
                     }
                 )
             else:
+                health_payload = self._response_payload(check)
+                if health_payload.get("status") == "draining":
+                    self._mark_draining(endpoint)
                 details.append(
                     {
                         "endpoint": endpoint.label,
@@ -471,11 +525,23 @@ class RankingRunnerClientPool:
                         "status_code": check.status_code,
                         "inflight_batches": endpoint.inflight_batches,
                         "missing_refresh_count": endpoint.missing_refresh_count,
+                        "is_trained": health_payload.get("is_trained"),
+                        "artifact_verified": health_payload.get("artifact_verified"),
+                        "model_version": health_payload.get("model_version"),
+                        "feature_schema_version": health_payload.get(
+                            "feature_schema_version"
+                        ),
+                        "failure_reason": health_payload.get("failure_reason"),
                     }
                 )
         return {
-            "status": "healthy" if healthy > 0 else "unhealthy",
+            "status": "healthy"
+            if healthy > 0
+            else "degraded"
+            if degraded > 0
+            else "unhealthy",
             "healthy_count": healthy,
+            "degraded_count": degraded,
             "total_count": len(self.endpoints),
             "dispatch_concurrency": self.dispatch_concurrency,
             "runner_max_inflight_batches": self.runner_max_inflight_batches,
@@ -574,6 +640,12 @@ class RankingRunnerClientPool:
         self._record_endpoint_event(endpoint, "overloaded")
         self._record_endpoint_capacity(endpoint)
 
+    def _mark_draining(self, endpoint: RankingRunnerEndpoint) -> None:
+        endpoint.draining = True
+        endpoint.drain_reason = "protocol"
+        self._record_endpoint_event(endpoint, "draining")
+        self._record_endpoint_capacity(endpoint)
+
     def _mark_slow_timeout(self, endpoint: RankingRunnerEndpoint) -> None:
         endpoint.overloaded_until = time.monotonic() + self.overload_backoff_seconds
         self._record_endpoint_event(endpoint, "slow_timeout")
@@ -581,13 +653,16 @@ class RankingRunnerClientPool:
 
     @staticmethod
     def _response_detail(response: RankingCoordinatorResponse) -> str:
+        payload = RankingRunnerClientPool._response_payload(response)
+        return str(payload.get("detail") or "")
+
+    @staticmethod
+    def _response_payload(response: RankingCoordinatorResponse) -> dict:
         try:
             payload = json.loads(response.body)
         except Exception:
-            return ""
-        if not isinstance(payload, dict):
-            return ""
-        return str(payload.get("detail") or "")
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     @staticmethod
     def _update_endpoint_capabilities(
@@ -690,7 +765,9 @@ class RankingRunnerClientPool:
                     existing.last_seen_at = now
                     existing.missing_since = 0.0
                     existing.missing_refresh_count = 0
-                    existing.draining = False
+                    if existing.drain_reason != "protocol":
+                        existing.draining = False
+                        existing.drain_reason = ""
                     next_endpoints.append(existing)
                     next_keys.add(existing.key)
                     self._record_endpoint_missing_refreshes(existing)
@@ -734,6 +811,7 @@ class RankingRunnerClientPool:
         ):
             if not endpoint.draining:
                 endpoint.draining = True
+                endpoint.drain_reason = "dns_missing"
                 self._record_endpoint_event(endpoint, "draining")
         self._record_endpoint_capacity(endpoint)
 
@@ -787,6 +865,18 @@ class RankingRunnerClientPool:
             self.observability.set_ranking_runner_endpoint_available_connections(
                 endpoint.label,
                 available,
+            )
+        if self.observability and hasattr(
+            self.observability, "set_ranking_effective_runner_capacity"
+        ):
+            self.observability.set_ranking_effective_runner_capacity(
+                self.effective_capacity
+            )
+        if self.observability and hasattr(
+            self.observability, "set_ranking_draining_runners"
+        ):
+            self.observability.set_ranking_draining_runners(
+                sum(1 for candidate in self.endpoints if candidate.draining)
             )
         self._record_endpoint_state(endpoint)
         self._record_endpoint_missing_refreshes(endpoint)

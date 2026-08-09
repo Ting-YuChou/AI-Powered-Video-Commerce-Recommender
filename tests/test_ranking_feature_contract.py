@@ -3,10 +3,16 @@ import numpy as np
 import pytest
 import threading
 import time
+from types import SimpleNamespace
 
 from video_commerce.common.config import RankingConfig
 from video_commerce.common.models import CandidateProduct, UserFeatures
-from video_commerce.ml.ranking import FeatureExtractor, RankingModel
+from video_commerce.ml.ranking import (
+    RANKING_FEATURE_SCHEMA_VERSION,
+    FeatureExtractor,
+    RankingModel,
+    RankingModelNotReadyError,
+)
 from video_commerce.ml.ranking_features import FeatureBundle, RankingFeatureAssembler
 from video_commerce.ml.ranking_training import (
     AttributionFacts,
@@ -142,7 +148,11 @@ async def test_untrained_ranker_uses_candidate_score_fallback(monkeypatch):
 
     observability = ObservabilitySpy()
     ranking = RankingModel(
-        RankingConfig(offload_inference_to_thread=False),
+        RankingConfig(
+            offload_inference_to_thread=False,
+            allow_untrained_fallback=True,
+            require_verified_artifact=False,
+        ),
         observability=observability,
     )
     await ranking.load_model()
@@ -177,6 +187,86 @@ async def test_untrained_ranker_uses_candidate_score_fallback(monkeypatch):
     assert profile["path"] == "fallback_untrained"
     assert ranking.untrained_fallback_count == 1
     assert observability.calls == 1
+
+
+def test_untrained_ranker_fails_closed_without_explicit_fallback():
+    ranking = RankingModel(
+        RankingConfig(
+            offload_inference_to_thread=False,
+            allow_untrained_fallback=False,
+            require_verified_artifact=False,
+        )
+    )
+    ranking.model = object()
+
+    with pytest.raises(RankingModelNotReadyError, match="ranking_model_not_ready"):
+        ranking._rank_candidates_sync(
+            [CandidateProduct(product_id="p1", combined_score=1.0, source="test")],
+            UserFeatures(user_id="u1"),
+            {},
+            k=1,
+            include_profile=True,
+        )
+
+    health = ranking.health_check(run_inference_test=False)
+    assert health["status"] == "unhealthy"
+    assert health["failure_reason"] == "model_untrained"
+
+
+def test_local_untrained_fallback_reports_degraded_health():
+    ranking = RankingModel(
+        RankingConfig(
+            allow_untrained_fallback=True,
+            require_verified_artifact=False,
+        )
+    )
+    ranking.model = object()
+
+    health = ranking.health_check(run_inference_test=False)
+
+    assert health["status"] == "degraded"
+    assert health["failure_reason"] == "model_untrained"
+
+
+def test_production_health_requires_verified_artifact_metadata():
+    ranking = RankingModel(
+        RankingConfig(
+            allow_untrained_fallback=False,
+            require_verified_artifact=True,
+        )
+    )
+    ranking.model = object()
+    ranking.is_trained = True
+
+    unverified = ranking.health_check(run_inference_test=False)
+    ranking.mark_artifact_verified(
+        model_version="ranking-2026-08-08",
+        artifact_sha256="a" * 64,
+        feature_schema_version=ranking.feature_schema_version,
+        metadata={"artifact_manifest": {"checkpoint": {"sha256": "a" * 64}}},
+    )
+    verified = ranking.health_check(run_inference_test=False)
+
+    assert unverified["status"] == "unhealthy"
+    assert unverified["failure_reason"] == "artifact_unverified"
+    assert verified["status"] == "healthy"
+    assert verified["artifact_verified"] is True
+    assert verified["model_version"] == "ranking-2026-08-08"
+    assert verified["feature_schema_version"] == RANKING_FEATURE_SCHEMA_VERSION
+
+
+def test_artifact_record_verification_rejects_schema_mismatch():
+    ranking = RankingModel(RankingConfig(require_verified_artifact=True))
+    record = SimpleNamespace(
+        model_version="ranking-v1",
+        payload={
+            "feature_schema_version": "wrong-schema",
+            "artifact_sha256": "b" * 64,
+        },
+    )
+
+    assert ranking.mark_artifact_record_verified(record) is False
+    assert ranking.artifact_verified is False
 
 
 def test_ranking_training_uses_pit_bundle_and_observation_timestamp(monkeypatch):
