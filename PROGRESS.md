@@ -37,6 +37,41 @@
   remain deliberately unexecuted. Record checkpoint version/checksum and prove
   fallback count zero before treating any future QPS result as model-serving
   evidence.
+## 2026-07-30 — Visual temporal attention recall path
+
+- Added an independent `VisualRetrievalPooler` that temporal-encodes up to 16
+  real-timestamped frame CLIP vectors, scores frames, weights the original
+  frozen 512-d CLIP vectors, and mixes them with mean pooling through a
+  near-zero initialized learned gate.
+- Added PIT-safe weighted multi-positive InfoNCE training with 1/2/3
+  click/cart/purchase weights, same-content false-negative masking, unclicked
+  impression negatives, time-group validation, optional ranker visual-encoder
+  warm start, and a strict `visual_retrieval_attention_v1` checkpoint lineage.
+- Added offline real-product-image CLIP encoding, checksum quarantine, a 95%
+  coverage gate, HNSW inner-product FAISS bundles, atomic manifest activation,
+  artifact persistence/sync, and removal of random fallback from this new
+  production index path.
+- Added `temporal_multimodal_v3`, preserved mean and attention retrieval
+  vectors, offline content-worker inference, no-video-decode v2-to-v3 backfill,
+  deterministic canary serving, strict CLIP/index compatibility, pinned CLIP
+  revision, deployment settings, and fixed-index Recall/MRR/coverage evaluation.
+- Key files: `video_commerce/ml/visual_retrieval.py`,
+  `video_commerce/ml/visual_product_index.py`,
+  `video_commerce/ml/content_processor.py`,
+  `video_commerce/services/model_trainer/main.py`,
+  `scripts/build_visual_product_index.py`, and
+  `scripts/backfill_visual_retrieval.py`.
+- Verification: focused Docker suite 49 passed; expanded visual/content/PIT/
+  trainer/artifact/config suite 130 passed; ranking optimizations 77 passed;
+  full Docker backend regression 546 passed, 8 skipped. Compose config, Helm
+  lint, kubeconform (33 valid), Black, focused Flake8, and `git diff --check`
+  passed. Real catalog coverage, Recall uplift confidence bounds, and
+  50/100/500-candidate latency promotion gates still require production data
+  and therefore are not claimed.
+- Final reviewer findings were fixed by observation-time filtering product-index
+  hard negatives, masking same-product and all-content-positive false negatives,
+  and giving visual shadow training an independent success marker/retry path
+  outside the main ranking manifest duplicate gate.
 
 ## 2026-07-12 — PIT DIN ranking implementation
 

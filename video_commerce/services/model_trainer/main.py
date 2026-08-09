@@ -32,6 +32,16 @@ from video_commerce.ml.vector_search import VectorSearchEngine
 from video_commerce.ml.text_embeddings import MultilingualTextEmbedder
 from video_commerce.ml.cf_cold_start import load_item_embedding_sidecar
 from video_commerce.ml.din import save_din_embedding_sidecar
+from video_commerce.ml.visual_product_index import load_visual_product_index_bundle
+from video_commerce.ml.visual_retrieval import (
+    VisualRetrievalPooler,
+    add_product_index_hard_negatives,
+    build_visual_retrieval_hard_negatives,
+    build_visual_retrieval_training_examples,
+    save_visual_retrieval_checkpoint,
+    train_visual_retrieval_pooler,
+    warm_start_visual_retrieval_encoder,
+)
 from video_commerce.common.observability import (
     ObservabilityManager,
     configure_logging,
@@ -59,6 +69,7 @@ class ModelTrainerService:
         self.artifact_manager: ModelArtifactManager | None = None
         self.pit_dataset_reader: PitTrainingDatasetReader | None = None
         self.last_trained_pit_run_id: str | None = None
+        self.last_trained_visual_pit_run_id: str | None = None
         self.legacy_training_adapter: LegacyTrainingDatasetAdapter | None = None
         self.observability = ObservabilityManager()
         self.running = False
@@ -490,6 +501,7 @@ class ModelTrainerService:
             if pit_dataset.materialization_run_id == getattr(
                 self, "last_trained_pit_run_id", None
             ):
+                await self._maybe_train_visual_retrieval_shadow(pit_dataset)
                 self.observability.record_training_run(
                     trigger,
                     "skipped_duplicate_manifest",
@@ -821,6 +833,8 @@ class ModelTrainerService:
                         )
                 elif use_pit_dataset:
                     raise RuntimeError("PIT ranking artifact was not persisted")
+            if use_pit_dataset and pit_dataset is not None:
+                await self._maybe_train_visual_retrieval_shadow(pit_dataset)
             if (
                 getattr(self.config.ranking_config, "trimodal_shadow", False)
                 and not getattr(self.config.ranking_config, "trimodal_enabled", False)
@@ -1004,6 +1018,142 @@ class ModelTrainerService:
                 status,
                 asyncio.get_running_loop().time() - shadow_started,
             )
+
+    async def _maybe_train_visual_retrieval_shadow(self, dataset) -> None:
+        model_config = getattr(self.config, "model_config", None)
+        if not getattr(
+            model_config,
+            "retrieval_visual_attention_shadow",
+            False,
+        ):
+            return
+        run_id = dataset.materialization_run_id
+        if run_id == getattr(self, "last_trained_visual_pit_run_id", None):
+            return
+        try:
+            if self.artifact_manager is not None:
+                existing = await self.artifact_manager.get_latest_model_checkpoint(
+                    ModelArtifactManager.VISUAL_RETRIEVAL_MODEL_NAME
+                )
+                existing_lineage = (
+                    (existing.payload.get("lineage") or {}) if existing else {}
+                )
+                if existing_lineage.get("pit_manifest_uri") == dataset.manifest_uri:
+                    self.last_trained_visual_pit_run_id = run_id
+                    return
+            trained = await self._train_visual_retrieval_shadow(dataset)
+            if trained:
+                self.last_trained_visual_pit_run_id = run_id
+        except Exception:
+            logger.exception(
+                "visual_retrieval_shadow_failed",
+                extra={"pit_run_id": run_id},
+            )
+
+    async def _train_visual_retrieval_shadow(self, dataset) -> bool:
+        """Train a recall-specific pooler without changing the serving ranker."""
+        model_config = self.config.model_config
+        manifest_path = str(
+            model_config.retrieval_visual_product_index_manifest_path or ""
+        ).strip()
+        if not manifest_path:
+            logger.info(
+                "visual_retrieval_shadow_skipped",
+                extra={"reason": "product_index_manifest_not_configured"},
+            )
+            return False
+        sidecar = dataset.candidate_embedding_sidecar or {}
+        bundle = load_visual_product_index_bundle(
+            manifest_path,
+            expected_clip_model_id=model_config.clip_model,
+            expected_clip_revision=model_config.clip_revision,
+        )
+        product_index_version = str(bundle.manifest["model_version"])
+        if str(sidecar.get("model_version") or "") != product_index_version:
+            raise RuntimeError(
+                "visual retrieval PIT sidecar and product index versions differ"
+            )
+        examples = build_visual_retrieval_training_examples(dataset.examples)
+        hard_negatives = build_visual_retrieval_hard_negatives(dataset.examples)
+        catalog_available_at = float(bundle.manifest["catalog_available_at"])
+        if examples and catalog_available_at > min(
+            example.as_of_ts for example in examples
+        ):
+            raise RuntimeError(
+                "visual product index activation is future data for PIT training"
+            )
+        hard_negatives = add_product_index_hard_negatives(
+            hard_negatives,
+            examples,
+            product_index_bundle=bundle,
+        )
+        if len(examples) < model_config.retrieval_visual_training_min_samples:
+            logger.info(
+                "visual_retrieval_shadow_skipped",
+                extra={
+                    "reason": "insufficient_samples",
+                    "sample_count": len(examples),
+                },
+            )
+            return False
+        pooler = VisualRetrievalPooler().to(self.ranking_model.device)
+        ranker_module = getattr(self.ranking_model, "model", None)
+        visual_encoder = getattr(ranker_module, "visual_encoder", None)
+        if visual_encoder is not None:
+            warm_start_visual_retrieval_encoder(pooler, visual_encoder)
+        metrics = await asyncio.to_thread(
+            train_visual_retrieval_pooler,
+            pooler,
+            examples,
+            epochs=model_config.retrieval_visual_training_epochs,
+            batch_size=model_config.retrieval_visual_training_batch_size,
+            learning_rate=model_config.retrieval_visual_training_learning_rate,
+            temperature=model_config.retrieval_visual_training_temperature,
+            validation_fraction=(
+                model_config.retrieval_visual_training_validation_fraction
+            ),
+            hard_negatives=hard_negatives,
+        )
+        model_version = f"visual-{dataset.materialization_run_id}"
+        lineage = {
+            "parent_ranker_checkpoint": str(
+                getattr(self.ranking_model, "model_version", "unversioned")
+            ),
+            "clip_model_id": model_config.clip_model,
+            "clip_revision": model_config.clip_revision,
+            "product_index_version": product_index_version,
+            "product_index_sha256": ObjectStorage.calculate_sha256(manifest_path),
+            "catalog_activation_id": bundle.manifest["catalog_activation_id"],
+            "pit_manifest_uri": dataset.manifest_uri,
+            "pit_sidecar_sha256": sidecar["sha256"],
+            "training_cutoff": sidecar["training_cutoff"],
+        }
+        checkpoint_path = model_config.retrieval_visual_checkpoint_path
+        checkpoint_sha256 = save_visual_retrieval_checkpoint(
+            checkpoint_path,
+            model=pooler,
+            model_version=model_version,
+            lineage=lineage,
+        )
+        if self.artifact_manager is not None:
+            record = await self.artifact_manager.persist_visual_retrieval_checkpoint(
+                local_path=checkpoint_path,
+                model_version=model_version,
+                payload={
+                    "schema_version": "visual_retrieval_attention_v1",
+                    "lineage": lineage,
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "training_metrics": {
+                        "training_examples": metrics.training_examples,
+                        "validation_examples": metrics.validation_examples,
+                        "final_training_loss": metrics.final_training_loss,
+                        "validation_loss": metrics.validation_loss,
+                    },
+                },
+            )
+            if record is None:
+                raise RuntimeError("visual retrieval artifact was not persisted")
+        return True
 
     async def shutdown(self):
         self.running = False

@@ -615,6 +615,63 @@ async def test_content_and_random_retrieval_use_bounded_executor():
 
 
 @pytest.mark.asyncio
+async def test_content_retrieval_canary_uses_lineage_matched_attention_embedding():
+    class ExecutorCFEngine:
+        is_trained = False
+
+        async def run_in_retrieval_executor(self, func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+    class RecordingVectorSearch:
+        embedding_dim = 2
+        product_metadata = {}
+        visual_product_index_version = "products-42"
+
+        def __init__(self):
+            self.query = None
+
+        def search_similar_products_sync(self, embedding, k=10, filter_categories=None):
+            self.query = np.asarray(embedding)
+            return []
+
+        def get_random_products_sync(self, k=10):
+            return []
+
+    vector_search = RecordingVectorSearch()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[]),
+        vector_search,
+        RecommendationConfig(
+            enable_sasrec=False,
+            max_live_content_candidates=1,
+            max_random_candidates=0,
+            max_pool_trending_candidates=0,
+            retrieval_visual_attention_enabled=True,
+            retrieval_visual_canary_percent=100.0,
+            retrieval_visual_model_version="retrieval-7",
+            retrieval_visual_product_index_version="products-42",
+        ),
+    )
+    engine.cf_engine = ExecutorCFEngine()
+
+    await engine.generate_candidates(
+        "u1",
+        content_features=ContentFeatures(
+            content_id="video-1",
+            visual_embedding=[1.0, 0.0],
+            retrieval_visual_embedding=[0.0, 1.0],
+            retrieval_model_version="retrieval-7",
+            retrieval_product_index_version="products-42",
+            multimodal_schema_version="temporal_multimodal_v3",
+        ),
+        include_profile=True,
+        user_interactions=[],
+    )
+
+    np.testing.assert_allclose(vector_search.query, np.array([0.0, 1.0]))
+
+
+@pytest.mark.asyncio
 async def test_speech_categories_feed_category_pools_after_explicit_context():
     feature_store = RecordingCategoryFeatureStore()
     engine = RecommendationEngine(

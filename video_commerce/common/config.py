@@ -88,6 +88,56 @@ class ModelConfig(BaseSettings):
     clip_model: str = Field(
         "openai/clip-vit-base-patch16", description="CLIP model identifier"
     )
+    clip_revision: str = Field(
+        "57c216476eefef5ab752ec549e440a49ae4ae5f3",
+        description="Pinned Hugging Face revision for the frozen CLIP encoder",
+    )
+    retrieval_visual_attention_shadow: bool = Field(
+        True,
+        env="RETRIEVAL_VISUAL_ATTENTION_SHADOW",
+        description="Write attention-pooled v3 content features when a checkpoint exists",
+    )
+    retrieval_visual_attention_enabled: bool = Field(
+        False,
+        env="RETRIEVAL_VISUAL_ATTENTION_ENABLED",
+        description="Enable visual retrieval attention artifact generation",
+    )
+    retrieval_visual_checkpoint_path: str = Field(
+        "/tmp/models/visual_retrieval_attention.pt",
+        env="RETRIEVAL_VISUAL_CHECKPOINT_PATH",
+    )
+    retrieval_visual_checkpoint_sha256: str = Field(
+        "", env="RETRIEVAL_VISUAL_CHECKPOINT_SHA256"
+    )
+    retrieval_visual_model_version: str = Field(
+        "", env="RETRIEVAL_VISUAL_MODEL_VERSION"
+    )
+    retrieval_visual_product_index_version: str = Field(
+        "", env="RETRIEVAL_VISUAL_PRODUCT_INDEX_VERSION"
+    )
+    retrieval_visual_product_index_manifest_path: str = Field(
+        "",
+        env="RETRIEVAL_VISUAL_PRODUCT_INDEX_MANIFEST_PATH",
+        description="Checksum manifest for the real product-image CLIP index",
+    )
+    retrieval_visual_training_epochs: int = Field(
+        3, ge=1, env="RETRIEVAL_VISUAL_TRAINING_EPOCHS"
+    )
+    retrieval_visual_training_batch_size: int = Field(
+        64, ge=2, env="RETRIEVAL_VISUAL_TRAINING_BATCH_SIZE"
+    )
+    retrieval_visual_training_learning_rate: float = Field(
+        1e-4, gt=0.0, env="RETRIEVAL_VISUAL_TRAINING_LEARNING_RATE"
+    )
+    retrieval_visual_training_temperature: float = Field(
+        0.07, gt=0.0, env="RETRIEVAL_VISUAL_TRAINING_TEMPERATURE"
+    )
+    retrieval_visual_training_min_samples: int = Field(
+        100, ge=2, env="RETRIEVAL_VISUAL_TRAINING_MIN_SAMPLES"
+    )
+    retrieval_visual_training_validation_fraction: float = Field(
+        0.2, gt=0.0, lt=1.0, env="RETRIEVAL_VISUAL_TRAINING_VALIDATION_FRACTION"
+    )
     embedding_dim: int = Field(512, description="Embedding dimension")
 
     # Model paths
@@ -205,6 +255,32 @@ class ModelConfig(BaseSettings):
         description="Torch inter-op CPU thread count; 0 auto-detects from cgroup quota",
     )
 
+    @root_validator(skip_on_failure=True)
+    def validate_visual_retrieval_activation(cls, values):
+        if not str(values.get("clip_revision") or "").strip():
+            raise ValueError("clip_revision must be pinned")
+        if values.get("retrieval_visual_attention_enabled"):
+            checksum = str(
+                values.get("retrieval_visual_checkpoint_sha256") or ""
+            ).strip()
+            if (
+                len(checksum) != 64
+                or not str(
+                    values.get("retrieval_visual_model_version") or ""
+                ).strip()
+                or not str(
+                    values.get("retrieval_visual_product_index_version") or ""
+                ).strip()
+                or not str(
+                    values.get("retrieval_visual_product_index_manifest_path") or ""
+                ).strip()
+            ):
+                raise ValueError(
+                    "visual retrieval activation requires checkpoint checksum, "
+                    "model version, and product index manifest/version"
+                )
+        return values
+
     class Config:
         env_prefix = "MODEL_"
 
@@ -289,6 +365,34 @@ class RecommendationConfig(BaseSettings):
     max_live_content_candidates: int = Field(
         20,
         description="Maximum content-similar candidates to fetch live per request",
+    )
+    retrieval_visual_attention_shadow: bool = Field(
+        True,
+        env="RETRIEVAL_VISUAL_ATTENTION_SHADOW",
+        description="Compute and store attention-pooled visual queries without serving them",
+    )
+    retrieval_visual_attention_enabled: bool = Field(
+        False,
+        env="RETRIEVAL_VISUAL_ATTENTION_ENABLED",
+        description="Allow lineage-matched attention-pooled visual queries in recall",
+    )
+    retrieval_visual_canary_percent: float = Field(
+        0.0,
+        env="RETRIEVAL_VISUAL_CANARY_PERCENT",
+        description=(
+            "Deterministic content-ID canary percentage; zero keeps all traffic "
+            "on mean pooling and 100 enables all eligible content"
+        ),
+    )
+    retrieval_visual_model_version: str = Field(
+        "",
+        env="RETRIEVAL_VISUAL_MODEL_VERSION",
+        description="Visual retrieval checkpoint version accepted by serving",
+    )
+    retrieval_visual_product_index_version: str = Field(
+        "",
+        env="RETRIEVAL_VISUAL_PRODUCT_INDEX_VERSION",
+        description="Product CLIP index version accepted by serving",
     )
     max_live_swing_itemcf_candidates: int = Field(
         40,
@@ -696,6 +800,29 @@ class RecommendationConfig(BaseSettings):
         if value < 0:
             raise ValueError("max_pool_cluster_candidates must be >= 0")
         return value
+
+    @validator("retrieval_visual_canary_percent")
+    def validate_retrieval_visual_canary_percent(cls, value: float) -> float:
+        if not 0.0 <= float(value) <= 100.0:
+            raise ValueError(
+                "retrieval_visual_canary_percent must be between 0 and 100"
+            )
+        return float(value)
+
+    @root_validator(skip_on_failure=True)
+    def validate_retrieval_visual_lineage(cls, values):
+        if values.get("retrieval_visual_attention_enabled") and not all(
+            (
+                str(values.get("retrieval_visual_model_version") or "").strip(),
+                str(
+                    values.get("retrieval_visual_product_index_version") or ""
+                ).strip(),
+            )
+        ):
+            raise ValueError(
+                "visual attention recall requires model and product index versions"
+            )
+        return values
 
     @validator("serving_recent_interaction_limit")
     def validate_serving_recent_interaction_limit(cls, value: int) -> int:

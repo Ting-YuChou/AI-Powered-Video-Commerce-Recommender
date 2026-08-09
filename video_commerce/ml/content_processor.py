@@ -33,6 +33,7 @@ from pytesseract import Output
 from video_commerce.common.models import AudioFeatures, ContentFeatures
 from video_commerce.common.config import ModelConfig
 from video_commerce.ml.text_embeddings import MultilingualTextEmbedder
+from video_commerce.ml.visual_retrieval import load_visual_retrieval_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class ContentProcessor:
         self.clip_processor = None
         self.ocr_region_extractor = None
         self.text_embedder = None
+        self.retrieval_pooler = None
         self.device = torch.device(self._get_device())
         self.is_initialized = False
         self.lazy_load = os.getenv("MODEL_LAZY_LOAD", "false").lower() == "true"
@@ -208,11 +210,15 @@ class ContentProcessor:
 
             # Load CLIP model and processor
             self.clip_model = CLIPModel.from_pretrained(
-                self.config.clip_model, cache_dir=self.config.cache_dir
+                self.config.clip_model,
+                revision=self.config.clip_revision,
+                cache_dir=self.config.cache_dir,
             ).to(self.device)
 
             self.clip_processor = CLIPProcessor.from_pretrained(
-                self.config.clip_model, cache_dir=self.config.cache_dir
+                self.config.clip_model,
+                revision=self.config.clip_revision,
+                cache_dir=self.config.cache_dir,
             )
 
             self.text_embedder = MultilingualTextEmbedder(
@@ -222,6 +228,45 @@ class ContentProcessor:
                 cache_dir=self.config.cache_dir,
             )
             self.text_embedder.load()
+
+            checkpoint_path = Path(self.config.retrieval_visual_checkpoint_path)
+            if (
+                (
+                    self.config.retrieval_visual_attention_shadow
+                    or self.config.retrieval_visual_attention_enabled
+                )
+                and checkpoint_path.exists()
+            ):
+                try:
+                    expected_sha256 = (
+                        self.config.retrieval_visual_checkpoint_sha256 or None
+                    )
+                    pooler, metadata = load_visual_retrieval_checkpoint(
+                        checkpoint_path,
+                        expected_sha256=expected_sha256,
+                        map_location=self.device,
+                    )
+                    lineage = metadata["lineage"]
+                    if (
+                        lineage["clip_model_id"] != self.config.clip_model
+                        or lineage["clip_revision"] != self.config.clip_revision
+                        or metadata["model_version"]
+                        != self.config.retrieval_visual_model_version
+                        or lineage["product_index_version"]
+                        != self.config.retrieval_visual_product_index_version
+                    ):
+                        raise ValueError(
+                            "visual retrieval checkpoint serving lineage mismatch"
+                        )
+                    self.retrieval_pooler = pooler.to(self.device).eval()
+                except (OSError, ValueError):
+                    if self.config.retrieval_visual_attention_enabled:
+                        raise
+                    logger.warning(
+                        "Visual retrieval shadow checkpoint is incompatible; "
+                        "continuing with v2 mean-pooled features",
+                        exc_info=True,
+                    )
 
             # Set to evaluation mode
             self.clip_model.eval()
@@ -308,6 +353,10 @@ class ContentProcessor:
             processing_time = time.time() - start_time
 
             # Create ContentFeatures object
+            retrieval_fields = self._retrieval_visual_fields(
+                visual_features.get("individual_embeddings", []),
+                frame_timestamps,
+            )
             content_features = ContentFeatures(
                 content_id=content_id,
                 visual_embedding=visual_features["embedding"].tolist(),
@@ -329,6 +378,7 @@ class ContentProcessor:
                     "price_mentions": text_features.get("price_mentions", []),
                     "ocr_categories": commerce_features.get("ocr_categories", []),
                 },
+                **retrieval_fields,
             )
 
             logger.info(
@@ -339,6 +389,38 @@ class ContentProcessor:
         except Exception as e:
             logger.error(f"Error processing video {video_path}: {e}")
             raise
+
+    def _retrieval_visual_fields(
+        self,
+        frame_embeddings: List[List[float]],
+        frame_timestamps_seconds: List[float],
+    ) -> Dict[str, Any]:
+        """Pool existing frozen CLIP frames; never re-decode video for v3."""
+        if self.retrieval_pooler is None or not frame_embeddings:
+            return {}
+        if len(frame_embeddings) != len(frame_timestamps_seconds):
+            raise ValueError("retrieval frame embeddings and timestamps are misaligned")
+        frames = torch.as_tensor(
+            frame_embeddings[:16], dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        starts = torch.as_tensor(
+            frame_timestamps_seconds[:16],
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+        mask = torch.ones(starts.shape, dtype=torch.bool, device=self.device)
+        with torch.no_grad():
+            output = self.retrieval_pooler(frames, starts, mask)
+        return {
+            "multimodal_schema_version": "temporal_multimodal_v3",
+            "retrieval_visual_embedding": output.embedding[0].cpu().tolist(),
+            "retrieval_model_version": self.config.retrieval_visual_model_version,
+            "retrieval_product_index_version": (
+                self.config.retrieval_visual_product_index_version
+            ),
+            "retrieval_clip_model": self.config.clip_model,
+            "retrieval_clip_revision": self.config.clip_revision,
+        }
 
     async def _extract_keyframes(
         self, video_path: str
