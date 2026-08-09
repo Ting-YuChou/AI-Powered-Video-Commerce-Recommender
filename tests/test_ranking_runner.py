@@ -6,8 +6,12 @@ import numpy as np
 import pytest
 
 from video_commerce.common.cache_codec import json_dumps, json_loads
-from video_commerce.ranking_runtime.ranking_coordinator_client import decode_response
+from video_commerce.ranking_runtime.ranking_coordinator_client import (
+    DRAIN_OPERATION,
+    decode_response,
+)
 from video_commerce.services.ranking_runner.main import RankingRunner
+from video_commerce.ranking_runtime.runner_healthcheck import probe_runner
 
 
 class SlowRankingModel:
@@ -105,6 +109,16 @@ class HealthyRankingModel:
         return {"status": "healthy"}
 
 
+class UnreadyRankingModel:
+    def health_check(self):
+        return {"status": "unhealthy", "failure_reason": "artifact_unverified"}
+
+
+class DegradedRankingModel:
+    def health_check(self):
+        return {"status": "degraded", "failure_reason": "model_untrained"}
+
+
 @pytest.mark.asyncio
 async def test_runner_health_exposes_batch_payload_capabilities():
     runner = RankingRunner()
@@ -115,6 +129,34 @@ async def test_runner_health_exposes_batch_payload_capabilities():
     assert status == 200
     assert payload["batch_payload_versions"] == [1, 2, 3, 4]
     assert payload["capabilities"]["batch_payload_versions"] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_inference_when_model_is_not_ready():
+    runner = RankingRunner()
+    runner.ranking_model = UnreadyRankingModel()
+    runner._executor = object()
+    runner._batch_queue = asyncio.Queue(maxsize=1)
+
+    status, payload = _decode_runner_response(
+        await asyncio.wait_for(
+            runner._handle_batch_rank(_request_body("p1")), timeout=0.1
+        )
+    )
+
+    assert status == 503
+    assert payload["detail"] == "ranking_model_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_runner_local_fallback_health_is_degraded_but_reachable():
+    runner = RankingRunner()
+    runner.ranking_model = DegradedRankingModel()
+
+    status, payload = _decode_runner_response(await runner._handle_health())
+
+    assert status == 200
+    assert payload["status"] == "degraded"
 
 
 @pytest.mark.asyncio
@@ -197,3 +239,76 @@ async def test_runner_queue_size_zero_rejects_when_worker_active():
     assert first_status == 200
     assert second_status == 429
     assert second_payload["detail"] == "ranking_runner_overloaded"
+
+
+@pytest.mark.asyncio
+async def test_runner_drain_rejects_new_batches_and_reports_not_ready():
+    runner = RankingRunner()
+    runner.ranking_model = HealthyRankingModel()
+    runner._batch_queue = asyncio.Queue(maxsize=1)
+
+    drain_status, drain_payload = _decode_runner_response(
+        await runner._handle_frame(DRAIN_OPERATION)
+    )
+    batch_status, batch_payload = _decode_runner_response(
+        await runner._handle_batch_rank(_request_body("p1"))
+    )
+    health_status, health_payload = _decode_runner_response(
+        await runner._handle_health()
+    )
+
+    assert drain_status == 200
+    assert drain_payload["status"] == "drained"
+    assert batch_status == 429
+    assert batch_payload["detail"] == "ranking_runner_draining"
+    assert health_status == 503
+    assert health_payload["status"] == "draining"
+
+
+@pytest.mark.asyncio
+async def test_runner_drain_waits_for_in_progress_admission_section():
+    runner = RankingRunner()
+    runner._batch_queue = asyncio.Queue(maxsize=1)
+    await runner._admission_lock.acquire()
+
+    drain = asyncio.create_task(runner._handle_drain())
+    await asyncio.sleep(0)
+
+    assert runner._draining is True
+    assert drain.done() is False
+
+    runner._admission_lock.release()
+    status, payload = _decode_runner_response(await drain)
+
+    assert status == 200
+    assert payload["status"] == "drained"
+
+
+@pytest.mark.asyncio
+async def test_protocol_healthcheck_validates_ready_payload():
+    runner = RankingRunner()
+    runner.ranking_model = HealthyRankingModel()
+
+    async def handle_client(reader, writer):
+        frame = await read_frame(reader)
+        writer.write(await runner._handle_frame(frame))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    from video_commerce.ranking_runtime.ranking_coordinator_client import read_frame
+
+    server = await asyncio.start_server(handle_client, host="127.0.0.1", port=0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        payload = await probe_runner(
+            host="127.0.0.1",
+            port=port,
+            operation="health",
+            timeout_seconds=1.0,
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert payload["status"] == "ready"

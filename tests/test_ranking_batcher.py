@@ -11,11 +11,12 @@ from video_commerce.common.models import (
     ProductRecommendation,
     UserFeatures,
 )
-from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.ranking import RankingModel, RankingModelNotReadyError
 from video_commerce.ml.ranking_history import RANKING_HISTORY_CONTEXT_KEY
 from video_commerce.ml.din import DIN_SEQUENCE_CONTEXT_KEY
 from video_commerce.ranking_runtime.ranking_batcher import (
     RankingBatcher,
+    RankingOverloadedError,
     RankingQueueTimeoutError,
     normalize_ranking_batch_payloads,
     run_ranking_batch_payloads,
@@ -146,6 +147,17 @@ def _config(**overrides):
     return SimpleNamespace(**defaults)
 
 
+def test_common_batch_execution_enforces_model_readiness_guard():
+    class GuardedTrainedModel(FakeRankingModel):
+        is_trained = True
+
+        def ensure_ready_for_inference(self):
+            raise RankingModelNotReadyError("ranking_model_not_ready")
+
+    with pytest.raises(RankingModelNotReadyError, match="ranking_model_not_ready"):
+        run_ranking_batch_payloads(GuardedTrainedModel(), [])
+
+
 @pytest.mark.asyncio
 async def test_global_dispatcher_drains_full_batches_before_dispatch():
     ranking = FakeRankingModel()
@@ -229,12 +241,23 @@ async def test_deadline_expired_requests_are_skipped_before_feature_prep():
 
     await batcher.start()
     try:
-        with pytest.raises(RankingQueueTimeoutError):
+        with pytest.raises(RankingOverloadedError):
             await task
     finally:
         await batcher.close()
 
     assert ranking.prepare_calls == 0
+
+
+def test_queued_request_expiration_is_classified_as_overload():
+    batcher = RankingBatcher(FakeRankingModel(), _config())
+    future = asyncio.get_event_loop().create_future()
+    request = SimpleNamespace(started_at=None, future=future)
+
+    batcher._expire_queued_request(request)
+
+    assert isinstance(future.exception(), RankingOverloadedError)
+    assert str(future.exception()) == "ranking_queue_wait_exceeded"
 
 
 @pytest.mark.asyncio
@@ -307,7 +330,7 @@ async def test_estimated_queue_wait_rejects_before_unbounded_backlog():
             )
         )
 
-    with pytest.raises(RankingQueueTimeoutError):
+    with pytest.raises(RankingOverloadedError):
         await batcher.rank_candidates(
             [CandidateProduct(product_id="p1", combined_score=1.0, source="test")],
             UserFeatures(user_id="u-new"),
@@ -317,7 +340,7 @@ async def test_estimated_queue_wait_rejects_before_unbounded_backlog():
         )
 
 
-def test_admission_uses_runner_service_time_not_dispatch_wait_feedback():
+def test_admission_uses_max_of_runner_waves_and_slot_wait():
     runner_pool = SimpleNamespace(
         capacity=1,
         has_available_endpoint=lambda: True,
@@ -340,7 +363,44 @@ def test_admission_uses_runner_service_time_not_dispatch_wait_feedback():
     batcher._runner_service_ewma_seconds = 0.001
     batcher._dispatch_wait_ewma_seconds = 10.0
 
-    assert batcher._estimated_queue_wait_exceeded() is False
+    assert batcher._estimated_queue_wait_exceeded() is True
+
+
+@pytest.mark.asyncio
+async def test_remote_worker_count_tracks_effective_capacity_ceiling():
+    class MutableRunnerPool:
+        capacity = 1
+        effective_capacity = 1
+
+        def has_available_endpoint(self):
+            return self.effective_capacity > 0
+
+        def has_dispatch_capacity(self):
+            return self.effective_capacity > 0
+
+    runner_pool = MutableRunnerPool()
+    batcher = RankingBatcher(
+        None,
+        _config(coordinator_dispatch_concurrency=16),
+        runner_pool=runner_pool,
+    )
+    await batcher.start()
+    try:
+        assert len(batcher._worker_tasks) == 1
+        assert batcher._batch_queue_capacity_limit() == 2
+
+        runner_pool.effective_capacity = 4
+        await batcher._sync_worker_capacity()
+        assert len(batcher._worker_tasks) == 4
+        assert batcher._batch_queue_capacity_limit() == 8
+
+        runner_pool.effective_capacity = 2
+        await batcher._sync_worker_capacity()
+        await asyncio.sleep(0)
+        assert len(batcher._worker_tasks) == 2
+        assert batcher._batch_queue_capacity_limit() == 4
+    finally:
+        await batcher.close()
 
 
 class FakeRunnerPool:
@@ -757,7 +817,12 @@ def test_remote_din_batch_fails_closed_without_v3_capability():
 
 @pytest.mark.asyncio
 async def test_untrained_microbatch_uses_combined_score_fallback():
-    ranking = RankingModel(RankingConfig())
+    ranking = RankingModel(
+        RankingConfig(
+            allow_untrained_fallback=True,
+            require_verified_artifact=False,
+        )
+    )
     await ranking.load_model()
     assert ranking.is_trained is False
 

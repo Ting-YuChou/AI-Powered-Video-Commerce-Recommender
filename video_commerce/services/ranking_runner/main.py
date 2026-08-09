@@ -25,6 +25,7 @@ from video_commerce.ranking_runtime.ranking_batcher import (
     run_ranking_batch_payloads,
 )
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
+    DRAIN_OPERATION,
     HEALTH_OPERATION,
     METRICS_OPERATION,
     RankingCoordinatorProtocolError,
@@ -69,6 +70,8 @@ class RankingRunner:
         self._active_batch_count = 0
         self._runner_batch_concurrency = 1
         self._runner_queue_size = 4
+        self._draining = False
+        self._admission_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self.config = Config()
@@ -101,7 +104,7 @@ class RankingRunner:
         )
         await self.ranking_model.load_model(self.config.model_config.ranking_model_path)
         if ranking_checkpoint:
-            self.ranking_model.model_version = ranking_checkpoint.model_version
+            self.ranking_model.mark_artifact_record_verified(ranking_checkpoint)
         self.ranking_model.enable_profiling_logs = (
             self.config.monitoring_config.enable_profiling_logs
         )
@@ -252,6 +255,8 @@ class RankingRunner:
             return await self._handle_batch_rank(body)
         if operation == HEALTH_OPERATION:
             return await self._handle_health()
+        if operation == DRAIN_OPERATION:
+            return await self._handle_drain()
         if operation == METRICS_OPERATION:
             return await self._handle_metrics()
         return _json_response(400, {"detail": "invalid ranking runner operation"})
@@ -260,6 +265,22 @@ class RankingRunner:
         started_at = time.perf_counter()
         status_code = 200
         try:
+            if self._draining:
+                status_code = 429
+                self._record_runner_batch("draining")
+                return _json_response(429, {"detail": "ranking_runner_draining"})
+            health_check = getattr(self.ranking_model, "health_check", None)
+            model_health = (
+                health_check()
+                if callable(health_check)
+                else {"status": "healthy"}
+                if self.ranking_model is not None
+                else {"status": "unhealthy"}
+            )
+            if model_health.get("status") not in {"healthy", "degraded"}:
+                status_code = 503
+                self._record_runner_batch("model_not_ready")
+                return _json_response(503, {"detail": "ranking_model_not_ready"})
             if (
                 self.ranking_model is None
                 or self._executor is None
@@ -277,27 +298,34 @@ class RankingRunner:
             requests = normalize_ranking_batch_payloads(payload)
             deadline_unix_seconds = _batch_deadline_unix_seconds(requests)
             if _deadline_expired(deadline_unix_seconds):
-                status_code = 503
+                status_code = 429
                 self._record_runner_batch("deadline_exceeded")
                 return _json_response(
-                    503, {"detail": "ranking_runner_deadline_exceeded"}
+                    429, {"detail": "ranking_runner_deadline_exceeded"}
                 )
-            if self._runner_queue_capacity_full():
-                status_code = 429
-                self._record_runner_batch("overloaded")
-                self._record_runner_queue_depth()
-                return _json_response(429, {"detail": "ranking_runner_overloaded"})
             loop = asyncio.get_running_loop()
             future: asyncio.Future[Tuple[int, bytes]] = loop.create_future()
-            try:
-                self._batch_queue.put_nowait(
-                    (requests, future, deadline_unix_seconds, time.perf_counter())
-                )
-            except asyncio.QueueFull:
-                status_code = 429
-                self._record_runner_batch("overloaded")
-                self._record_runner_queue_depth()
-                return _json_response(429, {"detail": "ranking_runner_overloaded"})
+            async with self._admission_lock:
+                # Drain and enqueue share this lock so drain cannot report
+                # completion while a request is still entering the queue.
+                if self._draining:
+                    status_code = 429
+                    self._record_runner_batch("draining")
+                    return _json_response(429, {"detail": "ranking_runner_draining"})
+                if self._runner_queue_capacity_full():
+                    status_code = 429
+                    self._record_runner_batch("overloaded")
+                    self._record_runner_queue_depth()
+                    return _json_response(429, {"detail": "ranking_runner_overloaded"})
+                try:
+                    self._batch_queue.put_nowait(
+                        (requests, future, deadline_unix_seconds, time.perf_counter())
+                    )
+                except asyncio.QueueFull:
+                    status_code = 429
+                    self._record_runner_batch("overloaded")
+                    self._record_runner_queue_depth()
+                    return _json_response(429, {"detail": "ranking_runner_overloaded"})
             self._record_runner_batch("queued")
             self._record_runner_queue_depth()
             status_code, response = await future
@@ -448,22 +476,58 @@ class RankingRunner:
             if self.ranking_model
             else {"status": "unhealthy", "error": "ranking model unavailable"}
         )
-        ready = ranking_health.get("status") == "healthy"
+        ready = not self._draining and ranking_health.get("status") == "healthy"
+        runner_status = (
+            "ready"
+            if ready
+            else "draining"
+            if self._draining
+            else "degraded"
+            if ranking_health.get("status") == "degraded"
+            else "not_ready"
+        )
         payload = {
-            "status": "ready" if ready else "not_ready",
+            "status": runner_status,
             "service": self.runtime.service_name,
             "checks": {"ranking_model": ranking_health},
             "process_id": os.getpid(),
             "batch_payload_versions": [1, 2, 3, 4],
             "capabilities": {"batch_payload_versions": [1, 2, 3, 4]},
+            "is_trained": ranking_health.get("is_trained"),
+            "artifact_verified": ranking_health.get("artifact_verified"),
+            "model_version": ranking_health.get("model_version"),
+            "feature_schema_version": ranking_health.get("feature_schema_version"),
+            "failure_reason": (
+                "runner_draining"
+                if self._draining
+                else ranking_health.get("failure_reason")
+            ),
         }
+        reachable = ready or runner_status == "degraded"
         self.runtime.observability.record_request(
             "GET",
             "/readyz",
-            200 if ready else 503,
+            200 if reachable else 503,
             time.perf_counter() - started_at,
         )
-        return _json_response(200 if ready else 503, payload)
+        return _json_response(200 if reachable else 503, payload)
+
+    async def _handle_drain(self) -> bytes:
+        self._draining = True
+        async with self._admission_lock:
+            pass
+        if self._batch_queue is not None:
+            try:
+                await asyncio.wait_for(self._batch_queue.join(), timeout=30.0)
+            except asyncio.TimeoutError:
+                return _json_response(
+                    503,
+                    {
+                        "status": "drain_timeout",
+                        "detail": "ranking_runner_drain_timeout",
+                    },
+                )
+        return _json_response(200, {"status": "drained"})
 
     async def _handle_metrics(self) -> bytes:
         if self.config and self.config.monitoring_config.enable_prometheus_metrics:
@@ -499,13 +563,14 @@ class RankingRunner:
                         latest_ranking
                         and latest_ranking.model_version != last_ranking_version
                     ):
-                        await self.artifact_manager.sync_latest_ranking_checkpoint(
+                        synced_ranking = await self.artifact_manager.sync_latest_ranking_checkpoint(
                             expected_feature_schema_version=self.ranking_model.feature_schema_version
                         )
                         if await self.ranking_model.reload_model_if_updated(model_path):
-                            self.ranking_model.model_version = (
-                                latest_ranking.model_version
-                            )
+                            if synced_ranking:
+                                self.ranking_model.mark_artifact_record_verified(
+                                    synced_ranking
+                                )
                             last_ranking_version = latest_ranking.model_version
             except asyncio.CancelledError:
                 break

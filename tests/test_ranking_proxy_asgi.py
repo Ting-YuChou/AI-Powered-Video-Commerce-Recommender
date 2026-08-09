@@ -2,7 +2,12 @@ import pytest
 from types import SimpleNamespace
 
 from video_commerce.common.cache_codec import json_loads
-from video_commerce.ranking_runtime.ranking_coordinator_client import RankingCoordinatorTimeout
+from video_commerce.ranking_runtime.ranking_coordinator_client import (
+    RankingCoordinatorTimeout,
+)
+from video_commerce.ranking_runtime.ranking_coordinator_client import (
+    RankingCoordinatorResponse,
+)
 from video_commerce.services.ranking_service import proxy_asgi as ranking_proxy_asgi
 from video_commerce.services.ranking_service.proxy_asgi import RankingProxyApp
 
@@ -66,3 +71,39 @@ async def test_ranking_proxy_returns_clean_503_on_coordinator_timeout():
         'video_commerce_ranking_coordinator_client_errors_total{reason="timeout"}'
         in metrics
     )
+
+
+@pytest.mark.asyncio
+async def test_ranking_proxy_adds_retry_after_to_coordinator_429():
+    class OverloadedCoordinatorClient:
+        async def rank(self, body):
+            return RankingCoordinatorResponse(
+                status_code=429,
+                content_type="application/json",
+                body=b'{"detail":"ranking_overloaded","retry_after_seconds":1}',
+            )
+
+    app = RankingProxyApp()
+    app.client = OverloadedCoordinatorClient()
+    messages = []
+    received = [{"type": "http.request", "body": b'{"request_id":"r1"}'}]
+
+    async def receive():
+        return received.pop(0)
+
+    async def send(message):
+        messages.append(message)
+
+    await app._handle_http(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/internal/rank",
+            "headers": [],
+        },
+        receive,
+        send,
+    )
+
+    assert messages[0]["status"] == 429
+    assert (b"retry-after", b"1") in messages[0]["headers"]

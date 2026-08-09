@@ -39,6 +39,11 @@ spec:
     name: {{ include "video-commerce.componentName" (dict "root" $ "name" $workload.name) }}
   minReplicas: {{ $workload.hpa.minReplicas }}
   maxReplicas: {{ $workload.hpa.maxReplicas }}
+  {{- with $workload.hpa.scaleDownStabilizationSeconds }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: {{ . }}
+  {{- end }}
   metrics:
     - type: Resource
       resource:

@@ -1,5 +1,6 @@
 import http from "k6/http";
 import { check } from "k6";
+import { Rate, Trend } from "k6/metrics";
 
 const baseUrl = __ENV.BASE_URL || "http://localhost:8003";
 const rate = Number(__ENV.RATE || __ENV.RPS || 1500);
@@ -7,6 +8,11 @@ const duration = __ENV.DURATION || "60s";
 const preAllocatedVUs = Number(__ENV.PRE_ALLOCATED_VUS || __ENV.VUS || 500);
 const maxVUs = Number(__ENV.MAX_VUS || Math.max(preAllocatedVUs, 2000));
 const internalKey = __ENV.SECURITY_INTERNAL_SERVICE_KEY || "";
+const mode = (__ENV.MODE || "acceptance").toLowerCase();
+
+const unexpectedErrors = new Rate("unexpected_errors");
+const fiveXx = new Rate("five_xx");
+const successfulLatency = new Trend("ranking_success_duration", true);
 
 export const options = {
   scenarios: {
@@ -19,10 +25,17 @@ export const options = {
       maxVUs,
     },
   },
-  thresholds: {
-    http_req_failed: ["rate<0.005"],
-    http_req_duration: ["p(95)<600"],
-  },
+  thresholds:
+    mode === "overload"
+      ? {
+          unexpected_errors: ["rate<0.001"],
+          five_xx: ["rate<0.001"],
+        }
+      : {
+          http_req_failed: ["rate<0.005"],
+          five_xx: ["rate<0.001"],
+          ranking_success_duration: ["p(95)<400", "p(99)<600"],
+        },
 };
 
 function candidate(index) {
@@ -77,7 +90,17 @@ export default function () {
     headers,
   });
 
+  const accepted = response.status === 200;
+  const expectedOverload = mode === "overload" && response.status === 429;
+  unexpectedErrors.add(!accepted && !expectedOverload);
+  fiveXx.add(response.status >= 500);
+  if (accepted) {
+    successfulLatency.add(response.timings.duration);
+  }
+
   check(response, {
-    "ranking status is 200": (r) => r.status === 200,
+    "ranking response is expected": () => accepted || expectedOverload,
+    "overload has retry-after": (r) =>
+      r.status !== 429 || r.headers["Retry-After"] === "1",
   });
 }

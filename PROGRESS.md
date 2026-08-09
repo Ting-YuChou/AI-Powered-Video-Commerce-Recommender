@@ -1,5 +1,42 @@
 # Progress
 
+## 2026-08-08 — Ranking high-concurrency safety and capacity control
+
+- Made ranking production serving fail closed unless the loaded model is
+  trained, Torch-ready, and backed by checksum-verified artifact metadata whose
+  feature schema matches the active contract. Local/test fallback is now an
+  explicit degraded mode, and runner/coordinator readiness exposes model
+  lineage plus the minimum healthy-runner requirement.
+- Added capacity-aware coordinator workers and bounded internal batch queues,
+  queue/slot EWMA admission control, immediate zero-capacity rejection, and a
+  stable HTTP 429 overload contract with `Retry-After` propagated through the
+  ranking proxy, recommendation service, and gateway. Added runner drain,
+  post-send no-retry protection, DNS-safe connection retirement, and rolling
+  deployment controls.
+- Changed the baseline to 64 max / 32 target requests, 16 ms batching, a 2,048
+  request queue, 100 ms max queue wait, four runners with one batch each, and
+  two ranking HTTP workers. Added runner/capacity/admission metrics, alerts,
+  production-safe Helm probes/PDB/HPA stabilization, a 20-candidate k6
+  acceptance scenario, and an evidence checklist in the load-test runbook.
+- Key files: `video_commerce/ml/ranking.py`,
+  `video_commerce/ranking_runtime/ranking_batcher.py`,
+  `video_commerce/ranking_runtime/ranking_runner_client.py`,
+  `video_commerce/services/ranking_runner/main.py`,
+  `video_commerce/services/ranking_coordinator/main.py`, and
+  `charts/video-commerce/`.
+- Verification: Docker backend suite `551 passed, 8 skipped`; ranking
+  fail-closed/capacity focused suite `54 passed`; `docker compose config -q`; Helm
+  lint/template; kubeconform strict `33 valid`; Prometheus rule tests; k6
+  script inspection; Black and `git diff --check`. PR CI later exposed three
+  legacy shape/fallback tests whose Compose-provided local fallback setting had
+  hidden their test-only dependency; those tests now opt into unverified or
+  untrained inference explicitly while production defaults remain fail closed.
+- Follow-up/blocker: the repository and current Compose state contain no
+  trained, verified ranking checkpoint, so the 1/2/4-runner matrix and the
+  1,500/2,000/2,500 QPS soak, overload, and rolling-restart acceptance runs
+  remain deliberately unexecuted. Record checkpoint version/checksum and prove
+  fallback count zero before treating any future QPS result as model-serving
+  evidence.
 ## 2026-07-30 — Visual temporal attention recall path
 
 - Added an independent `VisualRetrievalPooler` that temporal-encodes up to 16

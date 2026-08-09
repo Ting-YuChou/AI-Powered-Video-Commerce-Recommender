@@ -11,6 +11,7 @@ from typing import Optional
 RANK_OPERATION = b"R"
 HEALTH_OPERATION = b"H"
 METRICS_OPERATION = b"M"
+DRAIN_OPERATION = b"D"
 MAX_FRAME_BYTES = 32 * 1024 * 1024
 
 

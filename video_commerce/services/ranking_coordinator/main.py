@@ -23,9 +23,10 @@ from video_commerce.common.cache_codec import json_dumps, json_loads
 from video_commerce.common.config import Config
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
-from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.ranking import RankingModel, RankingModelNotReadyError
 from video_commerce.ranking_runtime.ranking_batcher import (
     RankingBatcher,
+    RankingOverloadedError,
     RankingQueueFullError,
     RankingQueueTimeoutError,
 )
@@ -117,7 +118,7 @@ class RankingCoordinator:
                 self.config.model_config.ranking_model_path
             )
             if ranking_checkpoint:
-                self.ranking_model.model_version = ranking_checkpoint.model_version
+                self.ranking_model.mark_artifact_record_verified(ranking_checkpoint)
             self.ranking_model.enable_profiling_logs = (
                 self.config.monitoring_config.enable_profiling_logs
             )
@@ -289,7 +290,7 @@ class RankingCoordinator:
             if self.ranking_batcher.should_reject_new_request(
                 payload.deadline_unix_seconds
             ):
-                raise RankingQueueTimeoutError("ranking_queue_wait_exceeded")
+                raise RankingOverloadedError("ranking_queue_wait_exceeded")
             recommendations, profile = await self.ranking_batcher.rank_candidates(
                 candidates=payload.candidates,
                 user_features=payload.user_features,
@@ -323,9 +324,18 @@ class RankingCoordinator:
         except HTTPException as exc:
             status_code = exc.status_code
             return _json_response(exc.status_code, {"detail": exc.detail})
-        except (RankingQueueFullError, RankingQueueTimeoutError) as exc:
+        except (RankingOverloadedError, RankingQueueFullError) as exc:
+            status_code = 429
+            return _json_response(
+                429,
+                {"detail": "ranking_overloaded", "retry_after_seconds": 1},
+            )
+        except RankingQueueTimeoutError as exc:
             status_code = 503
             return _json_response(503, {"detail": str(exc)})
+        except RankingModelNotReadyError:
+            status_code = 503
+            return _json_response(503, {"detail": "ranking_model_not_ready"})
         except RankingCoordinatorProtocolError as exc:
             status_code = 400
             return _json_response(400, {"detail": str(exc)})
@@ -351,8 +361,43 @@ class RankingCoordinator:
 
     async def _handle_health(self) -> bytes:
         started_at = time.perf_counter()
+        allow_degraded = bool(
+            getattr(
+                getattr(self.config, "ranking_config", None),
+                "allow_untrained_fallback",
+                False,
+            )
+        )
         if self.runner_pool is not None:
             ranking_health = await self.runner_pool.health_check()
+            required_healthy_count = max(
+                1,
+                int(
+                    getattr(
+                        self.config.service_topology_config,
+                        "ranking_min_healthy_runners",
+                        2,
+                    )
+                ),
+            )
+            healthy_count = int(ranking_health.get("healthy_count", 0) or 0)
+            degraded_count = int(ranking_health.get("degraded_count", 0) or 0)
+            ranking_health = {
+                **ranking_health,
+                "status": (
+                    "healthy"
+                    if healthy_count >= required_healthy_count
+                    else "degraded"
+                    if allow_degraded
+                    and healthy_count + degraded_count >= required_healthy_count
+                    else "degraded"
+                    if healthy_count > 0
+                    else "unhealthy"
+                ),
+                "required_healthy_count": required_healthy_count,
+            }
+            if hasattr(self.runtime.observability, "set_ranking_healthy_runners"):
+                self.runtime.observability.set_ranking_healthy_runners(healthy_count)
             ranking_check_name = "ranking_runners"
         else:
             ranking_health = (
@@ -373,9 +418,21 @@ class RankingCoordinator:
             ranking_check_name: ranking_health,
             "database": database_health,
         }
-        ready = all(check.get("status") == "healthy" for check in checks.values())
+        ready = all(
+            check.get("status") == "healthy"
+            or (allow_degraded and check.get("status") == "degraded")
+            for check in checks.values()
+        )
+        response_status = (
+            "ready"
+            if ready
+            and all(check.get("status") == "healthy" for check in checks.values())
+            else "degraded"
+            if ready
+            else "not_ready"
+        )
         payload = {
-            "status": "ready" if ready else "not_ready",
+            "status": response_status,
             "service": self.runtime.service_name,
             "checks": checks,
             "process_id": os.getpid(),
@@ -421,13 +478,14 @@ class RankingCoordinator:
                         latest_ranking
                         and latest_ranking.model_version != last_ranking_version
                     ):
-                        await self.artifact_manager.sync_latest_ranking_checkpoint(
+                        synced_ranking = await self.artifact_manager.sync_latest_ranking_checkpoint(
                             expected_feature_schema_version=self.ranking_model.feature_schema_version
                         )
                         if await self.ranking_model.reload_model_if_updated(model_path):
-                            self.ranking_model.model_version = (
-                                latest_ranking.model_version
-                            )
+                            if synced_ranking:
+                                self.ranking_model.mark_artifact_record_verified(
+                                    synced_ranking
+                                )
                             last_ranking_version = latest_ranking.model_version
             except asyncio.CancelledError:
                 break

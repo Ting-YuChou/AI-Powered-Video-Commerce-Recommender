@@ -17,9 +17,32 @@ from video_commerce.ranking_runtime.ranking_runner_client import (
     BATCH_RANK_OPERATION,
     RankingRunnerClientPool,
     RankingRunnerEndpoint,
+    RankingRunnerOverloaded,
+    RankingRunnerRequestUncertain,
     RankingRunnerTimeout,
     parse_runner_urls,
 )
+
+
+def test_runner_effective_capacity_excludes_non_dispatchable_endpoints():
+    endpoints = [
+        RankingRunnerEndpoint(host="127.0.0.1", port=8100 + index, label=f"r{index}")
+        for index in range(4)
+    ]
+    client = RankingRunnerClientPool(
+        endpoints,
+        dispatch_concurrency=16,
+        runner_max_inflight_batches=1,
+        connect_timeout_seconds=0.1,
+        request_timeout_seconds=0.1,
+        unhealthy_cooldown_seconds=1.0,
+    )
+    endpoints[1].draining = True
+    endpoints[2].failed_until = time.monotonic() + 10
+    endpoints[3].overloaded_until = time.monotonic() + 10
+
+    assert client.effective_capacity == 1
+    assert client.capacity == 1
 
 
 def test_coordinator_response_round_trips_status_content_type_and_body():
@@ -242,7 +265,7 @@ async def test_runner_client_health_check_records_batch_payload_capability():
             encode_response(
                 200,
                 "application/json",
-                b'{"status":"ready","batch_payload_versions":[1,2]}',
+                b'{"status":"ready","batch_payload_versions":[1,2],"is_trained":true,"artifact_verified":true,"model_version":"ranking-v1","feature_schema_version":"ranking_v3_00_temporal_multimodal"}',
             )
         )
         await writer.drain()
@@ -270,42 +293,101 @@ async def test_runner_client_health_check_records_batch_payload_capability():
 
     assert client.supports_batch_payload_version(2) is True
     assert health["endpoints"][0]["batch_payload_versions"] == [1, 2]
+    assert health["endpoints"][0]["is_trained"] is True
+    assert health["endpoints"][0]["artifact_verified"] is True
+    assert health["endpoints"][0]["model_version"] == "ranking-v1"
 
 
 @pytest.mark.asyncio
-async def test_runner_client_retries_overload_without_marking_unhealthy():
-    attempts = 0
-
+async def test_runner_client_counts_degraded_separately_from_healthy():
     async def handle_client(reader, writer):
-        nonlocal attempts
-        while True:
-            try:
-                await read_frame(reader)
-            except Exception:
-                break
-            attempts += 1
-            if attempts == 1:
-                writer.write(
-                    encode_response(
-                        429,
-                        "application/json",
-                        b'{"detail":"ranking_runner_overloaded"}',
-                    )
-                )
-            else:
-                writer.write(
-                    encode_response(200, "application/json", b'{"results":[]}')
-                )
-            await writer.drain()
+        await read_frame(reader)
+        writer.write(
+            encode_response(
+                200,
+                "application/json",
+                b'{"status":"degraded","failure_reason":"model_untrained"}',
+            )
+        )
+        await writer.drain()
         writer.close()
         await writer.wait_closed()
 
     server = await asyncio.start_server(handle_client, host="127.0.0.1", port=0)
-    port = server.sockets[0].getsockname()[1]
-    endpoint = RankingRunnerEndpoint(host="127.0.0.1", port=port, label="local")
     client = RankingRunnerClientPool(
-        [endpoint],
+        [
+            RankingRunnerEndpoint(
+                host="127.0.0.1",
+                port=server.sockets[0].getsockname()[1],
+                label="local",
+            )
+        ],
         dispatch_concurrency=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        unhealthy_cooldown_seconds=0.1,
+    )
+    try:
+        health = await client.health_check()
+    finally:
+        await client.aclose()
+        server.close()
+        await server.wait_closed()
+
+    assert health["healthy_count"] == 0
+    assert health["degraded_count"] == 1
+    assert health["endpoints"][0]["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_runner_client_retries_overload_without_marking_unhealthy():
+    attempts = []
+
+    async def overloaded_runner(reader, writer):
+        try:
+            await read_frame(reader)
+            attempts.append("overloaded")
+            writer.write(
+                encode_response(
+                    429,
+                    "application/json",
+                    b'{"detail":"ranking_runner_overloaded"}',
+                )
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def healthy_runner(reader, writer):
+        try:
+            await read_frame(reader)
+            attempts.append("healthy")
+            writer.write(encode_response(200, "application/json", b'{"results":[]}'))
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    overloaded_server = await asyncio.start_server(
+        overloaded_runner, host="127.0.0.1", port=0
+    )
+    healthy_server = await asyncio.start_server(
+        healthy_runner, host="127.0.0.1", port=0
+    )
+    overloaded_endpoint = RankingRunnerEndpoint(
+        host="127.0.0.1",
+        port=overloaded_server.sockets[0].getsockname()[1],
+        label="overloaded",
+    )
+    healthy_endpoint = RankingRunnerEndpoint(
+        host="127.0.0.1",
+        port=healthy_server.sockets[0].getsockname()[1],
+        label="healthy",
+    )
+    client = RankingRunnerClientPool(
+        [overloaded_endpoint, healthy_endpoint],
+        dispatch_concurrency=2,
         runner_max_inflight_batches=1,
         connect_timeout_seconds=1.0,
         request_timeout_seconds=1.0,
@@ -315,12 +397,141 @@ async def test_runner_client_retries_overload_without_marking_unhealthy():
         response = await client.rank_batch(b'{"requests":[]}')
     finally:
         await client.aclose()
+        overloaded_server.close()
+        healthy_server.close()
+        await overloaded_server.wait_closed()
+        await healthy_server.wait_closed()
+
+    assert response.status_code == 200
+    assert attempts == ["overloaded", "healthy"]
+    assert overloaded_endpoint.failed_until == 0.0
+
+
+@pytest.mark.asyncio
+async def test_single_runner_overload_fails_fast_without_same_endpoint_retry():
+    attempts = 0
+
+    async def handle_client(reader, writer):
+        nonlocal attempts
+        try:
+            while True:
+                await read_frame(reader)
+                attempts += 1
+                writer.write(
+                    encode_response(
+                        429,
+                        "application/json",
+                        b'{"detail":"ranking_runner_overloaded"}',
+                    )
+                )
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle_client, host="127.0.0.1", port=0)
+    port = server.sockets[0].getsockname()[1]
+    endpoint = RankingRunnerEndpoint(host="127.0.0.1", port=port, label="local")
+    client = RankingRunnerClientPool(
+        [endpoint],
+        dispatch_concurrency=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        unhealthy_cooldown_seconds=1.0,
+    )
+    try:
+        with pytest.raises(RankingRunnerOverloaded):
+            await client.rank_batch(b'{"requests":[]}')
+    finally:
+        await client.aclose()
         server.close()
         await server.wait_closed()
 
-    assert response.status_code == 200
-    assert attempts == 2
-    assert endpoint.failed_until == 0.0
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_client_marks_draining_response_immediately():
+    async def handle_client(reader, writer):
+        await read_frame(reader)
+        writer.write(
+            encode_response(
+                429,
+                "application/json",
+                b'{"detail":"ranking_runner_draining"}',
+            )
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle_client, host="127.0.0.1", port=0)
+    port = server.sockets[0].getsockname()[1]
+    endpoint = RankingRunnerEndpoint(host="127.0.0.1", port=port, label="local")
+    client = RankingRunnerClientPool(
+        [endpoint],
+        dispatch_concurrency=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        unhealthy_cooldown_seconds=1.0,
+    )
+    try:
+        with pytest.raises(RankingRunnerOverloaded, match="draining"):
+            await client.rank_batch(b'{"requests":[]}')
+    finally:
+        await client.aclose()
+        server.close()
+        await server.wait_closed()
+
+    assert endpoint.draining is True
+    assert client.effective_capacity == 0
+
+
+@pytest.mark.asyncio
+async def test_protocol_draining_state_survives_dns_presence(monkeypatch):
+    endpoint = RankingRunnerEndpoint(
+        host="10.0.0.1",
+        port=8014,
+        label="runner->10.0.0.1:8014",
+        source_host="runner",
+        source_port=8014,
+    )
+
+    async def resolve_same(host, port, *, connect_timeout_seconds):
+        return [
+            RankingRunnerEndpoint(
+                host="10.0.0.1",
+                port=8014,
+                label="runner->10.0.0.1:8014",
+                source_host="runner",
+                source_port=8014,
+            )
+        ]
+
+    monkeypatch.setattr(
+        RankingRunnerClientPool,
+        "_resolve_endpoint",
+        staticmethod(resolve_same),
+    )
+    client = RankingRunnerClientPool(
+        [endpoint],
+        configured_endpoints=[("runner", 8014)],
+        dispatch_concurrency=1,
+        connect_timeout_seconds=0.1,
+        request_timeout_seconds=0.1,
+        unhealthy_cooldown_seconds=0.1,
+        dns_refresh_seconds=0.0,
+    )
+    client._mark_draining(endpoint)
+    try:
+        await client._refresh_endpoints_if_needed(force=True)
+    finally:
+        await client.aclose()
+
+    assert endpoint.draining is True
+    assert endpoint.drain_reason == "protocol"
 
 
 @pytest.mark.asyncio
@@ -599,3 +810,54 @@ async def test_runner_client_timeout_does_not_retry_sent_batch():
 
     assert attempts == 1
     assert endpoint.failed_until == 0.0
+
+
+@pytest.mark.asyncio
+async def test_runner_client_connection_close_after_send_does_not_retry():
+    attempts = []
+
+    async def closes_after_read(reader, writer):
+        await read_frame(reader)
+        attempts.append("accepted")
+        writer.close()
+        await writer.wait_closed()
+
+    async def healthy_runner(reader, writer):
+        await read_frame(reader)
+        attempts.append("retried")
+        writer.write(encode_response(200, "application/json", b'{"results":[]}'))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    first = await asyncio.start_server(closes_after_read, host="127.0.0.1", port=0)
+    second = await asyncio.start_server(healthy_runner, host="127.0.0.1", port=0)
+    client = RankingRunnerClientPool(
+        [
+            RankingRunnerEndpoint(
+                host="127.0.0.1",
+                port=first.sockets[0].getsockname()[1],
+                label="first",
+            ),
+            RankingRunnerEndpoint(
+                host="127.0.0.1",
+                port=second.sockets[0].getsockname()[1],
+                label="second",
+            ),
+        ],
+        dispatch_concurrency=2,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        unhealthy_cooldown_seconds=1.0,
+    )
+    try:
+        with pytest.raises(RankingRunnerRequestUncertain):
+            await client.rank_batch(b'{"requests":[]}')
+    finally:
+        await client.aclose()
+        first.close()
+        second.close()
+        await first.wait_closed()
+        await second.wait_closed()
+
+    assert attempts == ["accepted"]

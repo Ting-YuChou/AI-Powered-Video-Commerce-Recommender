@@ -963,6 +963,14 @@ class RankingConfig(BaseSettings):
         True,
         description="Enable micro-batching queue for ranking inference",
     )
+    allow_untrained_fallback: bool = Field(
+        False,
+        description="Allow deterministic candidate-score fallback when no trained ranking checkpoint is active; local/test only",
+    )
+    require_verified_artifact: bool = Field(
+        True,
+        description="Require checksum-verified artifact metadata before serving ranking traffic",
+    )
     batch_max_requests: int = Field(
         64,
         description="Maximum number of ranking requests to combine into one micro-batch",
@@ -972,15 +980,15 @@ class RankingConfig(BaseSettings):
         description="Target number of ranking requests to accumulate before dispatching a micro-batch",
     )
     batch_wait_ms: float = Field(
-        48.0,
+        16.0,
         description="Maximum time to wait for more ranking requests before dispatching a batch",
     )
     batch_queue_size: int = Field(
-        32768,
+        2048,
         description="Maximum queued ranking requests per worker",
     )
     batch_runner_count: int = Field(
-        16,
+        4,
         description="Number of concurrent micro-batch runners per recommendation worker",
     )
     coordinator_dispatch_concurrency: int = Field(
@@ -1068,7 +1076,7 @@ class RankingConfig(BaseSettings):
         description="Local ranking-owned frozen DIN item embedding sidecar",
     )
     max_queue_wait_ms: float = Field(
-        150.0,
+        100.0,
         description="Maximum time a ranking request may wait in the queue before failing fast",
     )
     runner_payload_v2_enabled: bool = Field(
@@ -1951,6 +1959,10 @@ class ServiceTopologyConfig(BaseSettings):
     ranking_runner_endpoint_missing_grace_seconds: float = Field(
         30.0,
         description="Minimum seconds an endpoint must be absent from DNS before draining",
+    )
+    ranking_min_healthy_runners: int = Field(
+        2,
+        description="Minimum verified healthy ranking runners required for coordinator readiness",
     )
     interaction_host: str = Field(
         "0.0.0.0", description="Interaction ingest service bind host"

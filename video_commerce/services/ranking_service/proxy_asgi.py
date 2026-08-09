@@ -342,14 +342,17 @@ class RankingProxyApp:
             header_name = (
                 self.runtime.config.monitoring_config.request_id_header.lower().encode()
             )
+        headers = [
+            (b"content-type", content_type.encode("ascii", errors="ignore")),
+            (header_name, request_id.encode("utf-8")),
+        ]
+        if int(status_code) == 429:
+            headers.append((b"retry-after", b"1"))
         await send(
             {
                 "type": "http.response.start",
                 "status": int(status_code),
-                "headers": [
-                    (b"content-type", content_type.encode("ascii", errors="ignore")),
-                    (header_name, request_id.encode("utf-8")),
-                ],
+                "headers": headers,
             }
         )
         await send({"type": "http.response.body", "body": body})

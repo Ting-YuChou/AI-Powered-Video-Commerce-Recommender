@@ -10,6 +10,12 @@ metadata:
     app.kubernetes.io/component: {{ $workload.name }}
 spec:
   replicas: {{ $workload.replicaCount }}
+  {{- with $workload.strategy }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "video-commerce.selectorLabels" (dict "root" $ "component" $workload.name) | nindent 6 }}
@@ -76,6 +82,10 @@ spec:
             {{- toYaml $workload.resources | nindent 12 }}
           securityContext:
             {{- toYaml $.Values.securityContext.container | nindent 12 }}
+          {{- with $workload.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: model-cache
               mountPath: /app/models
@@ -87,7 +97,38 @@ spec:
               mountPath: /app/logs
             - name: tmp
               mountPath: /tmp
-          {{- if eq $workload.probes.type "http" }}
+          {{- if hasKey $workload.probes "livenessType" }}
+          livenessProbe:
+            {{- if eq $workload.probes.livenessType "tcp" }}
+            tcpSocket:
+              port: {{ default "tcp" $workload.service.portName }}
+            {{- else if eq $workload.probes.livenessType "http" }}
+            httpGet:
+              path: {{ $workload.probes.livenessPath }}
+              port: {{ default "http" $workload.service.portName }}
+            {{- end }}
+            initialDelaySeconds: {{ $workload.probes.initialDelaySeconds }}
+            periodSeconds: {{ $workload.probes.periodSeconds }}
+            timeoutSeconds: {{ $workload.probes.timeoutSeconds }}
+            failureThreshold: {{ $workload.probes.failureThreshold }}
+          readinessProbe:
+            {{- if eq $workload.probes.readinessType "exec" }}
+            exec:
+              command:
+                {{- toYaml $workload.probes.readinessCommand | nindent 16 }}
+            {{- else if eq $workload.probes.readinessType "tcp" }}
+            tcpSocket:
+              port: {{ default "tcp" $workload.service.portName }}
+            {{- else if eq $workload.probes.readinessType "http" }}
+            httpGet:
+              path: {{ $workload.probes.readinessPath }}
+              port: {{ default "http" $workload.service.portName }}
+            {{- end }}
+            initialDelaySeconds: {{ $workload.probes.initialDelaySeconds }}
+            periodSeconds: {{ $workload.probes.periodSeconds }}
+            timeoutSeconds: {{ $workload.probes.timeoutSeconds }}
+            failureThreshold: {{ $workload.probes.failureThreshold }}
+          {{- else if eq $workload.probes.type "http" }}
           livenessProbe:
             httpGet:
               path: {{ $workload.probes.livenessPath }}

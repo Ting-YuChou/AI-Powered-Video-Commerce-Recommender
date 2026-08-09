@@ -83,6 +83,13 @@ def test_prometheus_rules_cover_service_worker_kafka_db_and_redis():
         "PitOrchestratorRunStuck",
         "PitOrchestratorLeaseExpired",
         "RankingArtifactFallbackPersisting",
+        "RankingVerifiedModelMissing",
+        "RankingHealthyRunnersLow",
+        "RankingQueueWaitP95High",
+        "RankingRunnerSlotP95High",
+        "RankingOverloadSustained",
+        "RankingCoordinatorPoolTimeout",
+        "Ranking5xxDetected",
     ):
         assert f"alert: {alert_name}" in rules
 

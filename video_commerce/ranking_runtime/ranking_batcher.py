@@ -29,6 +29,7 @@ from video_commerce.ranking_runtime.ranking_payloads import (
     model_payload,
 )
 from video_commerce.ranking_runtime.ranking_runner_client import (
+    RankingRunnerOverloaded,
     RankingRunnerTimeout,
     RankingRunnerUnavailable,
     RankingRunnerClientPool,
@@ -56,6 +57,10 @@ class RankingQueueFullError(RuntimeError):
 
 class RankingQueueTimeoutError(TimeoutError):
     """Raised when a ranking request waits too long before inference."""
+
+
+class RankingOverloadedError(RuntimeError):
+    """Raised when admission rejects work because dispatch capacity is exhausted."""
 
 
 @dataclass
@@ -156,6 +161,9 @@ def run_ranking_batch_payloads(
     profile_path: str = "torch_microbatch_process",
 ) -> Dict[str, Any]:
     """Execute a full ranking micro-batch and return JSON-serializable results."""
+    readiness_guard = getattr(ranking_model, "ensure_ready_for_inference", None)
+    if callable(readiness_guard):
+        readiness_guard()
     batch_execution_started = time.perf_counter()
     stages: Dict[str, float] = {}
     normalized_requests: List[Dict[str, Any]] = []
@@ -496,6 +504,11 @@ class RankingBatcher:
         ] = asyncio.Queue(maxsize=max(1, self.runner_count * 2))
         self._dispatcher_task: Optional[asyncio.Task] = None
         self._worker_tasks: List[asyncio.Task] = []
+        self._worker_busy: set[asyncio.Task] = set()
+        self._retiring_workers: set[asyncio.Task] = set()
+        self._worker_sequence = 0
+        self._worker_sync_lock = asyncio.Lock()
+        self._capacity_task: Optional[asyncio.Task] = None
         self._executor: Optional[ThreadPoolExecutor] = (
             ThreadPoolExecutor(
                 max_workers=self.executor_workers,
@@ -529,12 +542,12 @@ class RankingBatcher:
         self._dispatcher_task = asyncio.create_task(
             self._dispatch(), name="ranking-batcher-dispatcher"
         )
-        self._worker_tasks = [
-            asyncio.create_task(
-                self._run_worker(worker_id), name=f"ranking-batcher-worker-{worker_id}"
+        await self._sync_worker_capacity()
+        if self.runner_pool is not None:
+            self._capacity_task = asyncio.create_task(
+                self._monitor_worker_capacity(),
+                name="ranking-batcher-capacity-monitor",
             )
-            for worker_id in range(self.runner_count)
-        ]
 
     async def _warm_process_executor(self) -> None:
         assert self._process_executor is not None
@@ -547,12 +560,16 @@ class RankingBatcher:
 
     async def close(self) -> None:
         self._closing = True
+        if self._capacity_task:
+            self._capacity_task.cancel()
+            await asyncio.gather(self._capacity_task, return_exceptions=True)
+            self._capacity_task = None
         if self._dispatcher_task:
             await self.queue.put(None)
             await self._dispatcher_task
             self._dispatcher_task = None
         if self._worker_tasks:
-            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+            await asyncio.gather(*list(self._worker_tasks), return_exceptions=True)
             self._worker_tasks = []
         if self._executor:
             self._executor.shutdown(wait=True, cancel_futures=False)
@@ -574,7 +591,13 @@ class RankingBatcher:
         product_metadata_map = product_metadata_map or {}
         if self._deadline_expired(deadline_unix_seconds):
             self._record_direct("deadline_expired_before_enqueue")
-            raise RankingQueueTimeoutError("ranking_queue_wait_exceeded")
+            self._record_admission_rejection("request_deadline")
+            raise RankingOverloadedError("ranking_queue_wait_exceeded")
+
+        if self.runner_pool is not None and self._effective_runner_capacity() <= 0:
+            self._record_direct("no_dispatch_capacity")
+            self._record_admission_rejection("no_dispatch_capacity")
+            raise RankingOverloadedError("no_dispatch_capacity")
 
         if not self.enabled:
             self._record_direct("batching_disabled")
@@ -603,7 +626,8 @@ class RankingBatcher:
 
         if self._estimated_queue_wait_exceeded(deadline_unix_seconds):
             self._record_direct("estimated_queue_wait_exceeded")
-            raise RankingQueueTimeoutError("ranking_queue_wait_exceeded")
+            self._record_admission_rejection("predicted_queue_wait")
+            raise RankingOverloadedError("ranking_queue_wait_exceeded")
 
         if self.max_queue_wait_seconds > 0:
             queue_timeout_seconds = self.max_queue_wait_seconds
@@ -623,7 +647,8 @@ class RankingBatcher:
         except asyncio.QueueFull as exc:
             self._cancel_queue_timeout(request)
             self._record_direct("queue_full")
-            raise RankingQueueFullError("ranking_batch_queue_full") from exc
+            self._record_admission_rejection("queue_hard_limit")
+            raise RankingOverloadedError("ranking_batch_queue_full") from exc
 
         self._record_queue_depth()
         return await future
@@ -634,10 +659,7 @@ class RankingBatcher:
     ) -> bool:
         if self.max_queue_wait_seconds <= 0:
             return False
-        if (
-            self.runner_pool is not None
-            and not self.runner_pool.has_available_endpoint()
-        ):
+        if self.runner_pool is not None and self._effective_runner_capacity() <= 0:
             return True
 
         pending_requests = self.queue.qsize()
@@ -645,23 +667,23 @@ class RankingBatcher:
         queued_batch_waves = math.ceil(
             pending_requests / max(1, self.target_batch_requests)
         )
-        runner_capacity = max(
-            1,
-            self.runner_pool.capacity
-            if self.runner_pool is not None
-            else self._runner_capacity,
-        )
+        runner_capacity = self._effective_runner_capacity()
+        if runner_capacity <= 0:
+            return True
         service_seconds = max(
             self.batch_wait_seconds,
             self._runner_service_ewma_seconds,
             0.001,
         )
-        batches_before_start = max(
+        batches_ahead = max(
             0,
-            self._active_batch_count + pending_batches + queued_batch_waves + 1,
+            self._active_batch_count + pending_batches + queued_batch_waves,
         )
-        batches_ahead = max(0, batches_before_start - runner_capacity)
-        estimated_wait_seconds = (batches_ahead / runner_capacity) * service_seconds
+        waves_ahead = math.ceil(batches_ahead / runner_capacity)
+        estimated_wait_seconds = self.batch_wait_seconds + max(
+            waves_ahead * service_seconds,
+            self._dispatch_wait_ewma_seconds,
+        )
         allowed_wait_seconds = self.max_queue_wait_seconds
         if deadline_unix_seconds is not None:
             allowed_wait_seconds = min(
@@ -681,6 +703,65 @@ class RankingBatcher:
             return True
         return self._estimated_queue_wait_exceeded(deadline_unix_seconds)
 
+    def _record_admission_rejection(self, reason: str) -> None:
+        if self.observability and hasattr(
+            self.observability, "record_ranking_admission_rejection"
+        ):
+            self.observability.record_ranking_admission_rejection(reason)
+
+    def _effective_runner_capacity(self) -> int:
+        if self.runner_pool is None:
+            return max(1, int(self._runner_capacity))
+        capacity = getattr(self.runner_pool, "effective_capacity", None)
+        if capacity is None:
+            capacity = getattr(self.runner_pool, "capacity", 0)
+        return max(0, min(self.runner_count, int(capacity or 0)))
+
+    def _batch_queue_capacity_limit(self) -> int:
+        return max(0, 2 * self._effective_runner_capacity())
+
+    async def _monitor_worker_capacity(self) -> None:
+        try:
+            while not self._closing:
+                await self._sync_worker_capacity()
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            return
+
+    async def _sync_worker_capacity(self) -> None:
+        target = (
+            self._effective_runner_capacity()
+            if self.runner_pool is not None
+            else self.runner_count
+        )
+        async with self._worker_sync_lock:
+            self._worker_tasks = [
+                task for task in self._worker_tasks if not task.done()
+            ]
+            while len(self._worker_tasks) < target and not self._closing:
+                worker_id = self._worker_sequence
+                self._worker_sequence += 1
+                task = asyncio.create_task(
+                    self._run_worker(worker_id),
+                    name=f"ranking-batcher-worker-{worker_id}",
+                )
+                self._worker_tasks.append(task)
+
+            excess = max(0, len(self._worker_tasks) - target)
+            cancelled = []
+            for task in reversed(self._worker_tasks):
+                if excess <= 0:
+                    break
+                if task in self._worker_busy:
+                    self._retiring_workers.add(task)
+                else:
+                    task.cancel()
+                    cancelled.append(task)
+                    self._worker_tasks.remove(task)
+                excess -= 1
+            if cancelled:
+                await asyncio.gather(*cancelled, return_exceptions=True)
+
     @staticmethod
     def _deadline_expired(deadline_unix_seconds: Optional[float]) -> bool:
         return (
@@ -694,7 +775,7 @@ class RankingBatcher:
         if request.future.done():
             return
         request.future.set_exception(
-            RankingQueueTimeoutError("ranking_queue_wait_exceeded")
+            RankingOverloadedError("ranking_queue_wait_exceeded")
         )
         self._record_cancelled("queue_wait_exceeded")
 
@@ -751,6 +832,22 @@ class RankingBatcher:
                         break
                     batch.append(next_item)
 
+                while not self._closing:
+                    await self._sync_worker_capacity()
+                    capacity_limit = self._batch_queue_capacity_limit()
+                    if (
+                        capacity_limit > 0
+                        and self._batch_queue.qsize() < capacity_limit
+                    ):
+                        break
+                    await asyncio.sleep(0.001)
+                if self._closing:
+                    for request in batch:
+                        if not request.future.done():
+                            request.future.set_exception(
+                                RankingOverloadedError("no_dispatch_capacity")
+                            )
+                    break
                 await self._batch_queue.put(batch)
                 self._record_queue_depth()
                 if self._closing:
@@ -760,11 +857,23 @@ class RankingBatcher:
                 await self._batch_queue.put(None)
 
     async def _run_worker(self, worker_id: int) -> None:
-        while True:
-            batch = await self._batch_queue.get()
-            if batch is None:
-                break
-            await self._fulfill_batch(batch)
+        task = asyncio.current_task()
+        assert task is not None
+        try:
+            while True:
+                batch = await self._batch_queue.get()
+                if batch is None:
+                    break
+                self._worker_busy.add(task)
+                try:
+                    await self._fulfill_batch(batch)
+                finally:
+                    self._worker_busy.discard(task)
+                if task in self._retiring_workers:
+                    break
+        finally:
+            self._worker_busy.discard(task)
+            self._retiring_workers.discard(task)
 
     async def _rank_direct(
         self,
@@ -876,6 +985,13 @@ class RankingBatcher:
                     stage=self._remote_failure_stage(exc),
                     duration_seconds=max(0.0, time.perf_counter() - batch_started),
                 )
+                if isinstance(exc, (RankingRunnerOverloaded, RankingOverloadedError)):
+                    error = RankingOverloadedError(str(exc) or "ranking_overloaded")
+                    for request in executable_batch:
+                        self._record_admission_rejection("runner_overloaded")
+                        if not request.future.done():
+                            request.future.set_exception(error)
+                    return
                 error_detail = (
                     str(exc)
                     if isinstance(exc, RankingQueueTimeoutError) and str(exc)
@@ -1127,7 +1243,7 @@ class RankingBatcher:
         body = self._build_remote_batch_body(batch, batch_started)
         timeout_seconds = self._remaining_batch_deadline_seconds(batch)
         if timeout_seconds is not None and timeout_seconds <= 0:
-            raise RankingQueueTimeoutError("ranking_queue_wait_exceeded")
+            raise RankingOverloadedError("ranking_queue_wait_exceeded")
         response = await self.runner_pool.rank_batch(
             body,
             timeout_seconds=timeout_seconds,
@@ -1143,6 +1259,8 @@ class RankingBatcher:
                     detail = str(error_payload["detail"])
             except Exception:
                 pass
+            if response.status_code == 429:
+                raise RankingOverloadedError("ranking_overloaded")
             raise RankingQueueTimeoutError(detail)
 
         process_result = json_loads(response.body)
@@ -1213,7 +1331,7 @@ class RankingBatcher:
         if self._deadline_expired(request.deadline_unix_seconds):
             if not request.future.done():
                 request.future.set_exception(
-                    RankingQueueTimeoutError("ranking_queue_wait_exceeded")
+                    RankingOverloadedError("ranking_queue_wait_exceeded")
                 )
             self._cancel_queue_timeout(request)
             self._record_cancelled("deadline_exceeded")
@@ -1224,7 +1342,7 @@ class RankingBatcher:
         ):
             if not request.future.done():
                 request.future.set_exception(
-                    RankingQueueTimeoutError("ranking_queue_wait_exceeded")
+                    RankingOverloadedError("ranking_queue_wait_exceeded")
                 )
             self._cancel_queue_timeout(request)
             self._record_cancelled("queue_wait_exceeded")

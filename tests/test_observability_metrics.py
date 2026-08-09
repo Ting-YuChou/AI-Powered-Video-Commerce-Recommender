@@ -51,6 +51,10 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     manager.set_pit_trainer_waiting_for_manifest(True)
     manager.record_pit_duplicate_manifest_skip()
     manager.record_ranking_untrained_fallback()
+    manager.set_ranking_effective_runner_capacity(4)
+    manager.set_ranking_healthy_runners(3)
+    manager.set_ranking_draining_runners(1)
+    manager.record_ranking_admission_rejection("no_dispatch_capacity")
     manager.update_pit_durable_state(
         last_success_timestamp=123.0,
         waiting_for_rows=False,
@@ -91,6 +95,13 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "pit_trainer_waiting_for_manifest 1.0" in payload
     assert "pit_training_duplicate_manifest_skips_total 1.0" in payload
     assert "ranking_untrained_fallback_total 1.0" in payload
+    assert "video_commerce_ranking_effective_runner_capacity 4.0" in payload
+    assert "video_commerce_ranking_healthy_runners 3.0" in payload
+    assert "video_commerce_ranking_draining_runners 1.0" in payload
+    assert (
+        'video_commerce_ranking_admission_rejections_total{reason="no_dispatch_capacity"} 1.0'
+        in payload
+    )
     assert "pit_orchestrator_last_success_timestamp 123.0" in payload
     assert "pit_orchestrator_run_in_progress 1.0" in payload
     assert "pit_orchestrator_lease_expired 0.0" in payload

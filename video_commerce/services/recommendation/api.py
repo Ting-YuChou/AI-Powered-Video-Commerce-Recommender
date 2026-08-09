@@ -41,6 +41,7 @@ from video_commerce.common.models import (
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.ranking_runtime.ranking_batcher import (
     RankingBatcher,
+    RankingOverloadedError,
     RankingQueueFullError,
     RankingQueueTimeoutError,
 )
@@ -48,7 +49,7 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
     RankingCoordinatorClientPool,
     RankingCoordinatorError,
 )
-from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.ranking import RankingModel, RankingModelNotReadyError
 from video_commerce.ml.ranking_history import (
     RANKING_HISTORY_CONTEXT_KEY,
     build_ranking_history_context,
@@ -1177,7 +1178,7 @@ async def startup_event():
             )
         await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
         if ranking_checkpoint:
-            ranking_model.model_version = ranking_checkpoint.model_version
+            ranking_model.mark_artifact_record_verified(ranking_checkpoint)
         ranking_model.enable_profiling_logs = (
             runtime.config.monitoring_config.enable_profiling_logs
         )
@@ -2411,8 +2412,16 @@ async def _rank_candidates_for_request(
             include_profile=True,
             deadline_unix_seconds=deadline_unix_seconds,
         )
+    except RankingOverloadedError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={"detail": "ranking_overloaded", "retry_after_seconds": 1},
+            headers={"Retry-After": "1"},
+        ) from exc
     except (RankingQueueFullError, RankingQueueTimeoutError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RankingModelNotReadyError as exc:
+        raise HTTPException(status_code=503, detail="ranking_model_not_ready") from exc
 
 
 async def _attach_realtime_window_features(
@@ -2544,6 +2553,16 @@ async def _rank_candidates_remote(
 
     if upstream.status_code >= 500:
         raise HTTPException(status_code=503, detail="Ranking service unavailable")
+    if upstream.status_code == 429:
+        try:
+            detail = upstream.json()
+        except Exception:
+            detail = {"detail": "ranking_overloaded", "retry_after_seconds": 1}
+        raise HTTPException(
+            status_code=429,
+            detail=detail,
+            headers={"Retry-After": upstream.headers.get("retry-after", "1")},
+        )
     if upstream.status_code >= 400:
         raise HTTPException(status_code=upstream.status_code, detail=upstream.text)
 
@@ -2593,6 +2612,16 @@ async def _rank_candidates_coordinator(
 
     if upstream.status_code >= 500:
         raise HTTPException(status_code=503, detail="Ranking service unavailable")
+    if upstream.status_code == 429:
+        try:
+            detail = json_loads(upstream.body)
+        except Exception:
+            detail = {"detail": "ranking_overloaded", "retry_after_seconds": 1}
+        raise HTTPException(
+            status_code=429,
+            detail=detail,
+            headers={"Retry-After": "1"},
+        )
     if upstream.status_code >= 400:
         raise HTTPException(
             status_code=upstream.status_code,
@@ -2920,11 +2949,12 @@ async def _periodic_ranking_checkpoint_sync(runtime) -> None:
                     latest_ranking
                     and latest_ranking.model_version != last_ranking_version
                 ):
-                    await artifact_manager.sync_latest_ranking_checkpoint(
+                    synced_ranking = await artifact_manager.sync_latest_ranking_checkpoint(
                         expected_feature_schema_version=ranking_model.feature_schema_version
                     )
                     if await ranking_model.reload_model_if_updated(model_path):
-                        ranking_model.model_version = latest_ranking.model_version
+                        if synced_ranking:
+                            ranking_model.mark_artifact_record_verified(synced_ranking)
                         last_ranking_version = latest_ranking.model_version
             if recommendation_engine:
                 if await recommendation_engine.sync_serving_artifacts_if_updated():

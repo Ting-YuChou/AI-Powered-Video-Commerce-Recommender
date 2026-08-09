@@ -351,6 +351,14 @@ def create_service_app(
             if runtime.config
             else "X-Request-ID"
         )
+        response_headers = dict(exc.headers or {})
+        response_headers[header_name] = request_id
+        if isinstance(exc.detail, dict):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=exc.detail,
+                headers=response_headers,
+            )
         detail = (
             exc.detail
             if isinstance(exc.detail, str)
@@ -361,7 +369,7 @@ def create_service_app(
             code=_error_code_for_status(exc.status_code),
             message=detail,
             request_id=request_id,
-            headers={header_name: request_id},
+            headers=response_headers,
         )
 
     @app.exception_handler(Exception)
