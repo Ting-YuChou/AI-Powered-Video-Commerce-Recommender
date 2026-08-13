@@ -55,6 +55,10 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     manager.set_ranking_healthy_runners(3)
     manager.set_ranking_draining_runners(1)
     manager.record_ranking_admission_rejection("no_dispatch_capacity")
+    manager.record_ranking_adapter_request("success")
+    manager.record_ranking_adapter_stage("triton_inference", 0.012)
+    manager.set_ranking_adapter_inflight(3)
+    manager.set_ranking_triton_model_ready(True)
     manager.update_pit_durable_state(
         last_success_timestamp=123.0,
         waiting_for_rows=False,
@@ -98,6 +102,10 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "video_commerce_ranking_effective_runner_capacity 4.0" in payload
     assert "video_commerce_ranking_healthy_runners 3.0" in payload
     assert "video_commerce_ranking_draining_runners 1.0" in payload
+    assert 'video_commerce_ranking_adapter_requests_total{outcome="success"} 1.0' in payload
+    assert "video_commerce_ranking_adapter_stage_seconds" in payload
+    assert "video_commerce_ranking_adapter_inflight 3.0" in payload
+    assert "video_commerce_ranking_triton_model_ready 1.0" in payload
     assert (
         'video_commerce_ranking_admission_rejections_total{reason="no_dispatch_capacity"} 1.0'
         in payload

@@ -21,6 +21,16 @@ scrape_configs:
     static_configs:
       - targets: ["recommendation-service:8001"]
 
+  - job_name: ranking-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ranking-service:8003"]
+
+  - job_name: ranking-triton
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ranking-triton:8002"]
+
   - job_name: interaction-ingest-service
     metrics_path: /metrics
     static_configs:

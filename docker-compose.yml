@@ -110,6 +110,21 @@ x-common-service: &common-service
     MODEL_MAX_OCR_TEMPORAL_TOKENS: ${MODEL_MAX_OCR_TEMPORAL_TOKENS:-32}
     MODEL_MAX_ASR_TEMPORAL_TOKENS: ${MODEL_MAX_ASR_TEMPORAL_TOKENS:-64}
     RANKING_TRIMODAL_ENABLED: ${RANKING_TRIMODAL_ENABLED:-false}
+    RANKING_INFERENCE_BACKEND: ${RANKING_INFERENCE_BACKEND:-legacy}
+    RANKING_REQUIRED_MODEL_VERSION: ${RANKING_REQUIRED_MODEL_VERSION:-}
+    RANKING_TRITON_GRPC_URL: ${RANKING_TRITON_GRPC_URL:-ranking-triton:8001}
+    RANKING_TRITON_MODEL_NAME: ${RANKING_TRITON_MODEL_NAME:-ranking_onnx}
+    RANKING_TRITON_MODEL_REPOSITORY: ${RANKING_TRITON_MODEL_REPOSITORY:-/models}
+    RANKING_TRITON_REQUEST_TIMEOUT_MS: ${RANKING_TRITON_REQUEST_TIMEOUT_MS:-500}
+    RANKING_TRITON_MAX_INFLIGHT: ${RANKING_TRITON_MAX_INFLIGHT:-64}
+    RANKING_TRITON_MAX_BATCH_SIZE: ${RANKING_TRITON_MAX_BATCH_SIZE:-256}
+    RANKING_TRITON_QUEUE_DELAY_MICROSECONDS: ${RANKING_TRITON_QUEUE_DELAY_MICROSECONDS:-2000}
+    RANKING_TRITON_QUEUE_SIZE: ${RANKING_TRITON_QUEUE_SIZE:-128}
+    RANKING_TRITON_QUEUE_TIMEOUT_MICROSECONDS: ${RANKING_TRITON_QUEUE_TIMEOUT_MICROSECONDS:-75000}
+    RANKING_TRITON_INSTANCE_COUNT: ${RANKING_TRITON_INSTANCE_COUNT:-1}
+    RANKING_TRITON_ORT_INTRA_OP_THREADS: ${RANKING_TRITON_ORT_INTRA_OP_THREADS:-1}
+    RANKING_TRITON_ORT_INTER_OP_THREADS: ${RANKING_TRITON_ORT_INTER_OP_THREADS:-1}
+    RANKING_ONNX_EXPORT_ENABLED: ${RANKING_ONNX_EXPORT_ENABLED:-false}
     RANKING_TRIMODAL_SHADOW: ${RANKING_TRIMODAL_SHADOW:-true}
     RANKING_TRIMODAL_MODALITY_DROPOUT: ${RANKING_TRIMODAL_MODALITY_DROPOUT:-0.1}
     RANKING_ALLOW_UNTRAINED_FALLBACK: ${RANKING_ALLOW_UNTRAINED_FALLBACK:-true}
@@ -392,6 +407,66 @@ services:
     deploy:
       replicas: ${RANKING_RUNNER_REPLICAS:-4}
 
+  ranking-triton-volume-init:
+    image: alpine:3.20
+    profiles: ["triton"]
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:10001 /app/models /models"]
+    volumes:
+      - models_data:/app/models
+      - triton_models:/models
+    networks:
+      - video-commerce-network
+    restart: "no"
+
+  ranking-triton-materializer:
+    <<: *common-service
+    profiles: ["triton"]
+    command: python -m video_commerce.ranking_runtime.triton_materializer
+    environment:
+      <<: *common-env
+      RANKING_INFERENCE_BACKEND: triton
+      RANKING_TRITON_MODEL_REPOSITORY: /models
+    volumes:
+      - models_data:/app/models
+      - triton_models:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ranking-triton-volume-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  ranking-triton:
+    image: nvcr.io/nvidia/tritonserver:26.07-py3
+    profiles: ["triton"]
+    command:
+      - tritonserver
+      - --model-repository=/models
+      - --model-control-mode=none
+      - --strict-readiness=true
+      - --allow-http=true
+      - --allow-grpc=true
+      - --allow-metrics=true
+    expose:
+      - "8000"
+      - "8001"
+      - "8002"
+    volumes:
+      - triton_models:/models:ro
+    depends_on:
+      ranking-triton-materializer:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
   ranking-coordinator:
     <<: *common-service
     command: python -m video_commerce.services.ranking_coordinator.main
@@ -433,8 +508,9 @@ services:
     expose:
       - "8003"
     depends_on:
-      ranking-coordinator:
+      ranking-triton:
         condition: service_healthy
+        required: false
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/readyz"]
       interval: 30s
@@ -1419,6 +1495,7 @@ volumes:
   grafana_data:
   minio_data:
   asr_models_data:
+  triton_models:
 
 networks:
   video-commerce-network:

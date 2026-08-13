@@ -728,11 +728,47 @@ class ModelTrainerService:
                     value_mask_coverage=self._value_mask_coverage(training_examples),
                 )
             if self.ranking_model.is_trained and self.artifact_manager:
+                ranking_checkpoint_path = (
+                    self.ranking_model.loaded_model_path
+                    or self.config.model_config.ranking_model_path
+                )
+                onnx_path = None
+                onnx_export = None
+                if getattr(
+                    self.config.ranking_config, "onnx_export_enabled", False
+                ):
+                    from pathlib import Path
+
+                    from video_commerce.data_plane.object_storage import ObjectStorage
+                    from video_commerce.ml.ranking_onnx import export_ranking_onnx
+
+                    source_sha256 = ObjectStorage.calculate_sha256(
+                        ranking_checkpoint_path
+                    )
+                    self.ranking_model.mark_artifact_verified(
+                        model_version=self.ranking_model.model_version,
+                        artifact_sha256=source_sha256,
+                        feature_schema_version=self.ranking_model.feature_schema_version,
+                        metadata={
+                            "publication_stage": "local_pre_persist",
+                            "source_checkpoint_sha256": source_sha256,
+                        },
+                    )
+                    onnx_path = str(
+                        Path(ranking_checkpoint_path).with_suffix(".onnx")
+                    )
+                    onnx_export = export_ranking_onnx(
+                        self.ranking_model,
+                        onnx_path,
+                    )
+                    onnx_export["source_checkpoint_sha256"] = source_sha256
+                persist_options = {"onnx_path": onnx_path} if onnx_path else {}
                 record = await self.artifact_manager.persist_ranking_checkpoint(
-                    local_path=self.ranking_model.loaded_model_path
-                    or self.config.model_config.ranking_model_path,
+                    local_path=ranking_checkpoint_path,
                     model_version=self.ranking_model.model_version,
+                    **persist_options,
                     payload={
+                        **({"onnx_export": onnx_export} if onnx_export else {}),
                         **(
                             {
                                 "din_embedding_sidecar_local_path": self.config.model_config.ranking_din_sidecar_path,

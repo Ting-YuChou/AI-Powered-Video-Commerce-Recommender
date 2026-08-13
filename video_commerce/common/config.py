@@ -936,6 +936,49 @@ class RankingConfig(BaseSettings):
     """Ranking model configuration."""
 
     model_type: str = Field("neural", description="Ranking model type")
+    inference_backend: str = Field(
+        "legacy",
+        description="Ranking inference backend: legacy coordinator/runner or Triton",
+    )
+    required_model_version: str = Field(
+        "",
+        description="Exact business model version required by immutable Triton serving",
+    )
+    triton_grpc_url: str = Field(
+        "ranking-triton:8001",
+        description="Internal Triton gRPC endpoint",
+    )
+    triton_model_name: str = Field(
+        "ranking_onnx",
+        description="Triton model repository name",
+    )
+    triton_model_repository: str = Field(
+        "/models",
+        description="Local immutable Triton model repository root",
+    )
+    triton_request_timeout_ms: int = Field(
+        500,
+        description="Maximum Triton inference RPC duration in milliseconds",
+    )
+    triton_max_inflight: int = Field(
+        64,
+        description="Maximum Triton inference requests per ranking-service process",
+    )
+    triton_max_batch_size: int = Field(256, description="Triton dynamic max batch")
+    triton_queue_delay_microseconds: int = Field(
+        2000, description="Triton dynamic batch queue delay"
+    )
+    triton_queue_size: int = Field(128, description="Triton request queue capacity")
+    triton_queue_timeout_microseconds: int = Field(
+        75000, description="Triton queue timeout before rejection"
+    )
+    triton_instance_count: int = Field(1, description="Triton CPU model instances")
+    triton_ort_intra_op_threads: int = Field(1, description="ORT intra-op threads")
+    triton_ort_inter_op_threads: int = Field(1, description="ORT inter-op threads")
+    onnx_export_enabled: bool = Field(
+        False,
+        description="Publish a parity-verified ONNX artifact after offline training",
+    )
     architecture: str = Field(
         "dcn",
         description="Ranking model architecture: mlp, dcn, or dcn_v2_low_rank",
@@ -1279,6 +1322,34 @@ class RankingConfig(BaseSettings):
     def validate_low_rank_dim(cls, value: int) -> int:
         if value < 1:
             raise ValueError("low_rank_dim must be >= 1")
+        return value
+
+    @validator("inference_backend")
+    def validate_inference_backend(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"legacy", "triton"}:
+            raise ValueError("inference_backend must be legacy or triton")
+        return normalized
+
+    @validator(
+        "triton_request_timeout_ms",
+        "triton_max_inflight",
+        "triton_max_batch_size",
+        "triton_queue_size",
+        "triton_queue_timeout_microseconds",
+        "triton_instance_count",
+        "triton_ort_intra_op_threads",
+        "triton_ort_inter_op_threads",
+    )
+    def validate_positive_triton_settings(cls, value: int, field) -> int:
+        if value < 1:
+            raise ValueError(f"{field.name} must be >= 1")
+        return value
+
+    @validator("triton_queue_delay_microseconds")
+    def validate_triton_queue_delay(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("triton_queue_delay_microseconds must be >= 0")
         return value
 
     @validator("ltr_pairwise_weight", "ltr_min_relevance_gap", "ltr_listwise_weight")

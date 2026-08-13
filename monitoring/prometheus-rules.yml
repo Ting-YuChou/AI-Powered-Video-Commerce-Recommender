@@ -260,6 +260,24 @@ groups:
           summary: Ranking serving is returning 5xx responses
           description: Capacity overload must return 429; investigate model, protocol, or dependency availability.
 
+      - alert: RankingTritonModelUnavailable
+        expr: max(video_commerce_ranking_triton_model_ready{job="ranking-service"}) < 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Required Triton ranking model is unavailable
+          description: Verify the exact business/numeric model version, ONNX checksum, and Triton readiness.
+
+      - alert: RankingTritonOverloadSustained
+        expr: sum(rate(video_commerce_ranking_adapter_requests_total{outcome=~"overloaded|rejected_inflight"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Triton ranking overload responses are sustained
+          description: Inspect adapter inflight, Triton queue, dynamic batch distribution, and CPU saturation.
+
   - name: video-commerce-feature-lake
     rules:
       - alert: FeatureLakeMaterializationLagHigh

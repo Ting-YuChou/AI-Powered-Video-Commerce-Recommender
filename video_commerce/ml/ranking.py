@@ -340,6 +340,59 @@ class MultiObjectiveRankingModel(nn.Module):
             "ranking_score": ranking_score,
         }
 
+    def forward_onnx(
+        self,
+        x: torch.Tensor,
+        *,
+        candidate_indices: Optional[torch.Tensor] = None,
+        history_indices: Optional[torch.Tensor] = None,
+        history_recency: Optional[torch.Tensor] = None,
+        history_mask: Optional[torch.Tensor] = None,
+        summary_features: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass with a branch-free DIN subgraph for ONNX export."""
+        if self.din is not None:
+            if any(
+                value is None
+                for value in (
+                    candidate_indices,
+                    history_indices,
+                    history_recency,
+                    history_mask,
+                    summary_features,
+                )
+            ):
+                raise ValueError("DIN ONNX export requires structured tensors")
+            interest = self.din.forward_onnx(
+                candidate_indices,
+                history_indices,
+                history_recency,
+                history_mask,
+            )
+            x = torch.cat([x, interest, summary_features], dim=1)
+        shared_features = self.shared_layers(x)
+        ctr_pred = torch.sigmoid(
+            self._collapse_scalar_head(self.ctr_tower(shared_features))
+        )
+        cvr_pred = torch.sigmoid(
+            self._collapse_scalar_head(self.cvr_tower(shared_features))
+        )
+        ctcvr_pred = ctr_pred * cvr_pred
+        gmv_pred = self._collapse_scalar_head(self.gmv_tower(shared_features))
+        combined_features = torch.cat(
+            [shared_features, ctr_pred, cvr_pred, gmv_pred], dim=1
+        )
+        ranking_score = self._collapse_scalar_head(
+            self.ranking_tower(combined_features)
+        )
+        return {
+            "ctr": ctr_pred,
+            "cvr": cvr_pred,
+            "ctcvr": ctcvr_pred,
+            "gmv": gmv_pred,
+            "ranking_score": ranking_score,
+        }
+
 
 class TemporalMultimodalRankingModel(nn.Module):
     """Candidate-conditioned temporal/OCR ranker requiring a new checkpoint."""

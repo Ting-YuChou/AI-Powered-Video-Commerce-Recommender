@@ -34,6 +34,25 @@ images:
     tag: ci
     pullPolicy: IfNotPresent
 
+rankingTriton:
+  enabled: false
+  image:
+    repository: nvcr.io/nvidia/tritonserver
+    tag: 26.07-py3
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  modelRepositoryPath: /models
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      memory: 8Gi
+  serviceMonitor:
+    enabled: true
+  networkPolicy:
+    enabled: true
+
 securityContext:
   pod:
     runAsNonRoot: true
@@ -246,6 +265,21 @@ appConfig:
     impressionLoggingEnabled: true
     impressionMaxItems: 100
   ranking:
+    inferenceBackend: legacy
+    requiredModelVersion: ""
+    tritonGrpcUrl: ""
+    tritonModelName: ranking_onnx
+    tritonModelRepository: /models
+    tritonRequestTimeoutMs: 500
+    tritonMaxInflight: 64
+    tritonMaxBatchSize: 256
+    tritonQueueDelayMicroseconds: 2000
+    tritonQueueSize: 128
+    tritonQueueTimeoutMicroseconds: 75000
+    tritonInstanceCount: 1
+    tritonOrtIntraOpThreads: 1
+    tritonOrtInterOpThreads: 1
+    onnxExportEnabled: false
     allowUntrainedFallback: false
     requireVerifiedArtifact: true
     trimodalEnabled: false

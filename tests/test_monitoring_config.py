@@ -10,6 +10,8 @@ def test_prometheus_scrapes_services_workers_and_exporters():
     for job_name in (
         "gateway-api",
         "recommendation-service",
+        "ranking-service",
+        "ranking-triton",
         "interaction-ingest-service",
         "content-worker",
         "feature-worker",
@@ -90,6 +92,8 @@ def test_prometheus_rules_cover_service_worker_kafka_db_and_redis():
         "RankingOverloadSustained",
         "RankingCoordinatorPoolTimeout",
         "Ranking5xxDetected",
+        "RankingTritonModelUnavailable",
+        "RankingTritonOverloadSustained",
     ):
         assert f"alert: {alert_name}" in rules
 

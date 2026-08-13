@@ -10,6 +10,27 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
 )
 from video_commerce.services.ranking_service import proxy_asgi as ranking_proxy_asgi
 from video_commerce.services.ranking_service.proxy_asgi import RankingProxyApp
+from video_commerce.ranking_runtime.ranking_triton import (
+    RankingTritonOverloaded,
+    RankingTritonUnavailable,
+)
+
+
+@pytest.mark.asyncio
+async def test_triton_startup_rejects_direct_coordinator_mode():
+    app = RankingProxyApp()
+    app.runtime.config = SimpleNamespace(
+        ranking_config=SimpleNamespace(
+            required_model_version="ranking-v1",
+            trimodal_enabled=False,
+        ),
+        service_topology_config=SimpleNamespace(
+            ranking_coordinator_direct_enabled=True,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="DIRECT_ENABLED=false"):
+        await app._startup_triton()
 
 
 class TimeoutCoordinatorClient:
@@ -107,3 +128,117 @@ async def test_ranking_proxy_adds_retry_after_to_coordinator_429():
 
     assert messages[0]["status"] == 429
     assert (b"retry-after", b"1") in messages[0]["headers"]
+
+
+@pytest.mark.asyncio
+async def test_ranking_proxy_routes_triton_backend_without_coordinator():
+    class Adapter:
+        async def rank_payload(self, payload, request_id=None):
+            assert payload["candidates"][0]["product_id"] == "p1"
+            assert request_id
+            return [{"product_id": "p1", "ranking_score": 0.9}], {
+                "inference_backend": "triton",
+                "model_version": "ranking-v1",
+            }
+
+    app = RankingProxyApp()
+    app.inference_backend = "triton"
+    app.adapter = Adapter()
+    messages = []
+    received = [
+        {
+            "type": "http.request",
+            "body": b'{"candidates":[{"product_id":"p1"}],"user_features":{"user_id":"u1"},"context":{},"product_metadata_map":{},"k":1}',
+        }
+    ]
+
+    async def receive():
+        return received.pop(0)
+
+    async def send(message):
+        messages.append(message)
+
+    await app._handle_http(
+        {"type": "http", "method": "POST", "path": "/internal/rank", "headers": []},
+        receive,
+        send,
+    )
+
+    assert messages[0]["status"] == 200
+    payload = json_loads(messages[1]["body"])
+    assert payload["recommendations"][0]["product_id"] == "p1"
+    assert payload["profile"]["inference_backend"] == "triton"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (RankingTritonOverloaded("busy"), 429),
+        (RankingTritonUnavailable("down"), 503),
+    ],
+)
+async def test_ranking_proxy_maps_triton_failures(error, status):
+    class Adapter:
+        async def rank_payload(self, payload, request_id=None):
+            raise error
+
+    app = RankingProxyApp()
+    app.inference_backend = "triton"
+    app.adapter = Adapter()
+    messages = []
+    received = [
+        {
+            "type": "http.request",
+            "body": b'{"candidates":[{"product_id":"p1"}],"user_features":{"user_id":"u1"},"context":{},"product_metadata_map":{},"k":1}',
+        }
+    ]
+
+    async def receive():
+        return received.pop(0)
+
+    async def send(message):
+        messages.append(message)
+
+    await app._handle_http(
+        {"type": "http", "method": "POST", "path": "/internal/rank", "headers": []},
+        receive,
+        send,
+    )
+
+    assert messages[0]["status"] == status
+    if status == 429:
+        assert (b"retry-after", b"1") in messages[0]["headers"]
+        assert json_loads(messages[1]["body"])["detail"] == "ranking_overloaded"
+    else:
+        assert json_loads(messages[1]["body"])["detail"] == "ranking_model_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_ranking_proxy_returns_400_for_invalid_triton_payload():
+    class Adapter:
+        async def rank_payload(self, payload, request_id=None):
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=400, detail="Invalid k")
+
+    app = RankingProxyApp()
+    app.inference_backend = "triton"
+    app.adapter = Adapter()
+    messages = []
+    received = [{"type": "http.request", "body": b'{"k":0}'}]
+
+    async def receive():
+        return received.pop(0)
+
+    async def send(message):
+        messages.append(message)
+
+    await app._handle_http(
+        {"type": "http", "method": "POST", "path": "/internal/rank", "headers": []},
+        receive,
+        send,
+    )
+
+    assert messages[0]["status"] == 400
+    assert json_loads(messages[1]["body"]) == {"detail": "Invalid k"}
