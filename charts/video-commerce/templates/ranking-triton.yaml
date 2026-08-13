@@ -1,0 +1,184 @@
+{{- if .Values.rankingTriton.enabled }}
+{{- if ne .Values.appConfig.ranking.inferenceBackend "triton" }}
+{{- fail "rankingTriton.enabled requires appConfig.ranking.inferenceBackend=triton" }}
+{{- end }}
+{{- if not .Values.appConfig.ranking.requiredModelVersion }}
+{{- fail "rankingTriton.enabled requires appConfig.ranking.requiredModelVersion" }}
+{{- end }}
+{{- if .Values.appConfig.service.rankingCoordinatorDirectEnabled }}
+{{- fail "rankingTriton.enabled requires appConfig.service.rankingCoordinatorDirectEnabled=false" }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" "ranking-triton") }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ranking-triton
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" . "component" "ranking-triton") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "video-commerce.selectorLabels" (dict "root" . "component" "ranking-triton") | nindent 8 }}
+      annotations:
+        checksum/backend-config: {{ include (print $.Template.BasePath "/backend-configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "video-commerce.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.securityContext.pod | nindent 8 }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: model-materializer
+          image: {{ include "video-commerce.backendImage" . | quote }}
+          imagePullPolicy: {{ .Values.images.backend.pullPolicy }}
+          command: ["python", "-m", "video_commerce.ranking_runtime.triton_materializer"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "video-commerce.fullname" . }}-backend-config
+          env:
+            {{- include "video-commerce.secretEnv" . | nindent 12 }}
+            - name: RANKING_INFERENCE_BACKEND
+              value: triton
+            - name: RANKING_TRITON_MODEL_REPOSITORY
+              value: {{ .Values.rankingTriton.modelRepositoryPath | quote }}
+          securityContext:
+            {{- toYaml .Values.securityContext.container | nindent 12 }}
+          volumeMounts:
+            - name: triton-models
+              mountPath: {{ .Values.rankingTriton.modelRepositoryPath }}
+            - name: model-cache
+              mountPath: /app/models
+            - name: object-storage-downloads
+              mountPath: /tmp/object-storage
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: ranking-triton
+          image: "{{ .Values.rankingTriton.image.repository }}:{{ .Values.rankingTriton.image.tag }}"
+          imagePullPolicy: {{ .Values.rankingTriton.image.pullPolicy }}
+          args:
+            - tritonserver
+            - --model-repository={{ .Values.rankingTriton.modelRepositoryPath }}
+            - --model-control-mode=none
+            - --strict-readiness=true
+            - --allow-http=true
+            - --allow-grpc=true
+            - --allow-metrics=true
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: grpc
+              containerPort: 8001
+            - name: metrics
+              containerPort: 8002
+          readinessProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /v2/health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          resources:
+            {{- toYaml .Values.rankingTriton.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext.container | nindent 12 }}
+          volumeMounts:
+            - name: triton-models
+              mountPath: {{ .Values.rankingTriton.modelRepositoryPath }}
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: triton-models
+          emptyDir: {}
+        - name: model-cache
+          emptyDir: {}
+        - name: object-storage-downloads
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" "ranking-triton") }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ranking-triton
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "video-commerce.selectorLabels" (dict "root" . "component" "ranking-triton") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+    - name: grpc
+      port: 8001
+      targetPort: grpc
+    - name: metrics
+      port: 8002
+      targetPort: metrics
+{{- if and .Values.monitoring.serviceMonitor.enabled .Values.rankingTriton.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" "ranking-triton") }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ranking-triton
+spec:
+  selector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" . "component" "ranking-triton") | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- if .Values.rankingTriton.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" "ranking-triton") }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" . "component" "ranking-triton") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ranking-service
+      ports:
+        - protocol: TCP
+          port: 8001
+    - ports:
+        - protocol: TCP
+          port: 8002
+{{- end }}
+{{- end }}

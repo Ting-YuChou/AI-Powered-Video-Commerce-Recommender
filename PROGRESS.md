@@ -1,5 +1,105 @@
 # Progress
 
+## 2026-08-12 — Opt-in ONNX Runtime and Triton ranking backend
+
+- Added an offline opset-17 ONNX export contract for verified DCN and DCN+DIN
+  ranking artifacts. Export validates fixed tensor contracts, source/checkpoint
+  and DIN-sidecar lineage, ONNX checker output, finite results, exact top-k, and
+  PyTorch/ONNX Runtime parity for batch sizes 1/20/64 plus empty, sparse, and
+  full DIN histories. Exact business-version lookup and checksum-derived Triton
+  numeric versions prevent ambiguous `latest` activation.
+- Added a fail-closed ranking adapter that keeps feature assembly, DIN tensors,
+  value calibration, and top-k in `ranking-service`, while sending one
+  candidate matrix per async gRPC call to Triton's bounded dynamic batcher.
+  Adapter inflight, preprocessing, inference, postprocessing, readiness, request
+  ID/deadline propagation, 429 overload, 503 availability, and no sent-request
+  retry/fallback semantics are covered by tests. Legacy coordinator/runner
+  remains the default rollback backend; trimodal models remain legacy-only.
+- Added opt-in Compose and Helm Triton 26.07 deployment/materialization,
+  immutable exact-version repositories, idempotent same-artifact startup,
+  legacy-volume ownership migration, strict readiness, ServiceMonitor,
+  NetworkPolicy, metrics/alerts, an architecture decision record, and an
+  interleaved matched A/B load runner. The existing full-path load harness can
+  now publish the synthetic verified checkpoint and its ONNX artifact together.
+- Key files: `video_commerce/ml/ranking_onnx.py`,
+  `video_commerce/ranking_runtime/ranking_triton.py`,
+  `video_commerce/services/ranking_service/proxy_asgi.py`,
+  `charts/video-commerce/templates/ranking-triton.yaml`, and
+  `docs/architecture/decisions/001-ranking-triton-adapter.md`.
+- Verification: scoped Docker regression suite `251 passed`; real base and DIN
+  export/parity executed inside that suite; Compose config; scoped Black; diff
+  checks; default/Triton Helm lint; strict kubeconform `36 valid`; Prometheus
+  check/test `43 rules`; production ranking-service/materializer image builds.
+  A fresh synthetic artifact was trained, verified, exported, and persisted in
+  an isolated Compose project. After reclaiming only dangling images and unused
+  build cache, Triton 26.07 pulled successfully. Live startup exposed missing
+  protobuf-list commas in generated `config.pbtxt`; a failing regression was
+  added before fixing the generator. Exact-model readiness, HTTP 200 ranking,
+  and Triton counters then proved one request executed 20 inference rows.
+- Read-only review against base `4949962` found no P0 and one P1: legal
+  candidate sets above Triton's 256-row limit would fail as one oversized RPC.
+  The adapter now sends ordered, non-retried chunks under one overall deadline
+  and concatenates all model outputs before scoring. Its 300-row regression and
+  the focused adapter/proxy/load suite passed `26` tests; the same reviewer
+  confirmed the P1 resolved with no new P0/P1 findings.
+- Directional OrbStack ARM short A/B, using the same 20-candidate payload,
+  synthetic checkpoint, one adapter process, and one legacy runner: at 500
+  offered QPS, Triton delivered 499.11 successful QPS, 0.16% rejection, zero
+  5xx, and 8.82 ms successful p95; legacy delivered 459.51 successful QPS,
+  7.19% rejection, zero 5xx, and 286.21 ms p95. This is about 8.6% successful
+  QPS improvement and 96.9% lower p95, below the formal 10% promotion gate. At
+  1000 offered QPS Triton delivered 745.07 successful QPS with 25.33% fast
+  rejection, zero 5xx, and 168.69 ms successful p95, identifying local
+  saturation rather than a passing case. Raw JSON stayed outside the repo.
+- Staged Triton tuning at 1000 offered QPS selected two CPU instances, 4 ms
+  queue delay, and ORT intra/inter-op threads of one. Relative to one instance,
+  two instances raised successful QPS from 745.07 to 904.76 and reduced p95
+  from 168.69 ms to 111.12 ms. With two instances, 1/2/4 ms queue delays
+  delivered 900.78/904.76/918.80 successful QPS and
+  120.94/111.12/101.13 ms p95 respectively. Raising intra-op threads to two
+  regressed to 902.54 successful QPS and 126.01 ms p95. The winner still had
+  8.08% fast rejection at 1000 QPS; confirmation runs at 900 and 800 QPS had
+  2.04% and 1.48% rejection, so none passed the <0.5% gate. All cases had zero
+  5xx. During 900 QPS, one adapter process used 91.69% CPU and 306.6 MiB while
+  Triton used 14.14% CPU and 38.4 MiB, identifying adapter feature/pre-post work
+  as the next local bottleneck. Winner counters averaged about 108.5 rows per
+  execution, 3.02 ms queue time per request, and 1.64 ms compute per execution.
+- Follow-up: run the scripted three-repetition matched legacy/Triton A/B and
+  30-minute winner soak on a dedicated Linux CPU host. Base and DIN must each
+  improve maximum sustained 2xx QPS by at least 10% without exceeding the p95,
+  5xx, parity, or fallback gates before staging enablement.
+
+## 2026-08-10 — Full recommendation-path capacity harness and local baseline
+
+- Added a deterministic catalog and synthetic trained/verified ranking
+  checkpoint generator for capacity-only tests, plus a k6 scenario that drives
+  Caddy through recommendation serving, candidate-cache lookup, coordinator
+  batching, ranking runners, and actual Torch model forward. Added path,
+  fallback, batch-fill, model-forward, 429/5xx, dropped-iteration, and
+  successful-latency evidence to the exported results.
+- Ran a fresh isolated OrbStack Compose stack with one, two, and four runners.
+  The complete path did not pass the 250-QPS gate, so 500/750/1,000 QPS were
+  deliberately not run. Two runners were directionally best, while four
+  runners increased CPU contention; increasing max queue wait to 500 ms formed
+  larger batches but produced p95 762 ms, p99 1.4 s, 0.57% 5xx, and dropped
+  work. The low-rate 300-user prewarm completed without errors and confirmed
+  real model-forward execution with zero untrained fallback.
+- Key files: `loadtest/k6/recommendations.js`,
+  `video_commerce/loadtest_support.py`,
+  `scripts/prepare_recommendation_loadtest.py`,
+  `scripts/summarize_recommendation_loadtest.py`, and
+  `loadtest/results/recommendation-path-20260810/README.md`.
+- Verification: focused host suite `4 passed`; Docker checkpoint/artifact/
+  feature-contract suite `31 passed`; Python compilation; Compose config; k6
+  script inspection; and `git diff --check`. Full result JSON, checkpoint
+  lineage, runner matrix, resource snapshot, limitations, and the next staged
+  test gate are recorded with the artifacts. The isolated Compose project and
+  its disposable volumes were removed and OrbStack was stopped after testing.
+- Follow-up: rerun on a dedicated Linux target with the load generator on a
+  separate host and fixed resource limits. Pass 250 QPS twice before ramping to
+  500/750/1,000 QPS; use a genuinely trained artifact for production
+  acceptance and ranking-quality claims.
+
 ## 2026-08-08 — Ranking high-concurrency safety and capacity control
 
 - Made ranking production serving fail closed unless the loaded model is
@@ -31,12 +131,13 @@
   legacy shape/fallback tests whose Compose-provided local fallback setting had
   hidden their test-only dependency; those tests now opt into unverified or
   untrained inference explicitly while production defaults remain fail closed.
-- Follow-up/blocker: the repository and current Compose state contain no
-  trained, verified ranking checkpoint, so the 1/2/4-runner matrix and the
-  1,500/2,000/2,500 QPS soak, overload, and rolling-restart acceptance runs
-  remain deliberately unexecuted. Record checkpoint version/checksum and prove
-  fallback count zero before treating any future QPS result as model-serving
-  evidence.
+- Follow-up/blocker: the repository contains no quality-trained production
+  checkpoint. A later synthetic-checkpoint matrix exercised real forward passes
+  for capacity diagnostics only; the 1,500/2,000/2,500 QPS production soak,
+  overload, and rolling-restart acceptance runs remain deliberately unexecuted.
+  Record a genuinely trained checkpoint version/checksum and prove fallback
+  count zero before treating future results as production acceptance evidence.
+
 ## 2026-07-30 — Visual temporal attention recall path
 
 - Added an independent `VisualRetrievalPooler` that temporal-encodes up to 16

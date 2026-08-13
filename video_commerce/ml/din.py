@@ -476,8 +476,6 @@ class DeepInterestNetwork(nn.Module):
             raise ValueError("history_recency shape must match history_indices")
         if history_mask.shape != history_indices.shape:
             raise ValueError("history_mask shape must match history_indices")
-        original_sequence_length = history_indices.shape[-1]
-        first_active = 0
         active_columns = history_mask.bool().any(dim=0).any(dim=0)
         if not active_columns.any():
             empty_interest = torch.zeros(
@@ -488,11 +486,6 @@ class DeepInterestNetwork(nn.Module):
             if return_attention:
                 return empty_interest, torch.zeros_like(history_recency)
             return empty_interest
-        if active_columns.any():
-            first_active = int(torch.nonzero(active_columns, as_tuple=False)[0].item())
-            history_indices = history_indices[:, :, first_active:]
-            history_recency = history_recency[:, :, first_active:]
-            history_mask = history_mask[:, :, first_active:]
         candidate = self.item_embedding(candidate_indices).unsqueeze(1).unsqueeze(1)
         history = self.item_embedding(history_indices)
         candidate = candidate.expand_as(history)
@@ -540,11 +533,60 @@ class DeepInterestNetwork(nn.Module):
         any_history = mask.any(dim=-1).any(dim=-1).to(interest.dtype).unsqueeze(-1)
         interest = interest * candidate_present * any_history
         if return_attention:
-            if first_active:
-                weights = F.pad(weights, (first_active, 0))
-                weights = weights[..., :original_sequence_length]
             return interest, weights
         return interest
+
+    def forward_onnx(
+        self,
+        candidate_indices: torch.Tensor,
+        history_indices: torch.Tensor,
+        history_recency: torch.Tensor,
+        history_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Branch-free fixed-shape DIN path used by ONNX export.
+
+        The eager path may trim leading padding for CPU efficiency. Export must
+        keep all 60 columns so graph shape and behavior do not depend on sample
+        values observed during tracing.
+        """
+        candidate = self.item_embedding(candidate_indices).unsqueeze(1).unsqueeze(1)
+        history = self.item_embedding(history_indices)
+        candidate = candidate.expand_as(history)
+        batch_size, _, sequence_length, _ = history.shape
+        action_ids = torch.arange(
+            len(DIN_ACTIONS), device=history.device, dtype=torch.long
+        ).view(1, len(DIN_ACTIONS), 1)
+        action_values = self.action_embedding(action_ids).expand(
+            batch_size, -1, sequence_length, -1
+        )
+        local_features = torch.cat(
+            [
+                candidate,
+                history,
+                candidate - history,
+                candidate * history,
+                action_values,
+                history_recency.to(history.dtype).unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        logits = self.attention_mlp(
+            local_features.reshape(-1, local_features.shape[-1])
+        ).reshape(batch_size, len(DIN_ACTIONS), sequence_length)
+        mask = history_mask.bool()
+        masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+        weights = torch.softmax(masked_logits, dim=-1)
+        weights = torch.where(mask, weights, torch.zeros_like(weights))
+        weights = torch.nan_to_num(weights, nan=0.0)
+        normalizer = weights.sum(dim=-1, keepdim=True)
+        weights = torch.where(
+            normalizer > 0, weights / normalizer.clamp_min(1e-12), weights
+        )
+        action_interests = torch.sum(weights.unsqueeze(-1) * history, dim=2)
+        interest = self.interest_projection(action_interests.flatten(start_dim=1))
+        candidate_present = candidate_indices.ne(0).to(interest.dtype).unsqueeze(-1)
+        any_history = mask.any(dim=-1).any(dim=-1).to(interest.dtype).unsqueeze(-1)
+        return interest * candidate_present * any_history
 
 
 def save_din_embedding_sidecar(

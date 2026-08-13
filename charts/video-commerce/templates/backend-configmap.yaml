@@ -167,6 +167,21 @@ data:
   RANKING_LTR_LISTWISE_ENABLED: {{ .Values.appConfig.ranking.ltrListwiseEnabled | quote }}
   RANKING_LTR_LISTWISE_WEIGHT: {{ .Values.appConfig.ranking.ltrListwiseWeight | quote }}
   RANKING_LTR_LISTWISE_MIN_GROUP_SIZE: {{ .Values.appConfig.ranking.ltrListwiseMinGroupSize | quote }}
+  RANKING_INFERENCE_BACKEND: {{ .Values.appConfig.ranking.inferenceBackend | quote }}
+  RANKING_REQUIRED_MODEL_VERSION: {{ .Values.appConfig.ranking.requiredModelVersion | quote }}
+  RANKING_TRITON_GRPC_URL: {{ default (printf "%s:8001" (include "video-commerce.componentName" (dict "root" . "name" "ranking-triton"))) .Values.appConfig.ranking.tritonGrpcUrl | quote }}
+  RANKING_TRITON_MODEL_NAME: {{ .Values.appConfig.ranking.tritonModelName | quote }}
+  RANKING_TRITON_MODEL_REPOSITORY: {{ .Values.appConfig.ranking.tritonModelRepository | quote }}
+  RANKING_TRITON_REQUEST_TIMEOUT_MS: {{ .Values.appConfig.ranking.tritonRequestTimeoutMs | quote }}
+  RANKING_TRITON_MAX_INFLIGHT: {{ .Values.appConfig.ranking.tritonMaxInflight | quote }}
+  RANKING_TRITON_MAX_BATCH_SIZE: {{ .Values.appConfig.ranking.tritonMaxBatchSize | quote }}
+  RANKING_TRITON_QUEUE_DELAY_MICROSECONDS: {{ .Values.appConfig.ranking.tritonQueueDelayMicroseconds | quote }}
+  RANKING_TRITON_QUEUE_SIZE: {{ .Values.appConfig.ranking.tritonQueueSize | quote }}
+  RANKING_TRITON_QUEUE_TIMEOUT_MICROSECONDS: {{ .Values.appConfig.ranking.tritonQueueTimeoutMicroseconds | quote }}
+  RANKING_TRITON_INSTANCE_COUNT: {{ .Values.appConfig.ranking.tritonInstanceCount | quote }}
+  RANKING_TRITON_ORT_INTRA_OP_THREADS: {{ .Values.appConfig.ranking.tritonOrtIntraOpThreads | quote }}
+  RANKING_TRITON_ORT_INTER_OP_THREADS: {{ .Values.appConfig.ranking.tritonOrtInterOpThreads | quote }}
+  RANKING_ONNX_EXPORT_ENABLED: {{ .Values.appConfig.ranking.onnxExportEnabled | quote }}
   CACHE_CANDIDATE_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.candidateCacheRaceTimeoutMs | quote }}
   CACHE_RECOMMENDATION_CACHE_RACE_TIMEOUT_MS: {{ .Values.appConfig.cache.recommendationCacheRaceTimeoutMs | quote }}
   CACHE_BACKGROUND_TASK_QUEUE_SIZE: {{ .Values.appConfig.cache.backgroundTaskQueueSize | quote }}

@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import numpy as np
 
+import pytest
+
 from video_commerce.common.config import (
     ModelConfig,
     ObjectStorageConfig,
@@ -36,6 +38,12 @@ class FakeSystemStore:
 
     async def get_latest_model_checkpoint(self, model_name):
         return self.latest.get(model_name)
+
+    async def get_model_checkpoint_by_version(self, model_name, model_version):
+        record = self.latest.get(model_name)
+        if record and record["model_version"] == model_version:
+            return record
+        return None
 
     async def get_model_checkpoint_for_materialization_run(
         self, model_name, materialization_run_id
@@ -208,6 +216,134 @@ def test_persist_ranking_checkpoint_activates_din_sidecar_in_same_record(tmp_pat
         fake_store.recorded[-1]["payload"]["artifact_manifest"]["checkpoint"]["sha256"]
         == hashlib.sha256(b"ranking").hexdigest()
     )
+
+
+def test_persist_ranking_checkpoint_publishes_verified_onnx_in_same_record(tmp_path):
+    fake_store = FakeSystemStore()
+    ranking_path = tmp_path / "ranking.pt"
+    onnx_path = tmp_path / "ranking.onnx"
+    ranking_path.write_bytes(b"ranking")
+    onnx_path.write_bytes(b"onnx")
+    checkpoint_sha = hashlib.sha256(b"ranking").hexdigest()
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(ranking_model_path=str(ranking_path)),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    record = asyncio.run(
+        manager.persist_ranking_checkpoint(
+            local_path=str(ranking_path),
+            model_version="ranking-onnx-1",
+            onnx_path=str(onnx_path),
+            payload={
+                "feature_schema_version": "ranking_v3_00_temporal_multimodal",
+                "onnx_export": {
+                    "source_checkpoint_sha256": checkpoint_sha,
+                    "opset": 17,
+                    "input_dim": 28,
+                    "din_enabled": False,
+                    "parity_verified": True,
+                    "model_architecture": "dcn",
+                    "feature_schema_version": "ranking_v3_00_temporal_multimodal",
+                    "input_contract": {"base_features": [None, 28]},
+                    "output_contract": {
+                        name: [None, 1]
+                        for name in (
+                            "ctr",
+                            "cvr",
+                            "ctcvr",
+                            "gmv",
+                            "ranking_score",
+                        )
+                    },
+                    "output_names": [
+                        "ctr",
+                        "cvr",
+                        "ctcvr",
+                        "gmv",
+                        "ranking_score",
+                    ],
+                    "validated_batch_sizes": [1, 20, 64],
+                    "export_torch_version": "2.5.0",
+                    "onnx_version": "1.19.0",
+                    "onnxruntime_version": "1.23.2",
+                    "target_triton_version": "26.07",
+                    "target_onnxruntime_version": "1.27.0",
+                },
+            },
+        )
+    )
+
+    manifest = record.payload["artifact_manifest"]
+    assert manifest["onnx_model"]["sha256"] == hashlib.sha256(b"onnx").hexdigest()
+    assert manifest["onnx_model"]["source_checkpoint_sha256"] == checkpoint_sha
+    assert "onnx_export" not in record.payload
+
+
+def test_persist_ranking_checkpoint_rejects_incomplete_onnx_contract(tmp_path):
+    fake_store = FakeSystemStore()
+    ranking_path = tmp_path / "ranking.pt"
+    onnx_path = tmp_path / "ranking.onnx"
+    ranking_path.write_bytes(b"ranking")
+    onnx_path.write_bytes(b"onnx")
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(ranking_model_path=str(ranking_path)),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="contract"):
+        asyncio.run(
+            manager.persist_ranking_checkpoint(
+                local_path=str(ranking_path),
+                model_version="ranking-onnx-bad",
+                onnx_path=str(onnx_path),
+                payload={
+                    "feature_schema_version": "ranking_v3_00_temporal_multimodal",
+                    "onnx_export": {
+                        "source_checkpoint_sha256": hashlib.sha256(
+                            b"ranking"
+                        ).hexdigest(),
+                        "opset": 17,
+                        "parity_verified": True,
+                    },
+                },
+            )
+        )
+
+    assert fake_store.recorded == []
+
+
+def test_get_ranking_checkpoint_requires_exact_model_version(tmp_path):
+    fake_store = FakeSystemStore()
+    fake_store.latest[ModelArtifactManager.RANKING_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.RANKING_MODEL_NAME,
+        "model_version": "ranking-v2",
+        "checkpoint_path": str(tmp_path / "ranking.pt"),
+        "payload": {},
+        "created_at": 1.0,
+    }
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(ranking_model_path=str(tmp_path / "ranking.pt")),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    exact = asyncio.run(manager.get_ranking_checkpoint("ranking-v2"))
+    missing = asyncio.run(manager.get_ranking_checkpoint("ranking-v1"))
+
+    assert exact is not None and exact.model_version == "ranking-v2"
+    assert missing is None
 
 
 def test_pit_checkpoint_conflict_returns_and_verifies_existing_artifact(tmp_path):

@@ -63,6 +63,10 @@ class ModelArtifactManager:
         return self.model_config.ranking_din_sidecar_path
 
     @property
+    def ranking_onnx_local_path(self) -> str:
+        return str(Path(self.ranking_local_path).with_suffix(".onnx"))
+
+    @property
     def two_tower_local_checkpoint_path(self) -> str:
         return self.recommendation_config.cf_index_path.replace(".faiss", ".pt")
 
@@ -126,6 +130,26 @@ class ModelArtifactManager:
         if not checkpoint:
             return None
 
+        return ModelArtifactRecord(
+            model_name=checkpoint["model_name"],
+            model_version=checkpoint["model_version"],
+            checkpoint_path=checkpoint["checkpoint_path"],
+            payload=checkpoint.get("payload") or {},
+            created_at=checkpoint.get("created_at"),
+        )
+
+    async def get_ranking_checkpoint(
+        self, model_version: str
+    ) -> Optional[ModelArtifactRecord]:
+        """Resolve an exact ranking version for immutable serving rollouts."""
+        if not self.system_store or not model_version:
+            return None
+        checkpoint = await self.system_store.get_model_checkpoint_by_version(
+            self.RANKING_MODEL_NAME,
+            str(model_version),
+        )
+        if not checkpoint:
+            return None
         return ModelArtifactRecord(
             model_name=checkpoint["model_name"],
             model_version=checkpoint["model_version"],
@@ -228,6 +252,95 @@ class ModelArtifactManager:
             )
         await self._sync_paths_to_local_atomically(artifact_specs)
         return record
+
+    async def sync_ranking_checkpoint_version(
+        self,
+        model_version: str,
+        *,
+        expected_feature_schema_version: Optional[str] = None,
+        require_onnx: bool = False,
+    ) -> Optional[ModelArtifactRecord]:
+        """Sync one exact immutable ranking version and verify its manifest."""
+        record = await self.get_ranking_checkpoint(model_version)
+        if record is None:
+            return None
+        payload = dict(record.payload or {})
+        schema = str(payload.get("feature_schema_version") or "")
+        if expected_feature_schema_version and schema != expected_feature_schema_version:
+            logger.warning(
+                "ranking_checkpoint_schema_incompatible",
+                extra={
+                    "checkpoint_schema": schema,
+                    "expected_schema": expected_feature_schema_version,
+                    "model_version": model_version,
+                },
+            )
+            return None
+        manifest = dict(payload.get("artifact_manifest") or {})
+        checkpoint = dict(manifest.get("checkpoint") or {})
+        if not checkpoint.get("path") or len(str(checkpoint.get("sha256") or "")) != 64:
+            raise ValueError("exact ranking checkpoint manifest is incomplete")
+        specs = [
+            (
+                str(checkpoint["path"]),
+                self.ranking_local_path,
+                str(checkpoint["sha256"]),
+            )
+        ]
+        onnx_model = dict(manifest.get("onnx_model") or {})
+        if require_onnx:
+            if not onnx_model.get("path") or len(str(onnx_model.get("sha256") or "")) != 64:
+                raise ValueError("exact ranking ONNX manifest is incomplete")
+            if onnx_model.get("source_checkpoint_sha256") != checkpoint.get("sha256"):
+                raise ValueError("ONNX source checkpoint lineage mismatch")
+            self._validate_ranking_onnx_contract(
+                onnx_model,
+                feature_schema_version=schema,
+            )
+            specs.append(
+                (
+                    str(onnx_model["path"]),
+                    self.ranking_onnx_local_path,
+                    str(onnx_model["sha256"]),
+                )
+            )
+        din_sidecar = dict(manifest.get("din_embedding_sidecar") or {})
+        if onnx_model.get("din_enabled"):
+            if not din_sidecar.get("path") or len(str(din_sidecar.get("sha256") or "")) != 64:
+                raise ValueError("exact ranking DIN sidecar manifest is incomplete")
+            if onnx_model.get("din_sidecar_sha256") != din_sidecar.get("sha256"):
+                raise ValueError("ONNX DIN sidecar lineage mismatch")
+            specs.append(
+                (
+                    str(din_sidecar["path"]),
+                    self.ranking_din_sidecar_local_path,
+                    str(din_sidecar["sha256"]),
+                )
+            )
+        await self._sync_paths_to_local_atomically(specs)
+        local_manifest = dict(manifest)
+        local_manifest["checkpoint"] = {
+            **checkpoint,
+            "path": self.ranking_local_path,
+        }
+        if require_onnx:
+            local_manifest["onnx_model"] = {
+                **onnx_model,
+                "path": self.ranking_onnx_local_path,
+            }
+        if din_sidecar:
+            local_manifest["din_embedding_sidecar"] = {
+                **din_sidecar,
+                "path": self.ranking_din_sidecar_local_path,
+            }
+        payload["artifact_manifest"] = local_manifest
+        return ModelArtifactRecord(
+            model_name=record.model_name,
+            model_version=record.model_version,
+            checkpoint_path=self.ranking_local_path,
+            payload=payload,
+            created_at=record.created_at,
+        )
 
     async def sync_latest_two_tower_artifacts(self) -> Optional[ModelArtifactRecord]:
         record = await self.get_latest_model_checkpoint(self.TWO_TOWER_MODEL_NAME)
@@ -386,6 +499,7 @@ class ModelArtifactManager:
         model_version: str,
         payload: Optional[Dict[str, Any]] = None,
         candidate_sidecar_path: Optional[str] = None,
+        onnx_path: Optional[str] = None,
     ) -> Optional[ModelArtifactRecord]:
         if not self.system_store:
             return None
@@ -423,7 +537,30 @@ class ModelArtifactManager:
                 model_name=f"{self.RANKING_MODEL_NAME}_candidates",
                 model_version=storage_version,
             )
+        onnx_sha256 = None
+        persisted_onnx = None
+        onnx_export = dict((payload or {}).get("onnx_export") or {})
+        if onnx_path:
+            if onnx_export.get("source_checkpoint_sha256") != artifact_sha256:
+                raise ValueError("ONNX source checkpoint lineage mismatch")
+            if int(onnx_export.get("opset") or 0) != 17:
+                raise ValueError("ONNX export must use opset 17")
+            if onnx_export.get("parity_verified") is not True:
+                raise ValueError("ONNX export parity must pass before persistence")
+            self._validate_ranking_onnx_contract(
+                onnx_export,
+                feature_schema_version=str(
+                    (payload or {}).get("feature_schema_version") or ""
+                ),
+            )
+            onnx_sha256 = ObjectStorage.calculate_sha256(onnx_path)
+            persisted_onnx = await self._persist_artifact(
+                local_path=onnx_path,
+                model_name=self.RANKING_MODEL_NAME,
+                model_version=storage_version,
+            )
         record_payload = dict(payload or {})
+        record_payload.pop("onnx_export", None)
         if (
             record_payload.get("feature_schema_version")
             == "ranking_v4_01_temporal_trimodal"
@@ -460,6 +597,12 @@ class ModelArtifactManager:
                 "sha256": din_sha256,
                 "local_cache_path": self.ranking_din_sidecar_local_path,
             }
+        if persisted_onnx and onnx_export.get("din_enabled"):
+            if din_manifest is None:
+                raise ValueError("DIN ONNX persistence requires a DIN sidecar")
+            expected_din_sha = onnx_export.get("din_sidecar_sha256")
+            if expected_din_sha != din_manifest["sha256"]:
+                raise ValueError("ONNX DIN sidecar lineage mismatch")
         record_payload.update(
             {
                 "local_cache_path": self.ranking_local_path,
@@ -484,6 +627,21 @@ class ModelArtifactManager:
                     **(
                         {"din_embedding_sidecar": din_manifest}
                         if din_manifest is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "onnx_model": {
+                                **onnx_export,
+                                "path": persisted_onnx,
+                                "sha256": onnx_sha256,
+                                "source_checkpoint_sha256": artifact_sha256,
+                                "feature_schema_version": record_payload.get(
+                                    "feature_schema_version"
+                                ),
+                            }
+                        }
+                        if persisted_onnx
                         else {}
                     ),
                 },
@@ -529,6 +687,47 @@ class ModelArtifactManager:
             checkpoint_path=persisted_path,
             payload=record_payload,
         )
+
+    @staticmethod
+    def _validate_ranking_onnx_contract(
+        contract: Dict[str, Any], *, feature_schema_version: str
+    ) -> None:
+        output_names = ["ctr", "cvr", "ctcvr", "gmv", "ranking_score"]
+        input_dim = int(contract.get("input_dim") or 0)
+        din_enabled = bool(contract.get("din_enabled"))
+        expected_inputs: Dict[str, Any] = {
+            "base_features": [None, input_dim]
+        }
+        if din_enabled:
+            expected_inputs.update(
+                {
+                    "candidate_indices": [None, 1],
+                    "history_indices": [None, 3, 60],
+                    "history_recency": [None, 3, 60],
+                    "history_mask": [None, 3, 60],
+                    "summary_features": [None, 12],
+                }
+            )
+        expected_outputs = {name: [None, 1] for name in output_names}
+        valid = all(
+            (
+                input_dim > 0,
+                contract.get("model_architecture") == "dcn",
+                contract.get("feature_schema_version")
+                == feature_schema_version,
+                contract.get("input_contract") == expected_inputs,
+                contract.get("output_contract") == expected_outputs,
+                contract.get("output_names") == output_names,
+                contract.get("validated_batch_sizes") == [1, 20, 64],
+                bool(contract.get("export_torch_version")),
+                bool(contract.get("onnx_version")),
+                bool(contract.get("onnxruntime_version")),
+                contract.get("target_triton_version") == "26.07",
+                contract.get("target_onnxruntime_version") == "1.27.0",
+            )
+        )
+        if not valid:
+            raise ValueError("ranking ONNX artifact contract is incomplete")
 
     async def _verify_existing_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         path = str(checkpoint.get("checkpoint_path") or "").strip()

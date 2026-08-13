@@ -3008,6 +3008,35 @@ class SystemStore:
             "created_at": row.created_at.timestamp() if row.created_at else None,
         }
 
+    async def get_model_checkpoint_by_version(
+        self, model_name: str, model_version: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the newest exact business version; never fall back to latest."""
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelCheckpoint)
+                .where(
+                    ModelCheckpoint.model_name == str(model_name),
+                    ModelCheckpoint.model_version == str(model_version),
+                )
+                .order_by(desc(ModelCheckpoint.created_at), desc(ModelCheckpoint.id))
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+        self._update_pool_metrics()
+        if row is None:
+            return None
+        return {
+            "id": row.id,
+            "model_name": row.model_name,
+            "model_version": row.model_version,
+            "checkpoint_path": row.checkpoint_path,
+            "payload": row.payload or {},
+            "created_at": row.created_at.timestamp() if row.created_at else None,
+        }
+
     async def get_model_checkpoint_for_materialization_run(
         self, model_name: str, materialization_run_id: str
     ) -> Optional[Dict[str, Any]]:

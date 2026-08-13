@@ -618,6 +618,29 @@ class ObservabilityManager:
             ["reason"],
             registry=self.registry,
         )
+        self.ranking_adapter_requests_total = Counter(
+            "video_commerce_ranking_adapter_requests_total",
+            "Ranking adapter requests by terminal outcome",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.ranking_adapter_stage_seconds = Histogram(
+            "video_commerce_ranking_adapter_stage_seconds",
+            "Ranking adapter feature, Triton, and post-processing latency",
+            ["stage"],
+            buckets=(0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1),
+            registry=self.registry,
+        )
+        self.ranking_adapter_inflight = Gauge(
+            "video_commerce_ranking_adapter_inflight",
+            "Ranking adapter requests currently admitted",
+            registry=self.registry,
+        )
+        self.ranking_triton_model_ready = Gauge(
+            "video_commerce_ranking_triton_model_ready",
+            "Whether the exact required Triton model version is ready",
+            registry=self.registry,
+        )
         self.upstream_requests_total = Counter(
             "video_commerce_upstream_requests_total",
             "Internal upstream HTTP requests by target and status",
@@ -1150,6 +1173,20 @@ class ObservabilityManager:
 
     def record_ranking_coordinator_client_error(self, reason: str) -> None:
         self.ranking_coordinator_client_errors_total.labels(reason=reason).inc()
+
+    def record_ranking_adapter_request(self, outcome: str) -> None:
+        self.ranking_adapter_requests_total.labels(outcome=str(outcome)).inc()
+
+    def record_ranking_adapter_stage(self, stage: str, duration_seconds: float) -> None:
+        self.ranking_adapter_stage_seconds.labels(stage=str(stage)).observe(
+            max(0.0, float(duration_seconds))
+        )
+
+    def set_ranking_adapter_inflight(self, count: int) -> None:
+        self.ranking_adapter_inflight.set(max(0, int(count)))
+
+    def set_ranking_triton_model_ready(self, ready: bool) -> None:
+        self.ranking_triton_model_ready.set(1 if ready else 0)
 
     def inc_upstream_inflight(self, target: str) -> None:
         self.upstream_inflight.labels(target=target).inc()
