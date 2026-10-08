@@ -120,15 +120,25 @@ public class InteractionFeatureJob {
         .sinkTo(buildKafkaSink(config.kafkaBootstrapServers, config.deadLetterTopic, null, config))
         .name("invalid-recommendation-event-dlq");
 
-    recommendationEvents
+    DataStream<RecommendationImpressionEvent> servedRecommendationEvents =
+        recommendationEvents.filter(event -> !event.viewed).name("served-recommendation-events");
+
+    servedRecommendationEvents
         .addSink(buildRecommendationImpressionSink(config))
         .name("postgres-recommendation-impressions");
 
-    recommendationEvents
+    servedRecommendationEvents
         .flatMap(new RecommendationImpressionItemFanout())
         .returns(RecommendationImpressionItemRow.class)
         .addSink(buildRecommendationImpressionItemSink(config))
         .name("postgres-recommendation-impression-items");
+
+    recommendationEvents
+        .filter(event -> event.viewed)
+        .flatMap(new RecommendationImpressionItemFanout())
+        .returns(RecommendationImpressionItemRow.class)
+        .addSink(buildRecommendationImpressionViewSink(config))
+        .name("postgres-recommendation-impression-views");
 
     DataStream<InteractionEvent> events =
         parsed.assignTimestampsAndWatermarks(
@@ -332,6 +342,36 @@ public class InteractionFeatureJob {
             .build());
   }
 
+  private static org.apache.flink.streaming.api.functions.sink.SinkFunction<RecommendationImpressionItemRow>
+      buildRecommendationImpressionViewSink(JobConfig config) {
+    String sql =
+        "INSERT INTO recommendation_impression_views "
+            + "(event_id, impression_id, product_id, position, context, viewed_at) "
+            + "VALUES (?, ?, ?, ?, CAST(? AS json), ?) "
+            + "ON CONFLICT (impression_id, product_id) DO NOTHING";
+    return JdbcSink.sink(
+        sql,
+        (statement, item) -> {
+          statement.setString(1, item.eventId);
+          statement.setString(2, item.impressionId);
+          statement.setString(3, item.productId);
+          statement.setInt(4, item.position);
+          statement.setString(5, jsonString(item.featureSnapshot));
+          statement.setTimestamp(6, Timestamp.from(Instant.ofEpochMilli(item.eventTimeMillis)));
+        },
+        JdbcExecutionOptions.builder()
+            .withBatchSize(config.jdbcBatchSize)
+            .withBatchIntervalMs(config.jdbcBatchIntervalMs)
+            .withMaxRetries(config.jdbcMaxRetries)
+            .build(),
+        new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+            .withUrl(config.postgresJdbcUrl)
+            .withDriverName("org.postgresql.Driver")
+            .withUsername(config.postgresUser)
+            .withPassword(config.postgresPassword)
+            .build());
+  }
+
   private static KafkaSink<String> buildKafkaSink(
       String bootstrapServers, String topic, String transactionalIdPrefix, JobConfig config) {
     var builder =
@@ -456,6 +496,30 @@ public class InteractionFeatureJob {
 
   static RecommendationImpressionEvent parseRecommendationEvent(String raw) throws Exception {
     Map<String, Object> payload = JSON.readValue(raw, MAP_TYPE);
+    String eventType = stringValue(payload.get("event_type"));
+    if ("recommendation_viewed".equals(eventType)) {
+      String eventId = stringValue(payload.get("event_id"));
+      String impressionId = stringValue(payload.get("impression_id"));
+      String productId = stringValue(payload.get("product_id"));
+      if (eventId.isBlank() || impressionId.isBlank() || productId.isBlank()) {
+        throw new IllegalArgumentException(
+            "recommendation view missing event_id/impression_id/product_id");
+      }
+      RecommendationImpressionEvent event = new RecommendationImpressionEvent();
+      event.viewed = true;
+      event.impressionId = impressionId;
+      event.userId = stringValue(payload.get("user_id"));
+      event.eventTimeMillis = recommendationEventTimeMillis(payload, safeMap(payload.get("context")));
+      RecommendationImpressionItemRow item = new RecommendationImpressionItemRow();
+      item.eventId = eventId;
+      item.impressionId = impressionId;
+      item.productId = productId;
+      item.position = intValue(payload.get("position"), 1);
+      item.featureSnapshot = safeMap(payload.get("context"));
+      item.eventTimeMillis = event.eventTimeMillis;
+      event.itemRows.add(item);
+      return event;
+    }
     Map<String, Object> metadata = safeMap(payload.get("metadata"));
     String impressionId =
         nullableString(firstNonNull(metadata.get("impression_id"), payload.get("impression_id")));
@@ -1133,6 +1197,7 @@ public class InteractionFeatureJob {
   }
 
   public static final class RecommendationImpressionEvent implements Serializable {
+    public boolean viewed;
     public String impressionId;
     public String requestId;
     public String userId;
@@ -1146,6 +1211,7 @@ public class InteractionFeatureJob {
   }
 
   public static final class RecommendationImpressionItemRow implements Serializable {
+    public String eventId;
     public String impressionId;
     public String productId;
     public int position;

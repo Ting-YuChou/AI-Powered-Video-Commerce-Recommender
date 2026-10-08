@@ -1,5 +1,63 @@
 # Progress
 
+## 2026-10-08 — Flink, event lineage, artifacts, and scoring reliability
+
+- Made the default startup path Flink-aware with idempotent named-job submission,
+  exact-one-job health checks, and a missing/duplicate-job alert. Content worker
+  failures now update status and rethrow so Kafka retry/DLQ owns offset commits.
+- Added fail-closed vector bootstrap modes and checksum/dimension/count manifests;
+  local artifacts publish immutable generations through one atomic active pointer,
+  while configured object-storage visual-index bundles sync and activate directly.
+  Sample data is created only by the explicit demo bootstrap service. Production
+  Helm values require verified vector and ranking artifacts.
+- Added UUID interaction idempotency through a leased Postgres ledger, durable
+  served-impression outbox dispatch, viewed-impression API/frontend tracking,
+  Flink viewed materialization, orphan isolation, reconciliation metrics, and
+  viewed-only negative sampling. Migration: `008_recommendation_event_reliability.sql`.
+- Follow-up two-axis review added owner-token-safe Postgres leases, Postgres
+  readiness, original content-error preservation, durable outbox retry recognition,
+  durable-slate validation for viewed events, attribution-window enforcement, and
+  viewed-history gating in the authoritative Flink PIT materialization.
+- Added the versioned `business-value-v1` Torch/NumPy score policy across training,
+  NDCG evaluation, model selection, and serving post-processing. Exact-version
+  Triton materialization now enforces the same policy and normalization metadata. Impression
+  snapshots and artifact metadata retain raw score, serving score, CTCVR,
+  predicted value, policy version, and deterministic product-ID tie breaking.
+- Key files: `startup.sh`, `video_commerce/data_plane/system_store.py`,
+  `video_commerce/services/interaction_ingest/api.py`,
+  `video_commerce/services/recommendation/api.py`,
+  `video_commerce/ml/ranking_score.py`, `video_commerce/ml/vector_search.py`,
+  `flink-jobs/interaction-features/`, and
+  `docs/operations/event-and-artifact-reliability.md`.
+- Verification: offline backend Docker suite 629 passed/9 skipped; Flink Maven suite 28
+  passed; frontend lint, 14 tests, and production build passed; Compose config,
+  shell/Python syntax, Helm lint, and kubeconform 33/33 passed.
+- Known gaps: the live Compose integration run rebuilt all affected images but
+  stopped before tests because the existing Kafka/ZooKeeper volumes have a stale
+  cluster-ID mismatch (`rGFua...` versus `dM0r...`). Containers were removed and
+  volumes preserved. Hot/unique load baselines therefore remain unrun; no latency
+  or production-readiness claim is made from the offline checks.
+
+## 2026-10-07 — Source-grounded project strengthening review
+
+- Reviewed split-service data capture, Kafka/Flink features, retrieval/ranking,
+  PIT training, artifacts, frontend, CI, and deployment defaults at `5695367`.
+  Added a prioritized report with 23 findings, source locations, model ablations,
+  acceptance criteria, and a staged implementation roadmap; runtime is unchanged.
+- Confirmed Compose default/PIT profile gaps, content-worker exceptions returning
+  handled to the Kafka retry wrapper, HTTP retry event-ID instability, synthetic
+  catalog bootstrap, serving/evaluation score mismatch, and scaling opportunities.
+- Key files: `docs/reviews/2026-10-07-project-strengthening-review.md`, `PROGRESS.md`.
+- Verification: Compose config and filtered profile rendering; 15 PIT/contract
+  tests plus 46 synchronous ranking/DIN tests passed (16 async deselected); two
+  isolated source-method probes; frontend lint/build passed. Frontend tests first
+  failed under Node 26 Web Storage, then 14 passed with
+  `NODE_OPTIONS=--no-experimental-webstorage`; no source fix was applied.
+- Gaps: Docker daemon unavailable; broader host tests need pytest-asyncio,
+  cv2/faiss/redis. No live Kafka/Flink, full backend/integration suite, model-quality
+  training, Helm validation, or new capacity benchmark. Findings remain open;
+  this task produced the review, not the proposed implementation.
+
 ## 2026-08-12 — Opt-in ONNX Runtime and Triton ranking backend
 
 - Added an offline opset-17 ONNX export contract for verified DCN and DCN+DIN

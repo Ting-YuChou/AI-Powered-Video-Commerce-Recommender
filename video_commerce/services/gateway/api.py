@@ -21,7 +21,11 @@ from video_commerce.common.cache_codec import json_dumps
 from video_commerce.common.config import Config
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.kafka_client import close_kafka, init_kafka
-from video_commerce.common.models import RecommendationRequest, UserInteractionRequest
+from video_commerce.common.models import (
+    RecommendationRequest,
+    UserInteractionRequest,
+    ViewedImpressionRequest,
+)
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.common.service_common import (
     RedisRateLimiter,
@@ -348,6 +352,19 @@ async def interactions(request: Request, payload: UserInteractionRequest = Body(
     return await _proxy_json_request(
         proxy_pool=interaction_proxy_pool,
         path="/api/interactions",
+        target="interaction-ingest-service",
+        payload=payload.dict(),
+        request=request,
+    )
+
+
+@app.post("/api/impressions/viewed")
+async def viewed_impressions(
+    request: Request, payload: ViewedImpressionRequest = Body(...)
+):
+    return await _proxy_json_request(
+        proxy_pool=interaction_proxy_pool,
+        path="/api/impressions/viewed",
         target="interaction-ingest-service",
         payload=payload.dict(),
         request=request,

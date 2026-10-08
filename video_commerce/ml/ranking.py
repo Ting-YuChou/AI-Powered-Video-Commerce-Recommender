@@ -26,6 +26,11 @@ import os
 import tempfile
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import ndcg_score, roc_auc_score
+from video_commerce.ml.ranking_score import (
+    SCORE_POLICY_VERSION,
+    canonical_score_numpy,
+    canonical_score_torch,
+)
 
 # Local imports
 from video_commerce.common.models import (
@@ -1873,9 +1878,12 @@ class RankingModel:
         ).reshape(-1)
         ctcvr = np.asarray(predictions.get("ctcvr", ctr * cvr)).reshape(-1)
         predictions["ctcvr"] = np.clip(ctcvr, 0.0, 1.0).astype(np.float32)
-        predictions["business_score"] = (
-            predictions["ctcvr"] * predicted_values
-        ).astype(np.float32)
+        predictions["business_score"] = canonical_score_numpy(
+            ctcvr=predictions["ctcvr"],
+            predicted_value=predicted_values,
+            raw_ranking_score=predictions.get("ranking_score", predicted_values),
+            business_score_enabled=True,
+        )
 
     def build_recommendations_from_predictions(
         self,
@@ -1900,11 +1908,13 @@ class RankingModel:
         if top_count <= 0:
             return [], round((time.perf_counter() - response_stage_started) * 1000, 2)
 
-        if ranking_scores.shape[0] > top_count:
-            top_indices = np.argpartition(-ranking_scores, top_count - 1)[:top_count]
-            top_indices = top_indices[np.argsort(-ranking_scores[top_indices])]
-        else:
-            top_indices = np.argsort(-ranking_scores)
+        top_indices = sorted(
+            range(min(len(valid_candidates), ranking_scores.shape[0])),
+            key=lambda index: (
+                -float(ranking_scores[index]),
+                str(_candidate_get(valid_candidates[index][0], "product_id", "")),
+            ),
+        )[:top_count]
 
         for i in top_indices:
             candidate, metadata = valid_candidates[int(i)]
@@ -1913,6 +1923,10 @@ class RankingModel:
             gmv_source = predictions.get("predicted_value", predictions.get("gmv"))
             gmv_score = float(gmv_source[i])
             ranking_score = float(ranking_scores[i])
+            raw_ranking_score = float(predictions["ranking_score"][i])
+            ctcvr_score = float(
+                predictions.get("ctcvr", predictions["ctr"] * predictions["cvr"])[i]
+            )
 
             if getattr(self.config, "business_score_enabled", True):
                 confidence_score = max(0.0, min(ctr_score * cvr_score, 1.0))
@@ -1947,6 +1961,10 @@ class RankingModel:
                     rating=metadata.get("rating"),
                     confidence_score=min(confidence_score, 1.0),
                     ranking_score=ranking_score,
+                    raw_ranking_score=raw_ranking_score,
+                    ctcvr=ctcvr_score,
+                    predicted_value=gmv_score,
+                    score_policy_version=SCORE_POLICY_VERSION,
                     reason=reason,
                 )
             )
@@ -2557,7 +2575,34 @@ class RankingModel:
             if len(set(ctr_labels)) > 1
             else None
         )
-        scores = predictions["ranking_score"].detach().cpu().numpy().reshape(-1)
+        raw_scores = predictions["ranking_score"].detach().cpu().numpy().reshape(-1)
+        normalized_values = predictions["gmv"].detach().cpu().numpy().reshape(-1)
+        bucket_ids = labels.get("value_bucket")
+        resolved_bucket_ids = (
+            bucket_ids.detach().cpu().numpy().reshape(-1).tolist()
+            if bucket_ids is not None
+            else None
+        )
+        predicted_values = np.asarray(
+            [
+                self._inverse_transform_business_value(value, bucket_id)
+                for value, bucket_id in zip(
+                    normalized_values,
+                    resolved_bucket_ids or [None] * len(normalized_values),
+                )
+            ],
+            dtype=np.float32,
+        )
+        scores = canonical_score_numpy(
+            ctcvr=predictions.get(
+                "ctcvr", predictions["ctr"] * predictions["cvr"]
+            ).detach().cpu().numpy().reshape(-1),
+            predicted_value=predicted_values,
+            raw_ranking_score=raw_scores,
+            business_score_enabled=bool(
+                getattr(self.config, "business_score_enabled", True)
+            ),
+        )
         relevance = labels["ranking_relevance"].detach().cpu().numpy().reshape(-1)
         groups = labels["ltr_group"].detach().cpu().numpy().reshape(-1)
         group_ndcg = []
@@ -3506,12 +3551,23 @@ class RankingModel:
             + self.config.gmv_weight * gmv_loss
         )
 
+        canonical_training_score = canonical_score_torch(
+            ctcvr=ctcvr_predictions,
+            predicted_value=self._inverse_transform_business_value_tensor(
+                predictions["gmv"], labels.get("value_bucket")
+            ),
+            raw_ranking_score=predictions["ranking_score"],
+            business_score_enabled=bool(
+                getattr(self.config, "business_score_enabled", True)
+            ),
+        )
+
         if (
             getattr(self.config, "ltr_pairwise_enabled", False)
             and getattr(self.config, "ltr_pairwise_weight", 0.0) > 0
         ):
             pairwise_loss = self._compute_pairwise_ltr_loss(
-                predictions["ranking_score"],
+                canonical_training_score,
                 labels.get("ranking_relevance"),
                 labels.get("pairwise_group"),
             )
@@ -3526,7 +3582,7 @@ class RankingModel:
             and getattr(self.config, "ltr_listwise_weight", 0.0) > 0
         ):
             listwise_loss = self._compute_listwise_ltr_loss(
-                predictions["ranking_score"],
+                canonical_training_score,
                 labels.get("ranking_relevance"),
                 labels.get("ltr_group"),
                 labels.get("ltr_is_slate_sample"),
@@ -3538,6 +3594,35 @@ class RankingModel:
             )
 
         return total_loss
+
+    def _inverse_transform_business_value_tensor(
+        self,
+        normalized_value: torch.Tensor,
+        bucket_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        result = torch.empty_like(normalized_value)
+        flattened = normalized_value.reshape(-1)
+        flattened_result = result.reshape(-1)
+        resolved_buckets = (
+            bucket_ids.reshape(-1)
+            if bucket_ids is not None
+            else torch.full_like(flattened, -1, dtype=torch.long)
+        )
+        for bucket in torch.unique(resolved_buckets).tolist():
+            bucket_id = None if int(bucket) < 0 else int(bucket)
+            stats = self._stats_for_value_bucket(bucket_id)
+            selected = resolved_buckets == int(bucket)
+            if int(stats.get("count", 0) or 0) <= 0:
+                flattened_result[selected] = flattened[selected].clamp_min(0.0)
+                continue
+            logged = flattened[selected] * float(stats.get("std", 1.0) or 1.0)
+            logged = logged + float(stats.get("mean", 0.0))
+            values = torch.expm1(logged).clamp_min(0.0)
+            clip = stats.get("clip")
+            if clip is not None:
+                values = values.clamp_max(max(0.0, float(clip)))
+            flattened_result[selected] = values
+        return result
 
     def _binary_cross_entropy_with_pos_weight(
         self,
@@ -3778,6 +3863,7 @@ class RankingModel:
                     "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
                     "feature_assembler_version": self.feature_assembler.version,
                     "ranking_objective_version": self.ranking_objective_version,
+                    "score_policy_version": SCORE_POLICY_VERSION,
                     "value_transform_stats": self.value_transform_stats,
                     "value_bucket_mapping": self.value_bucket_mapping,
                     "trimodal_enabled": bool(

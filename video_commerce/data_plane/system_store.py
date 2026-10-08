@@ -8,8 +8,10 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import logging
 import time
+import uuid
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -292,8 +294,17 @@ def _score_snapshot_from_item(item: Mapping[str, Any]) -> Dict[str, Any]:
 def build_ltr_training_samples_from_impression_records(
     impression_items: Iterable[Mapping[str, Any]],
     interactions: Iterable[Mapping[str, Any]],
+    impression_views: Optional[Iterable[Mapping[str, Any]]] = None,
+    attribution_window_hours: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Build slate-level ranking samples with no-click negatives."""
+    impression_items = list(impression_items)
+    impression_times = {
+        str(item.get("impression_id") or "").strip(): _coerce_datetime(
+            item.get("created_at")
+        )
+        for item in impression_items
+    }
     strongest_interactions: Dict[tuple[str, str, str], Mapping[str, Any]] = {}
     for interaction in interactions:
         context = _safe_dict(interaction.get("context"))
@@ -302,12 +313,35 @@ def build_ltr_training_samples_from_impression_records(
         user_id = str(interaction.get("user_id") or "").strip()
         if not impression_id or not product_id or not user_id:
             continue
+        if attribution_window_hours is not None:
+            impression_time = impression_times.get(impression_id)
+            interaction_time = _coerce_datetime(
+                interaction.get("occurred_at") or interaction.get("event_time")
+            )
+            if (
+                impression_time is None
+                or interaction_time is None
+                or interaction_time < impression_time
+                or interaction_time
+                > impression_time + timedelta(hours=attribution_window_hours)
+            ):
+                continue
         key = (impression_id, product_id, user_id)
         previous = strongest_interactions.get(key)
         if previous is None or _interaction_relevance(
             interaction.get("action")
         ) >= _interaction_relevance(previous.get("action")):
             strongest_interactions[key] = interaction
+
+    viewed_keys = None
+    if impression_views is not None:
+        viewed_keys = {
+            (
+                str(view.get("impression_id") or "").strip(),
+                str(view.get("product_id") or "").strip(),
+            )
+            for view in impression_views
+        }
 
     samples: List[Dict[str, Any]] = []
     for item in impression_items:
@@ -320,6 +354,9 @@ def build_ltr_training_samples_from_impression_records(
         matched_interaction = strongest_interactions.get(
             (impression_id, product_id, user_id)
         )
+        was_viewed = viewed_keys is None or (impression_id, product_id) in viewed_keys
+        if matched_interaction is None and not was_viewed:
+            continue
         action = str(
             matched_interaction.get("action") if matched_interaction else "view"
         )
@@ -351,6 +388,7 @@ def build_ltr_training_samples_from_impression_records(
             "recommendation_source": source,
             "recommendation_ranking_score": scores.get("ranking_score"),
             "candidate_scores": scores,
+            "impression_viewed": bool(was_viewed),
         }
         if item.get("content_id") is not None:
             context["content_id"] = item.get("content_id")
@@ -427,6 +465,7 @@ TWO_TOWER_POSITIVE_ACTIONS = {"click", "add_to_cart", "purchase", "favorite", "s
 def build_two_tower_training_negatives_from_impression_records(
     impression_items: Iterable[Mapping[str, Any]],
     interactions: Iterable[Mapping[str, Any]],
+    impression_views: Optional[Iterable[Mapping[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Build weak retrieval negatives from returned no-click and rejected candidates."""
     positive_keys: Set[tuple[str, str, str]] = set()
@@ -440,6 +479,16 @@ def build_two_tower_training_negatives_from_impression_records(
         user_id = str(interaction.get("user_id") or "").strip()
         if impression_id and product_id and user_id:
             positive_keys.add((impression_id, product_id, user_id))
+
+    viewed_keys = None
+    if impression_views is not None:
+        viewed_keys = {
+            (
+                str(view.get("impression_id") or "").strip(),
+                str(view.get("product_id") or "").strip(),
+            )
+            for view in impression_views
+        }
 
     negatives: List[Dict[str, Any]] = []
     emitted: Set[tuple[str, str, str, str]] = set()
@@ -461,6 +510,8 @@ def build_two_tower_training_negatives_from_impression_records(
                     rejected_contexts[(impression_id, user_id)].append(rejected)
 
         if (impression_id, product_id, user_id) in positive_keys:
+            continue
+        if viewed_keys is not None and (impression_id, product_id) not in viewed_keys:
             continue
         key = (impression_id, product_id, user_id, "impression_no_click")
         if key in emitted:
@@ -581,6 +632,68 @@ class RecommendationImpressionItem(Base):
     scores: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+
+
+class RecommendationImpressionView(Base):
+    __tablename__ = "recommendation_impression_views"
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    impression_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    product_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    context: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    viewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RecommendationEventOutbox(Base):
+    __tablename__ = "recommendation_event_outbox"
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    impression_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    claimed_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    claim_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    published_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class InteractionIdempotencyLedger(Base):
+    __tablename__ = "interaction_idempotency_ledger"
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    published_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
@@ -847,6 +960,18 @@ Index(
     RecommendationImpressionItem.impression_id,
     RecommendationImpressionItem.product_id,
     unique=True,
+)
+Index(
+    "ux_recommendation_impression_views_impression_product",
+    RecommendationImpressionView.impression_id,
+    RecommendationImpressionView.product_id,
+    unique=True,
+)
+Index(
+    "ix_recommendation_event_outbox_pending",
+    RecommendationEventOutbox.published_at,
+    RecommendationEventOutbox.next_attempt_at,
+    RecommendationEventOutbox.claim_expires_at,
 )
 Index(
     "ix_catalog_feature_outbox_pending",
@@ -1417,6 +1542,330 @@ class SystemStore:
             await session.execute(item_stmt)
         self._update_pool_metrics()
 
+    async def record_recommendation_impression_views(
+        self,
+        *,
+        impression_id: str,
+        viewed_at: float,
+        items: Iterable[Mapping[str, Any]],
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> int:
+        """Persist viewport-confirmed items idempotently."""
+        if not self.enabled:
+            return 0
+        rows = []
+        for item in items:
+            event_id = str(item.get("event_id") or "").strip()
+            product_id = str(item.get("product_id") or "").strip()
+            if not event_id or not product_id:
+                continue
+            rows.append(
+                {
+                    "event_id": event_id,
+                    "impression_id": impression_id,
+                    "product_id": product_id,
+                    "position": max(1, int(item.get("position") or 1)),
+                    "context": dict(context or {}),
+                    "viewed_at": _coerce_datetime(viewed_at) or _utc_now(),
+                }
+            )
+        if not rows:
+            return 0
+        stmt = pg_insert(RecommendationImpressionView).values(rows)
+        stmt = stmt.on_conflict_do_nothing()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(stmt)
+        self._update_pool_metrics()
+        return int(result.rowcount or 0)
+
+    async def is_known_recommendation_impression(self, impression_id: str) -> bool:
+        """Return whether an impression is durable in the outbox or materialized tables."""
+        if not self.enabled:
+            return False
+        async with self.session_factory() as session:
+            materialized = await session.scalar(
+                select(RecommendationImpression.impression_id)
+                .where(RecommendationImpression.impression_id == impression_id)
+                .limit(1)
+            )
+            if materialized is not None:
+                return True
+            staged = await session.scalar(
+                select(RecommendationEventOutbox.impression_id)
+                .where(RecommendationEventOutbox.impression_id == impression_id)
+                .limit(1)
+            )
+            return staged is not None
+
+    async def get_recommendation_impression_slate(
+        self, impression_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve the durable user and product positions for a served slate."""
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            impression = await session.scalar(
+                select(RecommendationImpression).where(
+                    RecommendationImpression.impression_id == impression_id
+                )
+            )
+            if impression is not None:
+                items = (
+                    await session.execute(
+                        select(RecommendationImpressionItem).where(
+                            RecommendationImpressionItem.impression_id == impression_id
+                        )
+                    )
+                ).scalars().all()
+                return {
+                    "user_id": impression.user_id,
+                    "items": {item.product_id: item.position for item in items},
+                }
+            outbox = await session.scalar(
+                select(RecommendationEventOutbox).where(
+                    RecommendationEventOutbox.impression_id == impression_id
+                )
+            )
+            if outbox is None:
+                return None
+            event = dict(outbox.event_payload or {})
+            metadata = _safe_dict(event.get("metadata"))
+            displayed_items = metadata.get("displayed_items") or []
+            return {
+                "user_id": str(event.get("user_id") or ""),
+                "items": {
+                    str(item.get("product_id")): int(item.get("position") or 0)
+                    for item in displayed_items
+                    if isinstance(item, Mapping) and item.get("product_id")
+                },
+            }
+
+    async def claim_interaction_event(
+        self,
+        *,
+        event_id: str,
+        payload_hash: str,
+        event_payload: Mapping[str, Any],
+        lease_seconds: int,
+    ) -> Dict[str, Any]:
+        """Claim an interaction publish lease and preserve its original payload."""
+        now = _utc_now()
+        lease_expires_at = now + timedelta(seconds=max(1, int(lease_seconds)))
+        claim_token = uuid.uuid4().hex
+        insert_stmt = pg_insert(InteractionIdempotencyLedger).values(
+            event_id=event_id,
+            payload_hash=payload_hash,
+            event_payload=dict(event_payload),
+            status="pending",
+            lease_owner=claim_token,
+            lease_expires_at=lease_expires_at,
+            updated_at=now,
+        ).on_conflict_do_nothing(index_elements=[InteractionIdempotencyLedger.event_id])
+        async with self.session_factory.begin() as session:
+            insert_result = await session.execute(insert_stmt)
+            inserted = bool(insert_result.rowcount)
+            row = await session.scalar(
+                select(InteractionIdempotencyLedger)
+                .where(InteractionIdempotencyLedger.event_id == event_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise RuntimeError("interaction ledger claim disappeared")
+            if row.payload_hash != payload_hash:
+                return {"status": "collision"}
+            if row.status == "published":
+                return {"status": "duplicate", "event_payload": dict(row.event_payload)}
+            if (
+                not inserted
+                and row.lease_expires_at
+                and row.lease_expires_at > now
+            ):
+                return {"status": "pending"}
+            row.status = "pending"
+            row.lease_owner = claim_token
+            row.lease_expires_at = lease_expires_at
+            row.updated_at = now
+            return {
+                "status": "claimed",
+                "claim_token": claim_token,
+                "event_payload": dict(row.event_payload),
+            }
+
+    async def mark_interaction_event_published(
+        self, event_id: str, *, claim_token: str
+    ) -> bool:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(InteractionIdempotencyLedger)
+                .where(
+                    InteractionIdempotencyLedger.event_id == event_id,
+                    InteractionIdempotencyLedger.status == "pending",
+                    InteractionIdempotencyLedger.lease_owner == claim_token,
+                )
+                .values(
+                    status="published",
+                    published_at=now,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=now,
+                )
+            )
+        return bool(result.rowcount)
+
+    async def release_interaction_event_claim(
+        self, event_id: str, *, claim_token: str
+    ) -> bool:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(InteractionIdempotencyLedger)
+                .where(
+                    InteractionIdempotencyLedger.event_id == event_id,
+                    InteractionIdempotencyLedger.status == "pending",
+                    InteractionIdempotencyLedger.lease_owner == claim_token,
+                )
+                .values(lease_owner=None, lease_expires_at=now, updated_at=now)
+            )
+        return bool(result.rowcount)
+
+    async def enqueue_recommendation_event(
+        self, event: Mapping[str, Any]
+    ) -> str:
+        """Durably stage one served-impression event before returning its ID."""
+        if not self.enabled:
+            return False
+        metadata = _safe_dict(event.get("metadata"))
+        event_id = str(event.get("event_id") or "").strip()
+        impression_id = str(metadata.get("impression_id") or "").strip()
+        if not event_id or not impression_id:
+            raise ValueError("recommendation outbox event requires event_id and impression_id")
+        payload = dict(event)
+        payload_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        stmt = pg_insert(RecommendationEventOutbox).values(
+            event_id=event_id,
+            impression_id=impression_id,
+            payload_hash=payload_hash,
+            event_payload=payload,
+            next_attempt_at=_utc_now(),
+        )
+        stmt = stmt.on_conflict_do_nothing(
+            index_elements=[RecommendationEventOutbox.event_id]
+        )
+        async with self.session_factory.begin() as session:
+            result = await session.execute(stmt)
+            if result.rowcount:
+                outcome = "inserted"
+            else:
+                existing = await session.scalar(
+                    select(RecommendationEventOutbox).where(
+                        RecommendationEventOutbox.event_id == event_id
+                    )
+                )
+                if existing is None or existing.payload_hash != payload_hash:
+                    raise ValueError(
+                        "recommendation outbox event_id payload collision"
+                    )
+                outcome = "duplicate"
+        self._update_pool_metrics()
+        return outcome
+
+    async def claim_recommendation_outbox(
+        self, *, worker_id: str, batch_size: int = 50, lease_seconds: int = 30
+    ) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        now = _utc_now()
+        statement = (
+            select(RecommendationEventOutbox)
+            .where(
+                RecommendationEventOutbox.published_at.is_(None),
+                RecommendationEventOutbox.next_attempt_at <= now,
+                or_(
+                    RecommendationEventOutbox.claim_expires_at.is_(None),
+                    RecommendationEventOutbox.claim_expires_at < now,
+                ),
+            )
+            .order_by(RecommendationEventOutbox.created_at)
+            .limit(max(1, int(batch_size)))
+            .with_for_update(skip_locked=True)
+        )
+        async with self.session_factory.begin() as session:
+            rows = list((await session.execute(statement)).scalars().all())
+            for row in rows:
+                row.claimed_by = worker_id
+                row.claim_expires_at = now + timedelta(seconds=max(1, lease_seconds))
+            events = [dict(row.event_payload) for row in rows]
+        self._update_pool_metrics()
+        return events
+
+    async def mark_recommendation_outbox_published(
+        self, event_id: str, *, worker_id: str
+    ) -> None:
+        if not self.enabled:
+            return
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                update(RecommendationEventOutbox)
+                .where(
+                    RecommendationEventOutbox.event_id == event_id,
+                    RecommendationEventOutbox.claimed_by == worker_id,
+                )
+                .values(
+                    published_at=_utc_now(),
+                    attempts=RecommendationEventOutbox.attempts + 1,
+                    claimed_by=None,
+                    claim_expires_at=None,
+                    last_error=None,
+                )
+            )
+        self._update_pool_metrics()
+
+    async def mark_recommendation_outbox_failed(
+        self, event_id: str, error: str, *, worker_id: str
+    ) -> None:
+        if not self.enabled:
+            return
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            row = await session.get(RecommendationEventOutbox, event_id)
+            attempts = int(row.attempts if row else 0) + 1
+            delay = min(300, 2 ** min(attempts, 8))
+            await session.execute(
+                update(RecommendationEventOutbox)
+                .where(
+                    RecommendationEventOutbox.event_id == event_id,
+                    RecommendationEventOutbox.claimed_by == worker_id,
+                )
+                .values(
+                    attempts=attempts,
+                    last_error=str(error)[:2000],
+                    next_attempt_at=now + timedelta(seconds=delay),
+                    claimed_by=None,
+                    claim_expires_at=None,
+                )
+            )
+        self._update_pool_metrics()
+
+    async def get_recommendation_outbox_stats(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"pending": 0, "oldest_age_seconds": 0.0}
+        async with self.session_factory() as session:
+            pending, oldest = (
+                await session.execute(
+                    select(
+                        func.count(RecommendationEventOutbox.event_id),
+                        func.min(RecommendationEventOutbox.created_at),
+                    ).where(RecommendationEventOutbox.published_at.is_(None))
+                )
+            ).one()
+        oldest_age = max(0.0, (_utc_now() - oldest).total_seconds()) if oldest else 0.0
+        return {"pending": int(pending or 0), "oldest_age_seconds": oldest_age}
+
     async def get_ltr_training_impressions(
         self,
         *,
@@ -1453,6 +1902,7 @@ class SystemStore:
             }
             item_rows = []
             interaction_rows = []
+            view_rows = []
             if impression_ids:
                 item_stmt = (
                     select(RecommendationImpressionItem)
@@ -1468,6 +1918,15 @@ class SystemStore:
                 )
                 item_result = await session.execute(item_stmt)
                 item_rows = item_result.scalars().all()
+                view_rows = (
+                    await session.execute(
+                        select(RecommendationImpressionView).where(
+                            RecommendationImpressionView.impression_id.in_(
+                                sorted(impression_ids)
+                            )
+                        )
+                    )
+                ).scalars().all()
 
                 user_ids = sorted(
                     {
@@ -1536,6 +1995,18 @@ class SystemStore:
         return build_ltr_training_samples_from_impression_records(
             flattened_items,
             interactions,
+            impression_views=[
+                {
+                    "event_id": row.event_id,
+                    "impression_id": row.impression_id,
+                    "product_id": row.product_id,
+                    "viewed_at": row.viewed_at,
+                }
+                for row in view_rows
+            ],
+            attribution_window_hours=int(
+                self.config.ltr_attribution_window_hours
+            ),
         )
 
     async def get_two_tower_training_impression_negatives(
@@ -1574,6 +2045,7 @@ class SystemStore:
             }
             item_rows = []
             interaction_rows = []
+            view_rows = []
             if impression_ids:
                 item_stmt = (
                     select(RecommendationImpressionItem)
@@ -1589,6 +2061,15 @@ class SystemStore:
                 )
                 item_result = await session.execute(item_stmt)
                 item_rows = item_result.scalars().all()
+                view_rows = (
+                    await session.execute(
+                        select(RecommendationImpressionView).where(
+                            RecommendationImpressionView.impression_id.in_(
+                                sorted(impression_ids)
+                            )
+                        )
+                    )
+                ).scalars().all()
 
                 user_ids = sorted(
                     {
@@ -1657,6 +2138,15 @@ class SystemStore:
         return build_two_tower_training_negatives_from_impression_records(
             flattened_items,
             interactions,
+            impression_views=[
+                {
+                    "event_id": row.event_id,
+                    "impression_id": row.impression_id,
+                    "product_id": row.product_id,
+                    "viewed_at": row.viewed_at,
+                }
+                for row in view_rows
+            ],
         )
 
     async def get_training_interactions(

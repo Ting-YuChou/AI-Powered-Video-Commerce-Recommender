@@ -18,6 +18,7 @@ from typing import Dict, List, Any, Optional, Tuple
 import time
 from pathlib import Path
 import threading
+import hashlib
 
 # Local imports
 from video_commerce.common.models import ProductData, CandidateProduct
@@ -111,25 +112,133 @@ class VectorSearchEngine:
     
     async def load_index(self, force_rebuild: bool = False):
         """Load or build the FAISS index."""
+        previous_state = None
+        if self.is_loaded and self.index is not None:
+            previous_state = (
+                self.index,
+                self.product_index_map,
+                self.product_embeddings,
+                self.product_metadata,
+                self.last_updated,
+                self.catalog_version,
+            )
         try:
-            index_path = Path(self.config.index_path)
-            metadata_path = index_path.with_suffix('.metadata.json')
+            logical_index_path = Path(self.config.index_path)
+            index_path, metadata_path = self._resolve_active_artifact_paths(
+                logical_index_path
+            )
             
             # Try to load existing index
             if not force_rebuild and index_path.exists() and metadata_path.exists():
+                manifest = self._validate_index_manifest(index_path, metadata_path)
                 await self._load_existing_index(index_path, metadata_path)
+                if manifest and int(manifest.get("product_count", -1)) != len(
+                    self.product_index_map
+                ):
+                    raise ValueError("vector index manifest product count mismatch")
+                if self.index.ntotal != len(self.product_index_map):
+                    raise ValueError("vector index row count does not match index map")
+                if set(self.product_index_map) != set(range(self.index.ntotal)):
+                    raise ValueError("vector index map is not contiguous")
             else:
-                # Build new index with sample data
-                await self._build_new_index()
+                mode = str(getattr(self.config, "bootstrap_mode", "required")).lower()
+                if mode == "sample":
+                    raise FileNotFoundError(
+                        "Sample vector index is missing; run "
+                        "python -m scripts.bootstrap_sample_vector_index explicitly"
+                    )
+                elif mode == "empty":
+                    await self._create_empty_index()
+                else:
+                    raise FileNotFoundError(
+                        f"Required vector index artifacts are missing: "
+                        f"{logical_index_path} active generation"
+                    )
             
             self.is_loaded = True
             logger.info(f"Vector search engine ready with {len(self.product_embeddings)} products")
             
         except Exception as e:
             logger.error(f"Failed to load vector index: {e}")
-            # Create empty index as fallback
-            await self._create_empty_index()
+            if previous_state is not None:
+                (
+                    self.index,
+                    self.product_index_map,
+                    self.product_embeddings,
+                    self.product_metadata,
+                    self.last_updated,
+                    self.catalog_version,
+                ) = previous_state
+                self.is_loaded = True
+            else:
+                await self._create_empty_index()
+                self.is_loaded = False
             raise
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _manifest_path(index_path: Path) -> Path:
+        return index_path.with_suffix(".manifest.json")
+
+    @staticmethod
+    def _active_generation_pointer(index_path: Path) -> Path:
+        return index_path.with_suffix(".active.json")
+
+    @staticmethod
+    def _generation_root(index_path: Path) -> Path:
+        return index_path.parent / f"{index_path.stem}.generations"
+
+    def _resolve_active_artifact_paths(self, index_path: Path) -> Tuple[Path, Path]:
+        pointer_path = self._active_generation_pointer(index_path)
+        if not pointer_path.exists():
+            return index_path, index_path.with_suffix(".metadata.json")
+        with pointer_path.open("r", encoding="utf-8") as handle:
+            pointer = json.load(handle)
+        generation = str(pointer.get("generation") or "")
+        if not generation or Path(generation).name != generation:
+            raise ValueError("invalid vector active generation pointer")
+        generation_dir = self._generation_root(index_path) / generation
+        return (
+            generation_dir / index_path.name,
+            generation_dir / index_path.with_suffix(".metadata.json").name,
+        )
+
+    def _validate_index_manifest(
+        self, index_path: Path, metadata_path: Path
+    ) -> Optional[Dict[str, Any]]:
+        manifest_path = self._manifest_path(index_path)
+        if not manifest_path.exists():
+            if str(getattr(self.config, "bootstrap_mode", "empty")) == "required":
+                raise FileNotFoundError(
+                    f"Required vector index manifest is missing: {manifest_path}"
+                )
+            return None
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if int(manifest.get("schema_version", 0)) != 1:
+            raise ValueError("unsupported vector index manifest schema")
+        if int(manifest.get("embedding_dim", -1)) != self.embedding_dim:
+            raise ValueError("vector index manifest embedding dimension mismatch")
+        if str(manifest.get("model_version") or "") != str(self.config.model_version):
+            raise ValueError("vector index manifest model version mismatch")
+        expected = {
+            index_path: manifest.get("faiss_sha256"),
+            metadata_path: manifest.get("metadata_sha256"),
+        }
+        sidecar_path = self._product_embedding_sidecar_path(index_path)
+        if manifest.get("embeddings_sha256"):
+            expected[sidecar_path] = manifest.get("embeddings_sha256")
+        for path, checksum in expected.items():
+            if not checksum or not path.exists() or self._sha256_file(path) != checksum:
+                raise ValueError(f"vector index checksum mismatch: {path.name}")
+        return manifest
     
     async def _load_existing_index(self, index_path: Path, metadata_path: Path):
         """Load existing FAISS index from disk."""
@@ -147,6 +256,8 @@ class VectorSearchEngine:
             # Load metadata
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
+                if int(metadata.get("embedding_dim", self.embedding_dim)) != self.embedding_dim:
+                    raise ValueError("vector index metadata embedding dimension mismatch")
                 self.product_index_map = {int(k): v for k, v in metadata['index_map'].items()}
                 self.product_metadata = metadata['product_metadata']
                 self.last_updated = metadata.get('last_updated', 0)
@@ -613,24 +724,29 @@ class VectorSearchEngine:
             logger.error(f"Error removing product {product_id}: {e}")
     
     async def save_index(self):
-        """Save FAISS index and metadata to disk."""
+        """Publish a verified immutable generation through one atomic pointer."""
         try:
             if not self.index:
                 return
-            
-            index_path = Path(self.config.index_path)
-            metadata_path = index_path.with_suffix('.metadata.json')
-            
-            # Create directory if it doesn't exist
-            index_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Save FAISS index
-            with self.index_lock:
-                faiss.write_index(self.index, str(index_path))
 
-            embedding_sidecar_path = self._save_product_embedding_sidecar(index_path)
-            
-            # Save metadata
+            logical_index_path = Path(self.config.index_path)
+            generation = f"{time.time_ns()}-{os.getpid()}"
+            generation_root = self._generation_root(logical_index_path)
+            staged_generation_dir = generation_root / f".{generation}.tmp"
+            generation_dir = generation_root / generation
+            staged_generation_dir.mkdir(parents=True, exist_ok=False)
+            staged_index_path = staged_generation_dir / logical_index_path.name
+            staged_metadata_path = staged_generation_dir / logical_index_path.with_suffix(
+                ".metadata.json"
+            ).name
+
+            with self.index_lock:
+                faiss.write_index(self.index, str(staged_index_path))
+
+            staged_embedding_sidecar_path = self._save_product_embedding_sidecar(
+                staged_index_path
+            )
+
             metadata = {
                 'index_map': {str(k): v for k, v in self.product_index_map.items()},
                 'product_metadata': self.product_metadata,
@@ -640,17 +756,69 @@ class VectorSearchEngine:
                 'index_type': self.config.index_type,
                 'total_products': len(self.product_embeddings)
             }
-            if embedding_sidecar_path is not None:
-                metadata["embedding_sidecar_path"] = embedding_sidecar_path.name
+            if staged_embedding_sidecar_path is not None:
+                metadata["embedding_sidecar_path"] = staged_embedding_sidecar_path.name
                 metadata["embedding_sidecar_format"] = "npz_product_embeddings_v1"
             
-            with open(metadata_path, 'w') as f:
+            with open(staged_metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
-            
-            logger.info(f"Saved index with {len(self.product_embeddings)} products to {index_path}")
+                f.flush()
+                os.fsync(f.fileno())
+
+            manifest = {
+                "schema_version": 1,
+                "model_version": self.config.model_version,
+                "index_version": str(self.catalog_version or int(time.time() * 1000)),
+                "embedding_dim": self.embedding_dim,
+                "index_type": self.config.index_type,
+                "product_count": len(self.product_index_map),
+                "faiss_sha256": self._sha256_file(staged_index_path),
+                "metadata_sha256": self._sha256_file(staged_metadata_path),
+                "embeddings_sha256": (
+                    self._sha256_file(staged_embedding_sidecar_path)
+                    if staged_embedding_sidecar_path is not None
+                    else None
+                ),
+            }
+            staged_manifest_path = self._manifest_path(staged_index_path)
+            with staged_manifest_path.open("w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            self._validate_index_manifest(staged_index_path, staged_metadata_path)
+            verified_index = faiss.read_index(str(staged_index_path))
+            if verified_index.ntotal != len(self.product_index_map):
+                raise ValueError("staged vector index row count does not match index map")
+
+            os.replace(staged_generation_dir, generation_dir)
+            pointer_path = self._active_generation_pointer(logical_index_path)
+            pointer_tmp = pointer_path.with_name(f".{pointer_path.name}.{generation}.tmp")
+            with pointer_tmp.open("w", encoding="utf-8") as handle:
+                json.dump({"generation": generation}, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(pointer_tmp, pointer_path)
+
+            logger.info(
+                "Saved index with %s products in generation %s",
+                len(self.product_embeddings),
+                generation,
+            )
             
         except Exception as e:
+            for staged_path in (
+                locals().get("pointer_tmp"),
+            ):
+                if isinstance(staged_path, Path) and staged_path.exists():
+                    staged_path.unlink()
+            staged_dir = locals().get("staged_generation_dir")
+            if isinstance(staged_dir, Path) and staged_dir.exists():
+                for path in staged_dir.iterdir():
+                    path.unlink()
+                staged_dir.rmdir()
             logger.error(f"Error saving index: {e}")
+            raise
 
     @staticmethod
     def _product_embedding_sidecar_path(index_path: Path) -> Path:

@@ -73,6 +73,25 @@ class FeatureHistoryMaterializerJobTest {
   }
 
   @Test
+  void recommendationViewedRoutesIntoDedicatedHistory() throws Exception {
+    String raw =
+        "{\"event_id\":\"view-1\",\"event_type\":\"recommendation_viewed\","
+            + "\"impression_id\":\"imp-1\",\"user_id\":\"u1\",\"product_id\":\"p1\","
+            + "\"position\":2,\"context\":{},\"event_time\":101,\"available_at\":102,"
+            + "\"source_event_id\":\"view-1\",\"source_version\":\"client-view-v1\","
+            + "\"feature_definition_version\":\"ranking_ltr_v1\",\"payload_schema_version\":1,"
+            + "\"payload_hash\":\"af07b6c3cde94ec6181d246df40b5518e695c1e1c1dffd98f993ca4b1d11d982\"}";
+
+    List<FeatureHistoryMaterializerJob.LakeHistoryRow> rows =
+        FeatureHistoryMaterializerJob.parseRawEvent(
+            new FeatureHistoryMaterializerJob.RawKafkaEvent("recommendation-events", raw));
+
+    assertEquals(1, rows.size());
+    assertEquals("recommendation_view_history", rows.get(0).targetTable);
+    assertEquals("imp-1:p1", rows.get(0).observationId);
+  }
+
+  @Test
   void legacyOperationalFeatureUpdatesAreNotAcceptedAsHistorySnapshots() {
     assertThrows(
         IllegalArgumentException.class,

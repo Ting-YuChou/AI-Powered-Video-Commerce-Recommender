@@ -63,10 +63,13 @@ data:
   DATABASE_ANALYTICS_SUMMARY_CACHE_TTL_SECONDS: {{ .Values.external.database.analyticsSummaryCacheTtlSeconds | quote }}
   DATABASE_TRAINING_SEQUENCE_LOOKBACK_DAYS: {{ .Values.external.database.trainingSequenceLookbackDays | quote }}
   DATABASE_LTR_IMPRESSION_LOOKBACK_DAYS: {{ .Values.external.database.ltrImpressionLookbackDays | quote }}
+  DATABASE_LTR_ATTRIBUTION_WINDOW_HOURS: {{ .Values.external.database.ltrAttributionWindowHours | quote }}
   DATABASE_IMPRESSION_RETENTION_DAYS: {{ .Values.external.database.impressionRetentionDays | quote }}
   DATABASE_AUTO_CREATE_SCHEMA: {{ .Values.external.database.autoCreateSchema | quote }}
   MODEL_CACHE_DIR: {{ .Values.appConfig.modelCacheDir | quote }}
   VECTOR_INDEX_PATH: {{ .Values.appConfig.vectorIndexPath | quote }}
+  VECTOR_BOOTSTRAP_MODE: {{ .Values.appConfig.vectorBootstrapMode | quote }}
+  VECTOR_MODEL_VERSION: {{ .Values.appConfig.vectorModelVersion | quote }}
   RECOMMENDATION_CF_INDEX_PATH: {{ .Values.appConfig.recommendationCfIndexPath | quote }}
   RECOMMENDATION_SWING_ITEMCF_INDEX_PATH: {{ .Values.appConfig.recommendationSwingItemcfIndexPath | quote }}
   DATA_UPLOAD_DIR: {{ .Values.appConfig.dataUploadDir | quote }}

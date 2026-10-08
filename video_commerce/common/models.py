@@ -15,6 +15,7 @@ except ImportError:
 from typing import List, Dict, Optional, Any, Union, TYPE_CHECKING
 from enum import Enum
 import time
+from uuid import UUID
 
 
 # Enums for categorical fields
@@ -78,6 +79,9 @@ class RecommendationRequest(BaseModel):
 class UserInteractionRequest(BaseModel):
     """Request model for logging user interactions."""
 
+    event_id: Optional[UUID] = Field(
+        None, description="Stable client event identifier reused across retries"
+    )
     user_id: str = Field(..., description="Unique user identifier")
     product_id: str = Field(..., description="Product identifier")
     action: InteractionType = Field(..., description="Type of interaction")
@@ -126,6 +130,19 @@ class UserInteractionRequest(BaseModel):
         }
 
 
+class ViewedImpressionItem(BaseModel):
+    event_id: UUID = Field(..., description="Stable per-item viewport event ID")
+    product_id: str = Field(..., min_length=1, max_length=255)
+    position: int = Field(..., ge=1, le=1000)
+
+
+class ViewedImpressionRequest(BaseModel):
+    impression_id: UUID
+    viewed_at: float
+    items: List[ViewedImpressionItem] = Field(..., min_items=1, max_items=100)
+    context: Dict[str, Any] = Field(default_factory=dict)
+
+
 # Response Models
 class ProductRecommendation(BaseModel):
     """Single product recommendation item."""
@@ -151,6 +168,16 @@ class ProductRecommendation(BaseModel):
         ..., ge=0, le=1, description="Recommendation confidence"
     )
     ranking_score: float = Field(..., description="Internal ranking score")
+    raw_ranking_score: Optional[float] = Field(
+        None, description="Model ranking score before the canonical serving policy"
+    )
+    ctcvr: Optional[float] = Field(None, description="Predicted click-through conversion")
+    predicted_value: Optional[float] = Field(
+        None, description="Inverse-transformed predicted business value"
+    )
+    score_policy_version: Optional[str] = Field(
+        None, description="Canonical serving score policy version"
+    )
     reason: Optional[str] = Field(None, description="Recommendation explanation")
 
     @validator("price", pre=True, always=True)

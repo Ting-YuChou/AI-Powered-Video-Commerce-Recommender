@@ -167,6 +167,16 @@ class ModelArtifactManager:
         if not record:
             return None
 
+        if os.getenv("ENVIRONMENT", "").lower() == "production":
+            from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
+
+            if record.payload.get("score_policy_version") != SCORE_POLICY_VERSION:
+                raise ValueError("ranking artifact score policy is missing or incompatible")
+            if not isinstance(record.payload.get("value_transform_stats"), dict):
+                raise ValueError(
+                    "ranking artifact value normalization metadata is missing"
+                )
+
         record_schema = str(record.payload.get("feature_schema_version") or "")
         schema_incompatible = bool(
             expected_feature_schema_version
@@ -265,6 +275,17 @@ class ModelArtifactManager:
         if record is None:
             return None
         payload = dict(record.payload or {})
+        if os.getenv("ENVIRONMENT", "").lower() == "production":
+            from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
+
+            if payload.get("score_policy_version") != SCORE_POLICY_VERSION:
+                raise ValueError(
+                    "exact ranking artifact score policy is missing or incompatible"
+                )
+            if not isinstance(payload.get("value_transform_stats"), dict):
+                raise ValueError(
+                    "exact ranking artifact value normalization metadata is missing"
+                )
         schema = str(payload.get("feature_schema_version") or "")
         if expected_feature_schema_version and schema != expected_feature_schema_version:
             logger.warning(
@@ -503,6 +524,15 @@ class ModelArtifactManager:
     ) -> Optional[ModelArtifactRecord]:
         if not self.system_store:
             return None
+        from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
+
+        if os.getenv("ENVIRONMENT", "").lower() == "production":
+            if (payload or {}).get("score_policy_version") != SCORE_POLICY_VERSION:
+                raise ValueError("ranking persistence requires the canonical score policy")
+            if not isinstance((payload or {}).get("value_transform_stats"), dict):
+                raise ValueError(
+                    "ranking persistence requires value normalization metadata"
+                )
         if (payload or {}).get(
             "feature_schema_version"
         ) == "ranking_v4_01_temporal_trimodal" and not candidate_sidecar_path:

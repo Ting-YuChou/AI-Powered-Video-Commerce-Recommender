@@ -39,7 +39,8 @@ describe('api payload builders', () => {
 
     expect(buildInteractionPayload('user-123', 'product-1', interactionActions.ADD_TO_CART, {
       session_id: 'session-1',
-    })).toEqual({
+    }, 'event-1')).toEqual({
+      event_id: 'event-1',
       user_id: 'user-123',
       product_id: 'product-1',
       action: 'add_to_cart',

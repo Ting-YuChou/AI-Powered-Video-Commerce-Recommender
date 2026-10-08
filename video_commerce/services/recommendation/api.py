@@ -50,6 +50,7 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
     RankingCoordinatorError,
 )
 from video_commerce.ml.ranking import RankingModel, RankingModelNotReadyError
+from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
 from video_commerce.ml.ranking_history import (
     RANKING_HISTORY_CONTEXT_KEY,
     build_ranking_history_context,
@@ -97,6 +98,7 @@ content_feature_snapshot_refresh_task: Optional[asyncio.Task] = None
 object_storage: Optional[ObjectStorage] = None
 artifact_manager: Optional[ModelArtifactManager] = None
 best_effort_task_queue = None
+recommendation_outbox_task: Optional[asyncio.Task] = None
 _recommendation_singleflight: Dict[str, asyncio.Future] = {}
 _recommendation_singleflight_lock = asyncio.Lock()
 _serving_version_context_cache: Optional[Dict[str, Any]] = None
@@ -864,6 +866,25 @@ def _build_displayed_item_snapshots(
                     "ranking_score",
                     scores.get("combined_score"),
                 ),
+                "serving_score": _recommendation_field(
+                    recommendation,
+                    "ranking_score",
+                    scores.get("combined_score"),
+                ),
+                "raw_ranking_score": _recommendation_field(
+                    recommendation,
+                    "raw_ranking_score",
+                    scores.get("combined_score"),
+                ),
+                "ctcvr": _recommendation_field(recommendation, "ctcvr", None),
+                "predicted_value": _recommendation_field(
+                    recommendation, "predicted_value", None
+                ),
+                "score_policy_version": _recommendation_field(
+                    recommendation,
+                    "score_policy_version",
+                    SCORE_POLICY_VERSION,
+                ),
                 "confidence_score": _recommendation_field(
                     recommendation,
                     "confidence_score",
@@ -900,6 +921,11 @@ def _build_displayed_item_snapshots(
             "popularity_score": scores.get("popularity_score"),
             "combined_score": scores.get("combined_score"),
             "ranking_score": scores.get("ranking_score"),
+            "serving_score": scores.get("serving_score"),
+            "raw_ranking_score": scores.get("raw_ranking_score"),
+            "ctcvr": scores.get("ctcvr"),
+            "predicted_value": scores.get("predicted_value"),
+            "score_policy_version": scores.get("score_policy_version"),
             "confidence_score": scores.get("confidence_score"),
             "price": _recommendation_field(
                 recommendation,
@@ -1029,7 +1055,7 @@ async def startup_event():
     global content_feature_snapshot_refresh_task
     global content_feature_snapshot_refresh_task
     global object_storage, artifact_manager
-    global best_effort_task_queue
+    global best_effort_task_queue, recommendation_outbox_task
     global _serving_version_context_cache, _serving_version_context_paths
 
     runtime = app.state.runtime
@@ -1127,7 +1153,6 @@ async def startup_event():
     )
 
     vector_search = VectorSearchEngine(runtime.config.vector_config)
-    await vector_search.load_index()
     visual_index_manifest = str(
         runtime.config.model_config.retrieval_visual_product_index_manifest_path
         or ""
@@ -1143,6 +1168,8 @@ async def startup_event():
             expected_clip_model_id=runtime.config.model_config.clip_model,
             expected_clip_revision=runtime.config.model_config.clip_revision,
         )
+    else:
+        await vector_search.load_index()
     if (
         runtime.config.recommendation_config.retrieval_visual_attention_enabled
         and vector_search.visual_product_index_version
@@ -1216,6 +1243,11 @@ async def startup_event():
         except Exception as exc:
             logger.warning(f"Recommendation service Kafka init failed: {exc}")
             kafka_manager = None
+    if kafka_manager is not None and system_store is not None:
+        recommendation_outbox_task = asyncio.create_task(
+            _run_recommendation_outbox_dispatcher(),
+            name="recommendation-event-outbox",
+        )
 
     logger.info(
         "recommendation_service_worker_started",
@@ -1233,6 +1265,15 @@ async def startup_event():
 async def shutdown_event():
     global ranking_checkpoint_sync_task, known_user_snapshot_refresh_task
     global best_effort_task_queue, ranking_coordinator_client_pool
+    global recommendation_outbox_task
+
+    if recommendation_outbox_task:
+        recommendation_outbox_task.cancel()
+        try:
+            await recommendation_outbox_task
+        except asyncio.CancelledError:
+            pass
+        recommendation_outbox_task = None
 
     if ranking_checkpoint_sync_task:
         ranking_checkpoint_sync_task.cancel()
@@ -1554,9 +1595,7 @@ async def get_recommendations(
                 )
             client_connected = not await _is_request_disconnected(http_request)
             if kafka_manager and client_connected:
-                _schedule_best_effort_task(
-                    "send_recommendation_event",
-                    kafka_manager.send_recommendation_event(
+                cache_tracking_durable = await _stage_served_impression_event(
                         user_id=payload.user_id,
                         recommendations=_recommendation_product_ids(cached),
                         response_time_ms=int((time.time() - start_time) * 1000),
@@ -1592,10 +1631,11 @@ async def get_recommendations(
                             "item_snapshot_scope": "returned_top_k",
                             "displayed_items": cached_displayed_items,
                         },
-                    ),
-                    timeout_seconds=runtime.config.cache_config.background_write_timeout_ms
-                    / 1000.0,
                 )
+                if not cache_tracking_durable:
+                    cache_impression_id = None
+            else:
+                cache_impression_id = None
             _attach_profile_headers(response, profile)
             _log_recommendation_profile(runtime, payload, profile)
             return _recommendation_json_response(
@@ -1612,6 +1652,10 @@ async def get_recommendations(
                             if cache_impression_id
                             else {}
                         ),
+                        "impression_tracking": (
+                            "durable" if cache_impression_id else "unavailable"
+                        ),
+                        "score_policy_version": SCORE_POLICY_VERSION,
                         "cache_freshness": "model_user_sequence_and_catalog_versioned",
                         "content_processed": payload.content_id is not None,
                         **(
@@ -1659,9 +1703,7 @@ async def get_recommendations(
                     as_of_ts=start_time,
                 )
             if kafka_manager and not await _is_request_disconnected(http_request):
-                _schedule_best_effort_task(
-                    "send_recommendation_event",
-                    kafka_manager.send_recommendation_event(
+                join_tracking_durable = await _stage_served_impression_event(
                         user_id=payload.user_id,
                         recommendations=_recommendation_product_ids(
                             shared_recommendations
@@ -1702,10 +1744,11 @@ async def get_recommendations(
                             "item_snapshot_scope": "returned_top_k",
                             "displayed_items": join_displayed_items,
                         },
-                    ),
-                    timeout_seconds=runtime.config.cache_config.background_write_timeout_ms
-                    / 1000.0,
                 )
+                if not join_tracking_durable:
+                    join_impression_id = None
+            else:
+                join_impression_id = None
             _attach_profile_headers(response, profile)
             _log_recommendation_profile(runtime, payload, profile)
             return _recommendation_json_response(
@@ -1724,6 +1767,10 @@ async def get_recommendations(
                             if join_impression_id
                             else {}
                         ),
+                        "impression_tracking": (
+                            "durable" if join_impression_id else "unavailable"
+                        ),
+                        "score_policy_version": SCORE_POLICY_VERSION,
                         "content_processed": shared_result.get(
                             "content_processed",
                             payload.content_id is not None,
@@ -2096,9 +2143,7 @@ async def get_recommendations(
 
         if kafka_manager and client_connected:
             stage_started = time.perf_counter()
-            _schedule_best_effort_task(
-                "send_recommendation_event",
-                kafka_manager.send_recommendation_event(
+            tracking_durable = await _stage_served_impression_event(
                     user_id=payload.user_id,
                     recommendations=[
                         item.product_id for item in ranked_recommendations
@@ -2131,13 +2176,14 @@ async def get_recommendations(
                         "displayed_items": displayed_items,
                         "rejected_candidate_items": rejected_candidate_items,
                     },
-                ),
-                timeout_seconds=runtime.config.cache_config.background_write_timeout_ms
-                / 1000.0,
             )
+            if not tracking_durable:
+                impression_id = None
             profile["kafka_schedule_ms"] = round(
                 (time.perf_counter() - stage_started) * 1000, 2
             )
+        else:
+            impression_id = None
 
         profile["total_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
         _attach_profile_headers(response, profile)
@@ -2161,6 +2207,10 @@ async def get_recommendations(
                     "response_time_ms": int(response_time * 1000),
                     "model_version": "v1.0.0",
                     **({"impression_id": impression_id} if impression_id else {}),
+                    "impression_tracking": (
+                        "durable" if impression_id else "unavailable"
+                    ),
+                    "score_policy_version": SCORE_POLICY_VERSION,
                     "cache_freshness": "model_user_sequence_and_catalog_versioned",
                     "cache_hit": False,
                     "content_processed": payload.content_id is not None,
@@ -2862,6 +2912,93 @@ def _default_user_features(user_id: str) -> UserFeatures:
         last_active=time.time(),
         demographics={},
     )
+
+
+async def _stage_served_impression_event(
+    *,
+    user_id: str,
+    recommendations: List[str],
+    response_time_ms: int,
+    request_id: Optional[str],
+    metadata: Dict[str, Any],
+) -> bool:
+    """Persist a stable served-impression event before exposing its ID."""
+    if kafka_manager is None or system_store is None:
+        return False
+    impression_id = str(metadata.get("impression_id") or "").strip()
+    if not impression_id:
+        return False
+    event_id = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"video-commerce:recommendation-served:{impression_id}"
+    ).hex
+    event = kafka_manager.build_recommendation_event(
+        user_id=user_id,
+        recommendations=recommendations,
+        response_time_ms=response_time_ms,
+        metadata=metadata,
+        request_id=request_id,
+        event_id=event_id,
+    )
+    try:
+        outcome = await system_store.enqueue_recommendation_event(event)
+        app.state.runtime.observability.record_recommendation_impression(
+            "served", outcome
+        )
+        return outcome in {"inserted", "duplicate"}
+    except Exception as exc:
+        app.state.runtime.observability.record_recommendation_impression(
+            "served", "unavailable"
+        )
+        logger.warning(
+            "recommendation_impression_outbox_failed",
+            extra={"impression_id": impression_id, "error": str(exc)},
+        )
+        return False
+
+
+async def _run_recommendation_outbox_dispatcher() -> None:
+    worker_id = f"recommendation-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    while True:
+        try:
+            if system_store is None or kafka_manager is None:
+                await asyncio.sleep(1.0)
+                continue
+            events = await system_store.claim_recommendation_outbox(
+                worker_id=worker_id, batch_size=50, lease_seconds=30
+            )
+            outbox_stats = await system_store.get_recommendation_outbox_stats()
+            app.state.runtime.observability.update_recommendation_outbox(
+                **outbox_stats
+            )
+            if not events:
+                await asyncio.sleep(0.25)
+                continue
+            for event in events:
+                event_id = str(event.get("event_id") or "")
+                try:
+                    published = await kafka_manager.publish_recommendation_event_payload(
+                        event
+                    )
+                    if not published:
+                        raise RuntimeError("Kafka publish returned false")
+                    await system_store.mark_recommendation_outbox_published(
+                        event_id, worker_id=worker_id
+                    )
+                    app.state.runtime.observability.record_recommendation_impression(
+                        "served", "published"
+                    )
+                except Exception as exc:
+                    await system_store.mark_recommendation_outbox_failed(
+                        event_id, str(exc), worker_id=worker_id
+                    )
+                    app.state.runtime.observability.record_recommendation_impression(
+                        "served", "publish_retry"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("recommendation_outbox_dispatch_failed: %s", exc)
+            await asyncio.sleep(1.0)
 
 
 def _schedule_best_effort_task(

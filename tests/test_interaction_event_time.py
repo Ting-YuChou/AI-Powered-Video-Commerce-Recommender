@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
@@ -75,8 +76,9 @@ async def test_interaction_ingest_stamps_server_receive_time(monkeypatch):
     )
 
     assert response.status_code == 202
-    assert manager.calls == [
-        {
+    assert len(manager.calls) == 1
+    assert UUID(manager.calls[0].pop("event_id"))
+    assert manager.calls == [{
             "user_id": "user-1",
             "product_id": "product-1",
             "action": "click",
@@ -84,8 +86,7 @@ async def test_interaction_ingest_stamps_server_receive_time(monkeypatch):
             "event_time": 1_700_000_000.0,
             "server_received_at": 1_700_000_100.0,
             "request_id": "request-1",
-        }
-    ]
+        }]
 
 
 @pytest.mark.asyncio
