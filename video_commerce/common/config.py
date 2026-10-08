@@ -92,6 +92,10 @@ class ModelConfig(BaseSettings):
         "57c216476eefef5ab752ec549e440a49ae4ae5f3",
         description="Pinned Hugging Face revision for the frozen CLIP encoder",
     )
+    content_pipeline_version: str = Field(
+        "temporal-multimodal-v3",
+        description="Operational idempotency version for content processing tasks",
+    )
     retrieval_visual_attention_shadow: bool = Field(
         True,
         env="RETRIEVAL_VISUAL_ATTENTION_SHADOW",
@@ -265,9 +269,7 @@ class ModelConfig(BaseSettings):
             ).strip()
             if (
                 len(checksum) != 64
-                or not str(
-                    values.get("retrieval_visual_model_version") or ""
-                ).strip()
+                or not str(values.get("retrieval_visual_model_version") or "").strip()
                 or not str(
                     values.get("retrieval_visual_product_index_version") or ""
                 ).strip()
@@ -316,7 +318,10 @@ class VectorConfig(BaseSettings):
         normalized = str(value).strip().lower()
         if normalized not in {"required", "empty", "sample"}:
             raise ValueError("bootstrap_mode must be required, empty, or sample")
-        if normalized == "sample" and os.getenv("ENVIRONMENT", "").lower() == "production":
+        if (
+            normalized == "sample"
+            and os.getenv("ENVIRONMENT", "").lower() == "production"
+        ):
             raise ValueError("sample vector bootstrap is not allowed in production")
         return normalized
 
@@ -831,9 +836,7 @@ class RecommendationConfig(BaseSettings):
         if values.get("retrieval_visual_attention_enabled") and not all(
             (
                 str(values.get("retrieval_visual_model_version") or "").strip(),
-                str(
-                    values.get("retrieval_visual_product_index_version") or ""
-                ).strip(),
+                str(values.get("retrieval_visual_product_index_version") or "").strip(),
             )
         ):
             raise ValueError(
@@ -2134,6 +2137,12 @@ class ServiceTopologyConfig(BaseSettings):
     interaction_workers: int = Field(
         2, description="Interaction ingest worker process count"
     )
+    content_outbox_batch_size: int = Field(50, ge=1)
+    content_outbox_lease_seconds: int = Field(30, ge=5)
+    content_outbox_poll_seconds: float = Field(0.25, gt=0.0)
+    content_outbox_retention_days: int = Field(7, ge=1)
+    content_orphan_grace_seconds: int = Field(86400, ge=60)
+    content_processing_lease_seconds: int = Field(300, ge=30)
 
     class Config:
         env_prefix = "SERVICE_"

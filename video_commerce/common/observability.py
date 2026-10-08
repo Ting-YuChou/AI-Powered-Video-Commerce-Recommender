@@ -720,6 +720,38 @@ class ObservabilityManager:
             "Age of the oldest unpublished catalog outbox row",
             registry=self.registry,
         )
+        self.content_task_outbox_pending = Gauge(
+            "content_task_outbox_pending",
+            "Unpublished durable content processing tasks",
+            registry=self.registry,
+        )
+        self.content_task_outbox_oldest_age_seconds = Gauge(
+            "content_task_outbox_oldest_age_seconds",
+            "Age of the oldest unpublished content processing task",
+            registry=self.registry,
+        )
+        self.content_task_publish_retries_total = Counter(
+            "content_task_publish_retries_total",
+            "Content task outbox publish retries",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.content_orphan_objects = Gauge(
+            "content_orphan_objects",
+            "Managed upload objects without a durable content job",
+            registry=self.registry,
+        )
+        self.content_orphan_objects_deleted_total = Counter(
+            "content_orphan_objects_deleted_total",
+            "Orphan upload objects removed after the grace period",
+            registry=self.registry,
+        )
+        self.content_processing_events_total = Counter(
+            "content_processing_events_total",
+            "Content processing lease and projection outcomes",
+            ["outcome"],
+            registry=self.registry,
+        )
         self.pit_export_rows = Gauge(
             "pit_export_rows",
             "Rows in the latest PIT Parquet export",
@@ -962,6 +994,27 @@ class ObservabilityManager:
     def update_catalog_outbox(self, *, pending: int, oldest_age_seconds: float) -> None:
         self.catalog_outbox_pending.set(max(0, int(pending)))
         self.catalog_outbox_oldest_age_seconds.set(max(0.0, float(oldest_age_seconds)))
+
+    def update_content_task_outbox(
+        self, *, pending: int, oldest_age_seconds: float
+    ) -> None:
+        self.content_task_outbox_pending.set(max(0, int(pending)))
+        self.content_task_outbox_oldest_age_seconds.set(
+            max(0.0, float(oldest_age_seconds))
+        )
+
+    def record_content_task_publish_retry(self, reason: str) -> None:
+        self.content_task_publish_retries_total.labels(reason=str(reason)).inc()
+
+    def update_content_orphans(
+        self, *, orphan_objects: int, deleted_objects: int
+    ) -> None:
+        self.content_orphan_objects.set(max(0, int(orphan_objects)))
+        if deleted_objects > 0:
+            self.content_orphan_objects_deleted_total.inc(int(deleted_objects))
+
+    def record_content_processing(self, outcome: str) -> None:
+        self.content_processing_events_total.labels(outcome=str(outcome)).inc()
 
     def record_pit_manifest_validation_failure(self, reason: str) -> None:
         self.pit_manifest_validation_failures_total.labels(reason=reason).inc()

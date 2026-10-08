@@ -1,5 +1,38 @@
 # Progress
 
+## 2026-10-08 — Content upload outbox and worker processing leases
+
+- Added migration `009_content_task_reliability.sql` for durable content-task
+  publication, pipeline-versioned job state, and owner-fenced processing runs.
+  Uploads now persist object plus DB/outbox state before publishing, return
+  `queued` only after Kafka acknowledgement, and return a traceable
+  `CONTENT_ENQUEUE_PENDING` 503 while background retries continue.
+- Added the horizontally safe `content-task-publisher` to Compose and Helm. It
+  uses leased outbox claims, stable event IDs, exponential retry, missing-object
+  terminalization, managed-prefix orphan cleanup after a grace period, and
+  seven-day published-row retention.
+- Content workers now prevent duplicate model computation per content and
+  pipeline version, renew and fence processing leases, commit durable feature
+  artifacts before Redis/vector projection, and repair projections from an
+  already-completed artifact after redelivery.
+- Added content outbox, orphan, duplicate, lease-conflict, lease-loss, and
+  projection-repair metrics and alerts. Updated the event/artifact reliability
+  guide and deploy/rollback sequence.
+- Key files: `migrations/postgres/009_content_task_reliability.sql`,
+  `video_commerce/data_plane/system_store.py`,
+  `video_commerce/services/content_task_publisher/main.py`,
+  `video_commerce/services/content_worker/video_processor.py`, and
+  `video_commerce/services/gateway/api.py`.
+- Verification: Docker backend suite `644 passed, 10 skipped`; Postgres-backed
+  outbox/lease and worker suite `10 passed`; scoped Black, Python compile,
+  Compose config, Prometheus rule tests, Helm lint, strict kubeconform `36/36`,
+  and production image build passed. A fresh `vc-phase-a-smoke` project proved
+  real Kafka/Postgres publication and recovery: the ack-before-mark event was
+  observed twice with one stable ID, the worker model ran once across a
+  redelivery, projections ran twice, and durable repair resolved `completed`.
+- Follow-up: hot/unique load baselines are outside this phase and remain unrun;
+  no performance-regression claim is made.
+
 ## 2026-10-08 — Flink, event lineage, artifacts, and scoring reliability
 
 - Made the default startup path Flink-aware with idempotent named-job submission,

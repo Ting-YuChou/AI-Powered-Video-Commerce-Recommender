@@ -42,6 +42,31 @@ def test_local_object_storage_deletes_local_file(tmp_path):
     assert not os.path.exists(staged_file)
 
 
+def test_local_object_listing_includes_size_and_last_modified(tmp_path):
+    staged_file = tmp_path / "video.mp4"
+    staged_file.write_bytes(b"video")
+    storage = ObjectStorage(
+        ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))
+    )
+
+    objects = asyncio.run(storage.list_storage_objects(str(tmp_path)))
+
+    assert len(objects) == 1
+    assert objects[0].uri == str(staged_file)
+    assert objects[0].size == 5
+    assert objects[0].last_modified > 0
+
+
+def test_local_object_storage_health_requires_writable_directory(tmp_path):
+    storage = ObjectStorage(ObjectStorageConfig(backend="local"))
+
+    healthy = asyncio.run(storage.health_check(local_path=str(tmp_path)))
+    missing = asyncio.run(storage.health_check(local_path=str(tmp_path / "missing")))
+
+    assert healthy["status"] == "healthy"
+    assert missing["status"] == "unhealthy"
+
+
 def test_local_object_storage_builds_artifact_object_name(tmp_path):
     storage = ObjectStorage(
         ObjectStorageConfig(backend="local", download_dir=str(tmp_path / "downloads"))

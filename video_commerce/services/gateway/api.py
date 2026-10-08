@@ -39,7 +39,11 @@ from video_commerce.common.service_common import (
     create_service_app,
     RoundRobinAsyncClientPool,
 )
-from video_commerce.data_plane.system_store import SystemStore
+from video_commerce.data_plane.system_store import (
+    PreparedContentTask,
+    SystemStore,
+    prepare_content_task,
+)
 from video_commerce.common.telemetry import inject_http_headers
 
 logger = logging.getLogger(__name__)
@@ -318,6 +322,12 @@ async def _gateway_readiness_response(*, include_worker_heartbeats: bool):
     elif runtime.config.kafka_config.enable:
         kafka_health = {"status": "unhealthy", "error": "Kafka producer unavailable"}
 
+    storage_health = {"status": "unhealthy", "error": "Object storage unavailable"}
+    if object_storage is not None:
+        storage_health = await object_storage.health_check(
+            local_path=runtime.config.data_config.upload_dir
+        )
+
     checks = {
         "redis": feature_store_health,
         "database": database_health,
@@ -325,6 +335,7 @@ async def _gateway_readiness_response(*, include_worker_heartbeats: bool):
         "ranking_service": ranking_health,
         "interaction_ingest_service": interaction_health,
         "kafka": kafka_health,
+        "object_storage": storage_health,
     }
 
     if include_worker_heartbeats and runtime.config.kafka_config.enable:
@@ -381,11 +392,19 @@ async def upload_content(
     runtime = app.state.runtime
     if priority not in {"low", "normal", "high"}:
         raise HTTPException(status_code=400, detail="Invalid priority")
-    if not kafka_manager or not runtime.config.kafka_config.enable:
+    if (
+        not kafka_manager
+        or not runtime.config.kafka_config.enable
+        or system_store is None
+        or object_storage is None
+    ):
         raise HTTPException(
             status_code=503,
-            detail="Content uploads require Kafka-backed worker deployment",
+            detail="Content uploads require Postgres, object storage, and Kafka",
         )
+    dependency_error = await _content_upload_dependency_error(runtime)
+    if dependency_error:
+        raise HTTPException(status_code=503, detail=dependency_error)
 
     suffix = validate_upload_file(file, runtime.config)
     content_id = str(uuid.uuid4())
@@ -397,7 +416,6 @@ async def upload_content(
         chunk_size=runtime.config.data_config.upload_chunk_size_bytes,
     )
     storage_path = file_path
-    inflight_recorded = False
     try:
         if object_storage:
             storage_path = await object_storage.persist_staged_file(
@@ -414,44 +432,43 @@ async def upload_content(
             os.remove(file_path)
         raise
 
-    if system_store:
-        await system_store.upsert_content_job(
+    try:
+        task, success = await _stage_and_publish_content_task(
+            system_store=system_store,
+            kafka_manager=kafka_manager,
             content_id=content_id,
-            filename=file.filename,
+            pipeline_version=runtime.config.model_config.content_pipeline_version,
             storage_path=storage_path,
+            filename=file.filename,
             user_id=user_id,
             priority=priority,
-            status="pending",
-            payload={
-                "request_id": request.state.request_id,
-                "storage_backend": runtime.config.object_storage_config.backend,
-            },
+            request_id=request.state.request_id,
+            occurred_at=time.time(),
+            lease_seconds=runtime.config.service_topology_config.content_outbox_lease_seconds,
         )
-
-    await feature_store.update_content_status(content_id, "pending")
-    success = await kafka_manager.send_video_processing_task(
-        content_id=content_id,
-        file_path=storage_path,
-        filename=file.filename,
-        user_id=user_id,
-        priority=priority,
-        request_id=request.state.request_id,
-    )
+    except Exception:
+        try:
+            await object_storage.delete_uploaded_object(storage_path)
+        except Exception as cleanup_error:
+            logger.warning("content_upload_cleanup_failed: %s", cleanup_error)
+        raise
     if not success:
         runtime.observability.record_content_upload(priority, "enqueue_failed")
-        if object_storage:
-            await object_storage.delete_uploaded_object(storage_path)
-        await feature_store.update_content_status(content_id, "failed")
-        if system_store:
-            await system_store.update_content_job_status(
-                content_id,
-                "failed",
-                error_message="Failed to enqueue video processing task",
-                storage_path=storage_path,
-            )
-        raise HTTPException(
-            status_code=503, detail="Failed to enqueue video processing task"
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "CONTENT_ENQUEUE_PENDING",
+                    "message": "Content is durable and pending Kafka acknowledgement",
+                    "request_id": request.state.request_id,
+                    "retryable": True,
+                },
+                "content_id": content_id,
+                "status": "pending_publish",
+            },
+            headers={"Retry-After": "1"},
         )
+    await feature_store.update_content_status(content_id, "queued")
     runtime.observability.record_content_upload(priority, "queued")
 
     return {
@@ -463,17 +480,85 @@ async def upload_content(
     }
 
 
+async def _content_upload_dependency_error(runtime) -> Optional[str]:
+    database_status = await system_store.health_check()
+    if database_status.status != "healthy":
+        return "Content upload database is unavailable"
+    kafka_status = await kafka_manager.health_check()
+    if not (kafka_status.get("producer") or {}).get("connected"):
+        return "Content upload Kafka producer is unavailable"
+    storage_status = await object_storage.health_check(
+        local_path=runtime.config.data_config.upload_dir
+    )
+    if storage_status.get("status") != "healthy":
+        return "Content upload object storage is unavailable"
+    return None
+
+
+async def _stage_and_publish_content_task(
+    *,
+    system_store,
+    kafka_manager,
+    content_id: str,
+    pipeline_version: str,
+    storage_path: str,
+    filename: Optional[str],
+    user_id: Optional[str],
+    priority: str,
+    request_id: Optional[str],
+    occurred_at: float,
+    lease_seconds: int,
+) -> Tuple[PreparedContentTask, bool]:
+    task = prepare_content_task(
+        content_id=content_id,
+        pipeline_version=pipeline_version,
+        storage_path=storage_path,
+        filename=filename,
+        user_id=user_id,
+        priority=priority,
+        request_id=request_id,
+        timestamp=occurred_at,
+    )
+    await system_store.stage_content_task(
+        task,
+        filename=filename,
+        storage_path=storage_path,
+        user_id=user_id,
+        priority=priority,
+        request_id=request_id,
+    )
+    worker_id = f"gateway-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        event = await system_store.claim_content_task_outbox_event(
+            task.event_id,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+        )
+        if event is None:
+            return task, False
+        acknowledged = await kafka_manager.publish_video_processing_task_payload(event)
+        if not acknowledged:
+            raise RuntimeError("Kafka broker did not acknowledge content task")
+        marked = await system_store.mark_content_task_outbox_published(
+            task.event_id, worker_id=worker_id
+        )
+        return task, bool(marked)
+    except Exception as exc:
+        try:
+            await system_store.mark_content_task_outbox_failed(
+                task.event_id, str(exc), worker_id=worker_id
+            )
+        except Exception as bookkeeping_error:
+            logger.error(
+                "content_outbox_failure_record_failed: event_id=%s error=%s",
+                task.event_id,
+                bookkeeping_error,
+            )
+        return task, False
+
+
 @app.get("/api/content/{content_id}/status")
 async def content_status(content_id: str):
-    status = await feature_store.get_content_status(content_id)
-    processed_at = await feature_store.get_content_processed_time(content_id)
-    if status:
-        return {
-            "content_id": content_id,
-            "status": status,
-            "processed_at": processed_at,
-        }
-
     if system_store:
         job = await system_store.get_content_job(content_id)
         if job:
@@ -482,6 +567,15 @@ async def content_status(content_id: str):
                 "status": job["status"],
                 "processed_at": job["updated_at"],
             }
+
+    status = await feature_store.get_content_status(content_id)
+    processed_at = await feature_store.get_content_processed_time(content_id)
+    if status:
+        return {
+            "content_id": content_id,
+            "status": status,
+            "processed_at": processed_at,
+        }
 
     raise HTTPException(status_code=404, detail="Content not found")
 

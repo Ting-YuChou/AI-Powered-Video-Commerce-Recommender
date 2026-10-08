@@ -41,6 +41,11 @@ scrape_configs:
     static_configs:
       - targets: ["content-worker:9101"]
 
+  - job_name: content-task-publisher
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["content-task-publisher:9105"]
+
   - job_name: feature-worker
     metrics_path: /metrics
     static_configs:
