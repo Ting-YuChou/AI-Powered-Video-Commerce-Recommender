@@ -119,6 +119,7 @@ external:
     analyticsSummaryCacheTtlSeconds: 15
     trainingSequenceLookbackDays: 90
     ltrImpressionLookbackDays: 30
+    ltrAttributionWindowHours: 168
     impressionRetentionDays: 90
     autoCreateSchema: true
   objectStorage:
@@ -189,6 +190,8 @@ appConfig:
   modelCacheDir: /app/models
   clipRevision: 57c216476eefef5ab752ec549e440a49ae4ae5f3
   vectorIndexPath: /app/models/vector_index.faiss
+  vectorBootstrapMode: required
+  vectorModelVersion: clip-vit-base-patch16
   recommendationCfIndexPath: /app/models/cf_vector_index.faiss
   recommendationSwingItemcfIndexPath: /app/models/swing_itemcf.json.gz
   dataUploadDir: /app/uploads

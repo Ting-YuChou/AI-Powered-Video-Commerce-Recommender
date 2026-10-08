@@ -47,6 +47,7 @@ public final class FeatureHistoryMaterializerJob {
   static final List<String> TABLES =
       Arrays.asList(
           "interaction_history",
+          "recommendation_view_history",
           "ranking_observations",
           "user_feature_history",
           "item_feature_history",
@@ -268,6 +269,9 @@ public final class FeatureHistoryMaterializerJob {
 
   private static List<LakeHistoryRow> parseRecommendation(
       String topic, Map<String, Object> event) throws Exception {
+    if ("recommendation_viewed".equals(nullable(event.get("event_type")))) {
+      return Collections.singletonList(parseRecommendationView(topic, event));
+    }
     requireFixedContract(event);
     Map<String, Object> metadata = safeMap(event.get("metadata"));
     String impressionId = required("impression_id", metadata.get("impression_id"));
@@ -352,6 +356,36 @@ public final class FeatureHistoryMaterializerJob {
       throw new IllegalArgumentException("recommendation event has no displayed items");
     }
     return rows;
+  }
+
+  private static LakeHistoryRow parseRecommendationView(
+      String topic, Map<String, Object> event) throws Exception {
+    String impressionId = required("impression_id", event.get("impression_id"));
+    String userId = required("user_id", event.get("user_id"));
+    String productId = required("product_id", event.get("product_id"));
+    int position = integer("position", event.get("position"));
+    Map<String, Object> context = safeMap(event.get("context"));
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("impression_id", impressionId);
+    payload.put("user_id", userId);
+    payload.put("product_id", productId);
+    payload.put("position", position);
+    payload.put("context", context);
+    String payloadHash = required("payload_hash", event.get("payload_hash"));
+    if (!payloadHash.equals(FeatureHistoryContract.payloadHash(payload))) {
+      throw new IllegalArgumentException("payload_hash does not match recommendation view payload");
+    }
+    LakeHistoryRow row = baseRow(topic, event, payload);
+    row.targetTable = "recommendation_view_history";
+    row.entityType = "item";
+    row.entityId = productId;
+    row.entityBucket = entityBucket(productId);
+    row.userId = userId;
+    row.productId = productId;
+    row.action = "view";
+    row.contextJson = FeatureHistoryContract.canonicalJson(context);
+    row.observationId = impressionId + ":" + productId;
+    return row;
   }
 
   private static LakeHistoryRow parseFeature(String topic, Map<String, Object> event)

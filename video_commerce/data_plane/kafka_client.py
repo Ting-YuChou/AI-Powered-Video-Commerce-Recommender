@@ -46,6 +46,7 @@ EVENT_SCHEMA_VERSION = 1
 def _build_event_payload(
     event_type: str,
     *,
+    event_id: Optional[str] = None,
     request_id: Optional[str] = None,
     occurred_at: Optional[float] = None,
     **payload: Any,
@@ -53,7 +54,7 @@ def _build_event_payload(
     event_time = time.time() if occurred_at is None else float(occurred_at)
     return {
         "schema_version": EVENT_SCHEMA_VERSION,
-        "event_id": str(uuid.uuid4()),
+        "event_id": str(event_id or uuid.uuid4()),
         "event_type": event_type,
         "request_id": request_id,
         "occurred_at": event_time,
@@ -687,6 +688,7 @@ class KafkaManager:
         user_id: str,
         product_id: str,
         action: str,
+        event_id: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
         timestamp: Optional[float] = None,
         event_time: Optional[float] = None,
@@ -715,6 +717,7 @@ class KafkaManager:
         )
         event = _build_event_payload(
             "user_interaction",
+            event_id=event_id,
             request_id=request_id,
             occurred_at=resolved_event_time,
             user_id=user_id,
@@ -747,6 +750,7 @@ class KafkaManager:
         user_id: str,
         product_id: str,
         action: str,
+        event_id: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
         timestamp: Optional[float] = None,
         event_time: Optional[float] = None,
@@ -764,6 +768,7 @@ class KafkaManager:
         )
         event = _build_event_payload(
             "user_interaction",
+            event_id=event_id,
             request_id=request_id,
             occurred_at=resolved_event_time,
             user_id=user_id,
@@ -842,6 +847,7 @@ class KafkaManager:
         response_time_ms: int,
         metadata: Optional[Dict[str, Any]] = None,
         request_id: Optional[str] = None,
+        event_id: Optional[str] = None,
     ) -> bool:
         """
         Send a recommendation event to Kafka.
@@ -855,6 +861,27 @@ class KafkaManager:
         Returns:
             True if sent successfully
         """
+        event = self.build_recommendation_event(
+            user_id=user_id,
+            recommendations=recommendations,
+            response_time_ms=response_time_ms,
+            metadata=metadata,
+            request_id=request_id,
+            event_id=event_id,
+        )
+        return await self.publish_recommendation_event_payload(event)
+
+    def build_recommendation_event(
+        self,
+        *,
+        user_id: str,
+        recommendations: List[str],
+        response_time_ms: int,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a stable recommendation event suitable for a durable outbox."""
         published_at = time.time()
         event_metadata = dict(metadata or {})
         observation_time = float(event_metadata.get("as_of_ts") or published_at)
@@ -864,7 +891,8 @@ class KafkaManager:
             or "unversioned"
         )
         event = _build_event_payload(
-            "recommendation",
+            "recommendation_served",
+            event_id=event_id,
             request_id=request_id,
             occurred_at=published_at,
             user_id=user_id,
@@ -893,6 +921,63 @@ class KafkaManager:
             }
         )
 
+        return event
+
+    async def publish_recommendation_event_payload(
+        self, event: Dict[str, Any]
+    ) -> bool:
+        """Publish a prebuilt event without changing its event identity."""
+        return await self.producer.send(
+            topic=self.config.recommendation_events_topic,
+            value=event,
+            key=str(event.get("user_id") or ""),
+            headers=_build_headers(event.get("request_id"), event["event_id"]),
+        )
+
+    async def send_recommendation_view(
+        self,
+        *,
+        event_id: str,
+        impression_id: str,
+        user_id: str,
+        product_id: str,
+        position: int,
+        viewed_at: float,
+        context: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
+    ) -> bool:
+        published_at = time.time()
+        view_payload = {
+            "impression_id": impression_id,
+            "user_id": user_id,
+            "product_id": product_id,
+            "position": position,
+            "context": dict(context or {}),
+        }
+        event = _build_event_payload(
+            "recommendation_viewed",
+            event_id=event_id,
+            request_id=request_id,
+            occurred_at=viewed_at,
+            impression_id=impression_id,
+            user_id=user_id,
+            product_id=product_id,
+            position=position,
+            context=dict(context or {}),
+            viewed_at=viewed_at,
+            timestamp=viewed_at,
+        )
+        event.update(
+            {
+                "payload_schema_version": FEATURE_HISTORY_PAYLOAD_SCHEMA_VERSION,
+                "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                "event_time": viewed_at,
+                "available_at": published_at,
+                "source_event_id": event["event_id"],
+                "source_version": "client-view-v1",
+                "payload_hash": payload_sha256(view_payload),
+            }
+        )
         return await self.producer.send(
             topic=self.config.recommendation_events_topic,
             value=event,

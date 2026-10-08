@@ -72,6 +72,8 @@ def test_prometheus_rules_cover_service_worker_kafka_db_and_redis():
         "DatabaseErrors",
         "DatabaseP95LatencyHigh",
         "FeatureLakeMaterializationLagHigh",
+        "FlinkInteractionFeatureJobMissing",
+        "RecommendationOutboxBacklog",
         "CatalogOutboxBacklog",
         "FeatureLakeDlqTraffic",
         "PitManifestValidationFailure",

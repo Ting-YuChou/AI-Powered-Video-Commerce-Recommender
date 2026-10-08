@@ -336,7 +336,9 @@ public final class PointInTimeFeatureJoinJob {
             + "LEFT JOIN user_ranked u ON u.observation_id=o.observation_id AND u.feature_rank=1\n"
             + "LEFT JOIN item_ranked it ON it.observation_id=o.observation_id AND it.feature_rank=1\n"
             + "LEFT JOIN feedback f ON f.observation_id=o.observation_id\n"
+            + "LEFT JOIN viewed_observations v ON v.observation_id=o.observation_id\n"
             + "WHERE u.canonical_payload_json IS NOT NULL "
+            + "AND (v.observation_id IS NOT NULL OR COALESCE(f.attributed_click,0)=1) "
             + "AND JSON_VALUE(o.canonical_payload_json,'$.impression_id') IS NOT NULL "
             + "AND o.context_json IS NOT NULL "
             + "AND JSON_VALUE(o.candidate_features_json,'$.collaborative_score') IS NOT NULL "
@@ -470,6 +472,13 @@ public final class PointInTimeFeatureJoinJob {
             + "AND i.event_time_epoch>=o.event_time_epoch "
             + "AND i.event_time_epoch<=o.event_time_epoch+%d "
             + "AND i.available_at_epoch<=CAST(%.3f AS DOUBLE)\n"
+            + "),viewed_observations AS (\n"
+            + " SELECT DISTINCT o.observation_id FROM eligible_observations o "
+            + "JOIN `%s`.`recommendation_view_history` v "
+            + "ON v.observation_id=o.observation_id "
+            + "AND v.event_time_epoch>=o.event_time_epoch "
+            + "AND v.event_time_epoch<=o.event_time_epoch+%d "
+            + "AND v.available_at_epoch<=CAST(%.3f AS DOUBLE)\n"
             + "),feedback_aggregated AS (\n"
             + " SELECT observation_id,CASE MAX(CASE action WHEN 'purchase' THEN 3 "
             + "WHEN 'add_to_cart' THEN 2 WHEN 'click' THEN 1 ELSE 0 END) "
@@ -508,6 +517,9 @@ public final class PointInTimeFeatureJoinJob {
         version,
         ns,
         version,
+        ns,
+        attributionSeconds,
+        materializationCutoff,
         ns,
         attributionSeconds,
         materializationCutoff);

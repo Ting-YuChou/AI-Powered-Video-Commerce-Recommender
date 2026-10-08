@@ -163,6 +163,29 @@ class InteractionFeatureJobTest {
   }
 
   @Test
+  void recommendationParserRecognizesViewedEvents() throws Exception {
+    InteractionFeatureJob.RecommendationImpressionEvent event =
+        InteractionFeatureJob.parseRecommendationEvent(
+            "{"
+                + "\"event_type\":\"recommendation_viewed\","
+                + "\"event_id\":\"view-1\","
+                + "\"impression_id\":\"imp-1\","
+                + "\"user_id\":\"u1\","
+                + "\"product_id\":\"p1\","
+                + "\"position\":2,"
+                + "\"timestamp\":10,"
+                + "\"context\":{\"surface\":\"feed\"}"
+                + "}");
+
+    assertTrue(event.viewed);
+    assertEquals("imp-1", event.impressionId);
+    assertEquals(1, event.itemRows.size());
+    assertEquals("view-1", event.itemRows.get(0).eventId);
+    assertEquals("p1", event.itemRows.get(0).productId);
+    assertEquals(2, event.itemRows.get(0).position);
+  }
+
+  @Test
   void recommendationParserSkipsMalformedDisplayedItemsAndNoopsEmptySlates()
       throws Exception {
     InteractionFeatureJob.RecommendationImpressionEvent event =
@@ -290,6 +313,8 @@ class InteractionFeatureJobTest {
     assertTrue(sql.contains("attributed_value"));
     assertTrue(sql.contains("attributed_value_source"));
     assertTrue(sql.contains("JSON_VALUE(context_json,'$.purchase_value')"));
+    assertTrue(sql.contains("recommendation_view_history"));
+    assertTrue(sql.contains("v.observation_id IS NOT NULL OR COALESCE(f.attributed_click,0)=1"));
     assertTrue(sql.contains("\nWITH eligible_observations"));
     assertEquals(
         true,

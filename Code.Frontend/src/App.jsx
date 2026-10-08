@@ -711,9 +711,33 @@ function ProductCard({
   feedback,
   onOpen,
   onAction,
+  onViewed,
 }) {
+  const cardRef = useRef(null);
+
+  useEffect(() => {
+    if (!onViewed || !cardRef.current || typeof IntersectionObserver === 'undefined') {
+      return undefined;
+    }
+    let timer = null;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting && entry.intersectionRatio >= 0.5) {
+        if (!timer) timer = window.setTimeout(() => onViewed(product), 1000);
+      } else if (timer) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    }, { threshold: [0.5] });
+    observer.observe(cardRef.current);
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      observer.disconnect();
+    };
+  }, [onViewed, product]);
+
   return (
     <article
+      ref={cardRef}
       className="group flex h-full flex-col overflow-hidden rounded-md border border-slate-200 bg-white shadow-sm transition hover:border-slate-300 hover:shadow-md"
     >
       <button type="button" onClick={() => onOpen(product)} className="text-left">
@@ -830,6 +854,7 @@ function RecommendationsPanel({
   actionFeedback,
   onOpenProduct,
   onProductAction,
+  onProductViewed,
 }) {
   return (
     <section className="space-y-5 rounded-md border border-slate-200 bg-white p-5 shadow-sm">
@@ -915,6 +940,7 @@ function RecommendationsPanel({
               feedback={actionFeedback[product.product_id]}
               onOpen={onOpenProduct}
               onAction={onProductAction}
+              onViewed={onProductViewed}
             />
           ))}
         </div>
@@ -1655,6 +1681,27 @@ function VideoCommerceApp() {
     }
   }, [buildRequestContext, currentContentId, metadata, mode, service, userId]);
 
+  const viewedProductKeysRef = useRef(new Set());
+  const viewEventIdsRef = useRef(new Map());
+  const handleProductViewed = useCallback(async (product) => {
+    const impressionId = metadata?.impression_id;
+    if (!impressionId || metadata?.impression_tracking !== 'durable') return;
+    const key = `${impressionId}:${product.product_id}`;
+    if (viewedProductKeysRef.current.has(key)) return;
+    viewedProductKeysRef.current.add(key);
+    const eventId = viewEventIdsRef.current.get(key) || crypto.randomUUID();
+    viewEventIdsRef.current.set(key, eventId);
+    try {
+      await service.logViewedImpression(
+        impressionId,
+        [{ event_id: eventId, product_id: product.product_id, position: product.rank || 1 }],
+        { ...buildRequestContext(), user_id: userId.trim() || 'demo_user' }
+      );
+    } catch (_error) {
+      viewedProductKeysRef.current.delete(key);
+    }
+  }, [buildRequestContext, metadata?.impression_id, metadata?.impression_tracking, service, userId]);
+
   const handleOpenProduct = useCallback(async (product) => {
     setSelectedProduct(product);
     await handleProductAction(product, interactionActions.CLICK);
@@ -1774,6 +1821,7 @@ function VideoCommerceApp() {
               actionFeedback={actionFeedback}
               onOpenProduct={handleOpenProduct}
               onProductAction={handleProductAction}
+              onProductViewed={handleProductViewed}
             />
             <UserActionsPanel interactionLog={interactionLog} />
           </div>

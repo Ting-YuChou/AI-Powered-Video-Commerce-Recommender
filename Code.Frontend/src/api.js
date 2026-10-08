@@ -76,8 +76,10 @@ export const buildInteractionPayload = (
   userId,
   productId,
   action,
-  context = {}
+  context = {},
+  eventId = crypto.randomUUID()
 ) => ({
+  event_id: eventId,
   user_id: userId,
   product_id: productId,
   action,
@@ -117,9 +119,19 @@ export const videoApi = {
   },
   
   // Log user interaction
-  logInteraction: async (userId, productId, action, context = {}) => {
-    const requestData = buildInteractionPayload(userId, productId, action, context);
+  logInteraction: async (userId, productId, action, context = {}, eventId) => {
+    const requestData = buildInteractionPayload(userId, productId, action, context, eventId);
     const response = await api.post('/api/interactions', requestData);
+    return response.data;
+  },
+
+  logViewedImpression: async (impressionId, items, context = {}, viewedAt = Date.now() / 1000) => {
+    const response = await api.post('/api/impressions/viewed', {
+      impression_id: impressionId,
+      viewed_at: viewedAt,
+      items,
+      context,
+    });
     return response.data;
   },
 };

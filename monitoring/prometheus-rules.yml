@@ -280,6 +280,24 @@ groups:
 
   - name: video-commerce-feature-lake
     rules:
+      - alert: FlinkInteractionFeatureJobMissing
+        expr: absent(flink_jobmanager_job_uptime{job_name="video-commerce-interaction-features"}) or count(flink_jobmanager_job_uptime{job_name="video-commerce-interaction-features"}) > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Flink interaction feature job is missing or duplicated
+          description: Restore exactly one running video-commerce-interaction-features job before trusting official online features.
+
+      - alert: RecommendationOutboxBacklog
+        expr: video_commerce_recommendation_outbox_oldest_age_seconds > 300 or video_commerce_recommendation_outbox_pending > 10000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Served-impression outbox is backlogged
+          description: Attribution coverage is falling behind; inspect Kafka publish retries and database health.
+
       - alert: FeatureLakeMaterializationLagHigh
         expr: max by (record_type) ({__name__=~"(.+_)?feature_lake_materialization_lag_seconds",record_type!="window_feature"}) > 120
         for: 10m

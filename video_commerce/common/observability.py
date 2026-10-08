@@ -670,6 +670,22 @@ class ObservabilityManager:
             ["action", "status"],
             registry=self.registry,
         )
+        self.recommendation_impression_events_total = Counter(
+            "video_commerce_recommendation_impression_events_total",
+            "Recommendation impression lifecycle events by stage and status",
+            ["stage", "status"],
+            registry=self.registry,
+        )
+        self.recommendation_outbox_pending = Gauge(
+            "video_commerce_recommendation_outbox_pending",
+            "Unpublished served-impression outbox rows",
+            registry=self.registry,
+        )
+        self.recommendation_outbox_oldest_age_seconds = Gauge(
+            "video_commerce_recommendation_outbox_oldest_age_seconds",
+            "Age of the oldest unpublished served-impression outbox row",
+            registry=self.registry,
+        )
         self.content_uploads_total = Counter(
             "video_commerce_content_uploads_total",
             "Content upload enqueue outcomes by priority and status",
@@ -1205,6 +1221,19 @@ class ObservabilityManager:
 
     def record_interaction_ingest(self, action: str, status: str) -> None:
         self.interactions_ingested_total.labels(action=action, status=status).inc()
+
+    def record_recommendation_impression(self, stage: str, status: str) -> None:
+        self.recommendation_impression_events_total.labels(
+            stage=stage, status=status
+        ).inc()
+
+    def update_recommendation_outbox(
+        self, *, pending: int, oldest_age_seconds: float
+    ) -> None:
+        self.recommendation_outbox_pending.set(max(0, int(pending)))
+        self.recommendation_outbox_oldest_age_seconds.set(
+            max(0.0, float(oldest_age_seconds))
+        )
 
     def record_content_upload(self, priority: str, status: str) -> None:
         self.content_uploads_total.labels(priority=priority, status=status).inc()

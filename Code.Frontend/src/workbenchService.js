@@ -34,6 +34,10 @@ const createMockService = () => ({
     await delay(60);
     return createMockInteractionResponse(action);
   },
+  logViewedImpression: async (impressionId, items) => {
+    await delay(20);
+    return { status: 'accepted', impression_id: impressionId, accepted_items: items.length };
+  },
   getAnalytics: async () => {
     await delay(40);
     return mockAnalytics;
@@ -49,6 +53,7 @@ const liveService = {
   getContentStatus: videoApi.getContentStatus,
   getRecommendations: videoApi.getRecommendations,
   logInteraction: videoApi.logInteraction,
+  logViewedImpression: videoApi.logViewedImpression,
   getAnalytics: systemApi.getAnalytics,
   getHealth: systemApi.getHealth,
 };

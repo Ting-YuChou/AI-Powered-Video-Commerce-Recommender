@@ -20,6 +20,7 @@ from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
 from video_commerce.ml.legacy_training_adapter import LegacyTrainingDatasetAdapter
 from video_commerce.ml.pit_training_dataset import (
     PitTrainingDatasetError,
@@ -687,6 +688,10 @@ class ModelTrainerService:
                     extra={
                         "trigger": trigger,
                         "training_sample_source": training_sample_source,
+                        "score_policy_version": SCORE_POLICY_VERSION,
+                        "value_transform_stats": getattr(
+                            self.ranking_model, "value_transform_stats", {}
+                        ),
                     },
                 )
                 if pit_training_claimed:

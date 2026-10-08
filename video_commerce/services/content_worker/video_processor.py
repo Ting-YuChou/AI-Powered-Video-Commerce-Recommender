@@ -194,20 +194,9 @@ class VideoProcessorWorker:
 
             # Check if file exists
             if not processing_path or not os.path.exists(processing_path):
-                logger.error(f"Video file not found: {file_path}")
-                await self.feature_store.update_content_status(content_id, "failed")
-                if self.system_store:
-                    await self.system_store.update_content_job_status(
-                        content_id,
-                        "failed",
-                        error_message="Uploaded file missing before processing",
-                        storage_path=file_path,
-                        payload={
-                            "request_id": request_id,
-                            "filename": filename,
-                        },
-                    )
-                return
+                raise FileNotFoundError(
+                    f"Uploaded file missing before processing: {file_path}"
+                )
 
             # Extract features from video
             features = await self.content_processor.process_video(
@@ -290,18 +279,37 @@ class VideoProcessorWorker:
         except Exception as e:
             status = "error"
             logger.error(f"Error processing video {content_id}: {e}")
-            await self.feature_store.update_content_status(content_id, "failed")
-            if self.system_store:
-                await self.system_store.update_content_job_status(
-                    content_id,
-                    "failed",
-                    error_message=str(e),
-                    storage_path=file_path,
-                    payload={
-                        "request_id": request_id,
-                        "filename": filename,
+            try:
+                await self.feature_store.update_content_status(content_id, "failed")
+            except Exception as status_error:
+                logger.error(
+                    "Failed to record content failure in feature store",
+                    extra={
+                        "content_id": content_id,
+                        "bookkeeping_error": str(status_error),
                     },
                 )
+            if self.system_store:
+                try:
+                    await self.system_store.update_content_job_status(
+                        content_id,
+                        "failed",
+                        error_message=str(e),
+                        storage_path=file_path,
+                        payload={
+                            "request_id": request_id,
+                            "filename": filename,
+                        },
+                    )
+                except Exception as status_error:
+                    logger.error(
+                        "Failed to record content failure in system store",
+                        extra={
+                            "content_id": content_id,
+                            "bookkeeping_error": str(status_error),
+                        },
+                    )
+            raise
 
         finally:
             self.observability.record_worker_message(

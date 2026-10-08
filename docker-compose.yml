@@ -48,11 +48,14 @@ x-common-service: &common-service
     DATABASE_ANALYTICS_SUMMARY_CACHE_TTL_SECONDS: ${DATABASE_ANALYTICS_SUMMARY_CACHE_TTL_SECONDS:-15}
     DATABASE_TRAINING_SEQUENCE_LOOKBACK_DAYS: ${DATABASE_TRAINING_SEQUENCE_LOOKBACK_DAYS:-90}
     DATABASE_LTR_IMPRESSION_LOOKBACK_DAYS: ${DATABASE_LTR_IMPRESSION_LOOKBACK_DAYS:-30}
+    DATABASE_LTR_ATTRIBUTION_WINDOW_HOURS: ${DATABASE_LTR_ATTRIBUTION_WINDOW_HOURS:-168}
     DATABASE_IMPRESSION_RETENTION_DAYS: ${DATABASE_IMPRESSION_RETENTION_DAYS:-90}
     DATABASE_AUTO_CREATE_SCHEMA: "true"
     MODEL_CACHE_DIR: /app/models
     MODEL_CLIP_REVISION: ${MODEL_CLIP_REVISION:-57c216476eefef5ab752ec549e440a49ae4ae5f3}
     VECTOR_INDEX_PATH: /app/models/vector_index.faiss
+    VECTOR_BOOTSTRAP_MODE: ${VECTOR_BOOTSTRAP_MODE:-required}
+    VECTOR_MODEL_VERSION: ${VECTOR_MODEL_VERSION:-clip-vit-base-patch16}
     RETRIEVAL_VISUAL_ATTENTION_SHADOW: ${RETRIEVAL_VISUAL_ATTENTION_SHADOW:-true}
     RETRIEVAL_VISUAL_ATTENTION_ENABLED: ${RETRIEVAL_VISUAL_ATTENTION_ENABLED:-false}
     RETRIEVAL_VISUAL_CANARY_PERCENT: ${RETRIEVAL_VISUAL_CANARY_PERCENT:-0}
@@ -294,6 +297,12 @@ x-common-service: &common-service
   restart: unless-stopped
 
 services:
+  vector-sample-bootstrap:
+    <<: *common-service
+    profiles: ["demo"]
+    command: python -m scripts.bootstrap_sample_vector_index
+    restart: "no"
+
   caddy:
     build:
       context: .
@@ -1048,10 +1057,18 @@ services:
       - -lc
       - |
         until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
-        flink run -d \
-          -m flink-jobmanager:8081 \
-          -c com.videocommerce.flink.InteractionFeatureJob \
-          /opt/flink/usrlib/interaction-features.jar
+        running_count="$$(flink list -m flink-jobmanager:8081 -r 2>/dev/null | grep -c 'video-commerce-interaction-features' || true)"
+        if [ "$${running_count}" -gt 1 ]; then
+          echo "multiple running video-commerce-interaction-features jobs detected" >&2
+          exit 1
+        fi
+        if [ "$${running_count}" -eq 0 ]; then
+          flink run -d \
+            -m flink-jobmanager:8081 \
+            -c com.videocommerce.flink.InteractionFeatureJob \
+            /opt/flink/usrlib/interaction-features.jar
+        fi
+        until [ "$$(flink list -m flink-jobmanager:8081 -r 2>/dev/null | grep -c 'video-commerce-interaction-features' || true)" -eq 1 ]; do sleep 2; done
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_USER_INTERACTIONS_TOPIC: ${KAFKA_USER_INTERACTIONS_TOPIC:-user-interactions}

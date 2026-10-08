@@ -293,6 +293,14 @@ class VectorConfig(BaseSettings):
     )
     embedding_dim: int = Field(512, description="Vector embedding dimension")
     index_type: str = Field("HNSW", description="FAISS index type (HNSW/IVF)")
+    model_version: str = Field(
+        "clip-vit-base-patch16",
+        description="Embedding model version recorded in vector manifests",
+    )
+    bootstrap_mode: str = Field(
+        "empty",
+        description="Index startup behavior: required, empty, or sample",
+    )
 
     # HNSW parameters
     hnsw_m: int = Field(32, description="HNSW M parameter")
@@ -302,6 +310,15 @@ class VectorConfig(BaseSettings):
     # Search parameters
     search_k: int = Field(100, description="Number of candidates to retrieve")
     similarity_threshold: float = Field(0.1, description="Minimum similarity threshold")
+
+    @validator("bootstrap_mode")
+    def validate_bootstrap_mode(cls, value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized not in {"required", "empty", "sample"}:
+            raise ValueError("bootstrap_mode must be required, empty, or sample")
+        if normalized == "sample" and os.getenv("ENVIRONMENT", "").lower() == "production":
+            raise ValueError("sample vector bootstrap is not allowed in production")
+        return normalized
 
     class Config:
         env_prefix = "VECTOR_"
@@ -2283,6 +2300,11 @@ class DatabaseConfig(BaseSettings):
         30,
         description="Lookback window for impression-backed LTR training samples",
     )
+    ltr_attribution_window_hours: int = Field(
+        168,
+        ge=1,
+        description="Maximum positive-feedback attribution window after an impression",
+    )
     interaction_retention_days: int = Field(
         90,
         description="Retention window for raw interaction_events rows",
@@ -2515,6 +2537,11 @@ class Config:
             errors.append("Speech-to-text maximum transcript length must be positive")
         if self.kafka_config.consumer_max_poll_interval_ms <= 0:
             errors.append("Kafka consumer maximum poll interval must be positive")
+        if os.getenv("ENVIRONMENT", "").lower() == "production":
+            if self.vector_config.bootstrap_mode != "required":
+                errors.append(
+                    "VECTOR_BOOTSTRAP_MODE=required is mandatory in production"
+                )
 
         # Validate file paths
         if not os.path.exists(os.path.dirname(self.model_config.cache_dir)):

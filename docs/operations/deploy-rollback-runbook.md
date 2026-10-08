@@ -1,11 +1,16 @@
 # Deploy And Rollback Runbook
 
+See [Event and artifact reliability](event-and-artifact-reliability.md) for
+the migration order, vector activation gate, durable impression flow, and
+score-policy rollback contract.
+
 ## Deploy
 1. Build and verify images:
    - `docker compose config -q`
    - `docker compose --profile test run --rm backend-tests`
 2. Apply the stack:
-   - `docker compose up -d --build`
+   - `./startup.sh start` (includes the authoritative Flink profile and the
+     explicit local sample-index bootstrap when configured)
 3. Verify health:
    - `docker compose ps`
    - `curl http://localhost/`
@@ -17,7 +22,7 @@
 1. Identify the last known-good image tags or Git revision.
 2. Rebuild or retag the last known-good revision.
 3. Re-apply:
-   - `docker compose up -d --build`
+   - `docker compose --profile flink up -d --build`
 4. Re-run readiness and smoke checks before reopening traffic.
 
 ## Release Gates

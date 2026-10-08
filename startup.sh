@@ -42,7 +42,8 @@ EOF
 
 start_stack() {
   print INFO "Starting microservice stack with Docker Compose"
-  run_compose up -d --build
+  run_compose --profile demo run --rm --no-deps vector-sample-bootstrap
+  run_compose --profile flink up -d --build
   print INFO "Public edge is expected at http://localhost"
   print INFO "Run './startup.sh health' once containers are healthy"
 }
@@ -75,6 +76,16 @@ check_health() {
   print INFO "Checking ${DEFAULT_HEALTH_URL}"
   curl --fail --silent --show-error "$DEFAULT_HEALTH_URL"
   printf '\n'
+  print INFO "Checking official Flink interaction feature job"
+  local jobs
+  jobs="$(run_compose --profile flink exec -T flink-jobmanager \
+    flink list -m flink-jobmanager:8081 -r)"
+  local matches
+  matches="$(printf '%s\n' "$jobs" | grep -c 'video-commerce-interaction-features' || true)"
+  if [[ "$matches" -ne 1 ]]; then
+    print ERROR "Expected exactly one running video-commerce-interaction-features job, found $matches"
+    return 1
+  fi
 }
 
 build_images() {

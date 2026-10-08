@@ -430,7 +430,10 @@ async def test_vector_search_save_load_preserves_real_product_embeddings(tmp_pat
     loaded = VectorSearchEngine(config)
     await loaded.load_index()
 
-    assert (tmp_path / "catalog.embeddings.npz").exists()
+    active_index_path, _ = engine._resolve_active_artifact_paths(
+        tmp_path / "catalog.faiss"
+    )
+    assert active_index_path.with_suffix(".embeddings.npz").exists()
     np.testing.assert_allclose(
         loaded.get_product_embedding("p1"),
         np.array([1.0, 0.0], dtype=np.float32),
