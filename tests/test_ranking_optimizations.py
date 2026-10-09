@@ -82,6 +82,42 @@ def _recommendation(product_id: str, ranking_score: float) -> ProductRecommendat
     )
 
 
+def test_ranking_request_body_normalizes_non_string_mapping_keys():
+    body = recommendation_api_module._ranking_request_body(
+        candidates=[
+            CandidateProduct(product_id="p1", combined_score=0.5, source="test")
+        ],
+        user_features=UserFeatures(
+            user_id="u1",
+            demographics={1: {2: "segment"}},
+        ),
+        context={"nested": {3: "context"}},
+        product_metadata_map={"p1": {4: "metadata"}},
+        k=1,
+        request_id="request-1",
+    )
+
+    payload = json.loads(body)
+
+    assert payload["user_features"]["demographics"] == {"1": {"2": "segment"}}
+    assert payload["context"]["nested"] == {"3": "context"}
+    assert payload["product_metadata_map"]["p1"] == {"4": "metadata"}
+
+
+def test_ranking_request_body_rejects_mapping_key_collisions():
+    with pytest.raises(ValueError, match="JSON object key collision"):
+        recommendation_api_module._ranking_request_body(
+            candidates=[
+                CandidateProduct(product_id="p1", combined_score=0.5, source="test")
+            ],
+            user_features=UserFeatures(user_id="u1"),
+            context={"nested": {1: "numeric", "1": "string"}},
+            product_metadata_map={"p1": {}},
+            k=1,
+            request_id="request-1",
+        )
+
+
 def test_build_recommendations_constructs_only_top_k_in_business_score_order():
     ranking = RankingModel(RankingConfig())
     candidates = [

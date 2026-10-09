@@ -134,7 +134,7 @@ async def _exercise_closed_loop():
             )
             assert recommendation.status_code == 200, recommendation.text
             metadata = recommendation.json()["metadata"]
-            assert metadata["impression_tracking"] == "durable"
+            assert metadata.get("impression_tracking") == "durable", recommendation.text
             impression_id = metadata["impression_id"]
 
             async def durable_recommendation_payload():

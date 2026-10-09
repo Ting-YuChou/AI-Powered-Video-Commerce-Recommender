@@ -2340,6 +2340,27 @@ def _recommendation_item_payload(item: Any) -> Dict[str, Any]:
     return dict(item)
 
 
+def _normalize_json_object_keys(value: Any, *, path: str = "$") -> Any:
+    """Convert nested mapping keys to JSON strings without hiding collisions."""
+    if isinstance(value, Mapping):
+        normalized: Dict[str, Any] = {}
+        for raw_key, nested_value in value.items():
+            key = raw_key if isinstance(raw_key, str) else str(raw_key)
+            if key in normalized:
+                raise ValueError(f"JSON object key collision at {path}.{key}")
+            normalized[key] = _normalize_json_object_keys(
+                nested_value,
+                path=f"{path}.{key}",
+            )
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_json_object_keys(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    return value
+
+
 def _recommendation_json_response(payload: Dict[str, Any], profile: dict) -> Response:
     return Response(
         content=json_dumps(payload),
@@ -2715,7 +2736,7 @@ def _ranking_request_body(
         payload["multimodal_context"] = multimodal_context
     if deadline_unix_seconds is not None:
         payload["deadline_unix_seconds"] = float(deadline_unix_seconds)
-    return json_dumps(payload)
+    return json_dumps(_normalize_json_object_keys(payload))
 
 
 def _ranking_deadline_unix_seconds(runtime) -> float:

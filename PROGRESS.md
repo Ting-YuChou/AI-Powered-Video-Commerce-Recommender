@@ -9,6 +9,9 @@
   Postgres row and one official Redis feature/sequence update, an identical
   retry remains exactly once, and the next durable impression snapshot proves
   recommendation serving consumed `total_interactions=1`.
+- Fixed the CI-discovered ranking payload failure for Flink-derived nested maps:
+  non-string JSON object keys are normalized at the ranking HTTP boundary, while
+  string-conversion collisions fail explicitly instead of overwriting data.
 - Extended the HTTP baseline with run isolation, excluded warm-up, successful
   latency/QPS, cache, transport/5xx, and durable tracking metrics. Added the
   three-pair hot/unique served-impression outbox A/B runner, exact published-row
@@ -18,9 +21,10 @@
   `tests/integration/test_flink_closed_loop.py`,
   `scripts/loadtest_api_baseline.py`, and
   `scripts/run_recommendation_outbox_ab.py`.
-- Verification: isolated Compose/Flink smoke passed (`1 passed`) and removed its
-  fresh project volumes; baseline/A/B and vector-regression tests passed
-  (`26 passed`); frontend 14 tests,
+- Verification: isolated Compose/Flink smoke passed again after the ranking
+  payload fix (`1 passed in 3.43s`) and removed its fresh project volumes;
+  the complete ranking optimization suite passed (`79 passed`), and the
+  baseline/A/B and vector-regression tests passed (`26 passed`); frontend 14 tests,
   lint, and build passed; Flink Maven 28 tests passed; Helm lint, strict
   kubeconform `36/36`, Prometheus rule tests, Compose config, shell/Python syntax,
   and diff checks passed.
