@@ -103,3 +103,26 @@ The script verifies ordinary publication, Kafka-ack-before-outbox-mark
 redelivery with a stable event ID, one model computation across worker
 redelivery, and durable projection repair. The project name and volumes are
 separate from the operator's normal stack.
+
+The PR-required Flink closed-loop smoke uses the same isolation rule:
+
+```bash
+COMPOSE_PROJECT_NAME=vc-flink-closed-loop-local \
+  scripts/run_flink_closed_loop_smoke.sh
+```
+
+It bootstraps a test-only sample vector generation, starts exactly one official
+`video-commerce-interaction-features` job, and sends one stable click event. The
+test waits for one Postgres interaction row and the matching official Redis
+`uf:`/`uiz:` state, retries the event to prove no duplicate effects, then asks
+for a recommendation. The final assertion reads the durable served-impression
+outbox and requires its `user_feature_snapshot` to contain the Flink-produced
+interaction. A failure saves Compose logs and Flink REST state under
+`FLINK_CLOSED_LOOP_ARTIFACT_DIR`; the runner always removes only its named
+project and volumes.
+
+The runner disables the known-user negative snapshot optimization so a newly
+created test user immediately exercises the authoritative official Redis keys.
+Production keeps the optimization enabled; its refresh interval can delay the
+first feature read for a newly observed user and is tracked as a separate
+freshness concern.

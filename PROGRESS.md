@@ -1,5 +1,36 @@
 # Progress
 
+## 2026-10-08 — Automated deployment gates, Flink closed loop, and outbox A/B harness
+
+- Expanded PR CI with Node 20 frontend tests/lint/build, Java 11 Flink Maven
+  tests, pinned Helm/kubeconform/promtool deployment validation, and an isolated
+  `flink-closed-loop` check with failure artifacts and project-scoped cleanup.
+- Added a real interaction-to-serving smoke: one stable click becomes one
+  Postgres row and one official Redis feature/sequence update, an identical
+  retry remains exactly once, and the next durable impression snapshot proves
+  recommendation serving consumed `total_interactions=1`.
+- Extended the HTTP baseline with run isolation, excluded warm-up, successful
+  latency/QPS, cache, transport/5xx, and durable tracking metrics. Added the
+  three-pair hot/unique served-impression outbox A/B runner, exact published-row
+  reconciliation, resource/artifact lineage, and all specified acceptance gates.
+- Key files: `.github/workflows/ci.yml`,
+  `scripts/run_flink_closed_loop_smoke.sh`,
+  `tests/integration/test_flink_closed_loop.py`,
+  `scripts/loadtest_api_baseline.py`, and
+  `scripts/run_recommendation_outbox_ab.py`.
+- Verification: isolated Compose/Flink smoke passed (`1 passed`) and removed its
+  fresh project volumes; baseline/A/B and vector-regression tests passed
+  (`26 passed`); frontend 14 tests,
+  lint, and build passed; Flink Maven 28 tests passed; Helm lint, strict
+  kubeconform `36/36`, Prometheus rule tests, Compose config, shell/Python syntax,
+  and diff checks passed.
+- Known gaps: the full three-pair 3,000-request hot/unique A/B run has not been
+  executed, so latency/QPS and outbox-cost gates remain unverified and no
+  performance-regression claim is made. The smoke disables the known-user
+  negative snapshot cache because its production refresh interval can hide a
+  newly created user's fresh Flink features. Checkpoint restore, artifact rolling
+  activation, DLQ replay, and Iceberg cleanup drills remain follow-up work.
+
 ## 2026-10-08 — Content upload outbox and worker processing leases
 
 - Added migration `009_content_task_reliability.sql` for durable content-task

@@ -4,6 +4,10 @@
 - `python scripts/loadtest_api_baseline.py --base-url http://127.0.0.1 --requests 3000 --concurrency 100 --mode hot --timeout 10`
 - `python scripts/loadtest_api_baseline.py --base-url http://127.0.0.1 --requests 3000 --concurrency 100 --mode unique --timeout 10`
 
+Use `--run-id` to isolate test users and correlate durable impression rows. Use
+`--warmup-requests` for an excluded warm-up phase. Hot warm-up reuses the
+measured user under a separate session ID; unique warm-up uses separate users.
+
 ## Output
 - Results are written to `loadtest/results/httpx-baseline-<mode>.json` unless `--output` is specified.
 - The summary includes:
@@ -12,12 +16,66 @@
   - p50 / p95 / p99 latency
   - max latency
   - status code distribution
+  - successful-response latency and QPS
+  - transport-error and HTTP 5xx rates
+  - recommendation-cache hit rate
+  - durable/unavailable impression tracking coverage
 
 ## Baseline Gate
 - `success_rate >= 0.99`
 - `p95_ms <= 1000`
 - `p99_ms <= 2000`
 - no unexpected `5xx` bursts
+
+## Served-Impression Outbox A/B
+
+`scripts/run_recommendation_outbox_ab.py` compares the same checkout with
+`RECOMMENDATION_IMPRESSION_LOGGING_ENABLED=false` and `true`. It performs three
+paired hot and unique runs in the fixed order off/on, on/off, off/on. Each run
+uses a distinct session ID, waits up to 60 seconds for the measured outbox rows
+to drain, and reconciles published rows against durable impression responses.
+
+Prepare a dedicated Compose project and its sample index for a directional
+local run:
+
+```bash
+export COMPOSE_PROJECT_NAME="vc-outbox-ab-$(date +%Y%m%d%H%M%S)"
+export ENVIRONMENT=test
+export VECTOR_BOOTSTRAP_MODE=sample
+export SERVICE_GATEWAY_WORKERS=1
+export SERVICE_RECOMMENDATION_WORKERS=1
+export SERVICE_RANKING_WORKERS=1
+export RANKING_RUNNER_REPLICAS=1
+
+docker compose --profile demo build vector-sample-bootstrap
+docker compose --profile demo run --rm vector-sample-bootstrap
+docker compose up -d --build caddy
+
+python scripts/run_recommendation_outbox_ab.py \
+  --base-url http://127.0.0.1 \
+  --compose-project-name "$COMPOSE_PROJECT_NAME" \
+  --requests 3000 \
+  --concurrency 100 \
+  --warmup-requests 300 \
+  --environment-class directional
+
+docker compose -p "$COMPOSE_PROJECT_NAME" down -v --remove-orphans
+```
+
+For a release go/no-go run, use fixed Linux resources, identical verified
+model/vector artifacts, `--environment-class fixed-linux`, and
+`--artifact-manifest <path>`. The runner records the commit, host information,
+artifact-manifest SHA-256, raw runs, medians, regressions, and gate reasons in
+`loadtest/results/recommendation-outbox-ab/summary.json`. Results remain ignored
+artifacts; the summary also captures host CPU/memory and recommendation-container
+CPU/memory limits. Record the reviewed summary in `PROGRESS.md`.
+
+Every outbox-enabled run must have error rate below 0.5%, HTTP 5xx below 0.1%,
+successful p95 below 1,000 ms, successful p99 below 2,000 ms, durable tracking
+coverage of at least 99.5%, zero pending measured rows, and exact durable versus
+published reconciliation. Across three runs, median p95 and successful QPS may
+not regress by more than 10% versus the disabled control. OrbStack results are
+directional and do not establish production capacity.
 
 ## Ranking High-Concurrency Acceptance
 
