@@ -5,6 +5,7 @@ Object storage abstraction for local and S3-compatible upload persistence.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
@@ -14,6 +15,13 @@ from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 from video_commerce.common.config import ObjectStorageConfig
+
+
+@dataclass(frozen=True)
+class StoredObject:
+    uri: str
+    size: int
+    last_modified: float
 
 
 class ObjectStorage:
@@ -52,6 +60,35 @@ class ObjectStorage:
         )
         if self.config.create_bucket_on_startup:
             await asyncio.to_thread(self._ensure_bucket_exists)
+
+    async def health_check(self, *, local_path: Optional[str] = None) -> dict:
+        """Verify the storage operations required by uploads and reconciliation."""
+        if not self.is_remote:
+            if not local_path:
+                return {"status": "healthy", "backend": "local"}
+            path = Path(local_path)
+            healthy = path.is_dir() and os.access(path, os.W_OK)
+            return {
+                "status": "healthy" if healthy else "unhealthy",
+                "backend": "local",
+                "error": None if healthy else f"Local storage is not writable: {path}",
+            }
+        if self._client is None:
+            return {
+                "status": "unhealthy",
+                "backend": "s3",
+                "error": "S3 client is not initialized",
+            }
+        try:
+            await asyncio.to_thread(
+                self._client.list_objects_v2,
+                Bucket=self.config.bucket,
+                Prefix=f"{self.config.prefix.rstrip('/')}/",
+                MaxKeys=1,
+            )
+            return {"status": "healthy", "backend": "s3", "error": None}
+        except Exception as exc:
+            return {"status": "unhealthy", "backend": "s3", "error": str(exc)}
 
     async def persist_staged_file(
         self,
@@ -223,6 +260,66 @@ class ObjectStorage:
             return
         if storage_path and os.path.exists(storage_path):
             os.remove(storage_path)
+
+    async def storage_path_exists(self, storage_path: str) -> bool:
+        if self.is_remote and self.is_remote_uri(storage_path):
+            bucket, key = self._parse_s3_uri(storage_path)
+            try:
+                await asyncio.to_thread(
+                    self._client.head_object, Bucket=bucket, Key=key
+                )
+                return True
+            except Exception as exc:
+                response = getattr(exc, "response", {}) or {}
+                status = (response.get("ResponseMetadata", {}) or {}).get(
+                    "HTTPStatusCode"
+                )
+                code = str((response.get("Error", {}) or {}).get("Code") or "")
+                if status == 404 or code in {"404", "NoSuchKey", "NotFound"}:
+                    return False
+                raise
+        return bool(storage_path and os.path.exists(storage_path))
+
+    async def list_storage_objects(self, prefix_uri: str) -> list[StoredObject]:
+        if self.is_remote and self.is_remote_uri(prefix_uri):
+            bucket, prefix = self._parse_s3_uri(prefix_uri.rstrip("/") + "/_")
+            prefix = prefix.rsplit("/", 1)[0] + "/"
+
+            def _list() -> list[StoredObject]:
+                result = []
+                paginator = self._client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for item in page.get("Contents", []):
+                        key = str(item.get("Key") or "")
+                        modified = item.get("LastModified")
+                        if key:
+                            result.append(
+                                StoredObject(
+                                    uri=f"s3://{bucket}/{key}",
+                                    size=int(item.get("Size") or 0),
+                                    last_modified=float(
+                                        modified.timestamp() if modified else 0.0
+                                    ),
+                                )
+                            )
+                return sorted(result, key=lambda item: item.uri)
+
+            return await asyncio.to_thread(_list)
+        root = Path(prefix_uri)
+        if not root.exists():
+            return []
+        result = []
+        for path in root.rglob("*"):
+            if path.is_file():
+                stat = path.stat()
+                result.append(
+                    StoredObject(
+                        uri=str(path),
+                        size=int(stat.st_size),
+                        last_modified=float(stat.st_mtime),
+                    )
+                )
+        return sorted(result, key=lambda item: item.uri)
 
     async def list_storage_uris(
         self, prefix_uri: str, *, suffix: str = ""

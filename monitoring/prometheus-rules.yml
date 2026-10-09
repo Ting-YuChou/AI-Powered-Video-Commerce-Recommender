@@ -88,7 +88,7 @@ groups:
           description: "{{ $labels.service }} has reported zero live instances for more than 2 minutes."
 
       - alert: WorkerMetricsTargetDown
-        expr: up{job=~"content-worker|feature-worker|model-trainer"} == 0
+        expr: up{job=~"content-worker|content-task-publisher|feature-worker|model-trainer"} == 0
         for: 2m
         labels:
           severity: critical
@@ -297,6 +297,33 @@ groups:
         annotations:
           summary: Served-impression outbox is backlogged
           description: Attribution coverage is falling behind; inspect Kafka publish retries and database health.
+
+      - alert: ContentTaskOutboxBacklog
+        expr: content_task_outbox_oldest_age_seconds > 300 or content_task_outbox_pending > 1000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Content task outbox is not draining
+          description: Durable uploads are waiting for Kafka publication; inspect the publisher and broker.
+
+      - alert: ContentUploadObjectMissing
+        expr: increase(content_task_publish_retries_total{reason="missing_object"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: A durable content job references a missing object
+          description: The task was terminalized before Kafka publish to avoid an unprocessable job.
+
+      - alert: ContentProcessingLeaseLost
+        expr: increase(content_processing_events_total{outcome="lease_lost"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: A content worker lost its processing lease
+          description: Check worker stalls, Postgres latency, and processing duration before retry takeover.
 
       - alert: FeatureLakeMaterializationLagHigh
         expr: max by (record_type) ({__name__=~"(.+_)?feature_lake_materialization_lag_seconds",record_type!="window_feature"}) > 120

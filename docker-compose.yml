@@ -53,6 +53,7 @@ x-common-service: &common-service
     DATABASE_AUTO_CREATE_SCHEMA: "true"
     MODEL_CACHE_DIR: /app/models
     MODEL_CLIP_REVISION: ${MODEL_CLIP_REVISION:-57c216476eefef5ab752ec549e440a49ae4ae5f3}
+    MODEL_CONTENT_PIPELINE_VERSION: ${MODEL_CONTENT_PIPELINE_VERSION:-temporal-multimodal-v3}
     VECTOR_INDEX_PATH: /app/models/vector_index.faiss
     VECTOR_BOOTSTRAP_MODE: ${VECTOR_BOOTSTRAP_MODE:-required}
     VECTOR_MODEL_VERSION: ${VECTOR_MODEL_VERSION:-clip-vit-base-patch16}
@@ -235,6 +236,12 @@ x-common-service: &common-service
     SERVICE_PROXY_MAX_CONNECTIONS: ${SERVICE_PROXY_MAX_CONNECTIONS:-2000}
     SERVICE_PROXY_MAX_KEEPALIVE_CONNECTIONS: ${SERVICE_PROXY_MAX_KEEPALIVE_CONNECTIONS:-1000}
     SERVICE_PROXY_KEEPALIVE_EXPIRY_SECONDS: ${SERVICE_PROXY_KEEPALIVE_EXPIRY_SECONDS:-30}
+    SERVICE_CONTENT_OUTBOX_BATCH_SIZE: ${SERVICE_CONTENT_OUTBOX_BATCH_SIZE:-50}
+    SERVICE_CONTENT_OUTBOX_LEASE_SECONDS: ${SERVICE_CONTENT_OUTBOX_LEASE_SECONDS:-30}
+    SERVICE_CONTENT_OUTBOX_POLL_SECONDS: ${SERVICE_CONTENT_OUTBOX_POLL_SECONDS:-0.25}
+    SERVICE_CONTENT_OUTBOX_RETENTION_DAYS: ${SERVICE_CONTENT_OUTBOX_RETENTION_DAYS:-7}
+    SERVICE_CONTENT_ORPHAN_GRACE_SECONDS: ${SERVICE_CONTENT_ORPHAN_GRACE_SECONDS:-86400}
+    SERVICE_CONTENT_PROCESSING_LEASE_SECONDS: ${SERVICE_CONTENT_PROCESSING_LEASE_SECONDS:-300}
     SECURITY_AUTH_MODE: ${SECURITY_AUTH_MODE:-api_key}
     SECURITY_INTERNAL_SERVICE_KEY: ${SECURITY_INTERNAL_SERVICE_KEY:-}
     SECURITY_INTERNAL_SERVICE_KEY_FILE: ${SECURITY_INTERNAL_SERVICE_KEY_FILE:-}
@@ -603,6 +610,29 @@ services:
         limits:
           memory: 2G
           cpus: "1.0"
+
+  content-task-publisher:
+    <<: *common-service
+    command: python -m video_commerce.services.content_task_publisher.main
+    environment:
+      <<: *common-env
+      MONITORING_WORKER_METRICS_PORT: 9105
+    expose:
+      - "9105"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
 
   asr-service:
     profiles: ["speech-gpu"]

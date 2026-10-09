@@ -67,6 +67,13 @@ data:
   DATABASE_IMPRESSION_RETENTION_DAYS: {{ .Values.external.database.impressionRetentionDays | quote }}
   DATABASE_AUTO_CREATE_SCHEMA: {{ .Values.external.database.autoCreateSchema | quote }}
   MODEL_CACHE_DIR: {{ .Values.appConfig.modelCacheDir | quote }}
+  MODEL_CONTENT_PIPELINE_VERSION: {{ .Values.appConfig.contentPipelineVersion | quote }}
+  SERVICE_CONTENT_OUTBOX_BATCH_SIZE: {{ .Values.appConfig.contentOutboxBatchSize | quote }}
+  SERVICE_CONTENT_OUTBOX_LEASE_SECONDS: {{ .Values.appConfig.contentOutboxLeaseSeconds | quote }}
+  SERVICE_CONTENT_OUTBOX_POLL_SECONDS: {{ .Values.appConfig.contentOutboxPollSeconds | quote }}
+  SERVICE_CONTENT_OUTBOX_RETENTION_DAYS: {{ .Values.appConfig.contentOutboxRetentionDays | quote }}
+  SERVICE_CONTENT_ORPHAN_GRACE_SECONDS: {{ .Values.appConfig.contentOrphanGraceSeconds | quote }}
+  SERVICE_CONTENT_PROCESSING_LEASE_SECONDS: {{ .Values.appConfig.contentProcessingLeaseSeconds | quote }}
   VECTOR_INDEX_PATH: {{ .Values.appConfig.vectorIndexPath | quote }}
   VECTOR_BOOTSTRAP_MODE: {{ .Values.appConfig.vectorBootstrapMode | quote }}
   VECTOR_MODEL_VERSION: {{ .Values.appConfig.vectorModelVersion | quote }}

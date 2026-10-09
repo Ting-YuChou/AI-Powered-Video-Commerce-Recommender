@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,11 @@ class FakeContentProcessor:
         )
 
 
+class FailingIfCalledProcessor:
+    async def process_video(self, _path, _content_id):
+        raise AssertionError("completed durable work must not be recomputed")
+
+
 class FakeVectorSearch:
     async def add_content_embedding(self, _content_id, _embedding):
         return None
@@ -46,7 +52,10 @@ class FakeKafkaManager:
 
 
 @pytest.mark.asyncio
-async def test_content_worker_publishes_speech_metadata_without_transcript(monkeypatch, tmp_path):
+async def test_content_worker_publishes_speech_metadata_without_transcript(
+    monkeypatch, tmp_path, caplog
+):
+    caplog.set_level(logging.INFO, logger=video_processor.logger.name)
     upload = tmp_path / "upload.mp4"
     upload.write_bytes(b"video")
     config = SimpleNamespace(
@@ -83,3 +92,52 @@ async def test_content_worker_publishes_speech_metadata_without_transcript(monke
     assert updates["transcription_status"] == "completed"
     assert updates["has_speech_categories"] is True
     assert "private transcript" not in str(kafka_manager.events)
+
+
+@pytest.mark.asyncio
+async def test_completed_content_run_repairs_projection_without_recomputing(
+    monkeypatch, tmp_path
+):
+    upload = tmp_path / "upload.mp4"
+    upload.write_bytes(b"video")
+    durable_features = ContentFeatures(
+        content_id="content-1",
+        visual_embedding=[0.3, 0.4],
+    )
+
+    class CompletedStore:
+        async def claim_content_processing_run(self, **_kwargs):
+            return {"outcome": "completed"}
+
+        async def get_content_feature_artifact(self, _content_id):
+            return durable_features.dict()
+
+    config = SimpleNamespace(
+        kafka_config=SimpleNamespace(),
+        data_config=SimpleNamespace(cleanup_temp_files=False),
+        model_config=SimpleNamespace(content_pipeline_version="temporal-multimodal-v3"),
+        service_topology_config=SimpleNamespace(content_processing_lease_seconds=60),
+    )
+    worker = video_processor.VideoProcessorWorker(config)
+    worker.feature_store = FakeFeatureStore()
+    worker.content_processor = FailingIfCalledProcessor()
+    worker.vector_search = FakeVectorSearch()
+    worker.system_store = CompletedStore()
+    worker.object_storage = None
+    monkeypatch.setattr(video_processor, "get_kafka_manager", lambda **_kwargs: None)
+
+    await worker._handle_video_task(
+        "video-processing-tasks",
+        "content-1",
+        {
+            "event_id": "event-1",
+            "content_id": "content-1",
+            "pipeline_version": "temporal-multimodal-v3",
+            "file_path": str(upload),
+            "filename": "upload.mp4",
+        },
+        None,
+    )
+
+    assert worker.feature_store.features.content_id == "content-1"
+    assert worker.feature_store.statuses[-1] == ("content-1", "completed")

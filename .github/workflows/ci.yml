@@ -36,10 +36,43 @@ jobs:
           cache-dependency-path: Code.Frontend/package-lock.json
       - name: Install frontend dependencies
         run: npm ci
+      - name: Test frontend
+        run: npm test
       - name: Lint frontend
         run: npm run lint
       - name: Build frontend
         run: npm run build
+
+  flink-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flink-jobs/interaction-features
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+          cache-dependency-path: flink-jobs/interaction-features/pom.xml
+      - name: Run Flink Maven tests
+        run: mvn -B -ntp test
+
+  deployment-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose
+        run: docker compose config -q
+      - name: Lint Helm chart
+        run: docker run --rm -v "$PWD:/work" -w /work alpine/helm:3.14.0 lint charts/video-commerce
+      - name: Render Helm chart
+        run: docker run --rm -v "$PWD:/work" -w /work alpine/helm:3.14.0 template video-commerce charts/video-commerce > /tmp/video-commerce.yaml
+      - name: Validate Kubernetes manifests
+        run: docker run --rm -v /tmp:/work ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary /work/video-commerce.yaml
+      - name: Test Prometheus rules
+        run: docker run --rm --entrypoint /bin/promtool -v "$PWD:/work" -w /work prom/prometheus:v2.54.1 test rules tests/monitoring/prometheus-rules.test.yml
 
   docker-build:
     runs-on: ubuntu-latest
@@ -78,3 +111,22 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run compose integration smoke tests
         run: docker compose --profile test up --build --abort-on-container-exit --exit-code-from integration-tests integration-tests
+
+  flink-closed-loop:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: vc-flink-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+      FLINK_CLOSED_LOOP_ARTIFACT_DIR: /tmp/flink-closed-loop-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run isolated interaction to recommendation Flink smoke
+        run: scripts/run_flink_closed_loop_smoke.sh
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flink-closed-loop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/flink-closed-loop-artifacts
+          if-no-files-found: warn

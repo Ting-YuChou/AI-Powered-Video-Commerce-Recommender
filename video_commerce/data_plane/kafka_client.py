@@ -838,6 +838,21 @@ class KafkaManager:
             headers=_build_headers(request_id, task["event_id"]),
         )
 
+    async def publish_video_processing_task_payload(
+        self, event: Dict[str, Any]
+    ) -> bool:
+        """Publish a previously persisted content task without regenerating identity."""
+        event_id = str(event.get("event_id") or "").strip()
+        content_id = str(event.get("content_id") or "").strip()
+        if not event_id or not content_id:
+            raise ValueError("content task requires event_id and content_id")
+        return await self.producer.send(
+            topic=self.config.video_processing_topic,
+            value=dict(event),
+            key=content_id,
+            headers=_build_headers(event.get("request_id"), event_id),
+        )
+
     # ==================== Recommendation Events ====================
 
     async def send_recommendation_event(
@@ -923,9 +938,7 @@ class KafkaManager:
 
         return event
 
-    async def publish_recommendation_event_payload(
-        self, event: Dict[str, Any]
-    ) -> bool:
+    async def publish_recommendation_event_payload(self, event: Dict[str, Any]) -> bool:
         """Publish a prebuilt event without changing its event identity."""
         return await self.producer.send(
             topic=self.config.recommendation_events_topic,

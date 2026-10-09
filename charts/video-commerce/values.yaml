@@ -189,6 +189,13 @@ appConfig:
   flinkFeatureOutputNamespace: official
   modelCacheDir: /app/models
   clipRevision: 57c216476eefef5ab752ec549e440a49ae4ae5f3
+  contentPipelineVersion: temporal-multimodal-v3
+  contentOutboxBatchSize: 50
+  contentOutboxLeaseSeconds: 30
+  contentOutboxPollSeconds: 0.25
+  contentOutboxRetentionDays: 7
+  contentOrphanGraceSeconds: 86400
+  contentProcessingLeaseSeconds: 300
   vectorIndexPath: /app/models/vector_index.faiss
   vectorBootstrapMode: required
   vectorModelVersion: clip-vit-base-patch16
@@ -736,6 +743,40 @@ backend:
         enabled: false
       pdb:
         enabled: false
+      serviceMonitor:
+        enabled: true
+        path: /metrics
+    contentTaskPublisher:
+      enabled: true
+      name: content-task-publisher
+      replicaCount: 2
+      command: ["python", "-m", "video_commerce.services.content_task_publisher.main"]
+      env:
+        MONITORING_WORKER_METRICS_PORT: "9105"
+      service:
+        enabled: true
+        port: 9105
+        targetPort: 9105
+        portName: metrics
+        annotations: {}
+      probes:
+        type: metrics
+        livenessPath: /metrics
+        initialDelaySeconds: 30
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          memory: 512Mi
+      hpa:
+        enabled: false
+      pdb:
+        enabled: true
+        minAvailable: 1
       serviceMonitor:
         enabled: true
         path: /metrics

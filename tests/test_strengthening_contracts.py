@@ -73,6 +73,23 @@ async def test_sample_mode_does_not_implicitly_generate_products(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_sample_product_patterns_wrap_with_small_embedding_dimension(tmp_path):
+    engine = VectorSearchEngine(
+        VectorConfig(
+            index_path=str(tmp_path / "sample.faiss"),
+            bootstrap_mode="sample",
+            embedding_dim=4,
+        )
+    )
+    await engine._create_empty_index()
+
+    await engine._create_sample_products(num_products=10)
+
+    assert engine.index.ntotal == 10
+    assert all(vector.shape == (4,) for vector in engine.product_embeddings.values())
+
+
+@pytest.mark.asyncio
 async def test_required_vector_index_rejects_checksum_mismatch(tmp_path):
     path = tmp_path / "vector.faiss"
     writer = VectorSearchEngine(VectorConfig(index_path=str(path), bootstrap_mode="empty"))

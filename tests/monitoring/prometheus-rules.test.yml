@@ -55,3 +55,36 @@ tests:
             exp_annotations:
               summary: "PIT manifest exists but typed training continues to fail"
               description: "The trainer has failed closed; inspect manifest, shard hash, schema, and version errors."
+
+  - interval: 1m
+    input_series:
+      - series: 'content_task_outbox_oldest_age_seconds{job="content-task-publisher"}'
+        values: '301x10'
+      - series: 'content_task_outbox_pending{job="content-task-publisher"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ContentTaskOutboxBacklog
+        exp_alerts:
+          - exp_labels:
+              job: content-task-publisher
+              severity: critical
+            exp_annotations:
+              summary: "Content task outbox is not draining"
+              description: "Durable uploads are waiting for Kafka publication; inspect the publisher and broker."
+
+  - interval: 1m
+    input_series:
+      - series: 'content_task_publish_retries_total{job="content-task-publisher",reason="missing_object"}'
+        values: '0+1x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ContentUploadObjectMissing
+        exp_alerts:
+          - exp_labels:
+              job: content-task-publisher
+              reason: missing_object
+              severity: critical
+            exp_annotations:
+              summary: "A durable content job references a missing object"
+              description: "The task was terminalized before Kafka publish to avoid an unprocessable job."

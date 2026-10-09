@@ -30,7 +30,11 @@ from video_commerce.data_plane.kafka_client import (
 )
 from video_commerce.common.config import Config, KafkaConfig
 from video_commerce.ml.content_processor import ContentProcessor
-from video_commerce.ml.content_artifacts import persist_content_features
+from video_commerce.ml.content_artifacts import (
+    persist_content_features,
+    publish_content_feature_artifact,
+)
+from video_commerce.common.models import ContentFeatures
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.data_plane.system_store import SystemStore
@@ -154,6 +158,28 @@ class VideoProcessorWorker:
         user_id = value.get("user_id")
         priority = value.get("priority", "normal")
         request_id = value.get("request_id")
+        task_event_id = str(value.get("event_id") or f"legacy:{content_id}")
+        configured_pipeline_version = str(
+            getattr(
+                getattr(self.config, "model_config", None),
+                "content_pipeline_version",
+                "temporal-multimodal-v3",
+            )
+        )
+        pipeline_version = str(
+            value.get("pipeline_version") or configured_pipeline_version
+        )
+        pipeline_mismatch = bool(
+            value.get("pipeline_version")
+            and pipeline_version != configured_pipeline_version
+        )
+        lease_seconds = int(
+            getattr(
+                getattr(self.config, "service_topology_config", None),
+                "content_processing_lease_seconds",
+                300,
+            )
+        )
         started_at = time.perf_counter()
         status = "success"
 
@@ -162,17 +188,78 @@ class VideoProcessorWorker:
             extra={
                 "content_id": content_id,
                 "priority": priority,
-                "filename": filename,
+                "content_filename": filename,
                 "request_id": request_id,
             },
         )
 
         processing_path = file_path
         cleanup_processing_path = False
+        lease_acquired = False
+        lease_task: Optional[asyncio.Task] = None
+        lease_lost = asyncio.Event()
         try:
+            if pipeline_mismatch:
+                raise ValueError(
+                    f"content pipeline version mismatch: task={pipeline_version} "
+                    f"worker={configured_pipeline_version}"
+                )
+            if self.system_store:
+                claim = await self.system_store.claim_content_processing_run(
+                    content_id=content_id,
+                    pipeline_version=pipeline_version,
+                    task_event_id=task_event_id,
+                    worker_id=self.instance_id,
+                    lease_seconds=lease_seconds,
+                )
+                if claim["outcome"] == "lease_held":
+                    self.observability.record_content_processing(
+                        "duplicate_in_progress"
+                    )
+                    logger.info(
+                        "content_processing_duplicate_in_progress",
+                        extra={"content_id": content_id},
+                    )
+                    return
+                if claim["outcome"] == "superseded":
+                    self.observability.record_content_processing("superseded")
+                    logger.info(
+                        "content_processing_superseded",
+                        extra={
+                            "content_id": content_id,
+                            "pipeline_version": pipeline_version,
+                            "current_pipeline_version": claim.get(
+                                "current_pipeline_version"
+                            ),
+                        },
+                    )
+                    return
+                if claim["outcome"] == "completed":
+                    durable = await self.system_store.get_content_feature_artifact(
+                        content_id
+                    )
+                    if durable is None:
+                        raise RuntimeError(
+                            "completed content run is missing durable artifact"
+                        )
+                    await self._project_completed_features(
+                        ContentFeatures.parse_obj(durable)
+                    )
+                    self.observability.record_content_processing("projection_repair")
+                    return
+                lease_acquired = True
+                lease_task = asyncio.create_task(
+                    self._renew_processing_lease(
+                        content_id=content_id,
+                        pipeline_version=pipeline_version,
+                        lease_seconds=lease_seconds,
+                        lease_lost=lease_lost,
+                    ),
+                    name=f"content-lease-{content_id}",
+                )
             # Update status to processing
             await self.feature_store.update_content_status(content_id, "processing")
-            if self.system_store:
+            if self.system_store and not lease_acquired:
                 await self.system_store.update_content_job_status(
                     content_id,
                     "processing",
@@ -203,13 +290,43 @@ class VideoProcessorWorker:
                 processing_path, content_id
             )
 
-            # Publish immutable training bytes before advancing current pointers.
-            features = await persist_content_features(
-                features,
-                object_storage=self.object_storage,
-                system_store=self.system_store,
-                feature_store=self.feature_store,
-            )
+            if lease_lost.is_set():
+                raise RuntimeError("content processing lease was lost")
+
+            if self.system_store and lease_acquired:
+                if not await self.system_store.assert_content_processing_lease(
+                    content_id=content_id,
+                    pipeline_version=pipeline_version,
+                    worker_id=self.instance_id,
+                ):
+                    raise RuntimeError("content processing lease was lost")
+                if self.object_storage is not None:
+                    features = await publish_content_feature_artifact(
+                        self.object_storage, features
+                    )
+                completed = await self.system_store.complete_content_processing_run(
+                    content_id=content_id,
+                    pipeline_version=pipeline_version,
+                    worker_id=self.instance_id,
+                    features=features.dict(),
+                    schema_version=features.multimodal_schema_version,
+                    artifact_uri=features.artifact_uri,
+                    artifact_sha256=features.artifact_sha256,
+                )
+                if not completed:
+                    raise RuntimeError("content processing completion lost its lease")
+                await self._project_completed_features(features)
+            else:
+                features = await persist_content_features(
+                    features,
+                    object_storage=self.object_storage,
+                    system_store=self.system_store,
+                    feature_store=self.feature_store,
+                )
+                if features.visual_embedding:
+                    await self.vector_search.add_content_embedding(
+                        content_id, features.visual_embedding
+                    )
 
             audio_features = features.audio_features
             transcription_status = (
@@ -232,15 +349,9 @@ class VideoProcessorWorker:
                     len(audio_features.asr_segments),
                 )
 
-            # Update vector search index
-            if features.visual_embedding:
-                await self.vector_search.add_content_embedding(
-                    content_id, features.visual_embedding
-                )
-
             # Update status to completed
             await self.feature_store.update_content_status(content_id, "completed")
-            if self.system_store:
+            if self.system_store and not lease_acquired:
                 await self.system_store.update_content_job_status(
                     content_id,
                     "completed",
@@ -289,7 +400,23 @@ class VideoProcessorWorker:
                         "bookkeeping_error": str(status_error),
                     },
                 )
-            if self.system_store:
+            if self.system_store and lease_acquired:
+                try:
+                    await self.system_store.fail_content_processing_run(
+                        content_id=content_id,
+                        pipeline_version=pipeline_version,
+                        worker_id=self.instance_id,
+                        error=str(e),
+                    )
+                except Exception as status_error:
+                    logger.error(
+                        "Failed to release content processing lease",
+                        extra={
+                            "content_id": content_id,
+                            "bookkeeping_error": str(status_error),
+                        },
+                    )
+            elif self.system_store:
                 try:
                     await self.system_store.update_content_job_status(
                         content_id,
@@ -312,6 +439,12 @@ class VideoProcessorWorker:
             raise
 
         finally:
+            if lease_task is not None:
+                lease_task.cancel()
+                try:
+                    await lease_task
+                except asyncio.CancelledError:
+                    pass
             self.observability.record_worker_message(
                 "content-worker",
                 topic,
@@ -339,6 +472,37 @@ class VideoProcessorWorker:
                 logger.warning(
                     f"Failed to cleanup file {processing_path or file_path}: {e}"
                 )
+
+    async def _project_completed_features(self, features: ContentFeatures) -> None:
+        """Repair online projections from the durable content artifact."""
+        await self.feature_store.store_content_features(features.content_id, features)
+        if features.visual_embedding:
+            await self.vector_search.add_content_embedding(
+                features.content_id, features.visual_embedding
+            )
+        await self.feature_store.update_content_status(features.content_id, "completed")
+
+    async def _renew_processing_lease(
+        self,
+        *,
+        content_id: str,
+        pipeline_version: str,
+        lease_seconds: int,
+        lease_lost: asyncio.Event,
+    ) -> None:
+        interval = max(10.0, float(lease_seconds) / 3.0)
+        while True:
+            await asyncio.sleep(interval)
+            renewed = await self.system_store.renew_content_processing_lease(
+                content_id=content_id,
+                pipeline_version=pipeline_version,
+                worker_id=self.instance_id,
+                lease_seconds=lease_seconds,
+            )
+            if not renewed:
+                self.observability.record_content_processing("lease_lost")
+                lease_lost.set()
+                return
 
     async def _publish_heartbeat(self):
         """Publish worker liveness into Redis for readiness checks."""

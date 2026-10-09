@@ -5,6 +5,35 @@ deploying the updated interaction, recommendation, or Flink services. The
 migration is additive and introduces the interaction idempotency ledger,
 served-impression outbox, and viewed-impression table.
 
+Apply `migrations/postgres/009_content_task_reliability.sql` before deploying
+the gateway, content-task publisher, or content workers. Uploads first persist
+the object and then atomically create the authoritative `content_jobs` row and
+`content_task_outbox` event. The event ID is UUIDv5 over content ID and content
+pipeline version, so every inline or background publish attempt uses the same
+Kafka identity. The gateway returns `queued` only after Kafka acknowledges the
+event. If publication is still pending, it returns HTTP 503 with
+`CONTENT_ENQUEUE_PENDING`, `content_id`, `status=pending_publish`, and
+`Retry-After`; the durable object and outbox row remain available for retry.
+
+Run `content-task-publisher` in every environment that accepts uploads. Multiple
+replicas safely claim rows with `FOR UPDATE SKIP LOCKED` and owner-token leases.
+It also reconciles managed upload objects: unreferenced objects are retained for
+the configured grace period before deletion, referenced missing objects
+terminalize the job as `failed_missing_object`, and published outbox records are
+retained for seven days by default. `content_jobs` is authoritative for status;
+Redis is only the completed projection/cache.
+
+Content workers claim `(content_id, pipeline_version)` in
+`content_processing_runs`. A valid competing lease skips duplicate model work,
+an expired or failed lease can be taken over, and an old owner cannot complete a
+new owner's run. Feature artifacts are immutable and committed with the run and
+job completion in one database transaction before Redis and vector projections
+are updated. A redelivery after that commit repairs projections from the durable
+artifact without recomputing the model. Keep
+`MODEL_CONTENT_PIPELINE_VERSION` identical on the gateway and workers; an
+explicit mismatched event is failed for investigation. Legacy events without a
+version map to the configured worker version during migration.
+
 Production must set `VECTOR_BOOTSTRAP_MODE=required`. A vector activation is
 accepted only when the FAISS file, metadata, optional embedding sidecar, and
 manifest agree on checksums, dimensions, row count, and index map. Local demos
@@ -52,3 +81,48 @@ Use `video_commerce_recommendation_impression_events_total` by stage and
 status together with Kafka consumer lag, Flink job state, and the durable
 outbox retry fields for reconciliation. Exclude responses with
 `impression_tracking=unavailable` from attribution and training datasets.
+For content delivery, alert on `content_task_outbox_pending`,
+`content_task_outbox_oldest_age_seconds`, missing-object retries, and
+`content_processing_events_total{outcome="lease_lost"}`. A growing outbox means
+uploads may be durable but are not yet available to workers.
+
+For an isolated release smoke with real Kafka and Postgres, use a disposable
+Compose project and test-only vector mode:
+
+```bash
+ENVIRONMENT=test VECTOR_BOOTSTRAP_MODE=empty \
+  docker compose -p vc-phase-a-smoke --profile test up -d \
+  postgres redis redis-cache zookeeper kafka kafka-init
+ENVIRONMENT=test VECTOR_BOOTSTRAP_MODE=empty \
+  docker compose -p vc-phase-a-smoke run --rm --build \
+  content-task-publisher python -m scripts.content_reliability_smoke
+docker compose -p vc-phase-a-smoke --profile test down -v
+```
+
+The script verifies ordinary publication, Kafka-ack-before-outbox-mark
+redelivery with a stable event ID, one model computation across worker
+redelivery, and durable projection repair. The project name and volumes are
+separate from the operator's normal stack.
+
+The PR-required Flink closed-loop smoke uses the same isolation rule:
+
+```bash
+COMPOSE_PROJECT_NAME=vc-flink-closed-loop-local \
+  scripts/run_flink_closed_loop_smoke.sh
+```
+
+It bootstraps a test-only sample vector generation, starts exactly one official
+`video-commerce-interaction-features` job, and sends one stable click event. The
+test waits for one Postgres interaction row and the matching official Redis
+`uf:`/`uiz:` state, retries the event to prove no duplicate effects, then asks
+for a recommendation. The final assertion reads the durable served-impression
+outbox and requires its `user_feature_snapshot` to contain the Flink-produced
+interaction. A failure saves Compose logs and Flink REST state under
+`FLINK_CLOSED_LOOP_ARTIFACT_DIR`; the runner always removes only its named
+project and volumes.
+
+The runner disables the known-user negative snapshot optimization so a newly
+created test user immediately exercises the authoritative official Redis keys.
+Production keeps the optimization enabled; its refresh interval can delay the
+first feature read for a newly observed user and is tracked as a separate
+freshness concern.

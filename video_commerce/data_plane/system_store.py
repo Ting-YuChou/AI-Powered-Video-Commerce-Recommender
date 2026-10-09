@@ -72,6 +72,62 @@ class PreparedCatalogActivation:
     outbox_rows: List[Dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class PreparedContentTask:
+    event_id: str
+    content_id: str
+    pipeline_version: str
+    payload_hash: str
+    payload: Dict[str, Any]
+
+
+def prepare_content_task(
+    *,
+    content_id: str,
+    pipeline_version: str,
+    storage_path: str,
+    filename: Optional[str],
+    user_id: Optional[str],
+    priority: str,
+    request_id: Optional[str],
+    timestamp: float,
+) -> PreparedContentTask:
+    """Build the stable Kafka task persisted in the content outbox."""
+    normalized_content_id = str(content_id or "").strip()
+    normalized_pipeline_version = str(pipeline_version or "").strip()
+    if not normalized_content_id:
+        raise ValueError("content_id must not be blank")
+    if not normalized_pipeline_version:
+        raise ValueError("pipeline_version must not be blank")
+    event_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"video-commerce:content-task:{normalized_content_id}:{normalized_pipeline_version}",
+    ).hex
+    payload = {
+        "schema_version": 1,
+        "event_id": event_id,
+        "source_event_id": event_id,
+        "event_type": "video_processing_task",
+        "request_id": request_id,
+        "occurred_at": float(timestamp),
+        "timestamp": float(timestamp),
+        "content_id": normalized_content_id,
+        "pipeline_version": normalized_pipeline_version,
+        "file_path": storage_path,
+        "filename": filename,
+        "user_id": user_id,
+        "priority": priority,
+        "status": "pending",
+    }
+    return PreparedContentTask(
+        event_id=event_id,
+        content_id=normalized_content_id,
+        pipeline_version=normalized_pipeline_version,
+        payload_hash=payload_sha256(payload),
+        payload=payload,
+    )
+
+
 def prepare_catalog_activation(
     *,
     source_version: str,
@@ -710,6 +766,10 @@ class ContentJob(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    pipeline_version: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    task_event_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, unique=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -720,6 +780,61 @@ class ContentJob(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+
+
+class ContentTaskOutbox(Base):
+    __tablename__ = "content_task_outbox"
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    content_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    pipeline_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    claimed_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    claim_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    published_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    terminal_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    terminal_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ContentProcessingRun(Base):
+    __tablename__ = "content_processing_runs"
+
+    content_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    pipeline_version: Mapped[str] = mapped_column(String(128), primary_key=True)
+    task_event_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    artifact_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    artifact_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
@@ -1138,6 +1253,20 @@ class SystemStore:
                 "ALTER TABLE product_catalog_snapshot "
                 "ADD COLUMN IF NOT EXISTS activation_id VARCHAR(64), "
                 "ADD COLUMN IF NOT EXISTS source_version VARCHAR(255)"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE content_jobs "
+                "ADD COLUMN IF NOT EXISTS pipeline_version VARCHAR(128), "
+                "ADD COLUMN IF NOT EXISTS task_event_id VARCHAR(64)"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE content_task_outbox "
+                "ADD COLUMN IF NOT EXISTS terminal_at TIMESTAMPTZ, "
+                "ADD COLUMN IF NOT EXISTS terminal_reason TEXT"
             )
         )
         await conn.execute(
@@ -1611,12 +1740,17 @@ class SystemStore:
             )
             if impression is not None:
                 items = (
-                    await session.execute(
-                        select(RecommendationImpressionItem).where(
-                            RecommendationImpressionItem.impression_id == impression_id
+                    (
+                        await session.execute(
+                            select(RecommendationImpressionItem).where(
+                                RecommendationImpressionItem.impression_id
+                                == impression_id
+                            )
                         )
                     )
-                ).scalars().all()
+                    .scalars()
+                    .all()
+                )
                 return {
                     "user_id": impression.user_id,
                     "items": {item.product_id: item.position for item in items},
@@ -1652,15 +1786,21 @@ class SystemStore:
         now = _utc_now()
         lease_expires_at = now + timedelta(seconds=max(1, int(lease_seconds)))
         claim_token = uuid.uuid4().hex
-        insert_stmt = pg_insert(InteractionIdempotencyLedger).values(
-            event_id=event_id,
-            payload_hash=payload_hash,
-            event_payload=dict(event_payload),
-            status="pending",
-            lease_owner=claim_token,
-            lease_expires_at=lease_expires_at,
-            updated_at=now,
-        ).on_conflict_do_nothing(index_elements=[InteractionIdempotencyLedger.event_id])
+        insert_stmt = (
+            pg_insert(InteractionIdempotencyLedger)
+            .values(
+                event_id=event_id,
+                payload_hash=payload_hash,
+                event_payload=dict(event_payload),
+                status="pending",
+                lease_owner=claim_token,
+                lease_expires_at=lease_expires_at,
+                updated_at=now,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[InteractionIdempotencyLedger.event_id]
+            )
+        )
         async with self.session_factory.begin() as session:
             insert_result = await session.execute(insert_stmt)
             inserted = bool(insert_result.rowcount)
@@ -1675,11 +1815,7 @@ class SystemStore:
                 return {"status": "collision"}
             if row.status == "published":
                 return {"status": "duplicate", "event_payload": dict(row.event_payload)}
-            if (
-                not inserted
-                and row.lease_expires_at
-                and row.lease_expires_at > now
-            ):
+            if not inserted and row.lease_expires_at and row.lease_expires_at > now:
                 return {"status": "pending"}
             row.status = "pending"
             row.lease_owner = claim_token
@@ -1729,9 +1865,7 @@ class SystemStore:
             )
         return bool(result.rowcount)
 
-    async def enqueue_recommendation_event(
-        self, event: Mapping[str, Any]
-    ) -> str:
+    async def enqueue_recommendation_event(self, event: Mapping[str, Any]) -> str:
         """Durably stage one served-impression event before returning its ID."""
         if not self.enabled:
             return False
@@ -1739,12 +1873,14 @@ class SystemStore:
         event_id = str(event.get("event_id") or "").strip()
         impression_id = str(metadata.get("impression_id") or "").strip()
         if not event_id or not impression_id:
-            raise ValueError("recommendation outbox event requires event_id and impression_id")
+            raise ValueError(
+                "recommendation outbox event requires event_id and impression_id"
+            )
         payload = dict(event)
         payload_hash = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
-                "utf-8"
-            )
+            json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), default=str
+            ).encode("utf-8")
         ).hexdigest()
         stmt = pg_insert(RecommendationEventOutbox).values(
             event_id=event_id,
@@ -1767,9 +1903,7 @@ class SystemStore:
                     )
                 )
                 if existing is None or existing.payload_hash != payload_hash:
-                    raise ValueError(
-                        "recommendation outbox event_id payload collision"
-                    )
+                    raise ValueError("recommendation outbox event_id payload collision")
                 outcome = "duplicate"
         self._update_pool_metrics()
         return outcome
@@ -1919,14 +2053,18 @@ class SystemStore:
                 item_result = await session.execute(item_stmt)
                 item_rows = item_result.scalars().all()
                 view_rows = (
-                    await session.execute(
-                        select(RecommendationImpressionView).where(
-                            RecommendationImpressionView.impression_id.in_(
-                                sorted(impression_ids)
+                    (
+                        await session.execute(
+                            select(RecommendationImpressionView).where(
+                                RecommendationImpressionView.impression_id.in_(
+                                    sorted(impression_ids)
+                                )
                             )
                         )
                     )
-                ).scalars().all()
+                    .scalars()
+                    .all()
+                )
 
                 user_ids = sorted(
                     {
@@ -2004,9 +2142,7 @@ class SystemStore:
                 }
                 for row in view_rows
             ],
-            attribution_window_hours=int(
-                self.config.ltr_attribution_window_hours
-            ),
+            attribution_window_hours=int(self.config.ltr_attribution_window_hours),
         )
 
     async def get_two_tower_training_impression_negatives(
@@ -2062,14 +2198,18 @@ class SystemStore:
                 item_result = await session.execute(item_stmt)
                 item_rows = item_result.scalars().all()
                 view_rows = (
-                    await session.execute(
-                        select(RecommendationImpressionView).where(
-                            RecommendationImpressionView.impression_id.in_(
-                                sorted(impression_ids)
+                    (
+                        await session.execute(
+                            select(RecommendationImpressionView).where(
+                                RecommendationImpressionView.impression_id.in_(
+                                    sorted(impression_ids)
+                                )
                             )
                         )
                     )
-                ).scalars().all()
+                    .scalars()
+                    .all()
+                )
 
                 user_ids = sorted(
                     {
@@ -2375,6 +2515,523 @@ class SystemStore:
             await session.execute(stmt)
         self._update_pool_metrics()
 
+    async def stage_content_task(
+        self,
+        task: PreparedContentTask,
+        *,
+        filename: Optional[str],
+        storage_path: str,
+        user_id: Optional[str],
+        priority: str,
+        request_id: Optional[str],
+    ) -> str:
+        """Atomically persist the current content job and its Kafka outbox row."""
+        if not self.enabled:
+            raise RuntimeError("content task outbox requires Postgres")
+        now = _utc_now()
+        job_stmt = pg_insert(ContentJob).values(
+            content_id=task.content_id,
+            filename=filename,
+            storage_path=storage_path,
+            user_id=user_id,
+            priority=priority,
+            status="pending_publish",
+            error_message=None,
+            payload={"request_id": request_id},
+            pipeline_version=task.pipeline_version,
+            task_event_id=task.event_id,
+            updated_at=now,
+        )
+        job_stmt = job_stmt.on_conflict_do_update(
+            index_elements=[ContentJob.content_id],
+            set_={
+                "filename": filename,
+                "storage_path": storage_path,
+                "user_id": user_id,
+                "priority": priority,
+                "status": "pending_publish",
+                "error_message": None,
+                "payload": {"request_id": request_id},
+                "pipeline_version": task.pipeline_version,
+                "task_event_id": task.event_id,
+                "updated_at": now,
+            },
+        )
+        outbox_stmt = (
+            pg_insert(ContentTaskOutbox)
+            .values(
+                event_id=task.event_id,
+                content_id=task.content_id,
+                pipeline_version=task.pipeline_version,
+                payload_hash=task.payload_hash,
+                event_payload=task.payload,
+                next_attempt_at=now,
+            )
+            .on_conflict_do_nothing(index_elements=[ContentTaskOutbox.event_id])
+        )
+        async with self.session_factory.begin() as session:
+            existing = await session.get(ContentTaskOutbox, task.event_id)
+            if existing is not None and existing.payload_hash != task.payload_hash:
+                raise ValueError("content task outbox event_id payload collision")
+            await session.execute(job_stmt)
+            await session.execute(outbox_stmt)
+        self._update_pool_metrics()
+        return "duplicate" if existing is not None else "inserted"
+
+    async def claim_content_task_outbox(
+        self, *, worker_id: str, batch_size: int, lease_seconds: int
+    ) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        now = _utc_now()
+        lease_until = now + timedelta(seconds=max(1, int(lease_seconds)))
+        statement = (
+            select(ContentTaskOutbox)
+            .where(
+                ContentTaskOutbox.published_at.is_(None),
+                ContentTaskOutbox.terminal_at.is_(None),
+                ContentTaskOutbox.next_attempt_at <= now,
+                or_(
+                    ContentTaskOutbox.claim_expires_at.is_(None),
+                    ContentTaskOutbox.claim_expires_at < now,
+                ),
+            )
+            .order_by(ContentTaskOutbox.created_at, ContentTaskOutbox.event_id)
+            .limit(max(1, int(batch_size)))
+            .with_for_update(skip_locked=True)
+        )
+        async with self.session_factory.begin() as session:
+            rows = (await session.execute(statement)).scalars().all()
+            events = []
+            for row in rows:
+                row.claimed_by = worker_id
+                row.claim_expires_at = lease_until
+                row.attempts = int(row.attempts or 0) + 1
+                events.append(dict(row.event_payload or {}))
+        self._update_pool_metrics()
+        return events
+
+    async def claim_content_task_outbox_event(
+        self, event_id: str, *, worker_id: str, lease_seconds: int
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            row = await session.get(ContentTaskOutbox, event_id, with_for_update=True)
+            if (
+                row is None
+                or row.published_at is not None
+                or row.terminal_at is not None
+                or (
+                    row.claim_expires_at is not None
+                    and row.claim_expires_at >= now
+                    and row.claimed_by != worker_id
+                )
+            ):
+                return None
+            row.claimed_by = worker_id
+            row.claim_expires_at = now + timedelta(seconds=max(1, int(lease_seconds)))
+            row.attempts = int(row.attempts or 0) + 1
+            return dict(row.event_payload or {})
+
+    async def mark_content_task_outbox_published(
+        self, event_id: str, *, worker_id: str
+    ) -> bool:
+        if not self.enabled:
+            return False
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(ContentTaskOutbox)
+                .where(
+                    ContentTaskOutbox.event_id == event_id,
+                    ContentTaskOutbox.published_at.is_(None),
+                    ContentTaskOutbox.claimed_by == worker_id,
+                    ContentTaskOutbox.claim_expires_at >= now,
+                )
+                .values(
+                    published_at=now,
+                    claimed_by=None,
+                    claim_expires_at=None,
+                    last_error=None,
+                )
+                .returning(ContentTaskOutbox.content_id)
+            )
+            content_id = result.scalar_one_or_none()
+            if content_id is not None:
+                await session.execute(
+                    update(ContentJob)
+                    .where(
+                        ContentJob.content_id == content_id,
+                        ContentJob.task_event_id == event_id,
+                    )
+                    .values(status="queued", error_message=None, updated_at=now)
+                )
+        self._update_pool_metrics()
+        return content_id is not None
+
+    async def mark_content_task_outbox_failed(
+        self, event_id: str, error: str, *, worker_id: str
+    ) -> bool:
+        if not self.enabled:
+            return False
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            row = await session.get(ContentTaskOutbox, event_id, with_for_update=True)
+            if (
+                row is None
+                or row.claimed_by != worker_id
+                or row.published_at is not None
+            ):
+                return False
+            delay = min(300, 2 ** min(max(0, int(row.attempts or 1) - 1), 8))
+            row.last_error = str(error)[:4000]
+            row.claimed_by = None
+            row.claim_expires_at = None
+            row.next_attempt_at = now + timedelta(seconds=delay)
+        self._update_pool_metrics()
+        return True
+
+    async def get_content_task_outbox_stats(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"pending": 0, "oldest_age_seconds": 0.0}
+        now = _utc_now()
+        async with self.session_factory() as session:
+            pending, oldest = (
+                await session.execute(
+                    select(
+                        func.count(ContentTaskOutbox.event_id),
+                        func.min(ContentTaskOutbox.created_at),
+                    ).where(
+                        ContentTaskOutbox.published_at.is_(None),
+                        ContentTaskOutbox.terminal_at.is_(None),
+                    )
+                )
+            ).one()
+        age = max(0.0, (now - oldest).total_seconds()) if oldest else 0.0
+        return {"pending": int(pending or 0), "oldest_age_seconds": age}
+
+    async def list_content_job_storage_paths(self) -> Set[str]:
+        if not self.enabled:
+            return set()
+        async with self.session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(ContentJob.storage_path).where(
+                            ContentJob.storage_path.is_not(None)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return {str(path) for path in rows if path}
+
+    async def mark_content_task_missing_object(
+        self, event_id: str, *, worker_id: str
+    ) -> bool:
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(ContentTaskOutbox)
+                .where(
+                    ContentTaskOutbox.event_id == event_id,
+                    ContentTaskOutbox.published_at.is_(None),
+                    ContentTaskOutbox.terminal_at.is_(None),
+                    ContentTaskOutbox.claimed_by == worker_id,
+                )
+                .values(
+                    terminal_at=now,
+                    terminal_reason="missing_object",
+                    last_error="Uploaded object is missing before Kafka publish",
+                    claimed_by=None,
+                    claim_expires_at=None,
+                )
+                .returning(ContentTaskOutbox.content_id)
+            )
+            content_id = result.scalar_one_or_none()
+            if content_id:
+                await session.execute(
+                    update(ContentJob)
+                    .where(ContentJob.content_id == content_id)
+                    .values(
+                        status="failed_missing_object",
+                        error_message="Uploaded object is missing",
+                        updated_at=now,
+                    )
+                )
+        return content_id is not None
+
+    async def prune_content_task_outbox(self, *, retention_days: int = 7) -> int:
+        if not self.enabled:
+            return 0
+        cutoff = _utc_now() - timedelta(days=max(1, int(retention_days)))
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                delete(ContentTaskOutbox).where(
+                    ContentTaskOutbox.published_at.is_not(None),
+                    ContentTaskOutbox.published_at < cutoff,
+                )
+            )
+        return int(result.rowcount or 0)
+
+    async def claim_content_processing_run(
+        self,
+        *,
+        content_id: str,
+        pipeline_version: str,
+        task_event_id: str,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> Dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("content processing lease requires Postgres")
+        now = _utc_now()
+        lease_until = now + timedelta(seconds=max(30, int(lease_seconds)))
+        async with self.session_factory.begin() as session:
+            job = await session.get(ContentJob, content_id, with_for_update=True)
+            if job is not None and (
+                (
+                    job.pipeline_version is not None
+                    and job.pipeline_version != pipeline_version
+                )
+                or (
+                    job.task_event_id is not None and job.task_event_id != task_event_id
+                )
+            ):
+                return {
+                    "outcome": "superseded",
+                    "current_pipeline_version": job.pipeline_version,
+                    "current_task_event_id": job.task_event_id,
+                }
+            row = await session.get(
+                ContentProcessingRun,
+                (content_id, pipeline_version),
+                with_for_update=True,
+            )
+            if row is not None and row.status == "completed":
+                return {
+                    "outcome": "completed",
+                    "artifact_uri": row.artifact_uri,
+                    "artifact_sha256": row.artifact_sha256,
+                }
+            if (
+                row is not None
+                and row.status == "processing"
+                and row.lease_expires_at is not None
+                and row.lease_expires_at >= now
+                and row.lease_owner != worker_id
+            ):
+                return {
+                    "outcome": "lease_held",
+                    "lease_expires_at": row.lease_expires_at,
+                }
+            if row is None:
+                row = ContentProcessingRun(
+                    content_id=content_id,
+                    pipeline_version=pipeline_version,
+                    task_event_id=task_event_id,
+                    status="processing",
+                    attempts=1,
+                    lease_owner=worker_id,
+                    lease_expires_at=lease_until,
+                    updated_at=now,
+                )
+                session.add(row)
+            else:
+                if row.task_event_id != task_event_id:
+                    raise ValueError("content processing task_event_id collision")
+                row.status = "processing"
+                row.attempts = int(row.attempts or 0) + 1
+                row.last_error = None
+                row.lease_owner = worker_id
+                row.lease_expires_at = lease_until
+                row.updated_at = now
+            await session.execute(
+                update(ContentJob)
+                .where(
+                    ContentJob.content_id == content_id,
+                    or_(
+                        ContentJob.pipeline_version == pipeline_version,
+                        ContentJob.pipeline_version.is_(None),
+                    ),
+                    or_(
+                        ContentJob.task_event_id == task_event_id,
+                        ContentJob.task_event_id.is_(None),
+                    ),
+                )
+                .values(
+                    status="processing",
+                    error_message=None,
+                    pipeline_version=pipeline_version,
+                    task_event_id=task_event_id,
+                    updated_at=now,
+                )
+            )
+        self._update_pool_metrics()
+        return {"outcome": "acquired", "lease_expires_at": lease_until}
+
+    async def renew_content_processing_lease(
+        self,
+        *,
+        content_id: str,
+        pipeline_version: str,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> bool:
+        if not self.enabled:
+            return False
+        now = _utc_now()
+        result = None
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(ContentProcessingRun)
+                .where(
+                    ContentProcessingRun.content_id == content_id,
+                    ContentProcessingRun.pipeline_version == pipeline_version,
+                    ContentProcessingRun.status == "processing",
+                    ContentProcessingRun.lease_owner == worker_id,
+                    ContentProcessingRun.lease_expires_at >= now,
+                )
+                .values(
+                    lease_expires_at=now
+                    + timedelta(seconds=max(30, int(lease_seconds))),
+                    updated_at=now,
+                )
+            )
+        return bool(result.rowcount)
+
+    async def assert_content_processing_lease(
+        self, *, content_id: str, pipeline_version: str, worker_id: str
+    ) -> bool:
+        if not self.enabled:
+            return False
+        now = _utc_now()
+        async with self.session_factory() as session:
+            row = await session.get(
+                ContentProcessingRun, (content_id, pipeline_version)
+            )
+        return bool(
+            row is not None
+            and row.status == "processing"
+            and row.lease_owner == worker_id
+            and row.lease_expires_at is not None
+            and row.lease_expires_at >= now
+        )
+
+    async def fail_content_processing_run(
+        self,
+        *,
+        content_id: str,
+        pipeline_version: str,
+        worker_id: str,
+        error: str,
+    ) -> bool:
+        if not self.enabled:
+            return False
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(ContentProcessingRun)
+                .where(
+                    ContentProcessingRun.content_id == content_id,
+                    ContentProcessingRun.pipeline_version == pipeline_version,
+                    ContentProcessingRun.status == "processing",
+                    ContentProcessingRun.lease_owner == worker_id,
+                )
+                .values(
+                    status="failed",
+                    last_error=str(error)[:4000],
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount:
+                await session.execute(
+                    update(ContentJob)
+                    .where(
+                        ContentJob.content_id == content_id,
+                        ContentJob.pipeline_version == pipeline_version,
+                    )
+                    .values(
+                        status="failed",
+                        error_message=str(error)[:4000],
+                        updated_at=now,
+                    )
+                )
+        self._update_pool_metrics()
+        return bool(result.rowcount)
+
+    async def complete_content_processing_run(
+        self,
+        *,
+        content_id: str,
+        pipeline_version: str,
+        worker_id: str,
+        features: Dict[str, Any],
+        schema_version: str,
+        artifact_uri: Optional[str],
+        artifact_sha256: Optional[str],
+    ) -> bool:
+        """Atomically activate durable features and complete the owned run."""
+        if not self.enabled:
+            return False
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(ContentProcessingRun)
+                .where(
+                    ContentProcessingRun.content_id == content_id,
+                    ContentProcessingRun.pipeline_version == pipeline_version,
+                    ContentProcessingRun.status == "processing",
+                    ContentProcessingRun.lease_owner == worker_id,
+                    ContentProcessingRun.lease_expires_at >= now,
+                )
+                .values(
+                    status="completed",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    artifact_uri=artifact_uri,
+                    artifact_sha256=artifact_sha256,
+                    completed_at=now,
+                    updated_at=now,
+                )
+            )
+            if not result.rowcount:
+                return False
+            artifact_stmt = pg_insert(ContentFeatureArtifact).values(
+                content_id=content_id,
+                schema_version=schema_version,
+                features=features,
+                updated_at=now,
+            )
+            artifact_stmt = artifact_stmt.on_conflict_do_update(
+                index_elements=[ContentFeatureArtifact.content_id],
+                set_={
+                    "schema_version": schema_version,
+                    "features": features,
+                    "updated_at": now,
+                },
+            )
+            await session.execute(artifact_stmt)
+            job_result = await session.execute(
+                update(ContentJob)
+                .where(
+                    ContentJob.content_id == content_id,
+                    ContentJob.pipeline_version == pipeline_version,
+                )
+                .values(status="completed", error_message=None, updated_at=now)
+            )
+            if not job_result.rowcount:
+                raise RuntimeError(
+                    "content job pipeline version changed during processing"
+                )
+        self._update_pool_metrics()
+        return True
+
     async def upsert_content_feature_artifact(
         self,
         content_id: str,
@@ -2512,6 +3169,8 @@ class SystemStore:
             "status": row.status,
             "error_message": row.error_message,
             "payload": row.payload or {},
+            "pipeline_version": row.pipeline_version,
+            "task_event_id": row.task_event_id,
             "created_at": row.created_at.timestamp() if row.created_at else None,
             "updated_at": row.updated_at.timestamp() if row.updated_at else None,
         }

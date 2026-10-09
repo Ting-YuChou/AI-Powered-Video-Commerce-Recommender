@@ -65,6 +65,10 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
         run_in_progress=True,
         lease_expired=False,
     )
+    manager.update_content_task_outbox(pending=2, oldest_age_seconds=12.5)
+    manager.record_content_task_publish_retry("kafka_error")
+    manager.update_content_orphans(orphan_objects=3, deleted_objects=1)
+    manager.record_content_processing("projection_repair")
 
     payload = manager.prometheus_payload().decode("utf-8")
 
@@ -102,7 +106,10 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "video_commerce_ranking_effective_runner_capacity 4.0" in payload
     assert "video_commerce_ranking_healthy_runners 3.0" in payload
     assert "video_commerce_ranking_draining_runners 1.0" in payload
-    assert 'video_commerce_ranking_adapter_requests_total{outcome="success"} 1.0' in payload
+    assert (
+        'video_commerce_ranking_adapter_requests_total{outcome="success"} 1.0'
+        in payload
+    )
     assert "video_commerce_ranking_adapter_stage_seconds" in payload
     assert "video_commerce_ranking_adapter_inflight 3.0" in payload
     assert "video_commerce_ranking_triton_model_ready 1.0" in payload
@@ -113,3 +120,9 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "pit_orchestrator_last_success_timestamp 123.0" in payload
     assert "pit_orchestrator_run_in_progress 1.0" in payload
     assert "pit_orchestrator_lease_expired 0.0" in payload
+    assert "content_task_outbox_pending 2.0" in payload
+    assert "content_task_outbox_oldest_age_seconds 12.5" in payload
+    assert 'content_task_publish_retries_total{reason="kafka_error"} 1.0' in payload
+    assert "content_orphan_objects 3.0" in payload
+    assert "content_orphan_objects_deleted_total 1.0" in payload
+    assert 'content_processing_events_total{outcome="projection_repair"} 1.0' in payload

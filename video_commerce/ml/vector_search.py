@@ -359,7 +359,13 @@ class VectorSearchEngine:
                 
                 # Add category-specific patterns
                 category_offset = hash(category) % self.embedding_dim
-                base_embedding[category_offset:category_offset+10] += np.random.normal(0.5, 0.1, 10)
+                pattern_width = min(10, self.embedding_dim)
+                pattern_indices = (
+                    category_offset + np.arange(pattern_width)
+                ) % self.embedding_dim
+                base_embedding[pattern_indices] += np.random.normal(
+                    0.5, 0.1, pattern_width
+                )
                 
                 # Normalize embedding
                 norm = np.linalg.norm(base_embedding)

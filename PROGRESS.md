@@ -1,5 +1,73 @@
 # Progress
 
+## 2026-10-08 — Automated deployment gates, Flink closed loop, and outbox A/B harness
+
+- Expanded PR CI with Node 20 frontend tests/lint/build, Java 11 Flink Maven
+  tests, pinned Helm/kubeconform/promtool deployment validation, and an isolated
+  `flink-closed-loop` check with failure artifacts and project-scoped cleanup.
+- Added a real interaction-to-serving smoke: one stable click becomes one
+  Postgres row and one official Redis feature/sequence update, an identical
+  retry remains exactly once, and the next durable impression snapshot proves
+  recommendation serving consumed `total_interactions=1`.
+- Fixed the CI-discovered ranking payload failure for Flink-derived nested maps:
+  non-string JSON object keys are normalized at the ranking HTTP boundary, while
+  string-conversion collisions fail explicitly instead of overwriting data.
+- Extended the HTTP baseline with run isolation, excluded warm-up, successful
+  latency/QPS, cache, transport/5xx, and durable tracking metrics. Added the
+  three-pair hot/unique served-impression outbox A/B runner, exact published-row
+  reconciliation, resource/artifact lineage, and all specified acceptance gates.
+- Key files: `.github/workflows/ci.yml`,
+  `scripts/run_flink_closed_loop_smoke.sh`,
+  `tests/integration/test_flink_closed_loop.py`,
+  `scripts/loadtest_api_baseline.py`, and
+  `scripts/run_recommendation_outbox_ab.py`.
+- Verification: isolated Compose/Flink smoke passed again after the ranking
+  payload fix (`1 passed in 3.43s`) and removed its fresh project volumes;
+  the complete ranking optimization suite passed (`79 passed`), and the
+  baseline/A/B and vector-regression tests passed (`26 passed`); frontend 14 tests,
+  lint, and build passed; Flink Maven 28 tests passed; Helm lint, strict
+  kubeconform `36/36`, Prometheus rule tests, Compose config, shell/Python syntax,
+  and diff checks passed.
+- Known gaps: the full three-pair 3,000-request hot/unique A/B run has not been
+  executed, so latency/QPS and outbox-cost gates remain unverified and no
+  performance-regression claim is made. The smoke disables the known-user
+  negative snapshot cache because its production refresh interval can hide a
+  newly created user's fresh Flink features. Checkpoint restore, artifact rolling
+  activation, DLQ replay, and Iceberg cleanup drills remain follow-up work.
+
+## 2026-10-08 — Content upload outbox and worker processing leases
+
+- Added migration `009_content_task_reliability.sql` for durable content-task
+  publication, pipeline-versioned job state, and owner-fenced processing runs.
+  Uploads now persist object plus DB/outbox state before publishing, return
+  `queued` only after Kafka acknowledgement, and return a traceable
+  `CONTENT_ENQUEUE_PENDING` 503 while background retries continue.
+- Added the horizontally safe `content-task-publisher` to Compose and Helm. It
+  uses leased outbox claims, stable event IDs, exponential retry, missing-object
+  terminalization, managed-prefix orphan cleanup after a grace period, and
+  seven-day published-row retention.
+- Content workers now prevent duplicate model computation per content and
+  pipeline version, renew and fence processing leases, commit durable feature
+  artifacts before Redis/vector projection, and repair projections from an
+  already-completed artifact after redelivery.
+- Added content outbox, orphan, duplicate, lease-conflict, lease-loss, and
+  projection-repair metrics and alerts. Updated the event/artifact reliability
+  guide and deploy/rollback sequence.
+- Key files: `migrations/postgres/009_content_task_reliability.sql`,
+  `video_commerce/data_plane/system_store.py`,
+  `video_commerce/services/content_task_publisher/main.py`,
+  `video_commerce/services/content_worker/video_processor.py`, and
+  `video_commerce/services/gateway/api.py`.
+- Verification: Docker backend suite `644 passed, 10 skipped`; Postgres-backed
+  outbox/lease and worker suite `10 passed`; scoped Black, Python compile,
+  Compose config, Prometheus rule tests, Helm lint, strict kubeconform `36/36`,
+  and production image build passed. A fresh `vc-phase-a-smoke` project proved
+  real Kafka/Postgres publication and recovery: the ack-before-mark event was
+  observed twice with one stable ID, the worker model ran once across a
+  redelivery, projections ran twice, and durable repair resolved `completed`.
+- Follow-up: hot/unique load baselines are outside this phase and remain unrun;
+  no performance-regression claim is made.
+
 ## 2026-10-08 — Flink, event lineage, artifacts, and scoring reliability
 
 - Made the default startup path Flink-aware with idempotent named-job submission,
