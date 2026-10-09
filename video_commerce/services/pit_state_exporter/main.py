@@ -31,6 +31,11 @@ async def run() -> None:
         while not stop.is_set():
             state = await store.get_pit_operational_metrics()
             observability.update_pit_durable_state(**state)
+            release_state = await store.get_model_release_operational_metrics(
+                model_name="ranking_model",
+                environment=config.model_release_config.environment,
+            )
+            observability.update_model_release_durable_state(**release_state)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=30)
             except asyncio.TimeoutError:

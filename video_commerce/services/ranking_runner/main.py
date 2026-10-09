@@ -99,12 +99,19 @@ class RankingRunner:
             self.config.ranking_config,
             observability=self.runtime.observability,
         )
-        ranking_checkpoint = await self.artifact_manager.sync_latest_ranking_checkpoint(
-            expected_feature_schema_version=self.ranking_model.feature_schema_version
+        ranking_checkpoint = await self.artifact_manager.sync_selected_ranking_checkpoint(
+            gate_mode=self.config.model_release_config.gate_mode,
+            environment=self.config.model_release_config.environment,
+            expected_feature_schema_version=self.ranking_model.feature_schema_version,
         )
         await self.ranking_model.load_model(self.config.model_config.ranking_model_path)
         if ranking_checkpoint:
             self.ranking_model.mark_artifact_record_verified(ranking_checkpoint)
+            generation = ranking_checkpoint.payload.get("active_generation")
+            self.runtime.observability.update_model_release_generation(
+                desired=generation,
+                observed=generation,
+            )
         self.ranking_model.enable_profiling_logs = (
             self.config.monitoring_config.enable_profiling_logs
         )
@@ -547,31 +554,37 @@ class RankingRunner:
             int(self.config.ranking_config.checkpoint_sync_interval_seconds),
         )
         model_path = self.config.model_config.ranking_model_path
-        last_ranking_version: Optional[str] = (
-            self.ranking_model.model_version if self.ranking_model else None
+        last_ranking_identity = (
+            self.ranking_model.model_version if self.ranking_model else None,
+            (
+                self.ranking_model.artifact_metadata.get("active_generation")
+                if self.ranking_model
+                else None
+            ),
         )
         while True:
             try:
                 await asyncio.sleep(interval_seconds)
                 if self.ranking_model and model_path and self.artifact_manager:
-                    latest_ranking = (
-                        await self.artifact_manager.get_latest_model_checkpoint(
-                            ModelArtifactManager.RANKING_MODEL_NAME
-                        )
+                    selected_ranking = await self.artifact_manager.sync_selected_ranking_checkpoint(
+                        gate_mode=self.config.model_release_config.gate_mode,
+                        environment=self.config.model_release_config.environment,
+                        expected_feature_schema_version=self.ranking_model.feature_schema_version,
                     )
-                    if (
-                        latest_ranking
-                        and latest_ranking.model_version != last_ranking_version
-                    ):
-                        synced_ranking = await self.artifact_manager.sync_latest_ranking_checkpoint(
-                            expected_feature_schema_version=self.ranking_model.feature_schema_version
-                        )
+                    selected_identity = (
+                        selected_ranking.model_version if selected_ranking else None,
+                        (
+                            selected_ranking.payload.get("active_generation")
+                            if selected_ranking
+                            else None
+                        ),
+                    )
+                    if selected_ranking and selected_identity != last_ranking_identity:
                         if await self.ranking_model.reload_model_if_updated(model_path):
-                            if synced_ranking:
-                                self.ranking_model.mark_artifact_record_verified(
-                                    synced_ranking
-                                )
-                            last_ranking_version = latest_ranking.model_version
+                            self.ranking_model.mark_artifact_record_verified(
+                                selected_ranking
+                            )
+                            last_ranking_identity = selected_identity
             except asyncio.CancelledError:
                 break
             except Exception as exc:

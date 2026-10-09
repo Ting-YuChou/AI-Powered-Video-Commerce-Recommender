@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from collections import Counter
@@ -18,7 +19,9 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     JSON,
@@ -1020,6 +1023,144 @@ class ModelCheckpoint(Base):
         nullable=False,
         server_default=func.now(),
     )
+
+
+class ModelRelease(Base):
+    __tablename__ = "model_releases"
+
+    release_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    checkpoint_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("model_checkpoints.id"), nullable=False, unique=True
+    )
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="registered"
+    )
+    validation_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    bundle_manifest: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    bootstrap_uncompared: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+Index(
+    "uq_model_releases_name_version",
+    ModelRelease.model_name,
+    ModelRelease.model_version,
+    unique=True,
+)
+Index(
+    "ix_model_releases_state",
+    ModelRelease.model_name,
+    ModelRelease.lifecycle_state,
+    ModelRelease.created_at.desc(),
+)
+
+
+class ModelReleaseEvaluation(Base):
+    __tablename__ = "model_release_evaluations"
+
+    evaluation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    release_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("model_releases.release_id"), nullable=False
+    )
+    champion_release_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("model_releases.release_id"), nullable=True
+    )
+    dataset_manifest_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    dataset_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    holdout_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    holdout_end: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    metrics: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    slice_metrics: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    bootstrap: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    gate_config: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+Index(
+    "uq_model_release_evaluation_input",
+    ModelReleaseEvaluation.release_id,
+    ModelReleaseEvaluation.champion_release_id,
+    ModelReleaseEvaluation.dataset_manifest_sha256,
+    ModelReleaseEvaluation.policy_version,
+    unique=True,
+)
+
+
+class ModelReleasePointer(Base):
+    __tablename__ = "model_release_pointers"
+
+    model_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(64), primary_key=True)
+    slot: Mapped[str] = mapped_column(String(32), primary_key=True)
+    release_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("model_releases.release_id"), nullable=False
+    )
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class ModelReleaseTransition(Base):
+    __tablename__ = "model_release_transitions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    release_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("model_releases.release_id"), nullable=False
+    )
+    evaluation_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("model_release_evaluations.evaluation_id"), nullable=True
+    )
+    from_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    to_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    pointer_generation: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+Index(
+    "ix_model_release_transitions_release",
+    ModelReleaseTransition.release_id,
+    ModelReleaseTransition.created_at.desc(),
+)
 
 
 Index(
@@ -3778,6 +3919,43 @@ class SystemStore:
             ),
         }
 
+    async def get_model_release_operational_metrics(
+        self, *, model_name: str, environment: str
+    ) -> Dict[str, Any]:
+        now = _utc_now()
+        async with self.session_factory() as session:
+            registered_result = await session.execute(
+                select(func.count(ModelRelease.release_id)).where(
+                    ModelRelease.model_name == str(model_name),
+                    ModelRelease.lifecycle_state == "registered",
+                )
+            )
+            staging_result = await session.execute(
+                select(func.min(ModelRelease.updated_at)).where(
+                    ModelRelease.model_name == str(model_name),
+                    ModelRelease.lifecycle_state == "staging",
+                )
+            )
+            pointer_result = await session.execute(
+                select(ModelReleasePointer.generation).where(
+                    ModelReleasePointer.model_name == str(model_name),
+                    ModelReleasePointer.environment == str(environment),
+                    ModelReleasePointer.slot == "active",
+                )
+            )
+            registered = int(registered_result.scalar_one() or 0)
+            staging_since = staging_result.scalar_one_or_none()
+            generation = pointer_result.scalar_one_or_none()
+        return {
+            "registered_backlog": registered,
+            "staging_age_seconds": (
+                max(0.0, (now - staging_since).total_seconds())
+                if staging_since is not None
+                else 0.0
+            ),
+            "active_generation": int(generation or 0),
+        }
+
     async def renew_pit_training_lease(
         self, *, run_id: str, worker_id: str, lease_seconds: int
     ) -> None:
@@ -4128,6 +4306,532 @@ class SystemStore:
             )
         self._update_pool_metrics()
         return int(result.rowcount or 0) == 1
+
+    async def register_model_release(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+        bundle_manifest: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Idempotently register an immutable checkpoint without activating it."""
+        if not self.enabled:
+            raise RuntimeError("model release registry requires Postgres")
+        async with self.session_factory.begin() as session:
+            checkpoint_result = await session.execute(
+                select(ModelCheckpoint)
+                .where(
+                    ModelCheckpoint.model_name == str(model_name),
+                    ModelCheckpoint.model_version == str(model_version),
+                )
+                .order_by(desc(ModelCheckpoint.created_at), desc(ModelCheckpoint.id))
+                .limit(1)
+            )
+            checkpoint = checkpoint_result.scalar_one_or_none()
+            if checkpoint is None:
+                raise ValueError(
+                    "model checkpoint must exist before release registration"
+                )
+            release_id = str(uuid.uuid4())
+            release_manifest = {
+                **dict(bundle_manifest),
+                "release_id": release_id,
+            }
+            inserted = await session.execute(
+                pg_insert(ModelRelease)
+                .values(
+                    release_id=release_id,
+                    checkpoint_id=checkpoint.id,
+                    model_name=str(model_name),
+                    model_version=str(model_version),
+                    lifecycle_state="registered",
+                    validation_status="pending",
+                    bundle_manifest=release_manifest,
+                    bootstrap_uncompared=False,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[ModelRelease.model_name, ModelRelease.model_version]
+                )
+            )
+            result = await session.execute(
+                select(ModelRelease).where(
+                    ModelRelease.model_name == str(model_name),
+                    ModelRelease.model_version == str(model_version),
+                )
+            )
+            release = result.scalar_one()
+            if int(inserted.rowcount or 0) == 1:
+                session.add(
+                    ModelReleaseTransition(
+                        release_id=release.release_id,
+                        from_state=None,
+                        to_state="registered",
+                        actor="model-trainer",
+                        reason="artifact persisted",
+                    )
+                )
+        self._update_pool_metrics()
+        return self._model_release_dict(release)
+
+    async def get_model_release(
+        self, model_name: str, model_version: str
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelRelease).where(
+                    ModelRelease.model_name == str(model_name),
+                    ModelRelease.model_version == str(model_version),
+                )
+            )
+            release = result.scalar_one_or_none()
+        self._update_pool_metrics()
+        return self._model_release_dict(release) if release else None
+
+    async def record_model_release_evaluation(
+        self,
+        *,
+        release_id: str,
+        champion_release_id: Optional[str],
+        dataset_manifest_uri: str,
+        dataset_manifest_sha256: str,
+        holdout_start: float,
+        holdout_end: float,
+        policy_version: str,
+        decision: str,
+        metrics: Dict[str, Any],
+        slice_metrics: Dict[str, Any],
+        bootstrap: Dict[str, Any],
+        gate_config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        normalized_decision = str(decision)
+        if normalized_decision not in {"passed", "failed", "insufficient_evidence"}:
+            raise ValueError("unsupported model release evaluation decision")
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(ModelRelease)
+                .where(ModelRelease.release_id == str(release_id))
+                .with_for_update()
+            )
+            release = result.scalar_one_or_none()
+            if release is None:
+                raise ValueError("model release does not exist")
+            evaluation_result = await session.execute(
+                select(ModelReleaseEvaluation).where(
+                    ModelReleaseEvaluation.release_id == str(release_id),
+                    ModelReleaseEvaluation.champion_release_id
+                    == (str(champion_release_id) if champion_release_id else None),
+                    ModelReleaseEvaluation.dataset_manifest_sha256
+                    == str(dataset_manifest_sha256),
+                    ModelReleaseEvaluation.policy_version == str(policy_version),
+                )
+            )
+            evaluation = evaluation_result.scalar_one_or_none()
+            evaluation_was_existing = evaluation is not None
+            if evaluation is None:
+                evaluation = ModelReleaseEvaluation(
+                    evaluation_id=str(uuid.uuid4()),
+                    release_id=str(release_id),
+                    champion_release_id=(
+                        str(champion_release_id) if champion_release_id else None
+                    ),
+                    dataset_manifest_uri=str(dataset_manifest_uri),
+                    dataset_manifest_sha256=str(dataset_manifest_sha256),
+                    holdout_start=datetime.fromtimestamp(
+                        float(holdout_start), tz=timezone.utc
+                    ),
+                    holdout_end=datetime.fromtimestamp(
+                        float(holdout_end), tz=timezone.utc
+                    ),
+                    policy_version=str(policy_version),
+                    decision=normalized_decision,
+                    metrics=dict(metrics),
+                    slice_metrics=dict(slice_metrics),
+                    bootstrap=dict(bootstrap),
+                    gate_config=dict(gate_config),
+                )
+                session.add(evaluation)
+                await session.flush()
+            previous_state = release.lifecycle_state
+            if evaluation_was_existing and previous_state in {
+                "validated",
+                "staging",
+                "active",
+                "retired",
+            }:
+                self._update_pool_metrics()
+                return {
+                    "evaluation_id": evaluation.evaluation_id,
+                    "release_id": evaluation.release_id,
+                    "decision": evaluation.decision,
+                    "policy_version": evaluation.policy_version,
+                }
+            release.validation_status = normalized_decision
+            if normalized_decision == "passed":
+                if previous_state != "registered":
+                    raise RuntimeError("only registered releases can be validated")
+                release.lifecycle_state = "validated"
+                session.add(
+                    ModelReleaseTransition(
+                        release_id=release.release_id,
+                        evaluation_id=evaluation.evaluation_id,
+                        from_state=previous_state,
+                        to_state="validated",
+                        actor="model-quality-evaluator",
+                        reason="offline quality gate passed",
+                    )
+                )
+        self._update_pool_metrics()
+        return {
+            "evaluation_id": evaluation.evaluation_id,
+            "release_id": evaluation.release_id,
+            "decision": evaluation.decision,
+            "policy_version": evaluation.policy_version,
+        }
+
+    async def stage_model_release(
+        self,
+        *,
+        release_id: str,
+        actor: str,
+        environment: str = "production",
+    ) -> bool:
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(ModelRelease)
+                .where(ModelRelease.release_id == str(release_id))
+                .with_for_update()
+            )
+            release = result.scalar_one_or_none()
+            if (
+                release is None
+                or release.lifecycle_state != "validated"
+                or release.validation_status != "passed"
+            ):
+                return False
+            release.lifecycle_state = "staging"
+            pointer_result = await session.execute(
+                select(ModelReleasePointer)
+                .where(
+                    ModelReleasePointer.model_name == release.model_name,
+                    ModelReleasePointer.environment == str(environment),
+                    ModelReleasePointer.slot == "staging",
+                )
+                .with_for_update()
+            )
+            pointer = pointer_result.scalar_one_or_none()
+            generation = 1 if pointer is None else int(pointer.generation) + 1
+            if pointer is None:
+                session.add(
+                    ModelReleasePointer(
+                        model_name=release.model_name,
+                        environment=str(environment),
+                        slot="staging",
+                        release_id=release.release_id,
+                        generation=generation,
+                        updated_by=str(actor),
+                        reason="bundle staging verification passed",
+                    )
+                )
+            else:
+                pointer.release_id = release.release_id
+                pointer.generation = generation
+                pointer.updated_by = str(actor)
+                pointer.reason = "bundle staging verification passed"
+            session.add(
+                ModelReleaseTransition(
+                    release_id=release.release_id,
+                    from_state="validated",
+                    to_state="staging",
+                    actor=str(actor),
+                    reason="bundle staging verification passed",
+                    pointer_generation=generation,
+                )
+            )
+        self._update_pool_metrics()
+        return True
+
+    async def activate_model_release(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+        environment: str,
+        expected_generation: int,
+        actor: str,
+        reason: str,
+        bootstrap: bool,
+        rollback: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically update the active pointer with generation fencing."""
+        async with self.session_factory.begin() as session:
+            pointer_result = await session.execute(
+                select(ModelReleasePointer)
+                .where(
+                    ModelReleasePointer.model_name == str(model_name),
+                    ModelReleasePointer.environment == str(environment),
+                    ModelReleasePointer.slot == "active",
+                )
+                .with_for_update()
+            )
+            pointer = pointer_result.scalar_one_or_none()
+            current_generation = int(pointer.generation) if pointer else 0
+            if current_generation != int(expected_generation):
+                return None
+            target_result = await session.execute(
+                select(ModelRelease)
+                .where(
+                    ModelRelease.model_name == str(model_name),
+                    ModelRelease.model_version == str(model_version),
+                )
+                .with_for_update()
+            )
+            target = target_result.scalar_one_or_none()
+            if target is None:
+                return None
+            from video_commerce.ml.model_release_quality import (
+                QUALITY_GATE_POLICY_VERSION,
+            )
+            from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
+
+            target_manifest = dict(target.bundle_manifest or {})
+            artifact_manifest = dict(target_manifest.get("artifact_manifest") or {})
+            checkpoint_manifest = dict(artifact_manifest.get("checkpoint") or {})
+            bundle_is_compatible = (
+                bool(checkpoint_manifest.get("path"))
+                and len(str(checkpoint_manifest.get("sha256") or "")) == 64
+                and bool(target_manifest.get("feature_schema_version"))
+                and target_manifest.get("score_policy_version") == SCORE_POLICY_VERSION
+                and isinstance(target_manifest.get("value_transform_stats"), dict)
+                and target_manifest.get("quality_gate_policy_version")
+                == QUALITY_GATE_POLICY_VERSION
+            )
+            if not bundle_is_compatible:
+                return None
+            if bootstrap:
+                if pointer is not None or target.lifecycle_state != "registered":
+                    return None
+            elif rollback:
+                if (
+                    target.lifecycle_state != "retired"
+                    or target.validation_status != "passed"
+                ):
+                    return None
+            elif (
+                target.lifecycle_state != "staging"
+                or target.validation_status != "passed"
+            ):
+                return None
+            if not bootstrap:
+                evaluation_result = await session.execute(
+                    select(ModelReleaseEvaluation)
+                    .where(
+                        ModelReleaseEvaluation.release_id == target.release_id,
+                        ModelReleaseEvaluation.decision == "passed",
+                        ModelReleaseEvaluation.policy_version
+                        == QUALITY_GATE_POLICY_VERSION,
+                    )
+                    .order_by(desc(ModelReleaseEvaluation.created_at))
+                    .limit(1)
+                )
+                evaluation = evaluation_result.scalar_one_or_none()
+                max_age_hours = max(
+                    1, int(os.getenv("MODEL_RELEASE_EVALUATION_MAX_AGE_HOURS", "168"))
+                )
+                if evaluation is None or evaluation.created_at < _utc_now() - timedelta(
+                    hours=max_age_hours
+                ):
+                    return None
+
+            next_generation = current_generation + 1
+            if pointer is not None:
+                current_result = await session.execute(
+                    select(ModelRelease)
+                    .where(ModelRelease.release_id == pointer.release_id)
+                    .with_for_update()
+                )
+                current = current_result.scalar_one_or_none()
+                if current is not None and current.release_id != target.release_id:
+                    current_manifest = dict(current.bundle_manifest or {})
+                    for compatibility_key in (
+                        "feature_schema_version",
+                        "score_policy_version",
+                    ):
+                        if current_manifest.get(
+                            compatibility_key
+                        ) != target_manifest.get(compatibility_key):
+                            return None
+                    previous_state = current.lifecycle_state
+                    current.lifecycle_state = "retired"
+                    session.add(
+                        ModelReleaseTransition(
+                            release_id=current.release_id,
+                            from_state=previous_state,
+                            to_state="retired",
+                            actor=str(actor),
+                            reason=str(reason),
+                            pointer_generation=next_generation,
+                        )
+                    )
+                pointer.release_id = target.release_id
+                pointer.generation = next_generation
+                pointer.updated_by = str(actor)
+                pointer.reason = str(reason)
+            else:
+                pointer = ModelReleasePointer(
+                    model_name=str(model_name),
+                    environment=str(environment),
+                    slot="active",
+                    release_id=target.release_id,
+                    generation=next_generation,
+                    updated_by=str(actor),
+                    reason=str(reason),
+                )
+                session.add(pointer)
+            previous_target_state = target.lifecycle_state
+            target.lifecycle_state = "active"
+            if bootstrap:
+                target.bootstrap_uncompared = True
+            session.add(
+                ModelReleaseTransition(
+                    release_id=target.release_id,
+                    from_state=previous_target_state,
+                    to_state="active",
+                    actor=str(actor),
+                    reason=str(reason),
+                    pointer_generation=next_generation,
+                )
+            )
+        self._update_pool_metrics()
+        return {
+            "release_id": target.release_id,
+            "model_name": target.model_name,
+            "model_version": target.model_version,
+            "generation": next_generation,
+        }
+
+    async def get_model_release_pointer(
+        self, model_name: str, *, environment: str, slot: str
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelReleasePointer, ModelRelease)
+                .join(
+                    ModelRelease,
+                    ModelRelease.release_id == ModelReleasePointer.release_id,
+                )
+                .where(
+                    ModelReleasePointer.model_name == str(model_name),
+                    ModelReleasePointer.environment == str(environment),
+                    ModelReleasePointer.slot == str(slot),
+                )
+            )
+            row = result.first()
+        self._update_pool_metrics()
+        if row is None:
+            return None
+        pointer, release = row
+        return {
+            **self._model_release_dict(release),
+            "environment": pointer.environment,
+            "slot": pointer.slot,
+            "generation": int(pointer.generation),
+            "updated_by": pointer.updated_by,
+            "reason": pointer.reason,
+            "updated_at": pointer.updated_at.timestamp()
+            if pointer.updated_at
+            else None,
+        }
+
+    async def list_model_releases(
+        self, model_name: str, *, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelRelease)
+                .where(ModelRelease.model_name == str(model_name))
+                .order_by(desc(ModelRelease.created_at))
+                .limit(max(1, min(int(limit), 500)))
+            )
+            releases = result.scalars().all()
+        self._update_pool_metrics()
+        return [self._model_release_dict(release) for release in releases]
+
+    async def get_active_model_checkpoint(
+        self, model_name: str, *, environment: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return only the checkpoint authorized by the active release pointer."""
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelReleasePointer, ModelRelease, ModelCheckpoint)
+                .join(
+                    ModelRelease,
+                    ModelRelease.release_id == ModelReleasePointer.release_id,
+                )
+                .join(
+                    ModelCheckpoint,
+                    ModelCheckpoint.id == ModelRelease.checkpoint_id,
+                )
+                .where(
+                    ModelReleasePointer.model_name == str(model_name),
+                    ModelReleasePointer.environment == str(environment),
+                    ModelReleasePointer.slot == "active",
+                    ModelRelease.lifecycle_state == "active",
+                )
+            )
+            row = result.first()
+        self._update_pool_metrics()
+        if row is None:
+            return None
+        pointer, release, checkpoint = row
+        payload = dict(checkpoint.payload or {})
+        payload.update(
+            {
+                "model_release_id": release.release_id,
+                "active_generation": int(pointer.generation),
+                "quality_gate_policy_version": (release.bundle_manifest or {}).get(
+                    "quality_gate_policy_version"
+                ),
+            }
+        )
+        return {
+            "id": checkpoint.id,
+            "model_name": checkpoint.model_name,
+            "model_version": checkpoint.model_version,
+            "checkpoint_path": checkpoint.checkpoint_path,
+            "payload": payload,
+            "created_at": (
+                checkpoint.created_at.timestamp() if checkpoint.created_at else None
+            ),
+            "release_id": release.release_id,
+            "generation": int(pointer.generation),
+        }
+
+    @staticmethod
+    def _model_release_dict(release: ModelRelease) -> Dict[str, Any]:
+        return {
+            "release_id": release.release_id,
+            "checkpoint_id": release.checkpoint_id,
+            "model_name": release.model_name,
+            "model_version": release.model_version,
+            "lifecycle_state": release.lifecycle_state,
+            "validation_status": release.validation_status,
+            "bundle_manifest": dict(release.bundle_manifest or {}),
+            "bootstrap_uncompared": bool(release.bootstrap_uncompared),
+            "created_at": release.created_at.timestamp()
+            if release.created_at
+            else None,
+            "updated_at": release.updated_at.timestamp()
+            if release.updated_at
+            else None,
+        }
 
     async def get_latest_model_checkpoint(
         self, model_name: str

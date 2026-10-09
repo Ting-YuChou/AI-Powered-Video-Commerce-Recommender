@@ -865,6 +865,38 @@ class ObservabilityManager:
             "Ranking requests served by combined-score fallback before a valid artifact",
             registry=self.registry,
         )
+        self.model_release_evaluations_total = Counter(
+            "model_release_evaluations_total",
+            "Offline ranking release quality-gate decisions",
+            ["decision"],
+            registry=self.registry,
+        )
+        self.model_release_active_generation = Gauge(
+            "model_release_active_generation",
+            "Active ranking release pointer generation observed by this process",
+            registry=self.registry,
+        )
+        self.model_release_registered_backlog = Gauge(
+            "model_release_registered_backlog",
+            "Ranking releases still waiting for a conclusive quality evaluation",
+            registry=self.registry,
+        )
+        self.model_release_staging_age_seconds = Gauge(
+            "model_release_staging_age_seconds",
+            "Age of the oldest ranking release still in staging",
+            registry=self.registry,
+        )
+        self.model_release_runner_generation_mismatch = Gauge(
+            "model_release_runner_generation_mismatch",
+            "Whether desired and locally observed ranking generations differ",
+            registry=self.registry,
+        )
+        self.model_release_transition_failures_total = Counter(
+            "model_release_transition_failures_total",
+            "Ranking release activation or rollback failures",
+            ["operation"],
+            registry=self.registry,
+        )
         self._process = psutil.Process()
 
     def record_request(
@@ -1054,6 +1086,33 @@ class ObservabilityManager:
 
     def record_ranking_untrained_fallback(self) -> None:
         self.ranking_untrained_fallback_total.inc()
+
+    def record_model_release_evaluation(self, decision: str) -> None:
+        self.model_release_evaluations_total.labels(decision=str(decision)).inc()
+
+    def update_model_release_generation(
+        self, *, desired: int | None, observed: int | None
+    ) -> None:
+        if observed is not None:
+            self.model_release_active_generation.set(max(0, int(observed)))
+        mismatch = desired is not None and observed is not None and desired != observed
+        self.model_release_runner_generation_mismatch.set(1 if mismatch else 0)
+
+    def update_model_release_durable_state(
+        self,
+        *,
+        registered_backlog: int,
+        staging_age_seconds: float,
+        active_generation: int,
+    ) -> None:
+        self.model_release_registered_backlog.set(max(0, int(registered_backlog)))
+        self.model_release_staging_age_seconds.set(max(0.0, float(staging_age_seconds)))
+        self.model_release_active_generation.set(max(0, int(active_generation)))
+
+    def record_model_release_transition_failure(self, operation: str) -> None:
+        self.model_release_transition_failures_total.labels(
+            operation=str(operation)
+        ).inc()
 
     def update_typed_pit_training_metrics(
         self,

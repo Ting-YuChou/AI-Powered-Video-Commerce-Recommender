@@ -2362,6 +2362,46 @@ class DatabaseConfig(BaseSettings):
         env_prefix = "DATABASE_"
 
 
+class ModelReleaseConfig(BaseSettings):
+    """Durable ranking release lifecycle and offline quality-gate settings."""
+
+    gate_mode: str = Field(
+        "observe", description="Release selection mode: legacy, observe, or enforced"
+    )
+    environment: str = Field(
+        "production", description="Release pointer environment selected by serving"
+    )
+    holdout_days: int = Field(7, ge=1)
+    bootstrap_samples: int = Field(2000, ge=1)
+    random_seed: int = Field(42, ge=0)
+    min_impressions: int = Field(1000, ge=1)
+    min_users: int = Field(200, ge=1)
+    min_clicks: int = Field(50, ge=1)
+    min_purchases: int = Field(30, ge=1)
+    min_slice_impressions: int = Field(200, ge=1)
+    min_slice_users: int = Field(50, ge=1)
+    min_slice_positives: int = Field(20, ge=1)
+    evaluation_max_age_hours: int = Field(168, ge=1)
+    overall_ndcg_min_delta: float = Field(0.0)
+    overall_ndcg_ci_lower: float = Field(-0.005)
+    slice_ndcg_min_delta: float = Field(-0.02)
+    slice_ndcg_ci_lower: float = Field(-0.03)
+    pr_auc_max_absolute_regression: float = Field(0.005, ge=0.0)
+    probability_error_max_relative_regression: float = Field(0.02, ge=0.0)
+    value_wape_max_relative_regression: float = Field(0.05, ge=0.0)
+    slice_error_max_relative_regression: float = Field(0.05, ge=0.0)
+
+    @validator("gate_mode")
+    def validate_gate_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"legacy", "observe", "enforced"}:
+            raise ValueError("gate_mode must be legacy, observe, or enforced")
+        return normalized
+
+    class Config:
+        env_prefix = "MODEL_RELEASE_"
+
+
 class Config:
     """Main configuration class that combines all configuration sections."""
 
@@ -2387,6 +2427,7 @@ class Config:
         self.security_config = SecurityConfig()
         self.service_topology_config = ServiceTopologyConfig()
         self.database_config = DatabaseConfig()
+        self.model_release_config = ModelReleaseConfig()
 
         # Load additional config from file if provided
         if config_file and os.path.exists(config_file):
@@ -2550,6 +2591,10 @@ class Config:
             if self.vector_config.bootstrap_mode != "required":
                 errors.append(
                     "VECTOR_BOOTSTRAP_MODE=required is mandatory in production"
+                )
+            if self.model_release_config.gate_mode != "enforced":
+                errors.append(
+                    "MODEL_RELEASE_GATE_MODE=enforced is mandatory in production"
                 )
 
         # Validate file paths

@@ -124,8 +124,10 @@ async def startup_event():
     )
     ranking_checkpoint = None
     if artifact_manager:
-        ranking_checkpoint = await artifact_manager.sync_latest_ranking_checkpoint(
-            expected_feature_schema_version=ranking_model.feature_schema_version
+        ranking_checkpoint = await artifact_manager.sync_selected_ranking_checkpoint(
+            gate_mode=runtime.config.model_release_config.gate_mode,
+            environment=runtime.config.model_release_config.environment,
+            expected_feature_schema_version=ranking_model.feature_schema_version,
         )
     await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
     if ranking_checkpoint:
@@ -448,19 +450,17 @@ async def _periodic_ranking_checkpoint_sync(runtime) -> None:
         try:
             await asyncio.sleep(interval_seconds)
             if ranking_model and model_path and artifact_manager:
-                latest_ranking = await artifact_manager.get_latest_model_checkpoint(
-                    ModelArtifactManager.RANKING_MODEL_NAME
+                latest_ranking = await artifact_manager.sync_selected_ranking_checkpoint(
+                    gate_mode=runtime.config.model_release_config.gate_mode,
+                    environment=runtime.config.model_release_config.environment,
+                    expected_feature_schema_version=ranking_model.feature_schema_version,
                 )
                 if (
                     latest_ranking
                     and latest_ranking.model_version != last_ranking_version
                 ):
-                    synced_ranking = await artifact_manager.sync_latest_ranking_checkpoint(
-                        expected_feature_schema_version=ranking_model.feature_schema_version
-                    )
                     if await ranking_model.reload_model_if_updated(model_path):
-                        if synced_ranking:
-                            ranking_model.mark_artifact_record_verified(synced_ranking)
+                        ranking_model.mark_artifact_record_verified(latest_ranking)
                         last_ranking_version = latest_ranking.model_version
         except asyncio.CancelledError:
             break

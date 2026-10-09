@@ -561,3 +561,38 @@
   benchmarks, and offline NDCG/AUC/GMV promotion evaluation require production
   hardware/data and remain rollout gates. No performance improvement is
   claimed.
+
+## 2026-10-09 — Ranking quality gate and release lifecycle
+
+- Added additive Postgres release, evaluation, pointer, and transition tables;
+  checkpoint persistence now creates an immutable `registered` ranking bundle
+  and repairs release registration after a checkpoint/outbox-style crash race.
+- Reserved a fixed seven-day mature PIT holdout before training and value
+  normalization. The trainer compares the active champion and challenger over
+  identical rows with canonical serving scores, deterministic user-cluster
+  bootstrap confidence intervals, and cold-user, cold-item, long-tail,
+  high-price, and modality-missing slices. Passing releases advance
+  automatically through `validated` to `staging`; failed or insufficient
+  releases remain non-serving.
+- Added audited CAS promotion, rollback, and one-time verified bootstrap CLI;
+  production serving selects only the active pointer in enforced mode. Legacy
+  runners carry release/generation lineage into durable impressions, and Triton
+  startup requires its exact model version to match the active release.
+- Added release backlog, staging age, evaluation decision, active generation,
+  and runner mismatch metrics and alerts, plus Compose observe-mode defaults,
+  enforced Helm production settings, and the model release rollout/rollback
+  runbook.
+- Key files: `migrations/postgres/010_model_release_quality_gate.sql`,
+  `video_commerce/ml/model_release.py`,
+  `video_commerce/ml/model_release_quality.py`,
+  `video_commerce/ml/model_artifacts.py`,
+  `video_commerce/services/model_trainer/main.py`, and
+  `docs/operations/model-release-runbook.md`.
+- Verification: isolated Docker backend suite passed 687 tests with 5 skips;
+  the Postgres lifecycle smoke proved bootstrap, pass-to-staging, CAS promotion,
+  stale-generation rejection, rollback eligibility, and failed-challenger
+  isolation. Production backend image build, Compose validation, Helm lint,
+  strict kubeconform (36 resources), Prometheus rule tests, scoped Black,
+  Python compile, and diff checks passed. No online canary or performance claim
+  is included; assignment, propensity, SRM, and uplift gates remain a later
+  phase.

@@ -111,8 +111,10 @@ class RankingCoordinator:
                 self.config.ranking_config,
                 observability=self.runtime.observability,
             )
-            ranking_checkpoint = await self.artifact_manager.sync_latest_ranking_checkpoint(
-                expected_feature_schema_version=self.ranking_model.feature_schema_version
+            ranking_checkpoint = await self.artifact_manager.sync_selected_ranking_checkpoint(
+                gate_mode=self.config.model_release_config.gate_mode,
+                environment=self.config.model_release_config.environment,
+                expected_feature_schema_version=self.ranking_model.feature_schema_version,
             )
             await self.ranking_model.load_model(
                 self.config.model_config.ranking_model_path
@@ -469,22 +471,19 @@ class RankingCoordinator:
             try:
                 await asyncio.sleep(interval_seconds)
                 if self.ranking_model and model_path and self.artifact_manager:
-                    latest_ranking = (
-                        await self.artifact_manager.get_latest_model_checkpoint(
-                            ModelArtifactManager.RANKING_MODEL_NAME
-                        )
+                    latest_ranking = await self.artifact_manager.sync_selected_ranking_checkpoint(
+                        gate_mode=self.config.model_release_config.gate_mode,
+                        environment=self.config.model_release_config.environment,
+                        expected_feature_schema_version=self.ranking_model.feature_schema_version,
                     )
                     if (
                         latest_ranking
                         and latest_ranking.model_version != last_ranking_version
                     ):
-                        synced_ranking = await self.artifact_manager.sync_latest_ranking_checkpoint(
-                            expected_feature_schema_version=self.ranking_model.feature_schema_version
-                        )
                         if await self.ranking_model.reload_model_if_updated(model_path):
-                            if synced_ranking:
+                            if latest_ranking:
                                 self.ranking_model.mark_artifact_record_verified(
-                                    synced_ranking
+                                    latest_ranking
                                 )
                             last_ranking_version = latest_ranking.model_version
             except asyncio.CancelledError:

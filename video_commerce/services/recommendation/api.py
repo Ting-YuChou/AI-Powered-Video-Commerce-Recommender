@@ -487,6 +487,17 @@ def _refresh_serving_version_context(runtime) -> Dict[str, Any]:
     return _serving_version_context_cache
 
 
+def _ranking_release_lineage(serving_versions: Dict[str, Any]) -> Dict[str, Any]:
+    lineage = {
+        "model_release_id": serving_versions.get("model_release_id"),
+        "active_generation": serving_versions.get("active_generation"),
+        "quality_gate_policy_version": serving_versions.get(
+            "quality_gate_policy_version"
+        ),
+    }
+    return {key: value for key, value in lineage.items() if value is not None}
+
+
 def _serving_version_paths(
     runtime,
 ) -> Tuple[
@@ -525,8 +536,16 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
     cluster_metadata_path, cluster_centroids_path = _content_cluster_artifact_paths(
         runtime
     )
+    ranking_artifact_metadata = (
+        getattr(ranking_model, "artifact_metadata", {}) or {} if ranking_model else {}
+    )
     return {
         "ranking_model": ranking_model.model_version if ranking_model else None,
+        "model_release_id": (ranking_artifact_metadata.get("model_release_id")),
+        "active_generation": (ranking_artifact_metadata.get("active_generation")),
+        "quality_gate_policy_version": (
+            ranking_artifact_metadata.get("quality_gate_policy_version")
+        ),
         "ranking_checkpoint_mtime": _safe_file_mtime(ranking_path),
         "two_tower_model": (
             recommendation_engine.loaded_two_tower_version
@@ -1154,8 +1173,7 @@ async def startup_event():
 
     vector_search = VectorSearchEngine(runtime.config.vector_config)
     visual_index_manifest = str(
-        runtime.config.model_config.retrieval_visual_product_index_manifest_path
-        or ""
+        runtime.config.model_config.retrieval_visual_product_index_manifest_path or ""
     ).strip()
     if visual_index_manifest and artifact_manager is not None:
         await artifact_manager.sync_latest_visual_product_index(
@@ -1200,8 +1218,10 @@ async def startup_event():
         )
         ranking_checkpoint = None
         if artifact_manager:
-            ranking_checkpoint = await artifact_manager.sync_latest_ranking_checkpoint(
-                expected_feature_schema_version=ranking_model.feature_schema_version
+            ranking_checkpoint = await artifact_manager.sync_selected_ranking_checkpoint(
+                gate_mode=runtime.config.model_release_config.gate_mode,
+                environment=runtime.config.model_release_config.environment,
+                expected_feature_schema_version=ranking_model.feature_schema_version,
             )
         await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
         if ranking_checkpoint:
@@ -1596,41 +1616,38 @@ async def get_recommendations(
             client_connected = not await _is_request_disconnected(http_request)
             if kafka_manager and client_connected:
                 cache_tracking_durable = await _stage_served_impression_event(
-                        user_id=payload.user_id,
-                        recommendations=_recommendation_product_ids(cached),
-                        response_time_ms=int((time.time() - start_time) * 1000),
-                        request_id=getattr(http_request.state, "request_id", None),
-                        metadata={
-                            **(
-                                {"impression_id": cache_impression_id}
-                                if cache_impression_id
-                                else {}
-                            ),
-                            "request_id": getattr(
-                                http_request.state, "request_id", None
-                            ),
-                            "session_id": (payload.context or {}).get("session_id"),
-                            "content_id": payload.content_id,
-                            "model_version": "v1.0.0",
-                            "ranking_model_version": serving_versions.get(
-                                "ranking_model"
-                            ),
-                            "as_of_ts": start_time,
-                            "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
-                            "user_feature_snapshot": _recommendation_item_payload(
-                                user_features
-                            ),
-                            "feature_context": dict(payload.context or {}),
-                            "context": _build_impression_context_snapshot(
-                                payload.context,
-                                content_id=payload.content_id,
-                            ),
-                            "candidate_count": len(cached),
-                            "candidate_source_counts": {},
-                            "ranked_source_counts": {},
-                            "item_snapshot_scope": "returned_top_k",
-                            "displayed_items": cached_displayed_items,
-                        },
+                    user_id=payload.user_id,
+                    recommendations=_recommendation_product_ids(cached),
+                    response_time_ms=int((time.time() - start_time) * 1000),
+                    request_id=getattr(http_request.state, "request_id", None),
+                    metadata={
+                        **(
+                            {"impression_id": cache_impression_id}
+                            if cache_impression_id
+                            else {}
+                        ),
+                        "request_id": getattr(http_request.state, "request_id", None),
+                        "session_id": (payload.context or {}).get("session_id"),
+                        "content_id": payload.content_id,
+                        "model_version": "v1.0.0",
+                        "ranking_model_version": serving_versions.get("ranking_model"),
+                        **_ranking_release_lineage(serving_versions),
+                        "as_of_ts": start_time,
+                        "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                        "user_feature_snapshot": _recommendation_item_payload(
+                            user_features
+                        ),
+                        "feature_context": dict(payload.context or {}),
+                        "context": _build_impression_context_snapshot(
+                            payload.context,
+                            content_id=payload.content_id,
+                        ),
+                        "candidate_count": len(cached),
+                        "candidate_source_counts": {},
+                        "ranked_source_counts": {},
+                        "item_snapshot_scope": "returned_top_k",
+                        "displayed_items": cached_displayed_items,
+                    },
                 )
                 if not cache_tracking_durable:
                     cache_impression_id = None
@@ -1655,6 +1672,7 @@ async def get_recommendations(
                         "impression_tracking": (
                             "durable" if cache_impression_id else "unavailable"
                         ),
+                        **_ranking_release_lineage(serving_versions),
                         "score_policy_version": SCORE_POLICY_VERSION,
                         "cache_freshness": "model_user_sequence_and_catalog_versioned",
                         "content_processed": payload.content_id is not None,
@@ -1704,46 +1722,41 @@ async def get_recommendations(
                 )
             if kafka_manager and not await _is_request_disconnected(http_request):
                 join_tracking_durable = await _stage_served_impression_event(
-                        user_id=payload.user_id,
-                        recommendations=_recommendation_product_ids(
-                            shared_recommendations
+                    user_id=payload.user_id,
+                    recommendations=_recommendation_product_ids(shared_recommendations),
+                    response_time_ms=int((time.time() - start_time) * 1000),
+                    request_id=getattr(http_request.state, "request_id", None),
+                    metadata={
+                        **(
+                            {"impression_id": join_impression_id}
+                            if join_impression_id
+                            else {}
                         ),
-                        response_time_ms=int((time.time() - start_time) * 1000),
-                        request_id=getattr(http_request.state, "request_id", None),
-                        metadata={
-                            **(
-                                {"impression_id": join_impression_id}
-                                if join_impression_id
-                                else {}
-                            ),
-                            "request_id": getattr(
-                                http_request.state, "request_id", None
-                            ),
-                            "session_id": (payload.context or {}).get("session_id"),
-                            "content_id": payload.content_id,
-                            "model_version": "v1.0.0",
-                            "ranking_model_version": serving_versions.get(
-                                "ranking_model"
-                            ),
-                            "as_of_ts": start_time,
-                            "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
-                            "user_feature_snapshot": _recommendation_item_payload(
-                                user_features
-                            ),
-                            "feature_context": dict(payload.context or {}),
-                            "context": _build_impression_context_snapshot(
-                                payload.context,
-                                content_id=payload.content_id,
-                            ),
-                            "candidate_count": shared_result.get(
-                                "total_candidates",
-                                len(shared_recommendations),
-                            ),
-                            "candidate_source_counts": {},
-                            "ranked_source_counts": {},
-                            "item_snapshot_scope": "returned_top_k",
-                            "displayed_items": join_displayed_items,
-                        },
+                        "request_id": getattr(http_request.state, "request_id", None),
+                        "session_id": (payload.context or {}).get("session_id"),
+                        "content_id": payload.content_id,
+                        "model_version": "v1.0.0",
+                        "ranking_model_version": serving_versions.get("ranking_model"),
+                        **_ranking_release_lineage(serving_versions),
+                        "as_of_ts": start_time,
+                        "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                        "user_feature_snapshot": _recommendation_item_payload(
+                            user_features
+                        ),
+                        "feature_context": dict(payload.context or {}),
+                        "context": _build_impression_context_snapshot(
+                            payload.context,
+                            content_id=payload.content_id,
+                        ),
+                        "candidate_count": shared_result.get(
+                            "total_candidates",
+                            len(shared_recommendations),
+                        ),
+                        "candidate_source_counts": {},
+                        "ranked_source_counts": {},
+                        "item_snapshot_scope": "returned_top_k",
+                        "displayed_items": join_displayed_items,
+                    },
                 )
                 if not join_tracking_durable:
                     join_impression_id = None
@@ -1770,6 +1783,7 @@ async def get_recommendations(
                         "impression_tracking": (
                             "durable" if join_impression_id else "unavailable"
                         ),
+                        **_ranking_release_lineage(serving_versions),
                         "score_policy_version": SCORE_POLICY_VERSION,
                         "content_processed": shared_result.get(
                             "content_processed",
@@ -2144,38 +2158,37 @@ async def get_recommendations(
         if kafka_manager and client_connected:
             stage_started = time.perf_counter()
             tracking_durable = await _stage_served_impression_event(
-                    user_id=payload.user_id,
-                    recommendations=[
-                        item.product_id for item in ranked_recommendations
-                    ],
-                    response_time_ms=int(response_time * 1000),
-                    request_id=getattr(http_request.state, "request_id", None),
-                    metadata={
-                        **({"impression_id": impression_id} if impression_id else {}),
-                        "request_id": getattr(http_request.state, "request_id", None),
-                        "session_id": (payload.context or {}).get("session_id"),
-                        "content_id": payload.content_id,
-                        "model_version": "v1.0.0",
-                        "ranking_model_version": serving_versions.get("ranking_model"),
-                        "as_of_ts": start_time,
-                        "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
-                        "user_feature_snapshot": _recommendation_item_payload(
-                            user_features
-                        ),
-                        "feature_context": ranking_context,
-                        "context": _build_impression_context_snapshot(
-                            payload.context,
-                            content_id=payload.content_id,
-                        ),
-                        "candidate_count": len(candidates),
-                        "candidate_source_counts": profile.get(
-                            "candidate_source_counts", {}
-                        ),
-                        "ranked_source_counts": profile.get("ranked_source_counts", {}),
-                        "item_snapshot_scope": "returned_top_k",
-                        "displayed_items": displayed_items,
-                        "rejected_candidate_items": rejected_candidate_items,
-                    },
+                user_id=payload.user_id,
+                recommendations=[item.product_id for item in ranked_recommendations],
+                response_time_ms=int(response_time * 1000),
+                request_id=getattr(http_request.state, "request_id", None),
+                metadata={
+                    **({"impression_id": impression_id} if impression_id else {}),
+                    "request_id": getattr(http_request.state, "request_id", None),
+                    "session_id": (payload.context or {}).get("session_id"),
+                    "content_id": payload.content_id,
+                    "model_version": "v1.0.0",
+                    "ranking_model_version": serving_versions.get("ranking_model"),
+                    **_ranking_release_lineage(serving_versions),
+                    "as_of_ts": start_time,
+                    "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                    "user_feature_snapshot": _recommendation_item_payload(
+                        user_features
+                    ),
+                    "feature_context": ranking_context,
+                    "context": _build_impression_context_snapshot(
+                        payload.context,
+                        content_id=payload.content_id,
+                    ),
+                    "candidate_count": len(candidates),
+                    "candidate_source_counts": profile.get(
+                        "candidate_source_counts", {}
+                    ),
+                    "ranked_source_counts": profile.get("ranked_source_counts", {}),
+                    "item_snapshot_scope": "returned_top_k",
+                    "displayed_items": displayed_items,
+                    "rejected_candidate_items": rejected_candidate_items,
+                },
             )
             if not tracking_durable:
                 impression_id = None
@@ -2210,6 +2223,7 @@ async def get_recommendations(
                     "impression_tracking": (
                         "durable" if impression_id else "unavailable"
                     ),
+                    **_ranking_release_lineage(serving_versions),
                     "score_policy_version": SCORE_POLICY_VERSION,
                     "cache_freshness": "model_user_sequence_and_catalog_versioned",
                     "cache_hit": False,
@@ -2988,17 +3002,15 @@ async def _run_recommendation_outbox_dispatcher() -> None:
                 worker_id=worker_id, batch_size=50, lease_seconds=30
             )
             outbox_stats = await system_store.get_recommendation_outbox_stats()
-            app.state.runtime.observability.update_recommendation_outbox(
-                **outbox_stats
-            )
+            app.state.runtime.observability.update_recommendation_outbox(**outbox_stats)
             if not events:
                 await asyncio.sleep(0.25)
                 continue
             for event in events:
                 event_id = str(event.get("event_id") or "")
                 try:
-                    published = await kafka_manager.publish_recommendation_event_payload(
-                        event
+                    published = (
+                        await kafka_manager.publish_recommendation_event_payload(event)
                     )
                     if not published:
                         raise RuntimeError("Kafka publish returned false")
@@ -3100,19 +3112,17 @@ async def _periodic_ranking_checkpoint_sync(runtime) -> None:
         try:
             await asyncio.sleep(interval_seconds)
             if ranking_model and model_path and artifact_manager:
-                latest_ranking = await artifact_manager.get_latest_model_checkpoint(
-                    ModelArtifactManager.RANKING_MODEL_NAME
+                latest_ranking = await artifact_manager.sync_selected_ranking_checkpoint(
+                    gate_mode=runtime.config.model_release_config.gate_mode,
+                    environment=runtime.config.model_release_config.environment,
+                    expected_feature_schema_version=ranking_model.feature_schema_version,
                 )
                 if (
                     latest_ranking
                     and latest_ranking.model_version != last_ranking_version
                 ):
-                    synced_ranking = await artifact_manager.sync_latest_ranking_checkpoint(
-                        expected_feature_schema_version=ranking_model.feature_schema_version
-                    )
                     if await ranking_model.reload_model_if_updated(model_path):
-                        if synced_ranking:
-                            ranking_model.mark_artifact_record_verified(synced_ranking)
+                        ranking_model.mark_artifact_record_verified(latest_ranking)
                         last_ranking_version = latest_ranking.model_version
             if recommendation_engine:
                 if await recommendation_engine.sync_serving_artifacts_if_updated():

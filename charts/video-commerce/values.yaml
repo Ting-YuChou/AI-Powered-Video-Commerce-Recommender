@@ -182,6 +182,19 @@ pitOrchestrator:
 
 appConfig:
   environment: production
+  modelRelease:
+    gateMode: enforced
+    environment: production
+    holdoutDays: 7
+    bootstrapSamples: 2000
+    evaluationMaxAgeHours: 168
+    minImpressions: 1000
+    minUsers: 200
+    minClicks: 50
+    minPurchases: 30
+    minSliceImpressions: 200
+    minSliceUsers: 50
+    minSlicePositives: 20
   apiCorsOrigins: "https://localhost,http://localhost,https://127.0.0.1,http://127.0.0.1"
   apiCorsCredentials: "false"
   apiRateLimitRequests: 120000

@@ -69,6 +69,13 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     manager.record_content_task_publish_retry("kafka_error")
     manager.update_content_orphans(orphan_objects=3, deleted_objects=1)
     manager.record_content_processing("projection_repair")
+    manager.record_model_release_evaluation("passed")
+    manager.update_model_release_durable_state(
+        registered_backlog=2,
+        staging_age_seconds=30.0,
+        active_generation=7,
+    )
+    manager.update_model_release_generation(desired=8, observed=7)
 
     payload = manager.prometheus_payload().decode("utf-8")
 
@@ -126,3 +133,8 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "content_orphan_objects 3.0" in payload
     assert "content_orphan_objects_deleted_total 1.0" in payload
     assert 'content_processing_events_total{outcome="projection_repair"} 1.0' in payload
+    assert 'model_release_evaluations_total{decision="passed"} 1.0' in payload
+    assert "model_release_registered_backlog 2.0" in payload
+    assert "model_release_staging_age_seconds 30.0" in payload
+    assert "model_release_active_generation 7.0" in payload
+    assert "model_release_runner_generation_mismatch 1.0" in payload

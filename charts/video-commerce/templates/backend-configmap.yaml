@@ -7,6 +7,18 @@ metadata:
     {{- include "video-commerce.labels" . | nindent 4 }}
 data:
   ENVIRONMENT: {{ .Values.appConfig.environment | quote }}
+  MODEL_RELEASE_GATE_MODE: {{ .Values.appConfig.modelRelease.gateMode | quote }}
+  MODEL_RELEASE_ENVIRONMENT: {{ .Values.appConfig.modelRelease.environment | quote }}
+  MODEL_RELEASE_HOLDOUT_DAYS: {{ .Values.appConfig.modelRelease.holdoutDays | quote }}
+  MODEL_RELEASE_BOOTSTRAP_SAMPLES: {{ .Values.appConfig.modelRelease.bootstrapSamples | quote }}
+  MODEL_RELEASE_EVALUATION_MAX_AGE_HOURS: {{ .Values.appConfig.modelRelease.evaluationMaxAgeHours | quote }}
+  MODEL_RELEASE_MIN_IMPRESSIONS: {{ .Values.appConfig.modelRelease.minImpressions | quote }}
+  MODEL_RELEASE_MIN_USERS: {{ .Values.appConfig.modelRelease.minUsers | quote }}
+  MODEL_RELEASE_MIN_CLICKS: {{ .Values.appConfig.modelRelease.minClicks | quote }}
+  MODEL_RELEASE_MIN_PURCHASES: {{ .Values.appConfig.modelRelease.minPurchases | quote }}
+  MODEL_RELEASE_MIN_SLICE_IMPRESSIONS: {{ .Values.appConfig.modelRelease.minSliceImpressions | quote }}
+  MODEL_RELEASE_MIN_SLICE_USERS: {{ .Values.appConfig.modelRelease.minSliceUsers | quote }}
+  MODEL_RELEASE_MIN_SLICE_POSITIVES: {{ .Values.appConfig.modelRelease.minSlicePositives | quote }}
   API_CORS_ORIGINS: {{ .Values.appConfig.apiCorsOrigins | quote }}
   API_CORS_CREDENTIALS: {{ .Values.appConfig.apiCorsCredentials | quote }}
   API_RATE_LIMIT_REQUESTS: {{ .Values.appConfig.apiRateLimitRequests | quote }}

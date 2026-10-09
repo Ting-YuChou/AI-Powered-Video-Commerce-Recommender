@@ -48,6 +48,10 @@ class PitTrainingDataset:
     quarantine_rows: int
     examples: List[RankingTrainingExample]
     candidate_embedding_sidecar: Dict[str, Any] | None = None
+    attribution_cutoff: float = 0.0
+    min_as_of_ts: float = 0.0
+    max_as_of_ts: float = 0.0
+    manifest_sha256: str = ""
 
 
 def arrow_schema_sha256(schema: pa.Schema) -> str:
@@ -126,6 +130,25 @@ class PitTrainingDatasetReader:
         if len(expected_schema_hash) != 64:
             raise PitTrainingDatasetError(
                 "PIT dataset manifest has invalid schema hash"
+            )
+        try:
+            attribution_cutoff = float(manifest["attribution_cutoff"])
+            min_as_of_ts = float(manifest["min_as_of_ts"])
+            max_as_of_ts = float(manifest["max_as_of_ts"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest has invalid holdout timestamps"
+            ) from exc
+        if (
+            not all(
+                np.isfinite(value)
+                for value in (attribution_cutoff, min_as_of_ts, max_as_of_ts)
+            )
+            or min_as_of_ts > max_as_of_ts
+            or max_as_of_ts > attribution_cutoff
+        ):
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest holdout timestamps are inconsistent"
             )
         shards = manifest.get("shards")
         if not isinstance(shards, list) or not shards:
@@ -276,6 +299,10 @@ class PitTrainingDatasetReader:
             quarantine_rows=max(0, int(manifest.get("quarantine_row_count", 0))),
             examples=examples,
             candidate_embedding_sidecar=candidate_sidecar_reference,
+            attribution_cutoff=attribution_cutoff,
+            min_as_of_ts=min_as_of_ts,
+            max_as_of_ts=max_as_of_ts,
+            manifest_sha256=payload_sha256(manifest),
         )
 
     async def _read_json_uri(self, uri: str, *, kind: str) -> Dict[str, Any]:

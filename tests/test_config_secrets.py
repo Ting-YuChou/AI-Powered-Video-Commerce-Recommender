@@ -367,6 +367,7 @@ def test_production_config_rejects_insecure_defaults(monkeypatch):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.setenv("VECTOR_BOOTSTRAP_MODE", "required")
+    monkeypatch.setenv("MODEL_RELEASE_GATE_MODE", "enforced")
     monkeypatch.setenv("SECURITY_AUTH_MODE", "api_key")
 
     reset_config()
@@ -393,6 +394,7 @@ def test_production_config_accepts_secret_files(monkeypatch, tmp_path):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.setenv("VECTOR_BOOTSTRAP_MODE", "required")
+    monkeypatch.setenv("MODEL_RELEASE_GATE_MODE", "enforced")
     monkeypatch.setenv("SECURITY_AUTH_MODE", "api_key")
     monkeypatch.setenv("API_API_KEY_FILE", str(api_key_file))
     monkeypatch.setenv("SECURITY_INTERNAL_SERVICE_KEY_FILE", str(internal_key_file))
