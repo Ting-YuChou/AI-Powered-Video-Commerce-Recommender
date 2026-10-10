@@ -19,7 +19,9 @@ from video_commerce.ml.visual_product_index import (
 class FakeSystemStore:
     def __init__(self):
         self.latest = {}
+        self.active = {}
         self.recorded = []
+        self.registered_releases = []
         self.catalog_activations = []
 
     async def record_model_checkpoint(
@@ -38,6 +40,23 @@ class FakeSystemStore:
 
     async def get_latest_model_checkpoint(self, model_name):
         return self.latest.get(model_name)
+
+    async def get_active_model_checkpoint(self, model_name, *, environment):
+        return self.active.get((model_name, environment))
+
+    async def register_model_release(
+        self, *, model_name, model_version, bundle_manifest
+    ):
+        release = {
+            "release_id": f"release-{model_version}",
+            "model_name": model_name,
+            "model_version": model_version,
+            "lifecycle_state": "registered",
+            "validation_status": "pending",
+            "bundle_manifest": bundle_manifest,
+        }
+        self.registered_releases.append(release)
+        return release
 
     async def get_model_checkpoint_by_version(self, model_name, model_version):
         record = self.latest.get(model_name)
@@ -143,6 +162,66 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
         fake_store.recorded[-1]["payload"]["artifact_sha256"]
         == hashlib.sha256(b"ranking").hexdigest()
     )
+    assert fake_store.registered_releases[-1]["model_version"] == "ranking-123"
+    assert (
+        fake_store.registered_releases[-1]["bundle_manifest"][
+            "quality_gate_policy_version"
+        ]
+        == "ranking_quality_gate_v1"
+    )
+    assert fake_store.registered_releases[-1]["lifecycle_state"] == "registered"
+
+
+def test_sync_active_ranking_checkpoint_never_selects_newer_registered_release(
+    tmp_path,
+):
+    store = FakeSystemStore()
+    active_path = tmp_path / "active.pt"
+    latest_path = tmp_path / "latest.pt"
+    active_path.write_bytes(b"active")
+    latest_path.write_bytes(b"latest")
+    active_payload = {
+        "artifact_sha256": hashlib.sha256(b"active").hexdigest(),
+        "feature_schema_version": "ranking_v3_00_temporal_multimodal",
+        "model_release_id": "release-active",
+        "active_generation": 7,
+    }
+    store.active[("ranking_model", "production")] = {
+        "model_name": "ranking_model",
+        "model_version": "active-v1",
+        "checkpoint_path": str(active_path),
+        "payload": active_payload,
+        "created_at": 1.0,
+    }
+    store.latest["ranking_model"] = {
+        "model_name": "ranking_model",
+        "model_version": "registered-v2",
+        "checkpoint_path": str(latest_path),
+        "payload": {
+            "artifact_sha256": hashlib.sha256(b"latest").hexdigest(),
+            "feature_schema_version": "ranking_v3_00_temporal_multimodal",
+        },
+        "created_at": 2.0,
+    }
+    local_path = tmp_path / "cache" / "ranking.pt"
+    manager = ModelArtifactManager(
+        system_store=store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(ranking_model_path=str(local_path)),
+        recommendation_config=RecommendationConfig(),
+    )
+
+    record = asyncio.run(
+        manager.sync_active_ranking_checkpoint(
+            environment="production",
+            expected_feature_schema_version="ranking_v3_00_temporal_multimodal",
+        )
+    )
+
+    assert record.model_version == "active-v1"
+    assert record.payload["model_release_id"] == "release-active"
+    assert record.payload["active_generation"] == 7
+    assert local_path.read_bytes() == b"active"
 
 
 def test_persist_visual_product_index_records_complete_atomic_bundle(tmp_path):
@@ -470,6 +549,89 @@ def test_sync_latest_two_tower_artifacts_copies_to_local_cache(tmp_path):
     assert (tmp_path / "cache" / "cf_index.pt").read_bytes() == b"pt"
     assert local_index.read_bytes() == b"faiss"
     assert local_index.with_suffix(".cf_meta.json").read_text(encoding="utf-8") == "{}"
+
+
+def test_sync_active_two_tower_artifacts_ignores_newer_unpromoted_release(tmp_path):
+    fake_store = FakeSystemStore()
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    checkpoint = remote_dir / "two_tower.pt"
+    index = remote_dir / "two_tower.faiss"
+    metadata = remote_dir / "two_tower.cf_meta.json"
+    checkpoint.write_bytes(b"active-pt")
+    index.write_bytes(b"active-faiss")
+    metadata.write_text('{"index_map": {}}', encoding="utf-8")
+    payload = {
+        "cf_index_path": str(index),
+        "cf_index_metadata_path": str(metadata),
+        "retrieval_pit_manifest_sha256": "a" * 64,
+        "catalog_manifest_sha256": "b" * 64,
+        "eligibility_policy_version": "retrieval_eligibility_v1",
+        "label_policy_version": "retrieval_label_v1",
+        "quality_gate_policy_version": "retrieval_quality_gate_v1",
+        "embedding_dimension": 128,
+    }
+    fake_store.active[(ModelArtifactManager.TWO_TOWER_MODEL_NAME, "production")] = {
+        "model_name": ModelArtifactManager.TWO_TOWER_MODEL_NAME,
+        "model_version": "two-tower-active",
+        "checkpoint_path": str(checkpoint),
+        "payload": payload,
+        "active_generation": 7,
+    }
+    fake_store.latest[ModelArtifactManager.TWO_TOWER_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.TWO_TOWER_MODEL_NAME,
+        "model_version": "two-tower-unpromoted",
+        "checkpoint_path": "/missing/unpromoted.pt",
+        "payload": {},
+    }
+    local_index = tmp_path / "cache" / "cf_index.faiss"
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(cf_index_path=str(local_index)),
+    )
+
+    record = asyncio.run(
+        manager.sync_active_two_tower_artifacts(
+            environment="production", require_compatible=True
+        )
+    )
+
+    assert record.model_version == "two-tower-active"
+    assert record.payload["active_generation"] == 7
+    assert local_index.read_bytes() == b"active-faiss"
+
+
+def test_active_two_tower_artifact_requires_retrieval_lineage(tmp_path):
+    fake_store = FakeSystemStore()
+    fake_store.active[(ModelArtifactManager.TWO_TOWER_MODEL_NAME, "production")] = {
+        "model_name": ModelArtifactManager.TWO_TOWER_MODEL_NAME,
+        "model_version": "two-tower-active",
+        "checkpoint_path": str(tmp_path / "missing.pt"),
+        "payload": {
+            "cf_index_path": str(tmp_path / "missing.faiss"),
+            "cf_index_metadata_path": str(tmp_path / "missing.json"),
+        },
+        "active_generation": 1,
+    }
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(),
+    )
+
+    with pytest.raises(ValueError, match="retrieval PIT lineage"):
+        asyncio.run(
+            manager.sync_active_two_tower_artifacts(
+                environment="production", require_compatible=True
+            )
+        )
 
 
 def test_sync_latest_two_tower_artifacts_removes_undeclared_optional_sidecars(tmp_path):

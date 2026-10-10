@@ -1397,8 +1397,9 @@ class RankingModel:
                         f"No compatible tensors found in ranking checkpoint {resolved_model_path}"
                     )
                 next_model.eval()
-                self.model = next_model
-                self.optimizer = next_optimizer
+                next_candidate_sidecar = None
+                next_candidate_sidecar_sha256 = None
+                next_candidate_sidecar_model_version = None
                 if getattr(self.config, "trimodal_enabled", False):
                     sidecar_sha256 = str(
                         checkpoint_config.get("candidate_sidecar_sha256") or ""
@@ -1413,13 +1414,21 @@ class RankingModel:
                     sidecar_path = str(
                         Path(resolved_model_path).with_suffix(".candidates.npz")
                     )
-                    self.candidate_embedding_sidecar = CandidateEmbeddingSidecar.load(
+                    next_candidate_sidecar = CandidateEmbeddingSidecar.load(
                         sidecar_path,
                         expected_sha256=sidecar_sha256,
                         expected_model_version=sidecar_model_version,
                     )
-                    self.candidate_sidecar_sha256 = sidecar_sha256
-                    self.candidate_sidecar_model_version = sidecar_model_version
+                    next_candidate_sidecar_sha256 = sidecar_sha256
+                    next_candidate_sidecar_model_version = sidecar_model_version
+                self.model = next_model
+                self.optimizer = next_optimizer
+                if next_candidate_sidecar is not None:
+                    self.candidate_embedding_sidecar = next_candidate_sidecar
+                    self.candidate_sidecar_sha256 = next_candidate_sidecar_sha256
+                    self.candidate_sidecar_model_version = (
+                        next_candidate_sidecar_model_version
+                    )
                 self.is_trained = True
                 self.ranking_objective_version = str(
                     checkpoint_config.get(
@@ -2594,9 +2603,11 @@ class RankingModel:
             dtype=np.float32,
         )
         scores = canonical_score_numpy(
-            ctcvr=predictions.get(
-                "ctcvr", predictions["ctr"] * predictions["cvr"]
-            ).detach().cpu().numpy().reshape(-1),
+            ctcvr=predictions.get("ctcvr", predictions["ctr"] * predictions["cvr"])
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1),
             predicted_value=predicted_values,
             raw_ranking_score=raw_scores,
             business_score_enabled=bool(
@@ -2676,6 +2687,56 @@ class RankingModel:
                 "last_attention_entropy",
                 None,
             ),
+        }
+
+    def predict_release_examples(
+        self,
+        examples: Sequence[RankingTrainingExample],
+    ) -> Dict[str, "RankingPrediction"]:
+        """Run canonical serving predictions over a fixed offline holdout."""
+        from video_commerce.ml.model_release_quality import RankingPrediction
+
+        if self.model is None or not self.is_trained:
+            raise RuntimeError("ranking release evaluation requires a trained model")
+        tensors = self._prepare_training_tensors(
+            examples,
+            fit_value_transform=False,
+        )
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(
+                tensors.base_features,
+                **tensors.trimodal_inputs,
+                **tensors.din_inputs,
+            )
+            ctcvr = outputs.get("ctcvr", outputs["ctr"] * outputs["cvr"])
+            predicted_values = self._inverse_transform_business_value_tensor(
+                outputs["gmv"], tensors.labels.get("value_bucket")
+            )
+            serving_scores = canonical_score_torch(
+                ctcvr=ctcvr,
+                predicted_value=predicted_values,
+                raw_ranking_score=outputs["ranking_score"],
+                business_score_enabled=bool(
+                    getattr(self.config, "business_score_enabled", True)
+                ),
+            )
+
+        def values(tensor: torch.Tensor) -> list[float]:
+            return tensor.detach().cpu().reshape(-1).tolist()
+
+        score_values = values(serving_scores)
+        ctr_values = values(outputs["ctr"])
+        ctcvr_values = values(ctcvr)
+        predicted_value_values = values(predicted_values)
+        return {
+            example.observation_id: RankingPrediction(
+                serving_score=float(score_values[index]),
+                ctr=float(ctr_values[index]),
+                ctcvr=float(ctcvr_values[index]),
+                predicted_value=float(predicted_value_values[index]),
+            )
+            for index, example in enumerate(examples)
         }
 
     def _prepare_training_tensors(

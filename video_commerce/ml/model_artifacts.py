@@ -158,6 +158,25 @@ class ModelArtifactManager:
             created_at=checkpoint.get("created_at"),
         )
 
+    async def get_two_tower_checkpoint(
+        self, model_version: str
+    ) -> Optional[ModelArtifactRecord]:
+        if not self.system_store or not model_version:
+            return None
+        checkpoint = await self.system_store.get_model_checkpoint_by_version(
+            self.TWO_TOWER_MODEL_NAME,
+            str(model_version),
+        )
+        if not checkpoint:
+            return None
+        return ModelArtifactRecord(
+            model_name=str(checkpoint["model_name"]),
+            model_version=str(checkpoint["model_version"]),
+            checkpoint_path=str(checkpoint["checkpoint_path"]),
+            payload=dict(checkpoint.get("payload") or {}),
+            created_at=checkpoint.get("created_at"),
+        )
+
     async def sync_latest_ranking_checkpoint(
         self,
         *,
@@ -171,7 +190,9 @@ class ModelArtifactManager:
             from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
 
             if record.payload.get("score_policy_version") != SCORE_POLICY_VERSION:
-                raise ValueError("ranking artifact score policy is missing or incompatible")
+                raise ValueError(
+                    "ranking artifact score policy is missing or incompatible"
+                )
             if not isinstance(record.payload.get("value_transform_stats"), dict):
                 raise ValueError(
                     "ranking artifact value normalization metadata is missing"
@@ -263,6 +284,109 @@ class ModelArtifactManager:
         await self._sync_paths_to_local_atomically(artifact_specs)
         return record
 
+    async def sync_active_ranking_checkpoint(
+        self,
+        *,
+        environment: str,
+        expected_feature_schema_version: Optional[str] = None,
+    ) -> Optional[ModelArtifactRecord]:
+        """Sync only the ranking bundle selected by the durable active pointer."""
+        if not self.system_store:
+            return None
+        checkpoint = await self.system_store.get_active_model_checkpoint(
+            self.RANKING_MODEL_NAME,
+            environment=str(environment),
+        )
+        if not checkpoint:
+            return None
+        record = ModelArtifactRecord(
+            model_name=str(checkpoint["model_name"]),
+            model_version=str(checkpoint["model_version"]),
+            checkpoint_path=str(checkpoint["checkpoint_path"]),
+            payload=dict(checkpoint.get("payload") or {}),
+            created_at=checkpoint.get("created_at"),
+        )
+        schema = str(record.payload.get("feature_schema_version") or "")
+        if (
+            expected_feature_schema_version
+            and schema != expected_feature_schema_version
+        ):
+            raise ValueError("active ranking artifact feature schema is incompatible")
+        if os.getenv("ENVIRONMENT", "").lower() == "production":
+            from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
+
+            if record.payload.get("score_policy_version") != SCORE_POLICY_VERSION:
+                raise ValueError("active ranking artifact score policy is incompatible")
+            if not isinstance(record.payload.get("value_transform_stats"), dict):
+                raise ValueError(
+                    "active ranking artifact value normalization metadata is missing"
+                )
+        artifact_specs = [
+            (
+                record.checkpoint_path,
+                self.ranking_local_path,
+                self._extract_artifact_sha256(
+                    record.payload,
+                    "checkpoint",
+                    legacy_key="artifact_sha256",
+                ),
+            )
+        ]
+        manifest = dict(record.payload.get("artifact_manifest") or {})
+        candidate = dict(manifest.get("candidate_sidecar") or {})
+        if candidate:
+            artifact_specs.append(
+                (
+                    str(candidate["path"]),
+                    self.ranking_candidate_sidecar_local_path,
+                    str(candidate["sha256"]),
+                )
+            )
+        elif schema == "ranking_v4_01_temporal_trimodal":
+            raise ValueError("active ranking_v4 artifact is missing candidate sidecar")
+        din_sidecar = dict(manifest.get("din_embedding_sidecar") or {})
+        if din_sidecar:
+            artifact_specs.append(
+                (
+                    str(din_sidecar["path"]),
+                    self.ranking_din_sidecar_local_path,
+                    str(din_sidecar["sha256"]),
+                )
+            )
+        await self._sync_paths_to_local_atomically(artifact_specs)
+        return record
+
+    async def sync_selected_ranking_checkpoint(
+        self,
+        *,
+        gate_mode: str,
+        environment: str,
+        expected_feature_schema_version: Optional[str] = None,
+    ) -> Optional[ModelArtifactRecord]:
+        """Resolve active releases with an explicit local migration fallback."""
+        normalized_mode = str(gate_mode or "").strip().lower()
+        if normalized_mode == "legacy":
+            return await self.sync_latest_ranking_checkpoint(
+                expected_feature_schema_version=expected_feature_schema_version
+            )
+        active = await self.sync_active_ranking_checkpoint(
+            environment=environment,
+            expected_feature_schema_version=expected_feature_schema_version,
+        )
+        if active is not None:
+            return active
+        if normalized_mode == "observe":
+            logger.warning(
+                "active_ranking_release_missing_using_latest_fallback",
+                extra={"release_environment": environment},
+            )
+            return await self.sync_latest_ranking_checkpoint(
+                expected_feature_schema_version=expected_feature_schema_version
+            )
+        if normalized_mode == "enforced":
+            raise RuntimeError("active ranking release is required")
+        raise ValueError("gate_mode must be legacy, observe, or enforced")
+
     async def sync_ranking_checkpoint_version(
         self,
         model_version: str,
@@ -287,7 +411,10 @@ class ModelArtifactManager:
                     "exact ranking artifact value normalization metadata is missing"
                 )
         schema = str(payload.get("feature_schema_version") or "")
-        if expected_feature_schema_version and schema != expected_feature_schema_version:
+        if (
+            expected_feature_schema_version
+            and schema != expected_feature_schema_version
+        ):
             logger.warning(
                 "ranking_checkpoint_schema_incompatible",
                 extra={
@@ -310,7 +437,10 @@ class ModelArtifactManager:
         ]
         onnx_model = dict(manifest.get("onnx_model") or {})
         if require_onnx:
-            if not onnx_model.get("path") or len(str(onnx_model.get("sha256") or "")) != 64:
+            if (
+                not onnx_model.get("path")
+                or len(str(onnx_model.get("sha256") or "")) != 64
+            ):
                 raise ValueError("exact ranking ONNX manifest is incomplete")
             if onnx_model.get("source_checkpoint_sha256") != checkpoint.get("sha256"):
                 raise ValueError("ONNX source checkpoint lineage mismatch")
@@ -327,7 +457,10 @@ class ModelArtifactManager:
             )
         din_sidecar = dict(manifest.get("din_embedding_sidecar") or {})
         if onnx_model.get("din_enabled"):
-            if not din_sidecar.get("path") or len(str(din_sidecar.get("sha256") or "")) != 64:
+            if (
+                not din_sidecar.get("path")
+                or len(str(din_sidecar.get("sha256") or "")) != 64
+            ):
                 raise ValueError("exact ranking DIN sidecar manifest is incomplete")
             if onnx_model.get("din_sidecar_sha256") != din_sidecar.get("sha256"):
                 raise ValueError("ONNX DIN sidecar lineage mismatch")
@@ -368,6 +501,107 @@ class ModelArtifactManager:
         if not record:
             return None
 
+        if not await self._sync_two_tower_record(record):
+            return None
+        return record
+
+    async def sync_active_two_tower_artifacts(
+        self,
+        *,
+        environment: str,
+        require_compatible: bool = True,
+    ) -> Optional[ModelArtifactRecord]:
+        """Sync only the Two-Tower bundle authorized by the active pointer."""
+        if not self.system_store:
+            return None
+        checkpoint = await self.system_store.get_active_model_checkpoint(
+            self.TWO_TOWER_MODEL_NAME,
+            environment=str(environment),
+        )
+        if not checkpoint:
+            return None
+        payload = dict(checkpoint.get("payload") or {})
+        if checkpoint.get("generation") is not None:
+            payload.setdefault("active_generation", int(checkpoint["generation"]))
+        elif checkpoint.get("active_generation") is not None:
+            payload.setdefault(
+                "active_generation", int(checkpoint["active_generation"])
+            )
+        record = ModelArtifactRecord(
+            model_name=str(checkpoint["model_name"]),
+            model_version=str(checkpoint["model_version"]),
+            checkpoint_path=str(checkpoint["checkpoint_path"]),
+            payload=payload,
+            created_at=checkpoint.get("created_at"),
+        )
+        if require_compatible:
+            self._validate_two_tower_release_payload(record.payload)
+        if not await self._sync_two_tower_record(record):
+            raise ValueError("active Two-Tower artifact bundle is incomplete")
+        return record
+
+    async def sync_two_tower_checkpoint_version(
+        self, model_version: str
+    ) -> Optional[ModelArtifactRecord]:
+        record = await self.get_two_tower_checkpoint(model_version)
+        if record is None:
+            return None
+        self._validate_two_tower_release_payload(record.payload)
+        if not await self._sync_two_tower_record(record):
+            return None
+        return record
+
+    async def sync_selected_two_tower_artifacts(
+        self,
+        *,
+        gate_mode: str,
+        environment: str,
+    ) -> Optional[ModelArtifactRecord]:
+        """Resolve an active Two-Tower release with explicit migration fallback."""
+        normalized_mode = str(gate_mode or "").strip().lower()
+        if normalized_mode == "legacy":
+            return await self.sync_latest_two_tower_artifacts()
+        active = await self.sync_active_two_tower_artifacts(
+            environment=environment,
+            require_compatible=True,
+        )
+        if active is not None:
+            return active
+        if normalized_mode == "observe":
+            logger.warning(
+                "active_two_tower_release_missing_using_latest_fallback",
+                extra={"release_environment": environment},
+            )
+            return await self.sync_latest_two_tower_artifacts()
+        if normalized_mode == "enforced":
+            raise RuntimeError("active Two-Tower release is required")
+        raise ValueError("gate_mode must be legacy, observe, or enforced")
+
+    @staticmethod
+    def _validate_two_tower_release_payload(payload: Dict[str, Any]) -> None:
+        required = {
+            "retrieval_pit_manifest_sha256": "retrieval PIT lineage",
+            "catalog_manifest_sha256": "catalog lineage",
+            "eligibility_policy_version": "eligibility policy",
+            "label_policy_version": "label policy",
+            "quality_gate_policy_version": "quality gate policy",
+            "embedding_dimension": "embedding dimension",
+        }
+        for key, description in required.items():
+            if payload.get(key) in {None, ""}:
+                raise ValueError(f"active Two-Tower artifact is missing {description}")
+        if payload["eligibility_policy_version"] != "retrieval_eligibility_v1":
+            raise ValueError("active Two-Tower eligibility policy is incompatible")
+        if payload["label_policy_version"] != "retrieval_label_v1":
+            raise ValueError("active Two-Tower label policy is incompatible")
+        if payload["quality_gate_policy_version"] != "retrieval_quality_gate_v1":
+            raise ValueError("active Two-Tower quality gate policy is incompatible")
+        if int(payload["embedding_dimension"]) <= 0:
+            raise ValueError("active Two-Tower embedding dimension is invalid")
+
+    async def _sync_two_tower_record(self, record: ModelArtifactRecord) -> bool:
+        """Validate and atomically install one resolved Two-Tower bundle."""
+
         payload = record.payload
         cf_index_path = payload.get("cf_index_path")
         cf_metadata_path = payload.get("cf_index_metadata_path")
@@ -381,7 +615,7 @@ class ModelArtifactManager:
                     "has_cf_metadata": bool(cf_metadata_path),
                 },
             )
-            return None
+            return False
         artifact_specs: List[Tuple[str, str, Optional[str]]] = [
             (
                 record.checkpoint_path,
@@ -438,7 +672,7 @@ class ModelArtifactManager:
             stale_optional_local_paths.append(self.two_tower_local_adapter_path)
         await self._sync_paths_to_local_atomically(artifact_specs)
         self._remove_local_artifacts(stale_optional_local_paths)
-        return record
+        return True
 
     async def sync_latest_sasrec_artifacts(self) -> Optional[ModelArtifactRecord]:
         record = await self.get_latest_model_checkpoint(self.SASREC_MODEL_NAME)
@@ -528,7 +762,9 @@ class ModelArtifactManager:
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":
             if (payload or {}).get("score_policy_version") != SCORE_POLICY_VERSION:
-                raise ValueError("ranking persistence requires the canonical score policy")
+                raise ValueError(
+                    "ranking persistence requires the canonical score policy"
+                )
             if not isinstance((payload or {}).get("value_transform_stats"), dict):
                 raise ValueError(
                     "ranking persistence requires value normalization metadata"
@@ -685,6 +921,34 @@ class ModelArtifactManager:
                 ),
             }
         )
+        from video_commerce.ml.model_release_quality import QUALITY_GATE_POLICY_VERSION
+
+        bundle_manifest = {
+            "artifact_manifest": dict(record_payload["artifact_manifest"]),
+            "artifact_sha256": artifact_sha256,
+            "feature_schema_version": record_payload.get("feature_schema_version"),
+            "feature_definition_version": record_payload.get(
+                "feature_definition_version"
+            ),
+            "label_definition_version": record_payload.get("label_definition_version"),
+            "feature_assembler_version": record_payload.get(
+                "feature_assembler_version"
+            ),
+            "score_policy_version": record_payload.get("score_policy_version"),
+            "value_transform_stats": record_payload.get("value_transform_stats"),
+            "feature_lake_manifest_uri": record_payload.get(
+                "feature_lake_manifest_uri"
+            ),
+            "feature_lake_manifest_sha256": record_payload.get(
+                "feature_lake_manifest_sha256"
+            ),
+            "holdout_window": {
+                "start": record_payload.get("quality_gate_holdout_start"),
+                "end": record_payload.get("quality_gate_holdout_end"),
+            },
+            "quality_gate_policy_version": QUALITY_GATE_POLICY_VERSION,
+            "training_code_revision": os.getenv("GIT_COMMIT_SHA", "unknown"),
+        }
         inserted = await self.system_store.record_model_checkpoint(
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
@@ -705,12 +969,59 @@ class ModelArtifactManager:
                     "PIT ranking checkpoint conflict has no durable winner"
                 )
             await self._verify_existing_checkpoint(existing)
+            winner_payload = dict(existing.get("payload") or {})
+            winner_bundle_manifest = {
+                **bundle_manifest,
+                "artifact_manifest": dict(
+                    winner_payload.get("artifact_manifest") or {}
+                ),
+                "artifact_sha256": winner_payload.get("artifact_sha256"),
+                "feature_schema_version": winner_payload.get("feature_schema_version"),
+                "feature_definition_version": winner_payload.get(
+                    "feature_definition_version"
+                ),
+                "label_definition_version": winner_payload.get(
+                    "label_definition_version"
+                ),
+                "feature_assembler_version": winner_payload.get(
+                    "feature_assembler_version"
+                ),
+                "score_policy_version": winner_payload.get("score_policy_version"),
+                "value_transform_stats": winner_payload.get("value_transform_stats"),
+                "feature_lake_manifest_uri": winner_payload.get(
+                    "feature_lake_manifest_uri"
+                ),
+                "feature_lake_manifest_sha256": winner_payload.get(
+                    "feature_lake_manifest_sha256"
+                ),
+                "holdout_window": {
+                    "start": winner_payload.get("quality_gate_holdout_start"),
+                    "end": winner_payload.get("quality_gate_holdout_end"),
+                },
+            }
+            release = await self.system_store.register_model_release(
+                model_name=self.RANKING_MODEL_NAME,
+                model_version=str(existing["model_version"]),
+                bundle_manifest=winner_bundle_manifest,
+            )
+            existing_payload = winner_payload
+            existing_payload["model_release_id"] = release["release_id"]
+            existing_payload[
+                "quality_gate_policy_version"
+            ] = QUALITY_GATE_POLICY_VERSION
             return ModelArtifactRecord(
                 model_name=str(existing["model_name"]),
                 model_version=str(existing["model_version"]),
                 checkpoint_path=str(existing["checkpoint_path"]),
-                payload=dict(existing.get("payload") or {}),
+                payload=existing_payload,
             )
+        release = await self.system_store.register_model_release(
+            model_name=self.RANKING_MODEL_NAME,
+            model_version=model_version,
+            bundle_manifest=bundle_manifest,
+        )
+        record_payload["model_release_id"] = release["release_id"]
+        record_payload["quality_gate_policy_version"] = QUALITY_GATE_POLICY_VERSION
         return ModelArtifactRecord(
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
@@ -725,9 +1036,7 @@ class ModelArtifactManager:
         output_names = ["ctr", "cvr", "ctcvr", "gmv", "ranking_score"]
         input_dim = int(contract.get("input_dim") or 0)
         din_enabled = bool(contract.get("din_enabled"))
-        expected_inputs: Dict[str, Any] = {
-            "base_features": [None, input_dim]
-        }
+        expected_inputs: Dict[str, Any] = {"base_features": [None, input_dim]}
         if din_enabled:
             expected_inputs.update(
                 {
@@ -743,8 +1052,7 @@ class ModelArtifactManager:
             (
                 input_dim > 0,
                 contract.get("model_architecture") == "dcn",
-                contract.get("feature_schema_version")
-                == feature_schema_version,
+                contract.get("feature_schema_version") == feature_schema_version,
                 contract.get("input_contract") == expected_inputs,
                 contract.get("output_contract") == expected_outputs,
                 contract.get("output_names") == output_names,
@@ -987,6 +1295,13 @@ class ModelArtifactManager:
             checkpoint_path=persisted_checkpoint,
             payload=record_payload,
         )
+        if record_payload.get("retrieval_pit_manifest_sha256"):
+            release = await self.system_store.register_model_release(
+                model_name=self.TWO_TOWER_MODEL_NAME,
+                model_version=model_version,
+                bundle_manifest=record_payload,
+            )
+            record_payload["model_release_id"] = release["release_id"]
         return ModelArtifactRecord(
             model_name=self.TWO_TOWER_MODEL_NAME,
             model_version=model_version,

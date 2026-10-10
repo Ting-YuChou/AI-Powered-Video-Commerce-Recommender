@@ -486,3 +486,48 @@ groups:
         annotations:
           summary: Serving still uses untrained fallback after PIT artifact creation
           description: Check artifact activation, checksum sync, and ranking runner reload state.
+
+      - alert: ModelReleaseRegisteredBacklog
+        expr: model_release_registered_backlog > 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: Ranking releases have waited more than 24 hours for evaluation
+          description: Inspect PIT evidence, evaluator failures, and slice sample thresholds.
+
+      - alert: ModelReleaseStagingTooOld
+        expr: model_release_staging_age_seconds > 86400
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A validated ranking release remains in staging
+          description: Review the offline gate evidence and either promote or retire the release.
+
+      - alert: ModelReleaseRunnerGenerationMismatch
+        expr: model_release_runner_generation_mismatch > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Ranking runner has not converged to the active generation
+          description: Inspect artifact download, checksum validation, and runner reload failures.
+
+      - alert: RetrievalReleaseRegisteredBacklog
+        expr: retrieval_release_registered_backlog > 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: Two-Tower releases have waited more than 24 hours for evaluation
+          description: Inspect retrieval PIT evidence, catalog coverage, and slice thresholds.
+
+      - alert: RetrievalReleaseStagingTooOld
+        expr: retrieval_release_staging_age_seconds > 86400
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A validated Two-Tower release remains in staging
+          description: Review retrieval gate evidence and either promote or retire the release.

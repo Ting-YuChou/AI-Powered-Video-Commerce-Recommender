@@ -9,11 +9,34 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
     RankingCoordinatorResponse,
 )
 from video_commerce.services.ranking_service import proxy_asgi as ranking_proxy_asgi
-from video_commerce.services.ranking_service.proxy_asgi import RankingProxyApp
+from video_commerce.services.ranking_service.proxy_asgi import (
+    RankingProxyApp,
+    _validate_required_release_version,
+)
 from video_commerce.ranking_runtime.ranking_triton import (
     RankingTritonOverloaded,
     RankingTritonUnavailable,
 )
+
+
+def test_triton_required_version_must_equal_active_release():
+    _validate_required_release_version(
+        gate_mode="enforced",
+        required_version="ranking-v2",
+        active_checkpoint={"model_version": "ranking-v2"},
+    )
+    with pytest.raises(RuntimeError, match="must match"):
+        _validate_required_release_version(
+            gate_mode="enforced",
+            required_version="ranking-v1",
+            active_checkpoint={"model_version": "ranking-v2"},
+        )
+    with pytest.raises(RuntimeError, match="active release"):
+        _validate_required_release_version(
+            gate_mode="enforced",
+            required_version="ranking-v1",
+            active_checkpoint=None,
+        )
 
 
 @pytest.mark.asyncio

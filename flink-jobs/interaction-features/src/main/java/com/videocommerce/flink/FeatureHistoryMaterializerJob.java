@@ -12,9 +12,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.metrics.Counter;
@@ -286,6 +288,7 @@ public final class FeatureHistoryMaterializerJob {
     Map<String, Object> context = safeMap(metadata.get("feature_context"));
     Map<String, Object> userFeatures = safeMap(metadata.get("user_feature_snapshot"));
     List<Object> displayedItems = safeList(metadata.get("displayed_items"));
+    List<Object> rejectedItems = safeList(metadata.get("rejected_candidate_items"));
     Map<String, Object> sourcePayload = new LinkedHashMap<>();
     sourcePayload.put("user_id", userId);
     sourcePayload.put("recommendations", safeList(event.get("recommendations")));
@@ -296,9 +299,11 @@ public final class FeatureHistoryMaterializerJob {
       throw new IllegalArgumentException("payload_hash does not match recommendation payload");
     }
     List<LakeHistoryRow> rows = new ArrayList<>();
+    Set<String> displayedProductIds = new HashSet<>();
     for (Object rawItem : displayedItems) {
       Map<String, Object> item = safeMap(rawItem);
       String productId = required("displayed_items.product_id", item.get("product_id"));
+      displayedProductIds.add(productId);
       String bundleHash = required("displayed_items.feature_bundle_hash", item.get("feature_bundle_hash"));
       String itemDefinition =
           required(
@@ -348,6 +353,47 @@ public final class FeatureHistoryMaterializerJob {
           FeatureHistoryContract.canonicalJson(safeMap(item.get("feature_snapshot")));
       row.userFeaturesJson = FeatureHistoryContract.canonicalJson(userFeatures);
       row.featureBundleHash = bundleHash;
+      row.observationId = observationId;
+      row.eventDate = eventDate(eventTime);
+      rows.add(row);
+    }
+    for (Object rawItem : rejectedItems) {
+      Map<String, Object> item = safeMap(rawItem);
+      String productId = required("rejected_candidate_items.product_id", item.get("product_id"));
+      if (displayedProductIds.contains(productId)) {
+        continue;
+      }
+      String observationId = impressionId + ":" + productId;
+      String observationSourceId =
+          FeatureHistoryContract.deterministicId(sourceEvent, observationId, "ranker-rejected");
+      Map<String, Object> payload = new LinkedHashMap<>();
+      payload.put("impression_id", impressionId);
+      payload.put("user_id", userId);
+      payload.put("product_id", productId);
+      payload.put("position", item.get("position"));
+      payload.put("candidate_features", safeMap(item.get("scores")));
+      LakeHistoryRow row = new LakeHistoryRow();
+      row.targetTable = "ranking_observations";
+      row.sourceTopic = topic;
+      row.eventId = observationSourceId;
+      row.sourceEventId = observationSourceId;
+      row.eventType = "ranking_rejected_observation";
+      row.entityType = "item";
+      row.entityId = productId;
+      row.entityBucket = entityBucket(productId);
+      row.userId = userId;
+      row.productId = productId;
+      row.eventTime = eventTime;
+      row.availableAt = availableAt;
+      row.sourceVersion = sourceVersion;
+      row.featureDefinitionVersion = definition;
+      row.payloadSchemaVersion = schemaVersion;
+      row.payloadHash = FeatureHistoryContract.payloadHash(payload);
+      row.canonicalPayloadJson = FeatureHistoryContract.canonicalJson(payload);
+      row.contextJson = FeatureHistoryContract.canonicalJson(context);
+      row.candidateFeaturesJson =
+          FeatureHistoryContract.canonicalJson(safeMap(item.get("scores")));
+      row.userFeaturesJson = FeatureHistoryContract.canonicalJson(userFeatures);
       row.observationId = observationId;
       row.eventDate = eventDate(eventTime);
       rows.add(row);

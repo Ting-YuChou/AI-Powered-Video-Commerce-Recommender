@@ -655,6 +655,54 @@ class RecommendationConfig(BaseSettings):
     tt_batch_size: int = Field(1024, description="Two-Tower training batch size")
     tt_epochs: int = Field(20, description="Two-Tower training epochs")
     tt_temperature: float = Field(0.07, description="InfoNCE temperature parameter")
+    retrieval_training_source: str = Field(
+        "pit" if os.getenv("ENVIRONMENT", "").lower() == "production" else "legacy",
+        env="RETRIEVAL_TRAINING_SOURCE",
+        description="Two-Tower trainer source: legacy or immutable retrieval PIT",
+    )
+    retrieval_release_gate_mode: str = Field(
+        "enforced"
+        if os.getenv("ENVIRONMENT", "").lower() == "production"
+        else "observe",
+        env="RETRIEVAL_RELEASE_GATE_MODE",
+        description="Two-Tower release selection mode: legacy, observe, or enforced",
+    )
+    retrieval_release_environment: str = Field(
+        "production",
+        env="RETRIEVAL_RELEASE_ENVIRONMENT",
+        description="Release pointer environment used by Two-Tower serving",
+    )
+    retrieval_holdout_days: int = Field(7, ge=1, env="RETRIEVAL_HOLDOUT_DAYS")
+    retrieval_eligibility_policy_version: str = Field(
+        "retrieval_eligibility_v1", env="RETRIEVAL_ELIGIBILITY_POLICY_VERSION"
+    )
+    retrieval_label_policy_version: str = Field(
+        "retrieval_label_v1", env="RETRIEVAL_LABEL_POLICY_VERSION"
+    )
+    retrieval_quality_gate_policy_version: str = Field(
+        "retrieval_quality_gate_v1", env="RETRIEVAL_QUALITY_GATE_POLICY_VERSION"
+    )
+    retrieval_ranker_rejected_mode: str = Field(
+        "weak",
+        env="RETRIEVAL_RANKER_REJECTED_MODE",
+        description="Ranker-rejected experiment mode: disabled, weak, or teacher_soft",
+    )
+    retrieval_gate_min_queries: int = Field(1000, ge=1)
+    retrieval_gate_min_users: int = Field(200, ge=1)
+    retrieval_gate_min_relevant_labels: int = Field(100, ge=1)
+    retrieval_gate_min_slice_queries: int = Field(200, ge=1)
+    retrieval_gate_min_slice_users: int = Field(50, ge=1)
+    retrieval_gate_min_slice_relevant_labels: int = Field(20, ge=1)
+    retrieval_gate_bootstrap_samples: int = Field(2000, ge=1)
+    retrieval_gate_random_seed: int = Field(42, ge=0)
+    online_retraining_enabled: bool = Field(
+        False if os.getenv("ENVIRONMENT", "").lower() == "production" else True,
+        description="Allow legacy recommendation-process Two-Tower retraining",
+    )
+    retrieval_required: bool = Field(
+        False,
+        description="Fail readiness when an active compatible Two-Tower release is absent",
+    )
 
     # Negative sampling settings
     tt_num_hard_negatives: int = Field(
@@ -696,6 +744,10 @@ class RecommendationConfig(BaseSettings):
     )
     tt_in_batch_loss_weight: float = Field(
         0.25, description="Loss weight for masked in-batch Two-Tower contrastive loss"
+    )
+    tt_logq_correction_enabled: bool = Field(
+        False,
+        description="Apply item-frequency logQ correction to negative sources with known sampling probability",
     )
     ranker_rejected_logging_max_items: int = Field(
         50,
@@ -750,6 +802,31 @@ class RecommendationConfig(BaseSettings):
         normalized = (value or "").strip().lower()
         if normalized not in {"dcn", "mlp"}:
             raise ValueError("tt_architecture must be one of: dcn, mlp")
+        return normalized
+
+    @validator("retrieval_training_source")
+    def validate_retrieval_training_source(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"legacy", "pit"}:
+            raise ValueError("retrieval_training_source must be legacy or pit")
+        return normalized
+
+    @validator("retrieval_release_gate_mode")
+    def validate_retrieval_release_gate_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"legacy", "observe", "enforced"}:
+            raise ValueError(
+                "retrieval_release_gate_mode must be legacy, observe, or enforced"
+            )
+        return normalized
+
+    @validator("retrieval_ranker_rejected_mode")
+    def validate_retrieval_ranker_rejected_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"disabled", "weak", "teacher_soft"}:
+            raise ValueError(
+                "retrieval_ranker_rejected_mode must be disabled, weak, or teacher_soft"
+            )
         return normalized
 
     @validator("tt_cross_layers")
@@ -1843,6 +1920,18 @@ class FeatureLakeConfig(BaseSettings):
         None,
         description="Versioned PIT training dataset export URI consumed by model-trainer",
     )
+    retrieval_pit_dataset_uri: Optional[str] = Field(
+        None,
+        description="Versioned retrieval PIT dataset pointer consumed by the offline Two-Tower trainer",
+    )
+    retrieval_pit_export_uri: Optional[str] = Field(
+        None,
+        description="Immutable retrieval PIT Parquet export prefix",
+    )
+    retrieval_catalog_generation_id: Optional[str] = Field(
+        None,
+        description="Immutable catalog generation pinned by a retrieval PIT run",
+    )
     feature_definition_version: str = Field(
         "ranking_ltr_v1",
         description="Shared online/offline ranking feature definition version",
@@ -2362,6 +2451,46 @@ class DatabaseConfig(BaseSettings):
         env_prefix = "DATABASE_"
 
 
+class ModelReleaseConfig(BaseSettings):
+    """Durable ranking release lifecycle and offline quality-gate settings."""
+
+    gate_mode: str = Field(
+        "observe", description="Release selection mode: legacy, observe, or enforced"
+    )
+    environment: str = Field(
+        "production", description="Release pointer environment selected by serving"
+    )
+    holdout_days: int = Field(7, ge=1)
+    bootstrap_samples: int = Field(2000, ge=1)
+    random_seed: int = Field(42, ge=0)
+    min_impressions: int = Field(1000, ge=1)
+    min_users: int = Field(200, ge=1)
+    min_clicks: int = Field(50, ge=1)
+    min_purchases: int = Field(30, ge=1)
+    min_slice_impressions: int = Field(200, ge=1)
+    min_slice_users: int = Field(50, ge=1)
+    min_slice_positives: int = Field(20, ge=1)
+    evaluation_max_age_hours: int = Field(168, ge=1)
+    overall_ndcg_min_delta: float = Field(0.0)
+    overall_ndcg_ci_lower: float = Field(-0.005)
+    slice_ndcg_min_delta: float = Field(-0.02)
+    slice_ndcg_ci_lower: float = Field(-0.03)
+    pr_auc_max_absolute_regression: float = Field(0.005, ge=0.0)
+    probability_error_max_relative_regression: float = Field(0.02, ge=0.0)
+    value_wape_max_relative_regression: float = Field(0.05, ge=0.0)
+    slice_error_max_relative_regression: float = Field(0.05, ge=0.0)
+
+    @validator("gate_mode")
+    def validate_gate_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"legacy", "observe", "enforced"}:
+            raise ValueError("gate_mode must be legacy, observe, or enforced")
+        return normalized
+
+    class Config:
+        env_prefix = "MODEL_RELEASE_"
+
+
 class Config:
     """Main configuration class that combines all configuration sections."""
 
@@ -2387,6 +2516,7 @@ class Config:
         self.security_config = SecurityConfig()
         self.service_topology_config = ServiceTopologyConfig()
         self.database_config = DatabaseConfig()
+        self.model_release_config = ModelReleaseConfig()
 
         # Load additional config from file if provided
         if config_file and os.path.exists(config_file):
@@ -2550,6 +2680,22 @@ class Config:
             if self.vector_config.bootstrap_mode != "required":
                 errors.append(
                     "VECTOR_BOOTSTRAP_MODE=required is mandatory in production"
+                )
+            if self.model_release_config.gate_mode != "enforced":
+                errors.append(
+                    "MODEL_RELEASE_GATE_MODE=enforced is mandatory in production"
+                )
+            if self.recommendation_config.retrieval_training_source != "pit":
+                errors.append(
+                    "RETRIEVAL_TRAINING_SOURCE=pit is mandatory in production"
+                )
+            if self.recommendation_config.retrieval_release_gate_mode != "enforced":
+                errors.append(
+                    "RETRIEVAL_RELEASE_GATE_MODE=enforced is mandatory in production"
+                )
+            if self.recommendation_config.online_retraining_enabled:
+                errors.append(
+                    "RECOMMENDATION_ONLINE_RETRAINING_ENABLED=false is mandatory in production"
                 )
 
         # Validate file paths

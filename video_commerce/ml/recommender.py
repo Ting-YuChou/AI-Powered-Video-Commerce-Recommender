@@ -30,7 +30,7 @@ from video_commerce.common.models import (
     InteractionType,
 )
 from video_commerce.data_plane.feature_store import FeatureStore
-from video_commerce.ml.model_artifacts import ModelArtifactManager
+from video_commerce.ml.model_artifacts import ModelArtifactManager, ModelArtifactRecord
 from video_commerce.ml.vector_search import VectorSearchEngine
 from video_commerce.common.config import RecommendationConfig
 from video_commerce.ml.two_tower import TwoTowerTrainer
@@ -104,6 +104,7 @@ class TwoTowerRetrievalEngine:
             random_negative_weight=config.tt_random_negative_weight,
             enable_in_batch_negatives=config.tt_enable_in_batch_negatives,
             in_batch_loss_weight=config.tt_in_batch_loss_weight,
+            enable_logq_correction=config.tt_logq_correction_enabled,
             user_hidden_dims=config.tt_user_hidden_dims,
             item_hidden_dims=config.tt_item_hidden_dims,
             architecture=config.tt_architecture,
@@ -1380,6 +1381,9 @@ class RecommendationEngine:
         self.is_initialized = False
         self.last_model_update = 0
         self.loaded_two_tower_version: Optional[str] = None
+        self.loaded_two_tower_release_id: Optional[str] = None
+        self.loaded_two_tower_generation: Optional[int] = None
+        self.loaded_two_tower_gate_policy: Optional[str] = None
         self.loaded_sasrec_version: Optional[str] = None
         self.loaded_swing_itemcf_version: Optional[str] = None
         self.loaded_content_cluster_version: Optional[str] = None
@@ -1400,7 +1404,8 @@ class RecommendationEngine:
             await self._try_load_cf_index()
 
             # Train / update with latest interaction data
-            await self._update_models_from_interactions()
+            if self.config.online_retraining_enabled:
+                await self._update_models_from_interactions()
 
             self.is_initialized = True
             logger.info("Recommendation models loaded successfully")
@@ -1464,7 +1469,10 @@ class RecommendationEngine:
             checkpoint_record = None
             if self.artifact_manager:
                 checkpoint_record = (
-                    await self.artifact_manager.sync_latest_two_tower_artifacts()
+                    await self.artifact_manager.sync_selected_two_tower_artifacts(
+                        gate_mode=self.config.retrieval_release_gate_mode,
+                        environment=self.config.retrieval_release_environment,
+                    )
                 )
 
             result = await asyncio.to_thread(
@@ -1475,6 +1483,27 @@ class RecommendationEngine:
                 index, metadata = result
                 index_map_raw = metadata.get("index_map", {})
                 index_map = {int(k): v for k, v in index_map_raw.items()}
+                expected_dimension = int(self.config.tt_embedding_dim)
+                metadata_dimension = int(
+                    metadata.get("embedding_dimension")
+                    or metadata.get("embedding_dim")
+                    or 0
+                )
+                metadata_count = int(
+                    metadata.get("product_count")
+                    or metadata.get("num_items")
+                    or len(index_map)
+                )
+                if (
+                    int(index.ntotal) != len(index_map)
+                    or metadata_count != len(index_map)
+                    or metadata_dimension != expected_dimension
+                    or int(getattr(index, "d", expected_dimension))
+                    != expected_dimension
+                ):
+                    raise ValueError(
+                        "active Two-Tower index dimension or mapping is incompatible"
+                    )
 
                 checkpoint_path = (
                     self.artifact_manager.two_tower_local_checkpoint_path
@@ -1491,6 +1520,10 @@ class RecommendationEngine:
                     loaded_engine.trainer.load_checkpoint, checkpoint_path
                 ):
                     loaded_engine.close()
+                    if self.config.retrieval_release_gate_mode == "enforced":
+                        raise RuntimeError(
+                            "active Two-Tower checkpoint failed inference loading"
+                        )
                     return False
 
                 loaded_engine.user_mapping = dict(loaded_engine.trainer.user_mapping)
@@ -1507,12 +1540,29 @@ class RecommendationEngine:
                 self.cf_engine = loaded_engine
                 if checkpoint_record:
                     self.loaded_two_tower_version = checkpoint_record.model_version
+                    self.loaded_two_tower_release_id = checkpoint_record.payload.get(
+                        "model_release_id"
+                    )
+                    generation = checkpoint_record.payload.get("active_generation")
+                    self.loaded_two_tower_generation = (
+                        int(generation) if generation is not None else None
+                    )
+                    self.loaded_two_tower_gate_policy = checkpoint_record.payload.get(
+                        "quality_gate_policy_version"
+                    )
                 elif loaded_engine.model_version:
                     self.loaded_two_tower_version = loaded_engine.model_version
+                    self.loaded_two_tower_release_id = None
+                    self.loaded_two_tower_generation = None
+                    self.loaded_two_tower_gate_policy = None
                 logger.info("Loaded pre-existing Two-Tower model and CF index")
                 return True
+            if self.config.retrieval_release_gate_mode == "enforced":
+                raise RuntimeError("active Two-Tower ANN index failed validation")
         except Exception as e:
             logger.warning(f"Could not load pre-existing CF index: {e}")
+            if self.config.retrieval_release_gate_mode == "enforced":
+                raise
         return False
 
     async def _try_load_sasrec_artifacts(self) -> bool:
@@ -1912,9 +1962,31 @@ class RecommendationEngine:
         if not self.artifact_manager:
             return updated
 
-        latest_two_tower = await self.artifact_manager.get_latest_model_checkpoint(
-            ModelArtifactManager.TWO_TOWER_MODEL_NAME
-        )
+        if self.config.retrieval_release_gate_mode == "legacy":
+            latest_two_tower = await self.artifact_manager.get_latest_model_checkpoint(
+                ModelArtifactManager.TWO_TOWER_MODEL_NAME
+            )
+        else:
+            store = getattr(self.artifact_manager, "system_store", None)
+            active = (
+                await store.get_active_model_checkpoint(
+                    ModelArtifactManager.TWO_TOWER_MODEL_NAME,
+                    environment=self.config.retrieval_release_environment,
+                )
+                if store is not None
+                else None
+            )
+            latest_two_tower = (
+                ModelArtifactRecord(
+                    model_name=str(active["model_name"]),
+                    model_version=str(active["model_version"]),
+                    checkpoint_path=str(active["checkpoint_path"]),
+                    payload=dict(active.get("payload") or {}),
+                    created_at=active.get("created_at"),
+                )
+                if active
+                else None
+            )
         if (
             latest_two_tower
             and latest_two_tower.model_version != self.loaded_two_tower_version
@@ -2471,12 +2543,8 @@ class RecommendationEngine:
                         )
                         == self.config.retrieval_visual_product_index_version
                     ),
-                    canary_percent=float(
-                        self.config.retrieval_visual_canary_percent
-                    ),
-                    expected_model_version=(
-                        self.config.retrieval_visual_model_version
-                    ),
+                    canary_percent=float(self.config.retrieval_visual_canary_percent),
+                    expected_model_version=(self.config.retrieval_visual_model_version),
                     expected_product_index_version=(
                         self.config.retrieval_visual_product_index_version
                     ),
@@ -2904,6 +2972,8 @@ class RecommendationEngine:
     async def update_models(self):
         """Periodically update recommendation models with new data."""
         try:
+            if not self.config.online_retraining_enabled:
+                return
             current_time = time.time()
             if current_time - self.last_model_update > 3600:
                 await self._update_models_from_interactions()

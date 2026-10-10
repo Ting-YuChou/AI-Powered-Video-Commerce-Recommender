@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import asdict, fields, replace
 import logging
 import os
 from pathlib import Path
@@ -18,6 +18,12 @@ import torch
 from video_commerce.common.config import Config, RankingConfig
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
+from video_commerce.ml.model_release_quality import (
+    RankingQualityGateConfig,
+    evaluate_quality_gate,
+    evaluation_rows_from_examples,
+    split_training_examples_fixed_holdout,
+)
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.ml.ranking import RankingModel
 from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
@@ -71,6 +77,7 @@ class ModelTrainerService:
         self.pit_dataset_reader: PitTrainingDatasetReader | None = None
         self.last_trained_pit_run_id: str | None = None
         self.last_trained_visual_pit_run_id: str | None = None
+        self.loaded_ranking_checkpoint = None
         self.legacy_training_adapter: LegacyTrainingDatasetAdapter | None = None
         self.observability = ObservabilityManager()
         self.running = False
@@ -344,8 +351,10 @@ class ModelTrainerService:
             )
         ranking_checkpoint = None
         if self.artifact_manager:
-            ranking_checkpoint = await self.artifact_manager.sync_latest_ranking_checkpoint(
-                expected_feature_schema_version=self.ranking_model.feature_schema_version
+            ranking_checkpoint = await self.artifact_manager.sync_selected_ranking_checkpoint(
+                gate_mode=self.config.model_release_config.gate_mode,
+                environment=self.config.model_release_config.environment,
+                expected_feature_schema_version=self.ranking_model.feature_schema_version,
             )
         loaded_existing_checkpoint = False
         try:
@@ -396,6 +405,7 @@ class ModelTrainerService:
             )
             self.ranking_model.loaded_checkpoint_mtime = 0.0
         if ranking_checkpoint and loaded_existing_checkpoint:
+            self.loaded_ranking_checkpoint = ranking_checkpoint
             self.ranking_model.model_version = ranking_checkpoint.model_version
             self.last_trained_pit_run_id = (
                 str(
@@ -652,9 +662,26 @@ class ModelTrainerService:
             },
         )
         status = "success"
+        release_holdout_examples = []
+        release_holdout_window = None
+        champion_model = None
         try:
             if use_pit_dataset:
-                training_examples = pit_dataset.examples
+                release_config = getattr(self.config, "model_release_config", None)
+                if release_config is not None and hasattr(
+                    pit_dataset, "attribution_cutoff"
+                ):
+                    (
+                        training_examples,
+                        release_holdout_examples,
+                        release_holdout_window,
+                    ) = split_training_examples_fixed_holdout(
+                        pit_dataset.examples,
+                        holdout_days=release_config.holdout_days,
+                        attribution_cutoff=pit_dataset.attribution_cutoff,
+                    )
+                else:
+                    training_examples = pit_dataset.examples
             else:
                 adapter = getattr(self, "legacy_training_adapter", None)
                 if adapter is None:
@@ -674,6 +701,17 @@ class ModelTrainerService:
             training_examples = await self._attach_trimodal_candidate_embeddings(
                 self.ranking_model, training_examples
             )
+            active_checkpoint = getattr(self, "loaded_ranking_checkpoint", None)
+            if (
+                use_pit_dataset
+                and release_holdout_examples
+                and active_checkpoint is not None
+                and active_checkpoint.payload.get("active_generation") is not None
+            ):
+                champion_model = RankingModel(self.config.ranking_config)
+                await champion_model.load_model(
+                    self.config.model_config.ranking_model_path
+                )
             training_kwargs = {"training_sample_source": training_sample_source}
             if pit_training_cancel_event is not None:
                 training_kwargs["cancellation_event"] = pit_training_cancel_event
@@ -739,9 +777,7 @@ class ModelTrainerService:
                 )
                 onnx_path = None
                 onnx_export = None
-                if getattr(
-                    self.config.ranking_config, "onnx_export_enabled", False
-                ):
+                if getattr(self.config.ranking_config, "onnx_export_enabled", False):
                     from pathlib import Path
 
                     from video_commerce.data_plane.object_storage import ObjectStorage
@@ -759,9 +795,7 @@ class ModelTrainerService:
                             "source_checkpoint_sha256": source_sha256,
                         },
                     )
-                    onnx_path = str(
-                        Path(ranking_checkpoint_path).with_suffix(".onnx")
-                    )
+                    onnx_path = str(Path(ranking_checkpoint_path).with_suffix(".onnx"))
                     onnx_export = export_ranking_onnx(
                         self.ranking_model,
                         onnx_path,
@@ -835,6 +869,22 @@ class ModelTrainerService:
                             None,
                         ),
                         "training_input_rows": len(training_examples),
+                        "quality_gate_holdout_rows": len(release_holdout_examples),
+                        "quality_gate_holdout_start": (
+                            release_holdout_window.start_ts
+                            if release_holdout_window
+                            else None
+                        ),
+                        "quality_gate_holdout_end": (
+                            release_holdout_window.end_ts
+                            if release_holdout_window
+                            else None
+                        ),
+                        "feature_lake_manifest_sha256": (
+                            getattr(pit_dataset, "manifest_sha256", None)
+                            if pit_dataset
+                            else None
+                        ),
                         "training_quarantine_rows": (
                             getattr(pit_dataset, "quarantine_rows", 0)
                             if pit_dataset
@@ -863,6 +913,78 @@ class ModelTrainerService:
                 )
                 if record:
                     self.ranking_model.model_version = record.model_version
+                    if (
+                        use_pit_dataset
+                        and champion_model is not None
+                        and release_holdout_examples
+                        and record.payload.get("model_release_id")
+                    ):
+                        quality_config = RankingQualityGateConfig(
+                            **{
+                                field.name: getattr(
+                                    self.config.model_release_config, field.name
+                                )
+                                for field in fields(RankingQualityGateConfig)
+                                if hasattr(self.config.model_release_config, field.name)
+                            }
+                        )
+                        evaluation_rows = evaluation_rows_from_examples(
+                            training_examples,
+                            release_holdout_examples,
+                            feature_schema_version=self.ranking_model.feature_schema_version,
+                        )
+                        gate_result = evaluate_quality_gate(
+                            evaluation_rows,
+                            champion_model.predict_release_examples(
+                                release_holdout_examples
+                            ),
+                            self.ranking_model.predict_release_examples(
+                                release_holdout_examples
+                            ),
+                            quality_config,
+                        )
+                        evaluation = (
+                            await self.system_store.record_model_release_evaluation(
+                                release_id=str(record.payload["model_release_id"]),
+                                champion_release_id=str(
+                                    active_checkpoint.payload["model_release_id"]
+                                ),
+                                dataset_manifest_uri=pit_dataset.manifest_uri,
+                                dataset_manifest_sha256=pit_dataset.manifest_sha256,
+                                holdout_start=release_holdout_window.start_ts,
+                                holdout_end=release_holdout_window.end_ts,
+                                policy_version=gate_result.policy_version,
+                                decision=gate_result.decision.value,
+                                metrics={
+                                    **dict(gate_result.overall),
+                                    "reasons": list(gate_result.reasons),
+                                },
+                                slice_metrics=dict(gate_result.slices),
+                                bootstrap=dict(gate_result.bootstrap),
+                                gate_config=asdict(quality_config),
+                            )
+                        )
+                        self.observability.record_model_release_evaluation(
+                            gate_result.decision.value
+                        )
+                        if gate_result.decision.value == "passed":
+                            staged = await self.system_store.stage_model_release(
+                                release_id=str(record.payload["model_release_id"]),
+                                actor="model-quality-evaluator",
+                                environment=self.config.model_release_config.environment,
+                            )
+                            if not staged:
+                                raise RuntimeError(
+                                    "validated ranking release could not enter staging"
+                                )
+                        logger.info(
+                            "ranking_release_evaluation_completed",
+                            extra={
+                                "model_version": record.model_version,
+                                "evaluation_id": evaluation["evaluation_id"],
+                                "decision": gate_result.decision.value,
+                            },
+                        )
                     if use_pit_dataset:
                         self.last_trained_pit_run_id = (
                             pit_dataset.materialization_run_id

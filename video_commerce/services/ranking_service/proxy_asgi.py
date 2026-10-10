@@ -35,6 +35,23 @@ from video_commerce.common.telemetry import configure_tracing
 logger = logging.getLogger(__name__)
 
 
+def _validate_required_release_version(
+    *,
+    gate_mode: str,
+    required_version: str,
+    active_checkpoint: Optional[Dict[str, Any]],
+) -> None:
+    if str(gate_mode).lower() == "legacy":
+        return
+    if active_checkpoint is None:
+        raise RuntimeError("Triton ranking requires an active release pointer")
+    active_version = str(active_checkpoint.get("model_version") or "")
+    if active_version != str(required_version):
+        raise RuntimeError(
+            "RANKING_REQUIRED_MODEL_VERSION must match the active release pointer"
+        )
+
+
 class ClientDisconnected(RuntimeError):
     """Raised when the HTTP caller disconnects before the body is available."""
 
@@ -150,6 +167,15 @@ class RankingProxyApp:
             ranking_model = RankingModel(
                 ranking_config,
                 observability=self.runtime.observability,
+            )
+            active_checkpoint = await self.system_store.get_active_model_checkpoint(
+                ModelArtifactManager.RANKING_MODEL_NAME,
+                environment=config.model_release_config.environment,
+            )
+            _validate_required_release_version(
+                gate_mode=config.model_release_config.gate_mode,
+                required_version=ranking_config.required_model_version,
+                active_checkpoint=active_checkpoint,
             )
             record = await manager.sync_ranking_checkpoint_version(
                 ranking_config.required_model_version,

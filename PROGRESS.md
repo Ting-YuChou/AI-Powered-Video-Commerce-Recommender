@@ -1,5 +1,46 @@
 # Progress
 
+## 2026-10-09 — Retrieval PIT and Two-Tower release gate
+
+- Added immutable, checksum-verified retrieval catalog generations and
+  `retrieval_training_pit_v1` manifests. The Flink materializer now builds
+  mature viewed, organic-positive, and ranker-rejected query rows with event,
+  availability, catalog-generation, and feature cutoffs enforced at `as_of_ts`.
+- Moved Two-Tower training to the offline PIT path with a fixed seven-day
+  holdout, deterministic catalog mappings, training-only frequency/logQ data,
+  source-specific negative probabilities, cutoff-safe false-negative masking,
+  and versioned negative-source experiments.
+- Added full-catalog Recall@50/100/200, MRR, hit rate, catalog/encoding
+  coverage, long-tail and cold/modality slices, deterministic user-cluster
+  bootstrap intervals, plus an exact-search audit that reports ANN recall
+  separately from model quality.
+- Extended the existing model release registry to validate Two-Tower bundles,
+  apply `retrieval_quality_gate_v1`, require manual CAS promotion, load only the
+  active verified generation in enforced mode, retain the previous in-memory
+  generation on reload failure, and record release/generation lineage in
+  durable impressions. Production configuration disables online retraining and
+  requires PIT training plus the enforced release gate.
+- Added retrieval release metrics/alerts, catalog/PIT publication and training
+  CLIs, and the retrieval rollout/rollback runbook.
+- Key files: `video_commerce/ml/retrieval_pit_dataset.py`,
+  `video_commerce/ml/retrieval_catalog.py`,
+  `video_commerce/ml/retrieval_training.py`,
+  `video_commerce/ml/retrieval_evaluation.py`,
+  `video_commerce/ml/retrieval_release_training.py`,
+  `flink-jobs/interaction-features/src/main/java/com/videocommerce/flink/RetrievalPointInTimeJoinJob.java`,
+  and `docs/operations/retrieval-pit-release-runbook.md`.
+- Verification: Docker backend suite `719 passed, 12 skipped`; the seven
+  Postgres-backed outbox, lease, PIT-run, idempotency, and release-CAS tests
+  passed in an isolated project; Flink Maven `31 passed` with a final focused
+  `11 passed`; Helm lint and strict kubeconform `36/36`, Prometheus rule tests,
+  Compose config, Python compilation, Black, diff checks, and the production
+  backend image build passed.
+- Known gaps: no real complete catalog generation or mature production holdout
+  labels were available, so popularity/champion/challenger baseline results
+  remain `insufficient_evidence`. No retrieval-quality or performance
+  improvement is claimed. A live Iceberg/object-storage/Flink release smoke and
+  production shadow/canary evaluation remain follow-up work.
+
 ## 2026-10-08 — Automated deployment gates, Flink closed loop, and outbox A/B harness
 
 - Expanded PR CI with Node 20 frontend tests/lint/build, Java 11 Flink Maven
@@ -561,3 +602,38 @@
   benchmarks, and offline NDCG/AUC/GMV promotion evaluation require production
   hardware/data and remain rollout gates. No performance improvement is
   claimed.
+
+## 2026-10-09 — Ranking quality gate and release lifecycle
+
+- Added additive Postgres release, evaluation, pointer, and transition tables;
+  checkpoint persistence now creates an immutable `registered` ranking bundle
+  and repairs release registration after a checkpoint/outbox-style crash race.
+- Reserved a fixed seven-day mature PIT holdout before training and value
+  normalization. The trainer compares the active champion and challenger over
+  identical rows with canonical serving scores, deterministic user-cluster
+  bootstrap confidence intervals, and cold-user, cold-item, long-tail,
+  high-price, and modality-missing slices. Passing releases advance
+  automatically through `validated` to `staging`; failed or insufficient
+  releases remain non-serving.
+- Added audited CAS promotion, rollback, and one-time verified bootstrap CLI;
+  production serving selects only the active pointer in enforced mode. Legacy
+  runners carry release/generation lineage into durable impressions, and Triton
+  startup requires its exact model version to match the active release.
+- Added release backlog, staging age, evaluation decision, active generation,
+  and runner mismatch metrics and alerts, plus Compose observe-mode defaults,
+  enforced Helm production settings, and the model release rollout/rollback
+  runbook.
+- Key files: `migrations/postgres/010_model_release_quality_gate.sql`,
+  `video_commerce/ml/model_release.py`,
+  `video_commerce/ml/model_release_quality.py`,
+  `video_commerce/ml/model_artifacts.py`,
+  `video_commerce/services/model_trainer/main.py`, and
+  `docs/operations/model-release-runbook.md`.
+- Verification: isolated Docker backend suite passed 687 tests with 5 skips;
+  the Postgres lifecycle smoke proved bootstrap, pass-to-staging, CAS promotion,
+  stale-generation rejection, rollback eligibility, and failed-challenger
+  isolation. Production backend image build, Compose validation, Helm lint,
+  strict kubeconform (36 resources), Prometheus rule tests, scoped Black,
+  Python compile, and diff checks passed. No online canary or performance claim
+  is included; assignment, propensity, SRM, and uplift gates remain a later
+  phase.

@@ -144,6 +144,9 @@ external:
     trainingSource: legacy
     pitShadowEnabled: false
     rankingPitDatasetUri: ""
+    retrievalPitDatasetUri: ""
+    retrievalPitExportUri: ""
+    retrievalCatalogGenerationId: ""
     featureDefinitionVersion: ranking_ltr_v1
     attributionWindowHours: 168
     allowedLatenessHours: 1
@@ -182,6 +185,19 @@ pitOrchestrator:
 
 appConfig:
   environment: production
+  modelRelease:
+    gateMode: enforced
+    environment: production
+    holdoutDays: 7
+    bootstrapSamples: 2000
+    evaluationMaxAgeHours: 168
+    minImpressions: 1000
+    minUsers: 200
+    minClicks: 50
+    minPurchases: 30
+    minSliceImpressions: 200
+    minSliceUsers: 50
+    minSlicePositives: 20
   apiCorsOrigins: "https://localhost,http://localhost,https://127.0.0.1,http://127.0.0.1"
   apiCorsCredentials: "false"
   apiRateLimitRequests: 120000
@@ -250,6 +266,16 @@ appConfig:
     workerMetricsHost: 0.0.0.0
     otlpEndpoint: ""
   recommendation:
+    retrievalTrainingSource: pit
+    retrievalReleaseGateMode: enforced
+    retrievalReleaseEnvironment: production
+    retrievalHoldoutDays: 7
+    retrievalEligibilityPolicyVersion: retrieval_eligibility_v1
+    retrievalLabelPolicyVersion: retrieval_label_v1
+    retrievalQualityGatePolicyVersion: retrieval_quality_gate_v1
+    retrievalRankerRejectedMode: weak
+    onlineRetrainingEnabled: false
+    ttLogqCorrectionEnabled: false
     userEmbeddingCacheSize: 20000
     userEmbeddingCacheTimeBucketSeconds: 1
     knownUserSnapshotEnabled: true
