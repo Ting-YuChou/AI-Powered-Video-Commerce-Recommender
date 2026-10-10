@@ -494,6 +494,13 @@ def _ranking_release_lineage(serving_versions: Dict[str, Any]) -> Dict[str, Any]
         "quality_gate_policy_version": serving_versions.get(
             "quality_gate_policy_version"
         ),
+        "two_tower_release_id": serving_versions.get("two_tower_release_id"),
+        "two_tower_active_generation": serving_versions.get(
+            "two_tower_active_generation"
+        ),
+        "retrieval_quality_gate_policy_version": serving_versions.get(
+            "retrieval_quality_gate_policy_version"
+        ),
     }
     return {key: value for key, value in lineage.items() if value is not None}
 
@@ -549,6 +556,21 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
         "ranking_checkpoint_mtime": _safe_file_mtime(ranking_path),
         "two_tower_model": (
             recommendation_engine.loaded_two_tower_version
+            if recommendation_engine
+            else None
+        ),
+        "two_tower_release_id": (
+            getattr(recommendation_engine, "loaded_two_tower_release_id", None)
+            if recommendation_engine
+            else None
+        ),
+        "two_tower_active_generation": (
+            getattr(recommendation_engine, "loaded_two_tower_generation", None)
+            if recommendation_engine
+            else None
+        ),
+        "retrieval_quality_gate_policy_version": (
+            getattr(recommendation_engine, "loaded_two_tower_gate_policy", None)
             if recommendation_engine
             else None
         ),

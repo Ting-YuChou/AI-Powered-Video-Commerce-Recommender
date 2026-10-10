@@ -897,6 +897,21 @@ class ObservabilityManager:
             ["operation"],
             registry=self.registry,
         )
+        self.retrieval_release_active_generation = Gauge(
+            "retrieval_release_active_generation",
+            "Active Two-Tower retrieval release pointer generation",
+            registry=self.registry,
+        )
+        self.retrieval_release_registered_backlog = Gauge(
+            "retrieval_release_registered_backlog",
+            "Two-Tower releases waiting for a conclusive quality evaluation",
+            registry=self.registry,
+        )
+        self.retrieval_release_staging_age_seconds = Gauge(
+            "retrieval_release_staging_age_seconds",
+            "Age of the oldest Two-Tower release still in staging",
+            registry=self.registry,
+        )
         self._process = psutil.Process()
 
     def record_request(
@@ -1113,6 +1128,19 @@ class ObservabilityManager:
         self.model_release_transition_failures_total.labels(
             operation=str(operation)
         ).inc()
+
+    def update_retrieval_release_durable_state(
+        self,
+        *,
+        registered_backlog: int,
+        staging_age_seconds: float,
+        active_generation: int,
+    ) -> None:
+        self.retrieval_release_registered_backlog.set(max(0, int(registered_backlog)))
+        self.retrieval_release_staging_age_seconds.set(
+            max(0.0, float(staging_age_seconds))
+        )
+        self.retrieval_release_active_generation.set(max(0, int(active_generation)))
 
     def update_typed_pit_training_metrics(
         self,

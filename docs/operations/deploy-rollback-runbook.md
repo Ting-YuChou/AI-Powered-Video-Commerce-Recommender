@@ -36,6 +36,9 @@ The model release migration is also additive and remains in place. Use the
 audited active-pointer rollback in
 `docs/operations/model-release-runbook.md`; do not delete release evidence or
 manually rewrite pointer rows.
+Two-Tower retrieval has a separate family-specific workflow in
+`docs/operations/retrieval-pit-release-runbook.md`. Keep its PIT and catalog
+artifacts immutable and roll back through the generation-fenced CLI.
 If rolling back the publisher or worker, first stop new uploads, wait for
 in-flight processing leases to expire or complete, and record the remaining
 `pending_publish` rows. Do not delete their objects or outbox rows. A compatible
@@ -49,3 +52,5 @@ do not run old and new content workers concurrently.
 - Gateway `/readyz` is healthy.
 - `content-task-publisher` is running and content outbox backlog is draining.
 - Prometheus shows no active critical alerts after deployment.
+- A real mature retrieval PIT baseline exists before enabling required
+  Two-Tower retrieval; synthetic smoke evidence cannot satisfy this gate.

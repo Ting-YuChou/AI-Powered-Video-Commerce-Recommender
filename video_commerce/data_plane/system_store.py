@@ -4590,24 +4590,15 @@ class SystemStore:
             target = target_result.scalar_one_or_none()
             if target is None:
                 return None
-            from video_commerce.ml.model_release_quality import (
-                QUALITY_GATE_POLICY_VERSION,
+            from video_commerce.ml.model_release_compatibility import (
+                model_release_compatibility,
             )
-            from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
 
             target_manifest = dict(target.bundle_manifest or {})
-            artifact_manifest = dict(target_manifest.get("artifact_manifest") or {})
-            checkpoint_manifest = dict(artifact_manifest.get("checkpoint") or {})
-            bundle_is_compatible = (
-                bool(checkpoint_manifest.get("path"))
-                and len(str(checkpoint_manifest.get("sha256") or "")) == 64
-                and bool(target_manifest.get("feature_schema_version"))
-                and target_manifest.get("score_policy_version") == SCORE_POLICY_VERSION
-                and isinstance(target_manifest.get("value_transform_stats"), dict)
-                and target_manifest.get("quality_gate_policy_version")
-                == QUALITY_GATE_POLICY_VERSION
+            target_compatibility = model_release_compatibility(
+                str(model_name), target_manifest
             )
-            if not bundle_is_compatible:
+            if not target_compatibility.compatible:
                 return None
             if bootstrap:
                 if pointer is not None or target.lifecycle_state != "registered":
@@ -4630,7 +4621,7 @@ class SystemStore:
                         ModelReleaseEvaluation.release_id == target.release_id,
                         ModelReleaseEvaluation.decision == "passed",
                         ModelReleaseEvaluation.policy_version
-                        == QUALITY_GATE_POLICY_VERSION,
+                        == target_compatibility.policy_version,
                     )
                     .order_by(desc(ModelReleaseEvaluation.created_at))
                     .limit(1)
@@ -4654,10 +4645,7 @@ class SystemStore:
                 current = current_result.scalar_one_or_none()
                 if current is not None and current.release_id != target.release_id:
                     current_manifest = dict(current.bundle_manifest or {})
-                    for compatibility_key in (
-                        "feature_schema_version",
-                        "score_policy_version",
-                    ):
+                    for compatibility_key in target_compatibility.compatibility_keys:
                         if current_manifest.get(
                             compatibility_key
                         ) != target_manifest.get(compatibility_key):

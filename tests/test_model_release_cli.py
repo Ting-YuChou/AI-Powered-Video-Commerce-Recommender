@@ -56,3 +56,13 @@ def test_model_release_cli_supports_status_evaluate_rollback_and_bootstrap():
         ).command
         == "bootstrap-active"
     )
+
+
+def test_model_release_cli_accepts_two_tower_family():
+    args = build_parser().parse_args(
+        ["--model-name", "two_tower_retrieval", "status", "--json"]
+    )
+
+    assert args.model_name == "two_tower_retrieval"
+    assert args.command == "status"
+    assert args.as_json is True

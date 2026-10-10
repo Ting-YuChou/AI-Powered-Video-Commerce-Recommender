@@ -36,6 +36,13 @@ async def run() -> None:
                 environment=config.model_release_config.environment,
             )
             observability.update_model_release_durable_state(**release_state)
+            retrieval_release_state = await store.get_model_release_operational_metrics(
+                model_name="two_tower_retrieval",
+                environment=config.recommendation_config.retrieval_release_environment,
+            )
+            observability.update_retrieval_release_durable_state(
+                **retrieval_release_state
+            )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=30)
             except asyncio.TimeoutError:

@@ -19,6 +19,16 @@ data:
   MODEL_RELEASE_MIN_SLICE_IMPRESSIONS: {{ .Values.appConfig.modelRelease.minSliceImpressions | quote }}
   MODEL_RELEASE_MIN_SLICE_USERS: {{ .Values.appConfig.modelRelease.minSliceUsers | quote }}
   MODEL_RELEASE_MIN_SLICE_POSITIVES: {{ .Values.appConfig.modelRelease.minSlicePositives | quote }}
+  RETRIEVAL_TRAINING_SOURCE: {{ .Values.appConfig.recommendation.retrievalTrainingSource | quote }}
+  RETRIEVAL_RELEASE_GATE_MODE: {{ .Values.appConfig.recommendation.retrievalReleaseGateMode | quote }}
+  RETRIEVAL_RELEASE_ENVIRONMENT: {{ .Values.appConfig.recommendation.retrievalReleaseEnvironment | quote }}
+  RETRIEVAL_HOLDOUT_DAYS: {{ .Values.appConfig.recommendation.retrievalHoldoutDays | quote }}
+  RETRIEVAL_ELIGIBILITY_POLICY_VERSION: {{ .Values.appConfig.recommendation.retrievalEligibilityPolicyVersion | quote }}
+  RETRIEVAL_LABEL_POLICY_VERSION: {{ .Values.appConfig.recommendation.retrievalLabelPolicyVersion | quote }}
+  RETRIEVAL_QUALITY_GATE_POLICY_VERSION: {{ .Values.appConfig.recommendation.retrievalQualityGatePolicyVersion | quote }}
+  RETRIEVAL_RANKER_REJECTED_MODE: {{ .Values.appConfig.recommendation.retrievalRankerRejectedMode | quote }}
+  RECOMMENDATION_ONLINE_RETRAINING_ENABLED: {{ .Values.appConfig.recommendation.onlineRetrainingEnabled | quote }}
+  RECOMMENDATION_TT_LOGQ_CORRECTION_ENABLED: {{ .Values.appConfig.recommendation.ttLogqCorrectionEnabled | quote }}
   API_CORS_ORIGINS: {{ .Values.appConfig.apiCorsOrigins | quote }}
   API_CORS_CREDENTIALS: {{ .Values.appConfig.apiCorsCredentials | quote }}
   API_RATE_LIMIT_REQUESTS: {{ .Values.appConfig.apiRateLimitRequests | quote }}
@@ -51,6 +61,9 @@ data:
   FEATURE_LAKE_TRAINING_SOURCE: {{ .Values.external.featureLake.trainingSource | quote }}
   FEATURE_LAKE_PIT_SHADOW_ENABLED: {{ .Values.external.featureLake.pitShadowEnabled | quote }}
   FEATURE_LAKE_RANKING_PIT_DATASET_URI: {{ .Values.external.featureLake.rankingPitDatasetUri | quote }}
+  FEATURE_LAKE_RETRIEVAL_PIT_DATASET_URI: {{ .Values.external.featureLake.retrievalPitDatasetUri | quote }}
+  FEATURE_LAKE_RETRIEVAL_PIT_EXPORT_URI: {{ .Values.external.featureLake.retrievalPitExportUri | quote }}
+  FEATURE_LAKE_RETRIEVAL_CATALOG_GENERATION_ID: {{ .Values.external.featureLake.retrievalCatalogGenerationId | quote }}
   FEATURE_LAKE_FEATURE_DEFINITION_VERSION: {{ .Values.external.featureLake.featureDefinitionVersion | quote }}
   FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS: {{ .Values.external.featureLake.attributionWindowHours | quote }}
   FEATURE_LAKE_ALLOWED_LATENESS_HOURS: {{ .Values.external.featureLake.allowedLatenessHours | quote }}

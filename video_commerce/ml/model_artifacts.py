@@ -158,6 +158,25 @@ class ModelArtifactManager:
             created_at=checkpoint.get("created_at"),
         )
 
+    async def get_two_tower_checkpoint(
+        self, model_version: str
+    ) -> Optional[ModelArtifactRecord]:
+        if not self.system_store or not model_version:
+            return None
+        checkpoint = await self.system_store.get_model_checkpoint_by_version(
+            self.TWO_TOWER_MODEL_NAME,
+            str(model_version),
+        )
+        if not checkpoint:
+            return None
+        return ModelArtifactRecord(
+            model_name=str(checkpoint["model_name"]),
+            model_version=str(checkpoint["model_version"]),
+            checkpoint_path=str(checkpoint["checkpoint_path"]),
+            payload=dict(checkpoint.get("payload") or {}),
+            created_at=checkpoint.get("created_at"),
+        )
+
     async def sync_latest_ranking_checkpoint(
         self,
         *,
@@ -482,6 +501,107 @@ class ModelArtifactManager:
         if not record:
             return None
 
+        if not await self._sync_two_tower_record(record):
+            return None
+        return record
+
+    async def sync_active_two_tower_artifacts(
+        self,
+        *,
+        environment: str,
+        require_compatible: bool = True,
+    ) -> Optional[ModelArtifactRecord]:
+        """Sync only the Two-Tower bundle authorized by the active pointer."""
+        if not self.system_store:
+            return None
+        checkpoint = await self.system_store.get_active_model_checkpoint(
+            self.TWO_TOWER_MODEL_NAME,
+            environment=str(environment),
+        )
+        if not checkpoint:
+            return None
+        payload = dict(checkpoint.get("payload") or {})
+        if checkpoint.get("generation") is not None:
+            payload.setdefault("active_generation", int(checkpoint["generation"]))
+        elif checkpoint.get("active_generation") is not None:
+            payload.setdefault(
+                "active_generation", int(checkpoint["active_generation"])
+            )
+        record = ModelArtifactRecord(
+            model_name=str(checkpoint["model_name"]),
+            model_version=str(checkpoint["model_version"]),
+            checkpoint_path=str(checkpoint["checkpoint_path"]),
+            payload=payload,
+            created_at=checkpoint.get("created_at"),
+        )
+        if require_compatible:
+            self._validate_two_tower_release_payload(record.payload)
+        if not await self._sync_two_tower_record(record):
+            raise ValueError("active Two-Tower artifact bundle is incomplete")
+        return record
+
+    async def sync_two_tower_checkpoint_version(
+        self, model_version: str
+    ) -> Optional[ModelArtifactRecord]:
+        record = await self.get_two_tower_checkpoint(model_version)
+        if record is None:
+            return None
+        self._validate_two_tower_release_payload(record.payload)
+        if not await self._sync_two_tower_record(record):
+            return None
+        return record
+
+    async def sync_selected_two_tower_artifacts(
+        self,
+        *,
+        gate_mode: str,
+        environment: str,
+    ) -> Optional[ModelArtifactRecord]:
+        """Resolve an active Two-Tower release with explicit migration fallback."""
+        normalized_mode = str(gate_mode or "").strip().lower()
+        if normalized_mode == "legacy":
+            return await self.sync_latest_two_tower_artifacts()
+        active = await self.sync_active_two_tower_artifacts(
+            environment=environment,
+            require_compatible=True,
+        )
+        if active is not None:
+            return active
+        if normalized_mode == "observe":
+            logger.warning(
+                "active_two_tower_release_missing_using_latest_fallback",
+                extra={"release_environment": environment},
+            )
+            return await self.sync_latest_two_tower_artifacts()
+        if normalized_mode == "enforced":
+            raise RuntimeError("active Two-Tower release is required")
+        raise ValueError("gate_mode must be legacy, observe, or enforced")
+
+    @staticmethod
+    def _validate_two_tower_release_payload(payload: Dict[str, Any]) -> None:
+        required = {
+            "retrieval_pit_manifest_sha256": "retrieval PIT lineage",
+            "catalog_manifest_sha256": "catalog lineage",
+            "eligibility_policy_version": "eligibility policy",
+            "label_policy_version": "label policy",
+            "quality_gate_policy_version": "quality gate policy",
+            "embedding_dimension": "embedding dimension",
+        }
+        for key, description in required.items():
+            if payload.get(key) in {None, ""}:
+                raise ValueError(f"active Two-Tower artifact is missing {description}")
+        if payload["eligibility_policy_version"] != "retrieval_eligibility_v1":
+            raise ValueError("active Two-Tower eligibility policy is incompatible")
+        if payload["label_policy_version"] != "retrieval_label_v1":
+            raise ValueError("active Two-Tower label policy is incompatible")
+        if payload["quality_gate_policy_version"] != "retrieval_quality_gate_v1":
+            raise ValueError("active Two-Tower quality gate policy is incompatible")
+        if int(payload["embedding_dimension"]) <= 0:
+            raise ValueError("active Two-Tower embedding dimension is invalid")
+
+    async def _sync_two_tower_record(self, record: ModelArtifactRecord) -> bool:
+        """Validate and atomically install one resolved Two-Tower bundle."""
+
         payload = record.payload
         cf_index_path = payload.get("cf_index_path")
         cf_metadata_path = payload.get("cf_index_metadata_path")
@@ -495,7 +615,7 @@ class ModelArtifactManager:
                     "has_cf_metadata": bool(cf_metadata_path),
                 },
             )
-            return None
+            return False
         artifact_specs: List[Tuple[str, str, Optional[str]]] = [
             (
                 record.checkpoint_path,
@@ -552,7 +672,7 @@ class ModelArtifactManager:
             stale_optional_local_paths.append(self.two_tower_local_adapter_path)
         await self._sync_paths_to_local_atomically(artifact_specs)
         self._remove_local_artifacts(stale_optional_local_paths)
-        return record
+        return True
 
     async def sync_latest_sasrec_artifacts(self) -> Optional[ModelArtifactRecord]:
         record = await self.get_latest_model_checkpoint(self.SASREC_MODEL_NAME)
@@ -1175,6 +1295,13 @@ class ModelArtifactManager:
             checkpoint_path=persisted_checkpoint,
             payload=record_payload,
         )
+        if record_payload.get("retrieval_pit_manifest_sha256"):
+            release = await self.system_store.register_model_release(
+                model_name=self.TWO_TOWER_MODEL_NAME,
+                model_version=model_version,
+                bundle_manifest=record_payload,
+            )
+            record_payload["model_release_id"] = release["release_id"]
         return ModelArtifactRecord(
             model_name=self.TWO_TOWER_MODEL_NAME,
             model_version=model_version,

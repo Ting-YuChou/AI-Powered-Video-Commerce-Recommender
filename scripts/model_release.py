@@ -16,11 +16,19 @@ from video_commerce.ml.model_release import ModelReleaseController
 from video_commerce.ml.ranking import RankingModel
 
 
-MODEL_NAME = ModelArtifactManager.RANKING_MODEL_NAME
+MODEL_NAMES = (
+    ModelArtifactManager.RANKING_MODEL_NAME,
+    ModelArtifactManager.TWO_TOWER_MODEL_NAME,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="model-release")
+    parser.add_argument(
+        "--model-name",
+        choices=MODEL_NAMES,
+        default=ModelArtifactManager.RANKING_MODEL_NAME,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     status = subparsers.add_parser("status")
     status.add_argument("--json", action="store_true", dest="as_json")
@@ -45,20 +53,23 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     await store.initialize()
     try:
         environment = config.model_release_config.environment
+        model_name = str(args.model_name)
+        if model_name == ModelArtifactManager.TWO_TOWER_MODEL_NAME:
+            environment = config.recommendation_config.retrieval_release_environment
         if args.command == "status":
             return {
                 "environment": environment,
                 "active": await store.get_model_release_pointer(
-                    MODEL_NAME, environment=environment, slot="active"
+                    model_name, environment=environment, slot="active"
                 ),
                 "staging": await store.get_model_release_pointer(
-                    MODEL_NAME, environment=environment, slot="staging"
+                    model_name, environment=environment, slot="staging"
                 ),
-                "releases": await store.list_model_releases(MODEL_NAME),
+                "releases": await store.list_model_releases(model_name),
             }
-        release = await store.get_model_release(MODEL_NAME, args.version)
+        release = await store.get_model_release(model_name, args.version)
         if release is None:
-            raise RuntimeError(f"ranking release {args.version!r} does not exist")
+            raise RuntimeError(f"{model_name} release {args.version!r} does not exist")
         if args.command == "evaluate":
             return {
                 "model_version": args.version,
@@ -80,16 +91,19 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 model_config=config.model_config,
                 recommendation_config=config.recommendation_config,
             )
-            model = RankingModel(config.ranking_config)
-            verified = await manager.sync_ranking_checkpoint_version(
-                args.version,
-                expected_feature_schema_version=model.feature_schema_version,
-                require_onnx=config.ranking_config.triton_enabled,
-            )
+            if model_name == ModelArtifactManager.RANKING_MODEL_NAME:
+                model = RankingModel(config.ranking_config)
+                verified = await manager.sync_ranking_checkpoint_version(
+                    args.version,
+                    expected_feature_schema_version=model.feature_schema_version,
+                    require_onnx=config.ranking_config.triton_enabled,
+                )
+            else:
+                verified = await manager.sync_two_tower_checkpoint_version(args.version)
             if verified is None:
                 raise RuntimeError("bootstrap artifact is missing or incompatible")
             return await controller.bootstrap_active(
-                model_name=MODEL_NAME,
+                model_name=model_name,
                 model_version=args.version,
                 environment=environment,
                 actor=args.actor,
@@ -99,7 +113,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             controller.promote if args.command == "promote" else controller.rollback
         )
         return await operation(
-            model_name=MODEL_NAME,
+            model_name=model_name,
             model_version=args.version,
             environment=environment,
             expected_generation=args.expected_generation,

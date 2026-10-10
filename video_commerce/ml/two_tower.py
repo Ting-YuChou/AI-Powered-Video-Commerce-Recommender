@@ -44,6 +44,32 @@ NEGATIVE_SOURCE_IMPRESSION_NO_CLICK = "impression_no_click"
 NEGATIVE_SOURCE_RANKER_REJECTED = "ranker_rejected"
 
 
+def logq_correct_logits(
+    logits: torch.Tensor,
+    sample_probabilities: torch.Tensor,
+    known_probability_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Subtract log sampling probability only where the source distribution is known."""
+    probabilities = sample_probabilities.to(device=logits.device, dtype=logits.dtype)
+    if probabilities.ndim == 1:
+        probabilities = probabilities.unsqueeze(0).expand_as(logits)
+    if probabilities.shape != logits.shape:
+        raise ValueError("logQ probabilities must match logits")
+    mask = (
+        torch.ones_like(logits, dtype=torch.bool)
+        if known_probability_mask is None
+        else known_probability_mask.to(device=logits.device, dtype=torch.bool)
+    )
+    if mask.shape != logits.shape:
+        raise ValueError("logQ known-probability mask must match logits")
+    if torch.any(probabilities[mask] <= 0):
+        raise ValueError("known logQ probabilities must be strictly positive")
+    safe_probabilities = torch.where(
+        mask, probabilities, torch.ones_like(probabilities)
+    )
+    return logits - torch.log(safe_probabilities)
+
+
 @dataclass(frozen=True)
 class ExternalNegativeCandidate:
     user_id: str
@@ -53,6 +79,8 @@ class ExternalNegativeCandidate:
     exposed: bool = True
     sample_prob: float = 1.0
     rank_position: Optional[int] = None
+    as_of_ts: Optional[float] = None
+    teacher_target: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +92,8 @@ class NegativeSample:
     exposed: bool = False
     sample_prob: float = 1.0
     rank_position: Optional[int] = None
+    as_of_ts: Optional[float] = None
+    teacher_target: Optional[float] = None
 
 
 def _hash_bucket(value: str, num_buckets: int) -> int:
@@ -118,17 +148,21 @@ class ItemFeatureEncoder:
     FEATURE_DIM = 8
 
     @staticmethod
-    def encode(metadata: Dict[str, Any]) -> np.ndarray:
+    def encode(
+        metadata: Dict[str, Any], current_time: Optional[float] = None
+    ) -> np.ndarray:
+        if current_time is None:
+            current_time = time.time()
         price = float(metadata.get("price", 0.0))
         rating = float(metadata.get("rating", 3.0))
         num_reviews = int(metadata.get("num_reviews", 0))
         in_stock = 1.0 if metadata.get("in_stock", True) else 0.0
-        created_at = float(metadata.get("created_at", time.time()))
+        created_at = float(metadata.get("created_at", current_time))
         tags = metadata.get("tags", [])
         category = str(metadata.get("category", "unknown"))
         brand = str(metadata.get("brand", "unknown"))
 
-        age_days = max((time.time() - created_at) / 86400.0, 0.0)
+        age_days = max((current_time - created_at) / 86400.0, 0.0)
 
         features = np.array(
             [
@@ -204,7 +238,9 @@ class UserTower(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, 0.0, 0.01)
 
-    def forward(self, user_ids: torch.Tensor, user_features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, user_ids: torch.Tensor, user_features: torch.Tensor
+    ) -> torch.Tensor:
         id_emb = self.user_embedding(user_ids)
         x = torch.cat([id_emb, user_features], dim=-1)
         if self.architecture == "mlp":
@@ -328,7 +364,9 @@ class TwoTowerModel(nn.Module):
             cross_layers=self.cross_layers,
         )
 
-    def encode_users(self, user_ids: torch.Tensor, user_features: torch.Tensor) -> torch.Tensor:
+    def encode_users(
+        self, user_ids: torch.Tensor, user_features: torch.Tensor
+    ) -> torch.Tensor:
         return self.user_tower(user_ids, user_features)
 
     def encode_items(
@@ -353,6 +391,10 @@ class TwoTowerModel(nn.Module):
         sample_weights: Optional[torch.Tensor] = None,
         in_batch_exclude_mask: Optional[torch.Tensor] = None,
         in_batch_loss_weight: float = 0.0,
+        neg_sample_probabilities: Optional[torch.Tensor] = None,
+        neg_logq_mask: Optional[torch.Tensor] = None,
+        in_batch_item_probabilities: Optional[torch.Tensor] = None,
+        neg_teacher_targets: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size = user_ids.size(0)
         num_neg = neg_item_ids.size(1)
@@ -360,7 +402,9 @@ class TwoTowerModel(nn.Module):
         user_emb = self.encode_users(user_ids, user_features)
         pos_emb = self.encode_items(pos_item_ids, pos_clip_embs, pos_item_feats)
 
-        pos_scores = torch.sum(user_emb * pos_emb, dim=-1, keepdim=True) / self.temperature
+        pos_scores = (
+            torch.sum(user_emb * pos_emb, dim=-1, keepdim=True) / self.temperature
+        )
 
         if num_neg > 0:
             neg_ids_flat = neg_item_ids.reshape(-1)
@@ -368,12 +412,23 @@ class TwoTowerModel(nn.Module):
             neg_feat_flat = neg_item_feats.reshape(-1, neg_item_feats.size(-1))
             neg_emb_flat = self.encode_items(neg_ids_flat, neg_clip_flat, neg_feat_flat)
             neg_emb = neg_emb_flat.reshape(batch_size, num_neg, -1)
-            neg_scores = torch.bmm(neg_emb, user_emb.unsqueeze(-1)).squeeze(-1) / self.temperature
+            neg_scores = (
+                torch.bmm(neg_emb, user_emb.unsqueeze(-1)).squeeze(-1)
+                / self.temperature
+            )
+            if neg_sample_probabilities is not None:
+                neg_scores = logq_correct_logits(
+                    neg_scores,
+                    neg_sample_probabilities,
+                    neg_logq_mask,
+                )
 
             if neg_weights is None:
                 neg_weights_t = torch.ones_like(neg_scores)
             else:
-                neg_weights_t = neg_weights.to(device=neg_scores.device, dtype=neg_scores.dtype)
+                neg_weights_t = neg_weights.to(
+                    device=neg_scores.device, dtype=neg_scores.dtype
+                )
             neg_weights_t = torch.clamp(neg_weights_t, min=1e-8)
             weighted_neg_scores = neg_scores + torch.log(neg_weights_t)
             denominator = torch.logsumexp(
@@ -384,27 +439,49 @@ class TwoTowerModel(nn.Module):
             logits_for_accuracy = torch.cat([pos_scores, neg_scores], dim=-1)
             accuracy = (logits_for_accuracy.argmax(dim=-1) == 0).float().mean()
         else:
-            row_loss = torch.zeros(batch_size, dtype=pos_scores.dtype, device=pos_scores.device)
+            row_loss = torch.zeros(
+                batch_size, dtype=pos_scores.dtype, device=pos_scores.device
+            )
             accuracy = torch.ones((), dtype=pos_scores.dtype, device=pos_scores.device)
 
         if sample_weights is not None:
-            sample_weights_t = sample_weights.to(device=row_loss.device, dtype=row_loss.dtype)
+            sample_weights_t = sample_weights.to(
+                device=row_loss.device, dtype=row_loss.dtype
+            )
             sample_weights_t = torch.clamp(sample_weights_t, min=0.0)
             mean_weight = torch.clamp(sample_weights_t.mean(), min=1e-8)
             row_loss = row_loss * (sample_weights_t / mean_weight)
 
         loss = row_loss.mean()
+        if num_neg > 0 and neg_teacher_targets is not None:
+            teacher_targets = neg_teacher_targets.to(
+                device=neg_scores.device, dtype=neg_scores.dtype
+            )
+            teacher_mask = torch.isfinite(teacher_targets)
+            if torch.any(teacher_mask):
+                loss = loss + F.binary_cross_entropy_with_logits(
+                    neg_scores[teacher_mask], teacher_targets[teacher_mask]
+                )
 
         if in_batch_loss_weight > 0.0 and batch_size > 1:
             in_batch_logits = torch.matmul(user_emb, pos_emb.t()) / self.temperature
+            if in_batch_item_probabilities is not None:
+                in_batch_logits = logq_correct_logits(
+                    in_batch_logits,
+                    in_batch_item_probabilities,
+                )
             if in_batch_exclude_mask is not None:
                 mask = in_batch_exclude_mask.to(
                     device=in_batch_logits.device,
                     dtype=torch.bool,
                 )
-                diag = torch.eye(batch_size, dtype=torch.bool, device=in_batch_logits.device)
+                diag = torch.eye(
+                    batch_size, dtype=torch.bool, device=in_batch_logits.device
+                )
                 in_batch_logits = in_batch_logits.masked_fill(mask & ~diag, -1e9)
-            labels = torch.arange(batch_size, dtype=torch.long, device=in_batch_logits.device)
+            labels = torch.arange(
+                batch_size, dtype=torch.long, device=in_batch_logits.device
+            )
             in_batch_row_loss = F.cross_entropy(
                 in_batch_logits,
                 labels,
@@ -441,13 +518,17 @@ class NegativeSampler:
         self.hard_ratio_start = hard_ratio_start
         self.hard_ratio_end = hard_ratio_end
         self.hard_ratio_cap = max(0.0, min(float(hard_ratio_cap), 1.0))
-        self.impression_negative_ratio = max(0.0, min(float(impression_negative_ratio), 1.0))
+        self.impression_negative_ratio = max(
+            0.0, min(float(impression_negative_ratio), 1.0)
+        )
         self.ranker_rejected_negative_ratio = max(
             0.0, min(float(ranker_rejected_negative_ratio), 1.0)
         )
         self.hard_negative_weight = max(float(hard_negative_weight), 0.0)
         self.impression_negative_weight = max(float(impression_negative_weight), 0.0)
-        self.ranker_rejected_negative_weight = max(float(ranker_rejected_negative_weight), 0.0)
+        self.ranker_rejected_negative_weight = max(
+            float(ranker_rejected_negative_weight), 0.0
+        )
         self.random_negative_weight = max(float(random_negative_weight), 0.0)
         self.item_index: Optional[faiss.Index] = None
         self.item_index_map: Dict[int, int] = {}
@@ -464,7 +545,10 @@ class NegativeSampler:
         if total_epochs <= 1:
             return self.hard_ratio_end
         progress = min(epoch / max(total_epochs - 1, 1), 1.0)
-        return self.hard_ratio_start + (self.hard_ratio_end - self.hard_ratio_start) * progress
+        return (
+            self.hard_ratio_start
+            + (self.hard_ratio_end - self.hard_ratio_start) * progress
+        )
 
     def sample(
         self,
@@ -486,7 +570,9 @@ class NegativeSampler:
         negatives: List[NegativeSample] = []
         selected: Set[int] = set()
 
-        def add_sample(sample: NegativeSample, *, weight: Optional[float] = None) -> bool:
+        def add_sample(
+            sample: NegativeSample, *, weight: Optional[float] = None
+        ) -> bool:
             if sample.item_idx <= 0:
                 return False
             if sample.item_idx in positive_items or sample.item_idx in selected:
@@ -501,6 +587,8 @@ class NegativeSampler:
                     exposed=sample.exposed,
                     sample_prob=sample.sample_prob,
                     rank_position=sample.rank_position,
+                    as_of_ts=sample.as_of_ts,
+                    teacher_target=sample.teacher_target,
                 )
             )
             return True
@@ -511,7 +599,9 @@ class NegativeSampler:
 
         for sample in external_by_source.get(NEGATIVE_SOURCE_IMPRESSION_NO_CLICK, []):
             impression_count = sum(
-                1 for neg in negatives if neg.source == NEGATIVE_SOURCE_IMPRESSION_NO_CLICK
+                1
+                for neg in negatives
+                if neg.source == NEGATIVE_SOURCE_IMPRESSION_NO_CLICK
             )
             if impression_count >= num_impression:
                 break
@@ -629,6 +719,7 @@ class TwoTowerTrainer:
         random_negative_weight: float = 1.0,
         enable_in_batch_negatives: bool = True,
         in_batch_loss_weight: float = 0.25,
+        enable_logq_correction: bool = False,
         user_hidden_dims: Optional[List[int]] = None,
         item_hidden_dims: Optional[List[int]] = None,
         architecture: str = "dcn",
@@ -645,7 +736,9 @@ class TwoTowerTrainer:
         self.item_hidden_dims = item_hidden_dims
         self.architecture = normalize_architecture(architecture)
         self.cross_layers = max(0, int(cross_layers))
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
         self.model: Optional[TwoTowerModel] = None
         self.negative_sampler: Optional[NegativeSampler] = None
@@ -663,18 +756,25 @@ class TwoTowerTrainer:
         self.random_negative_weight = random_negative_weight
         self.enable_in_batch_negatives = enable_in_batch_negatives
         self.in_batch_loss_weight = in_batch_loss_weight
+        self.enable_logq_correction = bool(enable_logq_correction)
 
         self.user_mapping: Dict[str, int] = {}
         self.item_mapping: Dict[str, int] = {}
         self.reverse_item_mapping: Dict[int, str] = {}
         self.user_positives: Dict[int, Set[int]] = defaultdict(set)
-        self._external_negatives_by_user: Dict[int, List[NegativeSample]] = defaultdict(list)
+        self._external_negatives_by_user: Dict[int, List[NegativeSample]] = defaultdict(
+            list
+        )
 
         self._item_clip_embs: Optional[np.ndarray] = None
         self._item_side_feats: Optional[np.ndarray] = None
+        self._item_metadata_by_idx: Dict[int, Dict[str, Any]] = {}
         self._last_item_embeddings: Optional[np.ndarray] = None
         self._user_side_feats: Dict[int, np.ndarray] = {}
-        self._train_samples: List[Tuple[int, int, float]] = []
+        self._train_samples: List[
+            Tuple[int, int, float, np.ndarray, float, frozenset[int]]
+        ] = []
+        self._item_sampling_probabilities: Optional[np.ndarray] = None
 
     def prepare(
         self,
@@ -685,12 +785,21 @@ class TwoTowerTrainer:
         external_negatives: Optional[
             Sequence[Mapping[str, Any] | ExternalNegativeCandidate]
         ] = None,
+        as_of_ts: Optional[float] = None,
     ):
         logger.info(f"Preparing training data from {len(interactions)} interactions")
 
         users: Set[str] = set()
         items: Set[str] = set()
-        for interaction in interactions:
+        known_positives_by_user: Dict[int, Set[int]] = defaultdict(set)
+        ordered_interactions = sorted(
+            interactions,
+            key=lambda value: (
+                float(value.get("as_of_ts", as_of_ts or 0.0)),
+                str(value.get("event_id") or ""),
+            ),
+        )
+        for interaction in ordered_interactions:
             uid = interaction.get("user_id")
             pid = interaction.get("product_id")
             if uid and pid:
@@ -727,6 +836,7 @@ class TwoTowerTrainer:
             (num_items + 1, ItemFeatureEncoder.FEATURE_DIM),
             dtype=np.float32,
         )
+        self._item_metadata_by_idx = {}
 
         for product_id, idx in self.item_mapping.items():
             clip_emb = product_clip_embeddings.get(product_id)
@@ -735,7 +845,10 @@ class TwoTowerTrainer:
                 if emb.shape[0] == self.clip_dim:
                     self._item_clip_embs[idx] = emb
             meta = product_metadata.get(product_id, {})
-            self._item_side_feats[idx] = ItemFeatureEncoder.encode(meta)
+            self._item_metadata_by_idx[idx] = dict(meta)
+            self._item_side_feats[idx] = ItemFeatureEncoder.encode(
+                meta, current_time=as_of_ts
+            )
 
         self._user_side_feats = {}
         for user_id, idx in self.user_mapping.items():
@@ -754,8 +867,42 @@ class TwoTowerTrainer:
             u_idx = self.user_mapping[uid]
             p_idx = self.item_mapping[pid]
             weight = INTERACTION_WEIGHTS.get(action, 1.0)
-            self._train_samples.append((u_idx, p_idx, weight))
+            sample_as_of_ts = interaction.get("as_of_ts", as_of_ts)
+            sample_user_features = interaction.get(
+                "user_features"
+            ) or user_features_map.get(uid, {})
+            sample_user_side_features = UserFeatureEncoder.encode(
+                sample_user_features,
+                current_time=(
+                    float(sample_as_of_ts) if sample_as_of_ts is not None else None
+                ),
+            )
+            sample_time = float(sample_as_of_ts or 0.0)
+            known_positives_by_user[u_idx].add(p_idx)
+            self._train_samples.append(
+                (
+                    u_idx,
+                    p_idx,
+                    weight,
+                    sample_user_side_features,
+                    sample_time,
+                    frozenset(known_positives_by_user[u_idx]),
+                )
+            )
             self.user_positives[u_idx].add(p_idx)
+
+        # Smoothed probabilities are derived only from the supplied training
+        # partition. Holdout labels must never be passed to prepare().
+        item_counts = np.ones(num_items + 1, dtype=np.float64)
+        item_counts[0] = 0.0
+        for _, item_idx, _, _, _, _ in self._train_samples:
+            item_counts[item_idx] += 1.0
+        total_item_count = float(item_counts.sum())
+        self._item_sampling_probabilities = (
+            item_counts / total_item_count
+            if total_item_count > 0
+            else np.zeros(num_items + 1, dtype=np.float64)
+        ).astype(np.float32)
 
         for candidate in external_negatives or []:
             if isinstance(candidate, ExternalNegativeCandidate):
@@ -767,6 +914,8 @@ class TwoTowerTrainer:
                     "exposed": candidate.exposed,
                     "sample_prob": candidate.sample_prob,
                     "rank_position": candidate.rank_position,
+                    "as_of_ts": candidate.as_of_ts,
+                    "teacher_target": candidate.teacher_target,
                 }
             else:
                 raw_candidate = dict(candidate)
@@ -782,6 +931,13 @@ class TwoTowerTrainer:
                 if source == NEGATIVE_SOURCE_RANKER_REJECTED
                 else self.impression_negative_weight
             )
+            teacher_target = (
+                float(raw_candidate["teacher_target"])
+                if raw_candidate.get("teacher_target") is not None
+                else None
+            )
+            if teacher_target is not None and not 0.0 <= teacher_target <= 1.0:
+                raise ValueError("ranker teacher target must be between zero and one")
             self._external_negatives_by_user[self.user_mapping[uid]].append(
                 NegativeSample(
                     item_idx=self.item_mapping[pid],
@@ -800,6 +956,12 @@ class TwoTowerTrainer:
                         if raw_candidate.get("rank_position") is not None
                         else None
                     ),
+                    as_of_ts=(
+                        float(raw_candidate["as_of_ts"])
+                        if raw_candidate.get("as_of_ts") is not None
+                        else None
+                    ),
+                    teacher_target=teacher_target,
                 )
             )
 
@@ -884,39 +1046,54 @@ class TwoTowerTrainer:
                     dtype=np.float32,
                 )
                 neg_item_ids_np = np.zeros((actual_bs, total_neg), dtype=np.int64)
-                neg_clip_np = np.zeros((actual_bs, total_neg, self.clip_dim), dtype=np.float32)
+                neg_clip_np = np.zeros(
+                    (actual_bs, total_neg, self.clip_dim), dtype=np.float32
+                )
                 neg_feat_np = np.zeros(
                     (actual_bs, total_neg, ItemFeatureEncoder.FEATURE_DIM),
                     dtype=np.float32,
                 )
                 neg_weights_np = np.ones((actual_bs, total_neg), dtype=np.float32)
+                neg_sample_probabilities_np = np.ones(
+                    (actual_bs, total_neg), dtype=np.float32
+                )
+                neg_logq_mask_np = np.zeros((actual_bs, total_neg), dtype=bool)
+                neg_teacher_targets_np = np.full(
+                    (actual_bs, total_neg), np.nan, dtype=np.float32
+                )
                 sample_weights_np = np.ones(actual_bs, dtype=np.float32)
                 in_batch_exclude_mask_np = np.zeros((actual_bs, actual_bs), dtype=bool)
 
                 for i, sample_idx in enumerate(batch_indices):
-                    u_idx, p_idx, sample_weight = self._train_samples[sample_idx]
+                    (
+                        u_idx,
+                        p_idx,
+                        sample_weight,
+                        sample_user_features,
+                        sample_as_of_ts,
+                        _,
+                    ) = self._train_samples[sample_idx]
 
                     user_ids_np[i] = u_idx
                     sample_weights_np[i] = float(sample_weight)
-                    user_feats_np[i] = self._user_side_feats.get(
-                        u_idx,
-                        np.zeros(UserFeatureEncoder.FEATURE_DIM, dtype=np.float32),
-                    )
+                    user_feats_np[i] = sample_user_features
 
                     pos_item_ids_np[i] = p_idx
                     pos_clip_np[i] = self._item_clip_embs[p_idx]
-                    pos_feat_np[i] = self._item_side_feats[p_idx]
+                    pos_feat_np[i] = ItemFeatureEncoder.encode(
+                        self._item_metadata_by_idx.get(p_idx, {}),
+                        current_time=sample_as_of_ts,
+                    )
 
                 if self.enable_in_batch_negatives and actual_bs > 1:
                     for i in range(actual_bs):
-                        user_positive_items = self.user_positives.get(int(user_ids_np[i]), set())
+                        user_positive_items = self._train_samples[batch_indices[i]][5]
                         for j in range(actual_bs):
                             if i == j:
                                 continue
-                            if (
-                                int(pos_item_ids_np[j]) in user_positive_items
-                                or int(pos_item_ids_np[j]) == int(pos_item_ids_np[i])
-                            ):
+                            if int(pos_item_ids_np[j]) in user_positive_items or int(
+                                pos_item_ids_np[j]
+                            ) == int(pos_item_ids_np[i]):
                                 in_batch_exclude_mask_np[i, j] = True
 
                 user_embeddings_np: Optional[np.ndarray] = None
@@ -933,25 +1110,44 @@ class TwoTowerTrainer:
                     was_training = self.model.training
                     self.model.eval()
                     with torch.no_grad():
-                        user_ids_t = torch.tensor(user_ids_np, dtype=torch.long, device=self.device)
+                        user_ids_t = torch.tensor(
+                            user_ids_np, dtype=torch.long, device=self.device
+                        )
                         user_feats_t = torch.tensor(user_feats_np, device=self.device)
-                        user_embeddings_np = self.model.encode_users(
-                            user_ids_t,
-                            user_feats_t,
-                        ).cpu().numpy()
+                        user_embeddings_np = (
+                            self.model.encode_users(
+                                user_ids_t,
+                                user_feats_t,
+                            )
+                            .cpu()
+                            .numpy()
+                        )
                     if was_training:
                         self.model.train()
 
                 for i, sample_idx in enumerate(batch_indices):
-                    u_idx, _, _ = self._train_samples[sample_idx]
+                    (
+                        u_idx,
+                        _,
+                        _,
+                        _,
+                        sample_as_of_ts,
+                        known_positives,
+                    ) = self._train_samples[sample_idx]
+                    available_external_negatives = [
+                        candidate
+                        for candidate in self._external_negatives_by_user.get(u_idx, [])
+                        if candidate.as_of_ts is None
+                        or candidate.as_of_ts <= sample_as_of_ts
+                    ]
                     neg_indices = self.negative_sampler.sample(
                         user_embedding=(
                             user_embeddings_np[i]
                             if user_embeddings_np is not None
                             else None
                         ),
-                        positive_items=self.user_positives.get(u_idx, set()),
-                        external_negatives=self._external_negatives_by_user.get(u_idx, []),
+                        positive_items=set(known_positives),
+                        external_negatives=available_external_negatives,
                         epoch=epoch,
                         total_epochs=self.epochs,
                     )
@@ -959,13 +1155,30 @@ class TwoTowerTrainer:
                         if isinstance(neg_sample, NegativeSample):
                             neg_idx = neg_sample.item_idx
                             neg_weights_np[i, j] = float(neg_sample.weight)
+                            if neg_sample.teacher_target is not None:
+                                neg_teacher_targets_np[i, j] = float(
+                                    neg_sample.teacher_target
+                                )
+                                neg_weights_np[i, j] = 1e-8
+                            if (
+                                self.enable_logq_correction
+                                and neg_sample.source == NEGATIVE_SOURCE_RANDOM
+                                and float(neg_sample.sample_prob) > 0.0
+                            ):
+                                neg_sample_probabilities_np[i, j] = float(
+                                    neg_sample.sample_prob
+                                )
+                                neg_logq_mask_np[i, j] = True
                         else:
                             neg_idx = int(neg_sample)
                             neg_weights_np[i, j] = 1.0
                         neg_item_ids_np[i, j] = neg_idx
                         if neg_idx < len(self._item_clip_embs):
                             neg_clip_np[i, j] = self._item_clip_embs[neg_idx]
-                            neg_feat_np[i, j] = self._item_side_feats[neg_idx]
+                            neg_feat_np[i, j] = ItemFeatureEncoder.encode(
+                                self._item_metadata_by_idx.get(neg_idx, {}),
+                                current_time=sample_as_of_ts,
+                            )
 
                 user_ids_t = torch.tensor(user_ids_np, device=self.device)
                 user_feats_t = torch.tensor(user_feats_np, device=self.device)
@@ -977,7 +1190,25 @@ class TwoTowerTrainer:
                 neg_feat_t = torch.tensor(neg_feat_np, device=self.device)
                 neg_weights_t = torch.tensor(neg_weights_np, device=self.device)
                 sample_weights_t = torch.tensor(sample_weights_np, device=self.device)
-                in_batch_mask_t = torch.tensor(in_batch_exclude_mask_np, device=self.device)
+                in_batch_mask_t = torch.tensor(
+                    in_batch_exclude_mask_np, device=self.device
+                )
+                neg_sample_probabilities_t = torch.tensor(
+                    neg_sample_probabilities_np, device=self.device
+                )
+                neg_logq_mask_t = torch.tensor(neg_logq_mask_np, device=self.device)
+                neg_teacher_targets_t = torch.tensor(
+                    neg_teacher_targets_np, device=self.device
+                )
+                in_batch_item_probabilities_t = (
+                    torch.tensor(
+                        self._item_sampling_probabilities[pos_item_ids_np],
+                        device=self.device,
+                    )
+                    if self.enable_logq_correction
+                    and self._item_sampling_probabilities is not None
+                    else None
+                )
 
                 optimizer.zero_grad()
                 outputs = self.model(
@@ -997,6 +1228,16 @@ class TwoTowerTrainer:
                         if self.enable_in_batch_negatives
                         else 0.0
                     ),
+                    neg_sample_probabilities=(
+                        neg_sample_probabilities_t
+                        if self.enable_logq_correction
+                        else None
+                    ),
+                    neg_logq_mask=(
+                        neg_logq_mask_t if self.enable_logq_correction else None
+                    ),
+                    in_batch_item_probabilities=in_batch_item_probabilities_t,
+                    neg_teacher_targets=neg_teacher_targets_t,
                 )
                 loss = outputs["loss"]
                 loss.backward()
@@ -1097,7 +1338,9 @@ class TwoTowerTrainer:
         available: Dict[str, bool] = {}
         for product_id, item_idx in self.item_mapping.items():
             if 0 <= item_idx < len(self._item_clip_embs):
-                available[product_id] = bool(np.linalg.norm(self._item_clip_embs[item_idx]) > 0.0)
+                available[product_id] = bool(
+                    np.linalg.norm(self._item_clip_embs[item_idx]) > 0.0
+                )
         return available
 
     @torch.no_grad()
@@ -1165,7 +1408,9 @@ class TwoTowerTrainer:
                 skipped.append(key)
                 continue
             current_value = current_state.get(key)
-            if current_value is not None and tuple(current_value.shape) == tuple(value.shape):
+            if current_value is not None and tuple(current_value.shape) == tuple(
+                value.shape
+            ):
                 compatible[key] = value
             else:
                 skipped.append(key)
@@ -1230,7 +1475,9 @@ class TwoTowerTrainer:
             self.user_mapping = checkpoint["user_mapping"]
             self.item_mapping = checkpoint["item_mapping"]
             self.reverse_item_mapping = checkpoint["reverse_item_mapping"]
-            architecture = normalize_architecture(cfg.get("architecture"), default="mlp")
+            architecture = normalize_architecture(
+                cfg.get("architecture"), default="mlp"
+            )
             cross_layers = int(cfg.get("cross_layers", self.cross_layers))
 
             self.model = TwoTowerModel(
@@ -1249,9 +1496,16 @@ class TwoTowerTrainer:
             self.model.eval()
 
             num_items = len(self.item_mapping)
-            if self._item_clip_embs is None or len(self._item_clip_embs) != num_items + 1:
-                self._item_clip_embs = np.zeros((num_items + 1, self.clip_dim), dtype=np.float32)
-                self._item_side_feats = np.zeros((num_items + 1, ItemFeatureEncoder.FEATURE_DIM), dtype=np.float32)
+            if (
+                self._item_clip_embs is None
+                or len(self._item_clip_embs) != num_items + 1
+            ):
+                self._item_clip_embs = np.zeros(
+                    (num_items + 1, self.clip_dim), dtype=np.float32
+                )
+                self._item_side_feats = np.zeros(
+                    (num_items + 1, ItemFeatureEncoder.FEATURE_DIM), dtype=np.float32
+                )
 
             logger.info(f"Loaded Two-Tower checkpoint from {path}")
             return True

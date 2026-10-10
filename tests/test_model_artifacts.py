@@ -551,6 +551,89 @@ def test_sync_latest_two_tower_artifacts_copies_to_local_cache(tmp_path):
     assert local_index.with_suffix(".cf_meta.json").read_text(encoding="utf-8") == "{}"
 
 
+def test_sync_active_two_tower_artifacts_ignores_newer_unpromoted_release(tmp_path):
+    fake_store = FakeSystemStore()
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    checkpoint = remote_dir / "two_tower.pt"
+    index = remote_dir / "two_tower.faiss"
+    metadata = remote_dir / "two_tower.cf_meta.json"
+    checkpoint.write_bytes(b"active-pt")
+    index.write_bytes(b"active-faiss")
+    metadata.write_text('{"index_map": {}}', encoding="utf-8")
+    payload = {
+        "cf_index_path": str(index),
+        "cf_index_metadata_path": str(metadata),
+        "retrieval_pit_manifest_sha256": "a" * 64,
+        "catalog_manifest_sha256": "b" * 64,
+        "eligibility_policy_version": "retrieval_eligibility_v1",
+        "label_policy_version": "retrieval_label_v1",
+        "quality_gate_policy_version": "retrieval_quality_gate_v1",
+        "embedding_dimension": 128,
+    }
+    fake_store.active[(ModelArtifactManager.TWO_TOWER_MODEL_NAME, "production")] = {
+        "model_name": ModelArtifactManager.TWO_TOWER_MODEL_NAME,
+        "model_version": "two-tower-active",
+        "checkpoint_path": str(checkpoint),
+        "payload": payload,
+        "active_generation": 7,
+    }
+    fake_store.latest[ModelArtifactManager.TWO_TOWER_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.TWO_TOWER_MODEL_NAME,
+        "model_version": "two-tower-unpromoted",
+        "checkpoint_path": "/missing/unpromoted.pt",
+        "payload": {},
+    }
+    local_index = tmp_path / "cache" / "cf_index.faiss"
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
+        ),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(cf_index_path=str(local_index)),
+    )
+
+    record = asyncio.run(
+        manager.sync_active_two_tower_artifacts(
+            environment="production", require_compatible=True
+        )
+    )
+
+    assert record.model_version == "two-tower-active"
+    assert record.payload["active_generation"] == 7
+    assert local_index.read_bytes() == b"active-faiss"
+
+
+def test_active_two_tower_artifact_requires_retrieval_lineage(tmp_path):
+    fake_store = FakeSystemStore()
+    fake_store.active[(ModelArtifactManager.TWO_TOWER_MODEL_NAME, "production")] = {
+        "model_name": ModelArtifactManager.TWO_TOWER_MODEL_NAME,
+        "model_version": "two-tower-active",
+        "checkpoint_path": str(tmp_path / "missing.pt"),
+        "payload": {
+            "cf_index_path": str(tmp_path / "missing.faiss"),
+            "cf_index_metadata_path": str(tmp_path / "missing.json"),
+        },
+        "active_generation": 1,
+    }
+    manager = ModelArtifactManager(
+        system_store=fake_store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        recommendation_config=RecommendationConfig(),
+    )
+
+    with pytest.raises(ValueError, match="retrieval PIT lineage"):
+        asyncio.run(
+            manager.sync_active_two_tower_artifacts(
+                environment="production", require_compatible=True
+            )
+        )
+
+
 def test_sync_latest_two_tower_artifacts_removes_undeclared_optional_sidecars(tmp_path):
     fake_store = FakeSystemStore()
     remote_dir = tmp_path / "remote"

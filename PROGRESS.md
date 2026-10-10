@@ -1,5 +1,46 @@
 # Progress
 
+## 2026-10-09 — Retrieval PIT and Two-Tower release gate
+
+- Added immutable, checksum-verified retrieval catalog generations and
+  `retrieval_training_pit_v1` manifests. The Flink materializer now builds
+  mature viewed, organic-positive, and ranker-rejected query rows with event,
+  availability, catalog-generation, and feature cutoffs enforced at `as_of_ts`.
+- Moved Two-Tower training to the offline PIT path with a fixed seven-day
+  holdout, deterministic catalog mappings, training-only frequency/logQ data,
+  source-specific negative probabilities, cutoff-safe false-negative masking,
+  and versioned negative-source experiments.
+- Added full-catalog Recall@50/100/200, MRR, hit rate, catalog/encoding
+  coverage, long-tail and cold/modality slices, deterministic user-cluster
+  bootstrap intervals, plus an exact-search audit that reports ANN recall
+  separately from model quality.
+- Extended the existing model release registry to validate Two-Tower bundles,
+  apply `retrieval_quality_gate_v1`, require manual CAS promotion, load only the
+  active verified generation in enforced mode, retain the previous in-memory
+  generation on reload failure, and record release/generation lineage in
+  durable impressions. Production configuration disables online retraining and
+  requires PIT training plus the enforced release gate.
+- Added retrieval release metrics/alerts, catalog/PIT publication and training
+  CLIs, and the retrieval rollout/rollback runbook.
+- Key files: `video_commerce/ml/retrieval_pit_dataset.py`,
+  `video_commerce/ml/retrieval_catalog.py`,
+  `video_commerce/ml/retrieval_training.py`,
+  `video_commerce/ml/retrieval_evaluation.py`,
+  `video_commerce/ml/retrieval_release_training.py`,
+  `flink-jobs/interaction-features/src/main/java/com/videocommerce/flink/RetrievalPointInTimeJoinJob.java`,
+  and `docs/operations/retrieval-pit-release-runbook.md`.
+- Verification: Docker backend suite `719 passed, 12 skipped`; the seven
+  Postgres-backed outbox, lease, PIT-run, idempotency, and release-CAS tests
+  passed in an isolated project; Flink Maven `31 passed` with a final focused
+  `11 passed`; Helm lint and strict kubeconform `36/36`, Prometheus rule tests,
+  Compose config, Python compilation, Black, diff checks, and the production
+  backend image build passed.
+- Known gaps: no real complete catalog generation or mature production holdout
+  labels were available, so popularity/champion/challenger baseline results
+  remain `insufficient_evidence`. No retrieval-quality or performance
+  improvement is claimed. A live Iceberg/object-storage/Flink release smoke and
+  production shadow/canary evaluation remain follow-up work.
+
 ## 2026-10-08 — Automated deployment gates, Flink closed loop, and outbox A/B harness
 
 - Expanded PR CI with Node 20 frontend tests/lint/build, Java 11 Flink Maven
