@@ -75,6 +75,12 @@ data:
   FEATURE_LAKE_PIT_SCHEDULE_HOUR_UTC: {{ .Values.external.featureLake.pitScheduleHourUtc | quote }}
   FEATURE_LAKE_PIT_ORCHESTRATOR_LEASE_SECONDS: {{ .Values.external.featureLake.pitOrchestratorLeaseSeconds | quote }}
   FEATURE_LAKE_PIT_TRAINING_LEASE_SECONDS: {{ .Values.external.featureLake.pitTrainingLeaseSeconds | quote }}
+  FEATURE_LAKE_PIT_READER_MODE: {{ .Values.external.featureLake.pitReaderMode | quote }}
+  FEATURE_LAKE_PIT_STAGING_DIR: {{ .Values.external.featureLake.pitStagingDir | quote }}
+  FEATURE_LAKE_PIT_STAGING_MAX_BYTES: {{ .Values.external.featureLake.pitStagingMaxBytes | quote }}
+  FEATURE_LAKE_PIT_BATCH_ROWS: {{ .Values.external.featureLake.pitBatchRows | quote }}
+  FEATURE_LAKE_PIT_MAX_GROUP_ROWS: {{ .Values.external.featureLake.pitMaxGroupRows | quote }}
+  FEATURE_LAKE_PIT_CONTENT_CACHE_BYTES: {{ .Values.external.featureLake.pitContentCacheBytes | quote }}
   FEATURE_LAKE_FLINK_JOBMANAGER: {{ .Values.external.featureLake.flinkJobmanager | quote }}
   FEATURE_LAKE_PIT_EXPORT_URI: {{ .Values.external.featureLake.pitExportUri | quote }}
   FEATURE_LAKE_CANDIDATE_SIDECAR_URI: {{ .Values.external.featureLake.candidateSidecarUri | quote }}

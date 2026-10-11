@@ -1932,6 +1932,30 @@ class FeatureLakeConfig(BaseSettings):
         None,
         description="Immutable catalog generation pinned by a retrieval PIT run",
     )
+    pit_reader_mode: str = Field(
+        "streaming",
+        description="PIT reader implementation: streaming or materialized",
+    )
+    pit_staging_dir: str = Field(
+        "/tmp/video-commerce-pit",
+        description="Local directory used for verified PIT generations",
+    )
+    pit_staging_max_bytes: int = Field(
+        20 * 1024 * 1024 * 1024,
+        description="Maximum bytes available to one staged PIT generation",
+    )
+    pit_batch_rows: int = Field(
+        1024,
+        description="Target rows per PIT training batch",
+    )
+    pit_max_group_rows: int = Field(
+        4096,
+        description="Maximum rows in one ranking impression or retrieval query",
+    )
+    pit_content_cache_bytes: int = Field(
+        512 * 1024 * 1024,
+        description="Byte bound for decoded content artifacts during PIT training",
+    )
     feature_definition_version: str = Field(
         "ranking_ltr_v1",
         description="Shared online/offline ranking feature definition version",
@@ -1965,6 +1989,13 @@ class FeatureLakeConfig(BaseSettings):
             raise ValueError("training_source must be one of: legacy, pit")
         return normalized
 
+    @validator("pit_reader_mode")
+    def validate_pit_reader_mode(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"streaming", "materialized"}:
+            raise ValueError("pit_reader_mode must be one of: streaming, materialized")
+        return normalized
+
     @validator(
         "attribution_window_hours",
         "catalog_outbox_batch_size",
@@ -1972,6 +2003,10 @@ class FeatureLakeConfig(BaseSettings):
         "catalog_outbox_retention_days",
         "pit_orchestrator_lease_seconds",
         "pit_training_lease_seconds",
+        "pit_staging_max_bytes",
+        "pit_batch_rows",
+        "pit_max_group_rows",
+        "pit_content_cache_bytes",
     )
     def validate_positive_feature_lake_ints(cls, value: int) -> int:
         if value <= 0:
@@ -2696,6 +2731,14 @@ class Config:
             if self.recommendation_config.online_retraining_enabled:
                 errors.append(
                     "RECOMMENDATION_ONLINE_RETRAINING_ENABLED=false is mandatory in production"
+                )
+            if self.feature_lake_config.pit_reader_mode != "streaming":
+                errors.append(
+                    "FEATURE_LAKE_PIT_READER_MODE=streaming is mandatory in production"
+                )
+            if "FEATURE_LAKE_PIT_STAGING_MAX_BYTES" not in os.environ:
+                errors.append(
+                    "FEATURE_LAKE_PIT_STAGING_MAX_BYTES must be explicitly set in production"
                 )
 
         # Validate file paths

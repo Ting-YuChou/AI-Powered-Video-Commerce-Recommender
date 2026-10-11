@@ -21,6 +21,12 @@ external:
     pitScheduleHourUtc: 2
     pitOrchestratorLeaseSeconds: 7200
     pitTrainingLeaseSeconds: 21600
+    pitReaderMode: streaming
+    pitStagingDir: /var/lib/video-commerce/pit
+    pitStagingMaxBytes: 21474836480
+    pitBatchRows: 1024
+    pitMaxGroupRows: 4096
+    pitContentCacheBytes: 536870912
     flinkJobmanager: ""
     pitExportUri: s3://video-commerce-features/training/ranking-pit
     pitJobJarPath: /opt/flink/usrlib/interaction-features.jar

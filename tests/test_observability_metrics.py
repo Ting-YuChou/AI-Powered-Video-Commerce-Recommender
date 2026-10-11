@@ -46,6 +46,17 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
         invalid_rows=0,
         value_mask_coverage=0.8,
     )
+    manager.observe_pit_stream_validation(
+        kind="ranking",
+        duration_seconds=1.5,
+        rows=100,
+        staging_bytes=2048,
+        largest_group_rows=8,
+        peak_rss_bytes=4096,
+    )
+    manager.observe_pit_stream_batch("ranking", 16)
+    manager.record_pit_stream_cache("hit")
+    manager.record_pit_stream_failure("cleanup")
     manager.record_pit_orchestrator_run("completed")
     manager.set_pit_orchestrator_waiting_for_rows(True)
     manager.set_pit_trainer_waiting_for_manifest(True)
@@ -104,6 +115,14 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "pit_current_state_calls" in payload
     assert "pit_invalid_feature_or_label_rows" in payload
     assert "pit_value_mask_coverage_ratio" in payload
+    assert "pit_stream_validation_seconds" in payload
+    assert "pit_stream_rows_per_second" in payload
+    assert "pit_stream_staging_bytes" in payload
+    assert "pit_stream_batch_rows" in payload
+    assert "pit_stream_largest_group_rows" in payload
+    assert "pit_stream_peak_rss_bytes" in payload
+    assert 'pit_stream_content_cache_total{result="hit"} 1.0' in payload
+    assert 'pit_stream_failures_total{reason="cleanup"} 1.0' in payload
     assert 'pit_orchestrator_runs_total{status="completed"} 1.0' in payload
     assert "pit_orchestrator_last_success_timestamp" in payload
     assert "pit_orchestrator_waiting_for_rows 0.0" in payload

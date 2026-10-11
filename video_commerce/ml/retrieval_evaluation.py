@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import math
+import heapq
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -72,14 +73,15 @@ def score_full_catalog_embeddings(
     item_embeddings: Mapping[str, np.ndarray],
     *,
     encode_user,
+    max_results: int = 200,
 ) -> dict[str, dict[str, float]]:
-    """Score every encoded eligible item; no sampled candidate set is accepted."""
+    """Scan every eligible item while retaining only deterministic top-k scores."""
     scores: dict[str, dict[str, float]] = {}
     for query in queries:
         user_embedding = np.asarray(encode_user(query), dtype=np.float64).reshape(-1)
         if not np.all(np.isfinite(user_embedding)):
             raise ValueError("retrieval user embedding is not finite")
-        query_scores = {}
+        ranked = []
         for product_id in query.eligible_product_ids:
             embedding = item_embeddings.get(product_id)
             if embedding is None:
@@ -90,8 +92,22 @@ def score_full_catalog_embeddings(
             score = float(np.dot(user_embedding, item_embedding))
             if not math.isfinite(score):
                 raise ValueError("retrieval score is not finite")
-            query_scores[product_id] = score
-        scores[query.query_id] = query_scores
+            normalized_product_id = str(product_id)
+            entry = (
+                score,
+                tuple(-ord(character) for character in normalized_product_id),
+                normalized_product_id,
+            )
+            if len(ranked) < int(max_results):
+                heapq.heappush(ranked, entry)
+            elif entry > ranked[0]:
+                heapq.heapreplace(ranked, entry)
+        scores[query.query_id] = {
+            product_id: score
+            for score, _, product_id in sorted(
+                ranked, key=lambda item: (-item[0], item[2])
+            )
+        }
     return scores
 
 
@@ -101,6 +117,7 @@ def score_ann_index(
     index_map: Mapping[int, str],
     *,
     encode_user,
+    max_results: int = 200,
 ) -> dict[str, dict[str, float]]:
     """Search an ANN index containing the complete pinned eligible catalog."""
     total = int(getattr(index, "ntotal", 0))
@@ -111,7 +128,7 @@ def score_ann_index(
         vector = np.asarray(encode_user(query), dtype=np.float32).reshape(1, -1)
         if not np.all(np.isfinite(vector)):
             raise ValueError("retrieval ANN query embedding is not finite")
-        distances, indices = index.search(vector, total)
+        distances, indices = index.search(vector, min(total, int(max_results)))
         query_scores: dict[str, float] = {}
         for raw_index, raw_score in zip(indices[0], distances[0]):
             faiss_index = int(raw_index)
@@ -131,6 +148,7 @@ def evaluate_full_catalog(
     scores: Mapping[str, Mapping[str, float]],
     *,
     cutoffs: Sequence[int] = (50, 100, 200),
+    encoding_coverage: float | None = None,
 ) -> dict[str, object]:
     normalized_cutoffs = tuple(sorted({int(k) for k in cutoffs if int(k) > 0}))
     if not normalized_cutoffs:
@@ -191,7 +209,11 @@ def evaluate_full_catalog(
         "queries": len(reciprocal_ranks),
         "mrr": float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0,
         "eligible_item_encoding_coverage": (
-            len(encoded_eligible) / len(all_eligible) if all_eligible else 0.0
+            float(encoding_coverage)
+            if encoding_coverage is not None
+            else len(encoded_eligible) / len(all_eligible)
+            if all_eligible
+            else 0.0
         ),
         "recommendation_catalog_coverage": (
             len(exposed) / len(all_eligible) if all_eligible else 0.0
@@ -263,6 +285,7 @@ def evaluate_retrieval_gate(
     champion_scores: Mapping[str, Mapping[str, float]],
     challenger_scores: Mapping[str, Mapping[str, float]],
     config: RetrievalEvaluationConfig,
+    challenger_encoding_coverage: float | None = None,
 ) -> RetrievalQualityGateResult:
     if _has_non_finite_scores(champion_scores) or _has_non_finite_scores(
         challenger_scores
@@ -276,7 +299,12 @@ def evaluate_retrieval_gate(
             {},
         )
     evidence = _evidence_reasons(queries, config, slice_name=None)
-    overall = _compare(queries, champion_scores, challenger_scores)
+    overall = _compare(
+        queries,
+        champion_scores,
+        challenger_scores,
+        challenger_encoding_coverage=challenger_encoding_coverage,
+    )
     bootstrap = _bootstrap_recall_delta(
         queries, champion_scores, challenger_scores, config
     )
@@ -336,9 +364,19 @@ def evaluate_retrieval_gate(
     )
 
 
-def _compare(queries, champion_scores, challenger_scores):
+def _compare(
+    queries,
+    champion_scores,
+    challenger_scores,
+    *,
+    challenger_encoding_coverage=None,
+):
     champion = evaluate_full_catalog(queries, champion_scores)
-    challenger = evaluate_full_catalog(queries, challenger_scores)
+    challenger = evaluate_full_catalog(
+        queries,
+        challenger_scores,
+        encoding_coverage=challenger_encoding_coverage,
+    )
     return {
         "queries": int(challenger["queries"]),
         "users": len({query.user_id for query in queries}),

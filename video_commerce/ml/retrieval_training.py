@@ -36,6 +36,137 @@ class RetrievalTrainingInputs:
     training_as_of_ts: float
 
 
+@dataclass(frozen=True)
+class RetrievalStreamingInputs:
+    source: Any
+    product_metadata: Mapping[str, Mapping[str, Any]]
+    product_clip_embeddings: Mapping[str, np.ndarray]
+    holdout_queries: tuple[RetrievalEvaluationQuery, ...]
+    holdout_window: RetrievalHoldoutWindow
+    training_as_of_ts: float
+    batch_rows: int
+
+
+def build_retrieval_streaming_inputs(
+    source,
+    *,
+    holdout_days: int,
+    batch_rows: int,
+) -> RetrievalStreamingInputs:
+    """Build O(items + queries) evaluation state while event rows remain on disk."""
+    window = source.assign_holdout(holdout_days=holdout_days)
+    catalog = source.catalog
+    metadata = {}
+    embeddings = {}
+    eligible_ids = tuple(product.product_id for product in catalog.eligible_products)
+    for product in catalog.eligible_products:
+        feature = catalog.item_features[product.product_id]
+        presence = dict(product.modality_presence)
+        presence["clip_embedding"] = feature.clip_embedding is not None
+        metadata[product.product_id] = {
+            **dict(product.metadata),
+            "active": product.active,
+            "in_stock": product.in_stock,
+            "modality_presence": presence,
+        }
+        embeddings[product.product_id] = (
+            np.asarray(feature.clip_embedding, dtype=np.float32)
+            if feature.clip_embedding is not None
+            else np.zeros(catalog.embedding_dimension, dtype=np.float32)
+        )
+    exposures: dict[str, int] = {}
+    training_as_of_ts = window.start_ts
+    for rows in source.iter_row_batches(
+        split="training", batch_rows=batch_rows, seed=42, epoch=0
+    ):
+        for row in rows:
+            exposures[row.product_id] = exposures.get(row.product_id, 0) + 1
+            training_as_of_ts = max(training_as_of_ts, float(row.as_of_ts))
+    ordered = sorted(
+        eligible_ids, key=lambda product_id: (-exposures.get(product_id, 0), product_id)
+    )
+    head_count = max(1, int(math.ceil(len(ordered) * 0.2))) if ordered else 0
+    long_tail = frozenset(ordered[head_count:])
+    queries = []
+    for rows in source.iter_row_batches(
+        split="holdout", batch_rows=batch_rows, seed=42, epoch=0
+    ):
+        grouped: dict[str, list[RetrievalPitRow]] = {}
+        for row in rows:
+            grouped.setdefault(row.query_id, []).append(row)
+        for query_id, query_rows in grouped.items():
+            relevant = frozenset(
+                row.product_id
+                for row in query_rows
+                if row.label_type in POSITIVE_LABELS
+            )
+            if not relevant:
+                continue
+            representative = min(
+                query_rows, key=lambda row: (row.as_of_ts, row.product_id)
+            )
+            cold_items = frozenset(
+                product_id
+                for product_id in eligible_ids
+                if representative.as_of_ts
+                - float(metadata[product_id].get("created_at", representative.as_of_ts))
+                <= 30 * 86400.0
+                or exposures.get(product_id, 0) <= 5
+            )
+            missing_by_name = {
+                name: frozenset(
+                    product_id
+                    for product_id in eligible_ids
+                    if not bool(
+                        dict(metadata[product_id].get("modality_presence") or {}).get(
+                            name, False
+                        )
+                    )
+                )
+                for name in sorted(
+                    {
+                        key
+                        for product_id in eligible_ids
+                        for key in dict(
+                            metadata[product_id].get("modality_presence") or {}
+                        )
+                    }
+                )
+            }
+            queries.append(
+                RetrievalEvaluationQuery(
+                    query_id=query_id,
+                    user_id=representative.user_id,
+                    relevant_product_ids=relevant,
+                    eligible_product_ids=eligible_ids,
+                    seen_product_ids=frozenset(representative.seen_product_ids),
+                    cold_user=int(
+                        representative.user_features.get("total_interactions", 0) or 0
+                    )
+                    < 5,
+                    cold_item_product_ids=cold_items,
+                    long_tail_product_ids=long_tail,
+                    missing_modality_product_ids=(
+                        frozenset().union(*missing_by_name.values())
+                        if missing_by_name
+                        else frozenset()
+                    ),
+                    missing_modality_product_ids_by_name=missing_by_name,
+                    as_of_ts=representative.as_of_ts,
+                    user_features=dict(representative.user_features),
+                )
+            )
+    return RetrievalStreamingInputs(
+        source=source,
+        product_metadata=metadata,
+        product_clip_embeddings=embeddings,
+        holdout_queries=tuple(sorted(queries, key=lambda query: query.query_id)),
+        holdout_window=window,
+        training_as_of_ts=training_as_of_ts,
+        batch_rows=int(batch_rows),
+    )
+
+
 def build_retrieval_training_inputs(
     dataset: RetrievalPitDataset,
     *,

@@ -798,6 +798,54 @@ class ObservabilityManager:
             "Purchase rows containing an actual attributed business value",
             registry=self.registry,
         )
+        self.pit_stream_validation_seconds = Histogram(
+            "pit_stream_validation_seconds",
+            "Time spent validating and staging one immutable PIT generation",
+            ["kind"],
+            registry=self.registry,
+        )
+        self.pit_stream_rows_per_second = Gauge(
+            "pit_stream_rows_per_second",
+            "Verified PIT rows processed per second",
+            ["kind"],
+            registry=self.registry,
+        )
+        self.pit_stream_staging_bytes = Gauge(
+            "pit_stream_staging_bytes",
+            "Bytes occupied by the active verified PIT generation",
+            ["kind"],
+            registry=self.registry,
+        )
+        self.pit_stream_batch_rows = Histogram(
+            "pit_stream_batch_rows",
+            "Rows emitted in one group-preserving PIT batch",
+            ["kind"],
+            registry=self.registry,
+        )
+        self.pit_stream_largest_group_rows = Gauge(
+            "pit_stream_largest_group_rows",
+            "Largest verified PIT group in rows",
+            ["kind"],
+            registry=self.registry,
+        )
+        self.pit_stream_peak_rss_bytes = Gauge(
+            "pit_stream_peak_rss_bytes",
+            "Peak resident bytes observed during PIT validation or training",
+            ["kind"],
+            registry=self.registry,
+        )
+        self.pit_stream_content_cache_total = Counter(
+            "pit_stream_content_cache_total",
+            "Bounded content artifact cache outcomes",
+            ["result"],
+            registry=self.registry,
+        )
+        self.pit_stream_failures_total = Counter(
+            "pit_stream_failures_total",
+            "PIT stream validation, capacity, and cleanup failures",
+            ["reason"],
+            registry=self.registry,
+        )
         self.din_sequence_coverage_ratio = Gauge(
             "din_sequence_coverage_ratio",
             "Training rows containing at least one DIN event",
@@ -1162,6 +1210,41 @@ class ObservabilityManager:
         self.pit_value_mask_coverage_ratio.set(
             max(0.0, min(1.0, float(value_mask_coverage)))
         )
+
+    def observe_pit_stream_validation(
+        self,
+        *,
+        kind: str,
+        duration_seconds: float,
+        rows: int,
+        staging_bytes: int,
+        largest_group_rows: int,
+        peak_rss_bytes: int,
+    ) -> None:
+        normalized = str(kind)
+        duration = max(0.0, float(duration_seconds))
+        self.pit_stream_validation_seconds.labels(kind=normalized).observe(duration)
+        self.pit_stream_rows_per_second.labels(kind=normalized).set(
+            max(0, int(rows)) / max(duration, 1e-9)
+        )
+        self.pit_stream_staging_bytes.labels(kind=normalized).set(
+            max(0, int(staging_bytes))
+        )
+        self.pit_stream_largest_group_rows.labels(kind=normalized).set(
+            max(0, int(largest_group_rows))
+        )
+        self.pit_stream_peak_rss_bytes.labels(kind=normalized).set(
+            max(0, int(peak_rss_bytes))
+        )
+
+    def observe_pit_stream_batch(self, kind: str, rows: int) -> None:
+        self.pit_stream_batch_rows.labels(kind=str(kind)).observe(max(0, int(rows)))
+
+    def record_pit_stream_cache(self, result: str) -> None:
+        self.pit_stream_content_cache_total.labels(result=str(result)).inc()
+
+    def record_pit_stream_failure(self, reason: str) -> None:
+        self.pit_stream_failures_total.labels(reason=str(reason)).inc()
 
     def update_din_training_metrics(
         self,

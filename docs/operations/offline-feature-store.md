@@ -107,6 +107,41 @@ online ranking, then the versioned label builder. A malformed row, unsupported
 feature/label version, non-finalized attribution, or NaN/Inf fails the entire
 PIT training run instead of falling back to legacy data.
 
+## Streaming PIT reader and staging
+
+Production training uses `FEATURE_LAKE_PIT_READER_MODE=streaming`. The reader
+pins `latest.json` once, validates every Parquet shard and referenced artifact,
+and builds a run-scoped SQLite generation under
+`FEATURE_LAKE_PIT_STAGING_DIR`. Training cannot start until the generation is
+fully verified and atomically published. Impression and query groups remain
+whole across Arrow batches and shard boundaries; a group larger than
+`FEATURE_LAKE_PIT_MAX_GROUP_ROWS` rejects the generation.
+
+Set `FEATURE_LAKE_PIT_STAGING_MAX_BYTES` explicitly in production. Kubernetes
+mounts a dedicated size-limited ephemeral volume for the model trainer and
+declares matching ephemeral-storage requests and limits. Ranking tensors and
+Two-Tower event samples are created per batch. Candidate NPZ sidecars are
+verified once and converted to read-only generation-local memory maps.
+
+`materialized` remains a local rollback comparison mode for one release cycle.
+Production configuration rejects it and never falls back from a failed stream
+generation to mutable online state.
+
+Run the manual bounded-memory acceptance test in a 2 GiB container:
+
+```bash
+docker build --target test -t video-commerce-pit-benchmark:ci .
+docker run --rm --memory=2g --memory-swap=2g \
+  video-commerce-pit-benchmark:ci \
+  python scripts/pit_memory_benchmark.py --rows 100000 500000
+```
+
+The command fails when either run reaches 2 GiB peak RSS, 500k rows increase
+peak RSS by more than 25% relative to 100k, or an incomplete staging directory
+remains. The same job is available through the manual `pit-memory-benchmark`
+GitHub Actions check. Record host/container resources and the JSON output
+before treating it as release evidence.
+
 ## Typed PIT shadow training
 
 To train a non-activating PIT artifact while legacy remains primary:

@@ -1,5 +1,40 @@
 # Progress
 
+## 2026-10-11 — PIT streaming datasets and bounded-memory training
+
+- Added a two-phase ranking and retrieval PIT reader that pins one manifest,
+  validates shards batchwise, preserves complete impression/query groups in a
+  run-scoped SQLite spool, and atomically exposes only verified generations.
+  Oversized groups, byte-limit breaches, corrupt sidecars, and incomplete
+  artifacts fail before optimizer startup.
+- Ranking now computes exact linear quantiles and Welford value statistics from
+  the training split, builds tensors one batch at a time, evaluates holdout
+  predictions through a compact SQLite spool, and records streaming lineage in
+  ranking release artifacts. Compressed candidate sidecars are converted to
+  read-only generation-local memory maps.
+- Two-Tower training now builds mappings and logQ frequencies in bounded passes,
+  keeps positive samples, cutoff histories, and exposure negatives in a disk
+  index, and iterates deterministic batches without an in-memory permutation.
+  Full-catalog scoring scans every eligible item while retaining only top-200;
+  the exact ANN audit remains separate.
+- Added production fail-closed reader configuration, PIT stream metrics,
+  Compose and Helm staging volumes with ephemeral-storage limits, a manual 2 GiB
+  100k/500k memory gate, and rollout/rollback documentation.
+- Key files: `video_commerce/ml/pit_streaming.py`,
+  `video_commerce/ml/pit_training_dataset.py`,
+  `video_commerce/ml/retrieval_pit_dataset.py`, `video_commerce/ml/ranking.py`,
+  `video_commerce/ml/two_tower.py`, and `scripts/pit_memory_benchmark.py`.
+- Verification: Docker backend suite `739 passed, 12 skipped`; focused PIT,
+  ranking, retrieval, release-spool, configuration, candidate-memmap, and
+  retrieval-evaluation suite `190 passed`; production backend image build,
+  Compose validation, Helm lint, strict kubeconform `36/36`, Prometheus rule
+  tests, Black, Python compilation, and diff checks passed. The manual 2 GiB
+  benchmark completed one optimizer epoch over 100k and 500k rows: peak RSS was
+  274,083,840 and 272,355,328 bytes respectively (`-0.63%` growth), with all
+  rows consumed and no residual staging generations.
+- Known gap: no real production PIT/catalog generation was available, so this
+  work does not claim model-quality or production-memory improvement.
+
 ## 2026-10-09 — Retrieval PIT and Two-Tower release gate
 
 - Added immutable, checksum-verified retrieval catalog generations and

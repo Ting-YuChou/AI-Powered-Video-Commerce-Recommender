@@ -20,7 +20,10 @@ from video_commerce.ml.retrieval_evaluation import (
     score_ann_index,
     score_full_catalog_embeddings,
 )
-from video_commerce.ml.retrieval_training import RetrievalTrainingInputs
+from video_commerce.ml.retrieval_training import (
+    RetrievalStreamingInputs,
+    RetrievalTrainingInputs,
+)
 
 
 @dataclass(frozen=True)
@@ -57,7 +60,7 @@ class RetrievalReleaseTrainingRunner:
 
     async def run_inputs(
         self,
-        inputs: RetrievalTrainingInputs,
+        inputs: RetrievalTrainingInputs | RetrievalStreamingInputs,
         *,
         model_version: str,
         output_dir: str,
@@ -65,7 +68,7 @@ class RetrievalReleaseTrainingRunner:
         champion_scores: Optional[Mapping[str, Mapping[str, float]]] = None,
         champion_release_id: Optional[str] = None,
     ) -> RetrievalReleaseTrainingOutcome:
-        if not inputs.interactions:
+        if isinstance(inputs, RetrievalTrainingInputs) and not inputs.interactions:
             raise ValueError("retrieval PIT training has no positive interactions")
         seed = int(self.gate_config.random_seed)
         random.seed(seed)
@@ -77,15 +80,35 @@ class RetrievalReleaseTrainingRunner:
         except ImportError:
             pass
         trainer = self.trainer_factory()
-        trainer.prepare(
-            list(inputs.interactions),
-            dict(inputs.product_metadata),
-            dict(inputs.product_clip_embeddings),
-            dict(inputs.user_features_map),
-            external_negatives=list(inputs.external_negatives),
-            as_of_ts=float(inputs.training_as_of_ts),
-        )
-        training_stats = dict(trainer.train())
+        try:
+            if isinstance(inputs, RetrievalStreamingInputs):
+                prepared = trainer.prepare_streaming_source(
+                    inputs.source,
+                    batch_rows=int(inputs.batch_rows),
+                    ranker_rejected_mode=str(
+                        getattr(self.config, "retrieval_ranker_rejected_mode", "weak")
+                    ),
+                )
+                if int(prepared.get("num_samples", 0)) <= 0:
+                    raise ValueError(
+                        "retrieval PIT training has no positive interactions"
+                    )
+            else:
+                trainer.prepare(
+                    list(inputs.interactions),
+                    dict(inputs.product_metadata),
+                    dict(inputs.product_clip_embeddings),
+                    dict(inputs.user_features_map),
+                    external_negatives=list(inputs.external_negatives),
+                    as_of_ts=float(inputs.training_as_of_ts),
+                )
+            training_stats = dict(trainer.train())
+        finally:
+            sample_store = getattr(trainer, "_train_samples", None)
+            if hasattr(sample_store, "cleanup"):
+                sample_store.cleanup()
+            elif hasattr(sample_store, "close"):
+                sample_store.close()
         bundle = dict(self.bundle_writer(trainer, output_dir, model_version))
         payload = {
             **dict(lineage),
@@ -145,12 +168,20 @@ class RetrievalReleaseTrainingRunner:
         comparison_scores = champion_scores or popularity_scores
         popularity_metrics = evaluate_full_catalog(queries, popularity_scores)
         champion_metrics = evaluate_full_catalog(queries, comparison_scores)
-        challenger_metrics = evaluate_full_catalog(queries, challenger_scores)
+        encoding_coverage = len(bundle["item_embeddings"]) / max(
+            len(inputs.product_metadata), 1
+        )
+        challenger_metrics = evaluate_full_catalog(
+            queries,
+            challenger_scores,
+            encoding_coverage=encoding_coverage,
+        )
         gate = evaluate_retrieval_gate(
             queries,
             comparison_scores,
             challenger_scores,
             self.gate_config,
+            challenger_encoding_coverage=encoding_coverage,
         )
         await self.system_store.record_model_release_evaluation(
             release_id=str(record.payload["model_release_id"]),
@@ -278,13 +309,21 @@ def write_two_tower_bundle(
     }
 
 
-def _popularity_scores(inputs: RetrievalTrainingInputs):
+def _popularity_scores(inputs: RetrievalTrainingInputs | RetrievalStreamingInputs):
     counts: dict[str, float] = {
         product_id: 0.0 for product_id in inputs.product_metadata
     }
-    for interaction in inputs.interactions:
-        product_id = str(interaction["product_id"])
-        counts[product_id] = counts.get(product_id, 0.0) + 1.0
+    if isinstance(inputs, RetrievalStreamingInputs):
+        for rows in inputs.source.iter_row_batches(
+            split="training", batch_rows=inputs.batch_rows, seed=42, epoch=0
+        ):
+            for row in rows:
+                if row.label_type in {"click", "add_to_cart", "purchase"}:
+                    counts[row.product_id] = counts.get(row.product_id, 0.0) + 1.0
+    else:
+        for interaction in inputs.interactions:
+            product_id = str(interaction["product_id"])
+            counts[product_id] = counts.get(product_id, 0.0) + 1.0
     return {
         query.query_id: {
             product_id: float(counts.get(product_id, 0.0))

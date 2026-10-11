@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from video_commerce.ml.retrieval_evaluation import (
     RetrievalEvaluationConfig,
@@ -11,7 +12,10 @@ from video_commerce.ml.retrieval_evaluation import (
 )
 from video_commerce.ml.retrieval_pit_dataset import RetrievalHoldoutWindow
 from video_commerce.ml.retrieval_release_training import RetrievalReleaseTrainingRunner
-from video_commerce.ml.retrieval_training import RetrievalTrainingInputs
+from video_commerce.ml.retrieval_training import (
+    RetrievalStreamingInputs,
+    RetrievalTrainingInputs,
+)
 
 
 class FakeTrainer:
@@ -64,6 +68,52 @@ class FakeStore:
     async def stage_model_release(self, **kwargs):
         self.staged = kwargs
         return True
+
+
+def test_streaming_prepare_failure_cleans_run_scoped_sample_store(tmp_path):
+    sample_path = tmp_path / "sample-store.sqlite3"
+
+    class SampleStore:
+        def cleanup(self):
+            sample_path.unlink(missing_ok=True)
+
+    class FailingTrainer:
+        def prepare_streaming_source(self, *_args, **_kwargs):
+            sample_path.write_text("partial", encoding="utf-8")
+            self._train_samples = SampleStore()
+            raise ValueError("invalid streaming row")
+
+    inputs = RetrievalStreamingInputs(
+        source=object(),
+        product_metadata={},
+        product_clip_embeddings={},
+        holdout_queries=(),
+        holdout_window=RetrievalHoldoutWindow(10.0, 20.0),
+        training_as_of_ts=9.0,
+        batch_rows=2,
+    )
+    runner = RetrievalReleaseTrainingRunner(
+        recommendation_config=SimpleNamespace(
+            retrieval_ranker_rejected_mode="weak",
+            retrieval_release_environment="production",
+        ),
+        artifact_manager=FakeArtifactManager(),
+        system_store=FakeStore(),
+        trainer_factory=FailingTrainer,
+        gate_config=RetrievalEvaluationConfig(),
+    )
+
+    with pytest.raises(ValueError, match="invalid streaming row"):
+        asyncio.run(
+            runner.run_inputs(
+                inputs,
+                model_version="tt-failure",
+                output_dir=str(tmp_path),
+                lineage={},
+            )
+        )
+
+    assert not sample_path.exists()
 
 
 def test_pit_training_registers_evaluates_and_stages_only_after_gate_pass(tmp_path):

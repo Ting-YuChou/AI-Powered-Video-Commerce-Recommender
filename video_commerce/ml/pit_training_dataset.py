@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
-from typing import Any, Dict, List
+from pathlib import Path
+import shutil
+import sqlite3
+import time
+from typing import Any, Dict, List, Mapping
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from video_commerce.common.feature_history_contracts import payload_sha256
-from video_commerce.common.models import CandidateProduct, UserFeatures
+from video_commerce.common.models import CandidateProduct, ContentFeatures, UserFeatures
 from video_commerce.ml.content_artifacts import load_content_feature_artifact
+from video_commerce.ml.content_artifacts import (
+    SUPPORTED_CONTENT_ARTIFACT_SCHEMA_VERSIONS,
+)
 from video_commerce.ml.candidate_embedding_sidecar import (
     CANDIDATE_SIDECAR_SCHEMA_VERSION,
     CandidateEmbeddingSidecar,
@@ -25,6 +33,11 @@ from video_commerce.ml.ranking_training import (
     RANKING_LABEL_DEFINITION_VERSION,
     AttributionFacts,
     RankingTrainingExample,
+)
+from video_commerce.ml.pit_streaming import (
+    PitSpoolBuilder,
+    VerifiedPitSource,
+    iter_arrow_batch_rows,
 )
 
 
@@ -52,6 +65,240 @@ class PitTrainingDataset:
     min_as_of_ts: float = 0.0
     max_as_of_ts: float = 0.0
     manifest_sha256: str = ""
+
+
+class RankingTrainingSource:
+    """Re-iterable typed ranking examples backed by one verified SQLite spool."""
+
+    def __init__(
+        self,
+        source: VerifiedPitSource,
+        *,
+        feature_definition_version: str,
+        label_definition_version: str,
+        content_cache_bytes: int = 512 * 1024 * 1024,
+        observability=None,
+    ) -> None:
+        self.source = source
+        self.feature_definition_version = str(feature_definition_version)
+        self.label_definition_version = str(label_definition_version)
+        self.content_cache_bytes = max(0, int(content_cache_bytes))
+        self._content_cache: OrderedDict[str, tuple[int, Any]] = OrderedDict()
+        self._content_cache_size = 0
+        self._candidate_sidecar = self._load_candidate_sidecar()
+        self.observability = observability
+
+    @property
+    def path(self) -> Path:
+        return self.source.path
+
+    @property
+    def work_dir(self) -> Path:
+        return self.source.path.parent.parent / "work"
+
+    @property
+    def row_count(self) -> int:
+        return self.source.row_count
+
+    @property
+    def group_count(self) -> int:
+        return self.source.group_count
+
+    @property
+    def lineage(self) -> Mapping[str, Any]:
+        return dict(self.source.metadata.get("lineage") or {})
+
+    def __getattr__(self, name: str):
+        lineage_aliases = {
+            "dataset_version": "dataset_version",
+            "materialization_run_id": "materialization_run_id",
+            "manifest_uri": "manifest_uri",
+            "iceberg_snapshot_id": "iceberg_snapshot_id",
+            "schema_hash": "schema_hash",
+            "quarantine_rows": "quarantine_rows",
+            "attribution_cutoff": "attribution_cutoff",
+            "min_as_of_ts": "min_as_of_ts",
+            "max_as_of_ts": "max_as_of_ts",
+            "manifest_sha256": "manifest_sha256",
+        }
+        if name in lineage_aliases:
+            return self.lineage.get(lineage_aliases[name])
+        if name == "candidate_embedding_sidecar":
+            return self.lineage.get("candidate_embedding_sidecar")
+        raise AttributeError(name)
+
+    def assign_splits(
+        self,
+        *,
+        holdout_days: int,
+        attribution_cutoff: float,
+        validation_fraction: float,
+    ) -> None:
+        self.source.assign_ranking_splits(
+            holdout_days=holdout_days,
+            attribution_cutoff=attribution_cutoff,
+            validation_fraction=validation_fraction,
+        )
+
+    def row_count_for_split(self, split: str) -> int:
+        return self.source.row_count_for_split(split)
+
+    def reindex_value_buckets(self, resolver) -> None:
+        def resolve_payload(payload: Mapping[str, Any]) -> int:
+            metadata = payload.get("product_metadata")
+            if metadata is None and payload.get("product_metadata_json") is not None:
+                metadata = json.loads(payload["product_metadata_json"])
+            return int(resolver(metadata if isinstance(metadata, dict) else {}))
+
+        self.source.reindex_value_buckets(resolve_payload)
+
+    def compute_value_transform_stats(self, **kwargs):
+        return self.source.compute_value_transform_stats(**kwargs)
+
+    def value_mask_coverage(self, split: str = "training") -> float:
+        return self.source.value_mask_coverage(split)
+
+    def evaluation_slice_stats(self) -> Mapping[str, Any]:
+        exposures: dict[str, int] = {}
+        prices_db = sqlite3.connect(":memory:")
+        prices_db.execute("CREATE TABLE prices(value REAL NOT NULL)")
+        try:
+            for examples in self.iter_example_batches(
+                split="training", batch_rows=1024, seed=42, epoch=0
+            ):
+                for example in examples:
+                    product_id = str(example.bundle.candidate.product_id)
+                    exposures[product_id] = exposures.get(product_id, 0) + 1
+                    prices_db.execute(
+                        "INSERT INTO prices(value) VALUES (?)",
+                        (
+                            float(
+                                example.bundle.product_metadata.get("price", 0.0) or 0.0
+                            ),
+                        ),
+                    )
+            prices_db.commit()
+            count = int(prices_db.execute("SELECT COUNT(*) FROM prices").fetchone()[0])
+            if count:
+                position = (count - 1) * 0.9
+                lower_index = int(np.floor(position))
+                upper_index = int(np.ceil(position))
+                lower = float(
+                    prices_db.execute(
+                        "SELECT value FROM prices ORDER BY value LIMIT 1 OFFSET ?",
+                        (lower_index,),
+                    ).fetchone()[0]
+                )
+                upper = float(
+                    prices_db.execute(
+                        "SELECT value FROM prices ORDER BY value LIMIT 1 OFFSET ?",
+                        (upper_index,),
+                    ).fetchone()[0]
+                )
+                price_p90 = lower + (upper - lower) * (position - lower_index)
+            else:
+                price_p90 = float("inf")
+        finally:
+            prices_db.close()
+        ordered = sorted(exposures, key=lambda product: (-exposures[product], product))
+        head_count = max(1, int(np.ceil(len(ordered) * 0.2))) if ordered else 0
+        return {
+            "exposures": exposures,
+            "head_products": frozenset(ordered[:head_count]),
+            "high_price_threshold": price_p90,
+        }
+
+    def iter_example_batches(
+        self,
+        *,
+        split: str,
+        batch_rows: int,
+        seed: int,
+        epoch: int = 0,
+    ):
+        for rows in self.source.iter_group_batches(
+            split=split,
+            batch_rows=batch_rows,
+            seed=seed,
+            epoch=epoch,
+        ):
+            if self.observability is not None:
+                self.observability.observe_pit_stream_batch("ranking", len(rows))
+            examples = []
+            for row in rows:
+                example = PitTrainingDatasetReader._normalize_training_row(
+                    row,
+                    self.feature_definition_version,
+                    self.label_definition_version,
+                )
+                reference = example.bundle.context.get("content_feature_ref")
+                if isinstance(reference, dict):
+                    example = replace(
+                        example,
+                        multimodal_content=self._load_content(reference),
+                    )
+                if self._candidate_sidecar is not None:
+                    values = self._candidate_sidecar.get(
+                        example.bundle.candidate.product_id,
+                        as_of_ts=example.bundle.as_of_ts,
+                    )
+                    embeddings: Dict[str, Any] = {}
+                    if values is not None:
+                        presence = values.pop("presence")
+                        for index, modality in enumerate(
+                            ("image", "text", "two_tower")
+                        ):
+                            if bool(presence[index]):
+                                embeddings[modality] = values[modality].tolist()
+                        embeddings["available_at"] = float(values["available_at"])
+                    example = replace(example, candidate_embeddings=embeddings)
+                examples.append(example)
+            yield examples
+
+    def _load_candidate_sidecar(self):
+        reference = self.lineage.get("candidate_embedding_sidecar")
+        if not isinstance(reference, dict):
+            return None
+        relative = str(reference.get("staged_path") or "")
+        if not relative:
+            return None
+        return CandidateEmbeddingSidecar.load_memmap(self.path / relative)
+
+    def _load_content(self, reference: Mapping[str, Any]):
+        digest = str(reference.get("sha256") or "")
+        cached = self._content_cache.pop(digest, None)
+        if cached is not None:
+            if self.observability is not None:
+                self.observability.record_pit_stream_cache("hit")
+            self._content_cache[digest] = cached
+            return cached[1]
+        path = self.path / "content" / f"{digest}.json"
+        if self.observability is not None:
+            self.observability.record_pit_stream_cache("miss")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise PitTrainingDatasetError("staged content artifact checksum mismatch")
+        payload = json.loads(raw)
+        features = ContentFeatures(**payload["features"])
+        features.artifact_uri = str(reference.get("uri") or "")
+        features.artifact_sha256 = digest
+        features.artifact_schema_version = str(reference.get("schema_version") or "")
+        features.artifact_created_at = float(
+            reference.get("created_at")
+            if reference.get("created_at") is not None
+            else payload.get("created_at")
+        )
+        size = len(raw)
+        if size <= self.content_cache_bytes:
+            while (
+                self._content_cache
+                and self._content_cache_size + size > self.content_cache_bytes
+            ):
+                _, (evicted_size, _) = self._content_cache.popitem(last=False)
+                self._content_cache_size -= evicted_size
+            self._content_cache[digest] = (size, features)
+            self._content_cache_size += size
+        return features
 
 
 def arrow_schema_sha256(schema: pa.Schema) -> str:
@@ -87,6 +334,342 @@ class PitTrainingDatasetReader:
                     type(exc).__name__
                 )
             raise
+
+    async def validate_and_stage(
+        self,
+        dataset_uri: str,
+        *,
+        staging_dir: str | Path,
+        batch_rows: int,
+        max_group_rows: int,
+        max_bytes: int,
+        content_cache_bytes: int = 512 * 1024 * 1024,
+    ) -> RankingTrainingSource:
+        """Validate a pinned manifest batchwise before exposing any training row."""
+        validation_started = time.monotonic()
+        pointer = await self._read_json_uri(dataset_uri, kind="latest pointer")
+        manifest_uri = str(pointer.get("manifest_uri") or "").strip()
+        pointer_run_id = str(pointer.get("materialization_run_id") or "").strip()
+        if not manifest_uri or not pointer_run_id:
+            raise PitTrainingDatasetError(
+                "PIT latest pointer is missing manifest_uri or materialization_run_id"
+            )
+        manifest = await self._read_json_uri(manifest_uri, kind="manifest")
+        contract = self._validate_streaming_manifest(manifest, pointer_run_id)
+        manifest_sha = payload_sha256(manifest)
+        sidecar_reference = self._validate_candidate_sidecar_reference(
+            manifest.get("candidate_embedding_sidecar"),
+            minimum_as_of=contract["min_as_of_ts"],
+        )
+        lineage = {
+            **contract,
+            "manifest_uri": manifest_uri,
+            "manifest_sha256": manifest_sha,
+            "pit_reader_mode": "streaming",
+            "pit_stream_contract_version": "pit_stream_v1",
+            "candidate_embedding_sidecar": sidecar_reference,
+        }
+        builder = PitSpoolBuilder(
+            staging_dir,
+            generation_id=f"ranking-{manifest_sha}",
+            kind="ranking",
+            max_group_rows=max_group_rows,
+            max_bytes=max_bytes,
+            lineage=lineage,
+        )
+        content_references: dict[str, dict[str, Any]] = {}
+        try:
+            pinned_schema: pa.Schema | None = None
+            seen_rows = 0
+            for shard in manifest["shards"]:
+                path, cleanup = await self._materialize_streaming_shard(shard)
+                try:
+                    parquet = pq.ParquetFile(path)
+                    schema = parquet.schema_arrow
+                    if arrow_schema_sha256(schema) != contract["schema_hash"]:
+                        raise PitTrainingDatasetError(
+                            f"PIT Parquet shard schema mismatch for {shard['uri']}"
+                        )
+                    if pinned_schema is None:
+                        pinned_schema = schema
+                    elif schema != pinned_schema:
+                        raise PitTrainingDatasetError(
+                            "PIT Parquet shard schema mismatch"
+                        )
+                    for batch in parquet.iter_batches(
+                        batch_size=max(1, int(batch_rows))
+                    ):
+                        spool_rows = []
+                        for row in iter_arrow_batch_rows(batch):
+                            example = self._normalize_training_row(
+                                row,
+                                contract["feature_definition_version"],
+                                contract["label_definition_version"],
+                            )
+                            reference = example.bundle.context.get(
+                                "content_feature_ref"
+                            )
+                            if reference is not None:
+                                if not isinstance(reference, dict):
+                                    raise PitTrainingDatasetError(
+                                        "content artifact reference must be an object"
+                                    )
+                                content_references[
+                                    str(reference.get("sha256") or "")
+                                ] = dict(reference)
+                            spool_rows.append(
+                                {
+                                    "group_id": example.impression_id,
+                                    "row_id": example.observation_id,
+                                    "as_of_ts": example.bundle.as_of_ts,
+                                    "business_value": example.attribution.attributed_value,
+                                    "value_bucket": -1,
+                                    "is_purchase": example.attribution.attributed_purchase,
+                                    "payload": row,
+                                }
+                            )
+                        builder.add_rows(spool_rows)
+                        seen_rows += len(spool_rows)
+                finally:
+                    if cleanup and os.path.exists(path):
+                        os.remove(path)
+            if seen_rows != int(manifest["row_count"]):
+                raise PitTrainingDatasetError(
+                    f"PIT dataset row count mismatch: expected {manifest['row_count']}, got {seen_rows}"
+                )
+            for reference in content_references.values():
+                await self._stage_content_artifact(reference, builder.staging_path)
+            if sidecar_reference is not None:
+                await self._stage_candidate_sidecar(
+                    sidecar_reference, builder.staging_path
+                )
+            verified = builder.finalize(expected_rows=seen_rows)
+            source = RankingTrainingSource(
+                verified,
+                feature_definition_version=contract["feature_definition_version"],
+                label_definition_version=contract["label_definition_version"],
+                content_cache_bytes=content_cache_bytes,
+                observability=self.observability,
+            )
+            if self.observability is not None:
+                try:
+                    import psutil
+
+                    peak_rss = int(psutil.Process().memory_info().rss)
+                except Exception:
+                    peak_rss = 0
+                self.observability.observe_pit_stream_validation(
+                    kind="ranking",
+                    duration_seconds=time.monotonic() - validation_started,
+                    rows=verified.row_count,
+                    staging_bytes=verified.staging_bytes,
+                    largest_group_rows=int(
+                        verified.metadata.get("largest_group_rows", 0)
+                    ),
+                    peak_rss_bytes=peak_rss,
+                )
+            return source
+        except Exception:
+            builder.abort()
+            if self.observability is not None:
+                self.observability.record_pit_stream_failure("validation")
+            raise
+
+    def _validate_streaming_manifest(
+        self, manifest: Mapping[str, Any], pointer_run_id: str
+    ) -> dict[str, Any]:
+        if manifest.get("status") != "complete":
+            raise PitTrainingDatasetError("PIT dataset manifest is not complete")
+        run_id = str(manifest.get("materialization_run_id") or "").strip()
+        if run_id != pointer_run_id:
+            raise PitTrainingDatasetError(
+                "PIT latest pointer and manifest materialization_run_id do not match"
+            )
+        feature_version = str(manifest.get("feature_definition_version") or "")
+        label_version = str(manifest.get("label_definition_version") or "")
+        if feature_version != self.expected_feature_definition_version:
+            raise PitTrainingDatasetError(
+                "PIT dataset feature definition version does not match the trainer"
+            )
+        if label_version != self.expected_label_definition_version:
+            raise PitTrainingDatasetError(
+                "PIT dataset label definition version does not match the trainer"
+            )
+        schema_hash = str(manifest.get("schema_hash") or "")
+        if len(schema_hash) != 64:
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest has invalid schema hash"
+            )
+        if not manifest.get("iceberg_table_id") or not manifest.get(
+            "iceberg_snapshot_id"
+        ):
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest is missing Iceberg table or snapshot ID"
+            )
+        shards = manifest.get("shards")
+        if not isinstance(shards, list) or not shards:
+            raise PitTrainingDatasetError("PIT dataset manifest has no Parquet shards")
+        try:
+            attribution_cutoff = float(manifest["attribution_cutoff"])
+            min_as_of_ts = float(manifest["min_as_of_ts"])
+            max_as_of_ts = float(manifest["max_as_of_ts"])
+            row_count = int(manifest["row_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest metadata is invalid"
+            ) from exc
+        if (
+            row_count < 0
+            or not all(
+                np.isfinite(value)
+                for value in (attribution_cutoff, min_as_of_ts, max_as_of_ts)
+            )
+            or min_as_of_ts > max_as_of_ts
+            or max_as_of_ts > attribution_cutoff
+        ):
+            raise PitTrainingDatasetError(
+                "PIT dataset manifest metadata is inconsistent"
+            )
+        return {
+            "dataset_version": str(manifest.get("dataset_version") or ""),
+            "materialization_run_id": run_id,
+            "feature_definition_version": feature_version,
+            "label_definition_version": label_version,
+            "iceberg_snapshot_id": str(manifest["iceberg_snapshot_id"]),
+            "schema_hash": schema_hash,
+            "attribution_cutoff": attribution_cutoff,
+            "min_as_of_ts": min_as_of_ts,
+            "max_as_of_ts": max_as_of_ts,
+            "row_count": row_count,
+        }
+
+    async def _materialize_streaming_shard(self, shard: Any):
+        if not isinstance(shard, dict):
+            raise PitTrainingDatasetError("PIT manifest shard entry must be an object")
+        uri = str(shard.get("uri") or "").strip()
+        expected_size = int(shard.get("byte_size", -1))
+        expected_hash = str(shard.get("sha256") or "")
+        if not uri or expected_size < 0 or len(expected_hash) != 64:
+            raise PitTrainingDatasetError("PIT manifest shard entry is incomplete")
+        try:
+            path, cleanup = await self.object_storage.materialize_for_processing(
+                uri, suggested_suffix=".parquet"
+            )
+        except (OSError, FileNotFoundError) as exc:
+            raise PitTrainingDatasetError(
+                f"PIT Parquet shard is missing: {uri}"
+            ) from exc
+        if os.path.getsize(path) != expected_size:
+            if cleanup:
+                os.remove(path)
+            raise PitTrainingDatasetError(f"PIT Parquet shard size mismatch for {uri}")
+        if self._sha256(path) != expected_hash:
+            if cleanup:
+                os.remove(path)
+            raise PitTrainingDatasetError(
+                f"PIT Parquet shard checksum mismatch for {uri}"
+            )
+        return path, cleanup
+
+    def _validate_candidate_sidecar_reference(
+        self, reference: Any, *, minimum_as_of: float
+    ) -> dict[str, Any] | None:
+        if reference is None:
+            if self.require_candidate_sidecar:
+                raise PitTrainingDatasetError(
+                    "PIT dataset manifest is missing candidate sidecar"
+                )
+            return None
+        if not isinstance(reference, dict):
+            raise PitTrainingDatasetError(
+                "PIT candidate sidecar reference must be an object"
+            )
+        resolved = dict(reference)
+        try:
+            training_cutoff = float(resolved.get("training_cutoff"))
+        except (TypeError, ValueError) as exc:
+            raise PitTrainingDatasetError(
+                "PIT candidate sidecar training cutoff is invalid"
+            ) from exc
+        if (
+            not str(resolved.get("uri") or "")
+            or len(str(resolved.get("sha256") or "")) != 64
+            or resolved.get("schema_version") != CANDIDATE_SIDECAR_SCHEMA_VERSION
+            or not str(resolved.get("model_version") or "")
+            or not np.isfinite(training_cutoff)
+            or training_cutoff < 0.0
+            or training_cutoff > minimum_as_of
+        ):
+            raise PitTrainingDatasetError(
+                "PIT candidate sidecar reference is incomplete or incompatible"
+            )
+        resolved["training_cutoff"] = training_cutoff
+        resolved["staged_path"] = "sidecars/candidates"
+        return resolved
+
+    async def _stage_candidate_sidecar(
+        self, reference: Mapping[str, Any], staging_path: Path
+    ) -> None:
+        path, cleanup = await self.object_storage.materialize_for_processing(
+            str(reference["uri"]), suggested_suffix=".npz"
+        )
+        try:
+            CandidateEmbeddingSidecar.materialize_memmap(
+                path,
+                staging_path / str(reference["staged_path"]),
+                expected_sha256=str(reference["sha256"]),
+                expected_model_version=str(reference["model_version"]),
+                expected_training_cutoff=float(reference["training_cutoff"]),
+            )
+        except (OSError, ValueError) as exc:
+            raise PitTrainingDatasetError(
+                f"unable to resolve PIT candidate sidecar: {exc}"
+            ) from exc
+        finally:
+            if cleanup and os.path.exists(path):
+                os.remove(path)
+
+    async def _stage_content_artifact(
+        self, reference: Mapping[str, Any], staging_path: Path
+    ) -> None:
+        uri = str(reference.get("uri") or "")
+        digest = str(reference.get("sha256") or "")
+        schema = str(reference.get("schema_version") or "")
+        content_id = str(reference.get("content_id") or "")
+        if (
+            not uri
+            or len(digest) != 64
+            or schema not in SUPPORTED_CONTENT_ARTIFACT_SCHEMA_VERSIONS
+            or not content_id
+        ):
+            raise PitTrainingDatasetError(
+                "content artifact reference is incomplete or incompatible"
+            )
+        path, cleanup = await self.object_storage.materialize_for_processing(
+            uri, suggested_suffix=".json"
+        )
+        try:
+            raw = Path(path).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise PitTrainingDatasetError("content artifact checksum mismatch")
+            payload = json.loads(raw)
+            if payload.get("schema_version") != schema:
+                raise PitTrainingDatasetError("content artifact schema mismatch")
+            features = ContentFeatures(**payload["features"])
+            if features.content_id != content_id:
+                raise PitTrainingDatasetError("content artifact content_id mismatch")
+            target = staging_path / "content" / f"{digest}.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            if isinstance(exc, PitTrainingDatasetError):
+                raise
+            raise PitTrainingDatasetError(
+                f"unable to resolve PIT content artifact: {exc}"
+            ) from exc
+        finally:
+            if cleanup and os.path.exists(path):
+                os.remove(path)
 
     async def _read_pinned(self, dataset_uri: str) -> PitTrainingDataset:
         pointer = await self._read_json_uri(dataset_uri, kind="latest pointer")

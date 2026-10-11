@@ -152,3 +152,17 @@ jobs:
           name: flink-recovery-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/flink-recovery-artifacts
           if-no-files-found: warn
+
+  pit-memory-benchmark:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build benchmark image
+        run: docker build --target test -t video-commerce-pit-benchmark:ci .
+      - name: Run bounded-memory 100k/500k comparison
+        run: >-
+          docker run --rm --memory=2g --memory-swap=2g
+          video-commerce-pit-benchmark:ci
+          python scripts/pit_memory_benchmark.py --rows 100000 500000

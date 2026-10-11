@@ -7,12 +7,34 @@ import pytest
 from video_commerce.ml.model_release_quality import (
     GateDecision,
     RankingEvaluationRow,
+    RankingEvaluationSpool,
     RankingPrediction,
     RankingQualityGateConfig,
     evaluate_quality_gate,
     split_fixed_holdout,
     split_training_examples_fixed_holdout,
 )
+
+
+def test_ranking_evaluation_spool_round_trips_compact_records(tmp_path):
+    row = _row(
+        impression="i1",
+        user="u1",
+        product="p1",
+        timestamp=100.0,
+        relevance=2.0,
+        clicked=True,
+    )
+    prediction = RankingPrediction(0.8, 0.7, 0.4, 12.0)
+    spool = RankingEvaluationSpool(tmp_path / "evaluation.sqlite3")
+    spool.add(row, prediction, prediction)
+
+    rows, champion, challenger = spool.load()
+    spool.close()
+
+    assert rows == [row]
+    assert champion[row.observation_id] == prediction
+    assert challenger[row.observation_id] == prediction
 
 
 def _row(

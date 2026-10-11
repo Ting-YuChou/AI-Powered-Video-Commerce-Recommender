@@ -158,6 +158,41 @@ def test_retrieval_reader_pins_catalog_and_preserves_missing_modalities(tmp_path
     assert dataset.rows[0].user_features == {"total_interactions": 4}
 
 
+def test_retrieval_streaming_reader_stages_rows_without_full_table(
+    tmp_path, monkeypatch
+):
+    latest = _write_retrieval_dataset(tmp_path / "dataset")
+    reader = RetrievalPitDatasetReader(LocalObjectStorage())
+    monkeypatch.setattr(
+        pq,
+        "read_table",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("streaming reader must not call read_table")
+        ),
+    )
+
+    source = asyncio.run(
+        reader.validate_and_stage(
+            str(latest),
+            staging_dir=tmp_path / "staging",
+            batch_rows=1,
+            max_group_rows=16,
+            max_bytes=10_000_000,
+        )
+    )
+
+    assert source.row_count == 1
+    assert source.group_count == 1
+    rows = [
+        row
+        for batch in source.iter_row_batches(split="all", batch_rows=1, seed=42)
+        for row in batch
+    ]
+    assert rows[0].query_id == "q1"
+    assert rows[0].user_features == {"total_interactions": 4}
+    assert source.lineage["pit_stream_contract_version"] == "pit_stream_v1"
+
+
 @pytest.mark.parametrize(
     ("row_overrides", "message"),
     [
