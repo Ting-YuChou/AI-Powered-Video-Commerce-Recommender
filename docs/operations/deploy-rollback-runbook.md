@@ -4,6 +4,10 @@ See [Event and artifact reliability](event-and-artifact-reliability.md) for
 the migration order, vector activation gate, durable impression flow, and
 score-policy rollback contract.
 
+See [Flink realtime feature recovery](flink-realtime-recovery.md) for
+interaction-feature savepoints, state epochs, late-event quarantine, and
+bounded DLQ replay.
+
 ## Deploy
 1. Apply additive migrations in order through
    `migrations/postgres/010_model_release_quality_gate.sql`. The gateway must not

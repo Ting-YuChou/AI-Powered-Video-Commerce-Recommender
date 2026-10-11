@@ -289,6 +289,50 @@ groups:
           summary: Flink interaction feature job is missing or duplicated
           description: Restore exactly one running video-commerce-interaction-features job before trusting official online features.
 
+      - alert: FlinkRedisSnapshotConflict
+        expr: increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_conflict[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Flink Redis snapshot version conflict detected
+          description: Stop cutover and inspect state epoch, generation, digest, and concurrent official writers.
+
+      - alert: FlinkRedisSnapshotWriteFailure
+        expr: increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_failure[10m]) > 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Flink Redis snapshot writes are repeatedly failing
+          description: Inspect Redis availability, Lua errors, and Flink restart/checkpoint state.
+
+      - alert: FlinkInteractionWatermarkLag
+        expr: (time() * 1000) - max(flink_taskmanager_job_task_operator_currentInputWatermark{job_name="video-commerce-interaction-features"}) > 900000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Flink interaction watermark is over 15 minutes behind
+          description: Inspect Kafka partition activity, idleness detection, consumer lag, and late-event volume.
+
+      - alert: FlinkCheckpointUnavailable
+        expr: time() - max(flink_jobmanager_job_lastCheckpointCompletionTimestamp{job_name="video-commerce-interaction-features"}) / 1000 > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Flink interaction job has no recent successful checkpoint
+          description: Pause replay and cutover until checkpoint storage and job health recover.
+
+      - alert: FlinkLatePurchaseSustained
+        expr: sum(increase(flink_taskmanager_job_task_operator_late_interactions_5m_purchase_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Late purchase events are continuously missing realtime windows
+          description: Reconcile the quarantine topic and inspect producer clocks, Kafka lag, and watermark policy.
+
       - alert: RecommendationOutboxBacklog
         expr: video_commerce_recommendation_outbox_oldest_age_seconds > 300 or video_commerce_recommendation_outbox_pending > 10000
         for: 5m

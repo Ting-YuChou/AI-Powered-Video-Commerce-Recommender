@@ -272,6 +272,8 @@ class InteractionFeatureJobTest {
 
     assertEquals("recommendation-events", payload.get("source_topic"));
     assertEquals("IllegalArgumentException", payload.get("error_type"));
+    assertEquals(2, payload.get("schema_version"));
+    assertEquals(payload.get("event_id"), event.payload().get("event_id"));
   }
 
   @Test
@@ -451,6 +453,8 @@ class InteractionFeatureJobTest {
                 + "\"occurred_at\":1,\"context\":{\"product_category\":\"shoes\"}}"));
 
     InteractionFeatureJob.UserFeatureSnapshot snapshot = accumulator.snapshot();
+    snapshot.stateEpoch = 7;
+    snapshot.snapshotDigest = InteractionFeatureJob.snapshotDigest(snapshot);
 
     assertEquals(2, snapshot.totalInteractions);
     assertEquals(1, snapshot.totalViews);
@@ -459,6 +463,10 @@ class InteractionFeatureJobTest {
     assertEquals("p1", snapshot.sequence.get(0).productId);
     assertEquals("p2", snapshot.sequence.get(1).productId);
     assertEquals("e2", snapshot.sequenceToken().get("latest_event_id"));
+    assertEquals(2, snapshot.generation);
+    assertEquals("e1", snapshot.sequenceDelta.eventId);
+    assertEquals(7L, snapshot.sequenceToken().get("state_epoch"));
+    assertEquals(64, snapshot.snapshotDigest.length());
 
     snapshot.availableAt = 3.0;
     Map<String, Object> kafkaEvent =
@@ -471,6 +479,65 @@ class InteractionFeatureJobTest {
     assertEquals("ranking_ltr_v1", kafkaEvent.get("feature_definition_version"));
     assertEquals(2.0, kafkaEvent.get("event_time"));
     assertEquals(3.0, kafkaEvent.get("available_at"));
+  }
+
+  @Test
+  void replayHorizonRequiresOneExtraDayOfDedupeState() {
+    InteractionFeatureJob.JobConfig config = new InteractionFeatureJob.JobConfig();
+    config.featureStateEpoch = 1;
+    config.watermarkIdlenessSeconds = 60;
+    config.replayHorizonDays = 7;
+    config.dedupStateTtlDays = 7;
+
+    assertThrows(IllegalArgumentException.class, config::validate);
+
+    config.dedupStateTtlDays = 8;
+    config.validate();
+  }
+
+  @Test
+  void operatorIdManifestLocksExistingStatefulVertices() throws Exception {
+    Map<String, Object> manifest =
+        JSON.readValue(
+            Files.readString(Path.of("operator-id-manifest.json")),
+            new TypeReference<Map<String, Object>>() {});
+    Map<String, Object> ids = (Map<String, Object>) manifest.get("stateful_job_vertices");
+
+    assertEquals(
+        "baf1e4c622ccdfb35723ebd10e622fa5", ids.get("dedupe-by-event-id"));
+    assertEquals(
+        "8347a046395918dded45c1e79a2e6b85", ids.get("user-feature-snapshots"));
+    assertEquals(ids.get("window-5m"), InteractionFeatureJob.windowUidHash("5m"));
+    assertEquals(ids.get("window-1h"), InteractionFeatureJob.windowUidHash("1h"));
+    assertEquals(ids.get("window-24h"), InteractionFeatureJob.windowUidHash("24h"));
+  }
+
+  @Test
+  void productionRequiresExplicitStateEpoch() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> InteractionFeatureJob.JobConfig.validateProductionStateEpoch("production", null));
+    InteractionFeatureJob.JobConfig.validateProductionStateEpoch("production", "4");
+    InteractionFeatureJob.JobConfig.validateProductionStateEpoch("development", null);
+  }
+
+  @Test
+  void lateEventStillAdvancesGenerationAndLifetimeCounters() throws Exception {
+    InteractionFeatureJob.UserAccumulator accumulator =
+        new InteractionFeatureJob.UserAccumulator("u1");
+    accumulator.apply(
+        InteractionFeatureJob.parseInteractionEvent(
+            "{\"event_id\":\"new\",\"user_id\":\"u1\",\"product_id\":\"p1\","
+                + "\"action\":\"click\",\"occurred_at\":100}"));
+    accumulator.apply(
+        InteractionFeatureJob.parseInteractionEvent(
+            "{\"event_id\":\"late\",\"user_id\":\"u1\",\"product_id\":\"p2\","
+                + "\"action\":\"purchase\",\"occurred_at\":1}"));
+
+    InteractionFeatureJob.UserFeatureSnapshot snapshot = accumulator.snapshot();
+    assertEquals(2, snapshot.generation);
+    assertEquals(1, snapshot.totalPurchases);
+    assertEquals("late", snapshot.sequenceDelta.eventId);
   }
 
   @Test
