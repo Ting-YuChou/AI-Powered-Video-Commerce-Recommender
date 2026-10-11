@@ -53,6 +53,10 @@ POSITIVE_SEQUENCE_ACTIONS = {
 
 REALTIME_WINDOW_NAMES = ("5m", "1h", "24h")
 
+ATOMIC_USER_CONTEXT_READ_LUA = """
+return {redis.call('GET', KEYS[1]), redis.call('GET', KEYS[2])}
+""".strip()
+
 
 class FeatureStore:
     """
@@ -475,10 +479,21 @@ class FeatureStore:
             client = self._client_for_key_type("user_features")
             feature_key = f"{self.prefixes['user_features']}{user_id}"
             sequence_key = self._user_sequence_token_key(user_id, sequence_limit)
-            pipeline = client.pipeline(transaction=False)
-            pipeline.get(feature_key)
-            pipeline.get(sequence_key)
-            feature_data, token_data = await pipeline.execute()
+            try:
+                feature_data, token_data = await client.eval(
+                    ATOMIC_USER_CONTEXT_READ_LUA,
+                    2,
+                    feature_key,
+                    sequence_key,
+                )
+            except (AttributeError, NotImplementedError):
+                # Compatibility for lightweight local Redis substitutes. Production
+                # Redis uses the read-only Lua path so both values share one server
+                # execution point and cannot straddle a Flink snapshot commit.
+                pipeline = client.pipeline(transaction=False)
+                pipeline.get(feature_key)
+                pipeline.get(sequence_key)
+                feature_data, token_data = await pipeline.execute()
 
             if feature_data:
                 user_features = self._decode_user_features(user_id, feature_data)
@@ -1200,7 +1215,7 @@ class FeatureStore:
             return cls._empty_user_sequence_token()
         if not isinstance(decoded, dict):
             return cls._empty_user_sequence_token()
-        return {
+        token = {
             "length": int(decoded.get("length") or 0),
             "latest_event_id": decoded.get("latest_event_id"),
             "latest_occurred_at": round(
@@ -1209,6 +1224,10 @@ class FeatureStore:
             "latest_product_id": decoded.get("latest_product_id"),
             "latest_action": decoded.get("latest_action"),
         }
+        for key in ("state_epoch", "generation", "snapshot_digest"):
+            if key in decoded:
+                token[key] = decoded[key]
+        return token
 
     @staticmethod
     def _empty_user_sequence_token() -> Dict[str, Any]:

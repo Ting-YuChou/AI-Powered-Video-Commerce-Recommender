@@ -637,3 +637,38 @@
   Python compile, and diff checks passed. No online canary or performance claim
   is included; assignment, propensity, SRM, and uplift gates remain a later
   phase.
+
+## 2026-10-10 — Flink online feature recovery and replay
+
+- Replaced full user-sequence rewrites with one atomic Redis Lua commit per
+  interaction. The commit versions feature, sequence delta, DIN action delta,
+  compact token, and `ufm:*` metadata by state epoch, per-user generation, and
+  deterministic digest; stale writes are ignored and split-brain conflicts fail
+  the sink. Realtime window writes now use equivalent window/revision metadata,
+  while serving reads feature and token through one read-only Lua execution.
+- Added idle-partition watermark handling, eight-day event dedupe for the
+  seven-day replay horizon, bounded lifetime-state metrics, deterministic late
+  event quarantine, deterministic DLQ v2 IDs, and production validation for an
+  explicit feature-state epoch. Captured the pre-change stateful JobVertex IDs
+  from commit `35a1601` and locked them in the job plus an operator manifest.
+- Added exact-one status/savepoint/stop/restore/verify operations, explicit
+  Compose savepoint restore, a bounded dry-run-first DLQ replay CLI, reliability
+  alerts/dashboard, recovery runbook, and an isolated PR recovery-drill CI job.
+  Replay audit rows retain hashes and source/destination coordinates without
+  copying payloads, keys, or headers, and timeout rather than silently stopping
+  before the fixed partition end offsets.
+- Key files: `flink-jobs/interaction-features/src/main/java/com/videocommerce/flink/InteractionFeatureJob.java`,
+  `flink-jobs/interaction-features/operator-id-manifest.json`,
+  `scripts/flink_realtime_ops.sh`, `scripts/replay_kafka_dlq.py`,
+  `scripts/run_flink_recovery_drill.sh`, and
+  `docs/operations/flink-realtime-recovery.md`.
+- Verification: Flink Maven passed 35 tests; focused Python and monitoring
+  suites passed 32 tests; Prometheus rule tests, Compose validation, shell/Python
+  syntax, dashboard JSON, and diff checks passed. The isolated recovery drill
+  passed savepoint restore, idle watermark progress, deterministic late purchase
+  quarantine, DLQ dry-run, two executed replays, exactly-once feature effect,
+  recent job health, and automatic `down -v` cleanup. The GitHub-hosted recovery
+  drill passed in 3m06s on PR #39, and `main` branch protection now requires the
+  `flink-recovery-drill` check with strict up-to-date branch enforcement.
+  The hosted drill also waits for the restored job and eventual Postgres sink
+  state explicitly, and reports the failing shell line in uploaded diagnostics.

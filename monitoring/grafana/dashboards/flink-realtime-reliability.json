@@ -1,0 +1,29 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {"type":"timeseries","title":"Redis round trips and outcomes","targets":[
+      {"expr":"sum(rate(flink_taskmanager_job_task_operator_redis_snapshot_sink_network_round_trips[5m]))","legendFormat":"round trips/s"},
+      {"expr":"sum(rate(flink_taskmanager_job_task_operator_redis_snapshot_sink_duplicate[5m]))","legendFormat":"duplicate/s"},
+      {"expr":"sum(rate(flink_taskmanager_job_task_operator_redis_snapshot_sink_stale[5m]))","legendFormat":"stale/s"},
+      {"expr":"sum(rate(flink_taskmanager_job_task_operator_redis_snapshot_sink_conflict[5m]))","legendFormat":"conflict/s"}
+    ],"gridPos":{"h":8,"w":12,"x":0,"y":0}},
+    {"type":"timeseries","title":"Redis last write latency","targets":[
+      {"expr":"max(flink_taskmanager_job_task_operator_redis_snapshot_sink_last_write_latency_micros)","legendFormat":"microseconds"}
+    ],"gridPos":{"h":8,"w":12,"x":12,"y":0}},
+    {"type":"timeseries","title":"Watermark lag","targets":[
+      {"expr":"(time()*1000)-max(flink_taskmanager_job_task_operator_currentInputWatermark{job_name=\"video-commerce-interaction-features\"})","legendFormat":"lag ms"}
+    ],"gridPos":{"h":8,"w":12,"x":0,"y":8}},
+    {"type":"timeseries","title":"Checkpoint duration and state size","targets":[
+      {"expr":"max(flink_jobmanager_job_lastCheckpointDuration{job_name=\"video-commerce-interaction-features\"})","legendFormat":"checkpoint ms"},
+      {"expr":"max(flink_jobmanager_job_lastCheckpointSize{job_name=\"video-commerce-interaction-features\"})","legendFormat":"state bytes"}
+    ],"gridPos":{"h":8,"w":12,"x":12,"y":8}}
+  ],
+  "schemaVersion": 39,
+  "tags": ["flink", "features", "recovery"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Flink realtime feature reliability",
+  "uid": "flink-realtime-reliability",
+  "version": 1
+}

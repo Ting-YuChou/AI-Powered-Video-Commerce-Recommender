@@ -1,0 +1,12 @@
+{
+  "captured_from_commit": "35a1601",
+  "job_name": "video-commerce-interaction-features",
+  "flink_version": "1.20.1",
+  "stateful_job_vertices": {
+    "dedupe-by-event-id": "baf1e4c622ccdfb35723ebd10e622fa5",
+    "user-feature-snapshots": "8347a046395918dded45c1e79a2e6b85",
+    "window-5m": "cf0eeab4e18fc06c05154ab68936a8a3",
+    "window-1h": "afd5ffb424d61a18dbb90f74ee3ad4b0",
+    "window-24h": "95a9dff8bd5d7246318a578d3eb26e6e"
+  }
+}

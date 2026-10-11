@@ -103,6 +103,7 @@ class FakeRedis:
         self.data = {}
         self.lrange_calls = []
         self.get_calls = []
+        self.eval_calls = []
 
     def pipeline(self, transaction=False):
         return FakePipeline(self)
@@ -126,6 +127,11 @@ class FakeRedis:
     async def get(self, key):
         self.get_calls.append(key)
         return self.data.get(key)
+
+    async def eval(self, script, numkeys, *args):
+        self.eval_calls.append((script, numkeys, args))
+        assert numkeys == 2
+        return [self.data.get(args[0]), self.data.get(args[1])]
 
     async def mget(self, keys):
         self.get_calls.extend(keys)
@@ -500,6 +506,38 @@ async def test_cold_user_serving_context_does_not_fallback_to_lrange():
     assert features.user_id == "cold-user"
     assert token["length"] == 0
     assert fake.lrange_calls == []
+
+
+@pytest.mark.asyncio
+async def test_serving_context_reads_feature_and_token_atomically_with_lua():
+    store = FeatureStore(RedisConfig(), CacheConfig())
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uf:warm-user"] = pack_cache_payload(
+        "user_features",
+        {"user_id": "warm-user", "total_interactions": 1},
+    )
+    fake.data["ust:200:warm-user"] = json.dumps(
+        {
+            "length": 1,
+            "latest_event_id": "e1",
+            "latest_occurred_at": 1.0,
+            "latest_product_id": "p1",
+            "latest_action": "click",
+            "state_epoch": 3,
+            "generation": 8,
+            "snapshot_digest": "abc",
+        }
+    )
+
+    features, token = await store.get_user_serving_context("warm-user")
+
+    assert features.total_interactions == 1
+    assert token["state_epoch"] == 3
+    assert token["generation"] == 8
+    assert token["snapshot_digest"] == "abc"
+    assert len(fake.eval_calls) == 1
+    assert fake.get_calls == []
 
 
 @pytest.mark.asyncio

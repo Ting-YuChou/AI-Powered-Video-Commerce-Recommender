@@ -4,11 +4,13 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
+import io.lettuce.core.ScriptOutputType;
 import io.lettuce.core.codec.ByteArrayCodec;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.sync.RedisCommands;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -23,10 +25,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.metrics.Counter;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.state.ValueState;
@@ -144,6 +148,7 @@ public class InteractionFeatureJob {
         parsed.assignTimestampsAndWatermarks(
             WatermarkStrategy.<InteractionEvent>forBoundedOutOfOrderness(
                     Duration.ofSeconds(config.watermarkOutOfOrdernessSeconds))
+                .withIdleness(Duration.ofSeconds(config.watermarkIdlenessSeconds))
                 .withTimestampAssigner((event, previousTimestamp) -> event.eventTimeMillis));
 
     DataStream<InteractionEvent> deduped =
@@ -151,6 +156,7 @@ public class InteractionFeatureJob {
             .keyBy((KeySelector<InteractionEvent, String>) event -> event.eventId)
             .process(new EventIdDeduplicator(config.dedupStateTtlDays))
             .name("dedupe-by-event-id")
+            .setUidHash("baf1e4c622ccdfb35723ebd10e622fa5")
             .returns(InteractionEvent.class);
 
     deduped
@@ -160,8 +166,9 @@ public class InteractionFeatureJob {
     DataStream<UserFeatureSnapshot> userFeatures =
         deduped
             .keyBy((KeySelector<InteractionEvent, String>) event -> event.userId)
-            .process(new UserFeatureAggregator())
+            .process(new UserFeatureAggregator(config.featureStateEpoch))
             .name("user-feature-snapshots")
+            .setUidHash("8347a046395918dded45c1e79a2e6b85")
             .returns(UserFeatureSnapshot.class);
 
     userFeatures
@@ -180,10 +187,23 @@ public class InteractionFeatureJob {
 
     DataStream<EntityEvent> entityEvents =
         deduped.flatMap(new EntityEventFanout()).returns(EntityEvent.class);
+    WindowStreams window5m =
+        buildWindow(entityEvents, "5m", Time.minutes(5), Time.minutes(1), config);
+    WindowStreams window1h =
+        buildWindow(entityEvents, "1h", Time.hours(1), Time.minutes(5), config);
+    WindowStreams window24h =
+        buildWindow(entityEvents, "24h", Time.hours(24), Time.hours(1), config);
     DataStream<WindowFeatureSnapshot> windowFeatures =
-        buildWindow(entityEvents, "5m", Time.minutes(5), Time.minutes(1), config)
-            .union(buildWindow(entityEvents, "1h", Time.hours(1), Time.minutes(5), config))
-            .union(buildWindow(entityEvents, "24h", Time.hours(24), Time.hours(1), config));
+        window5m.snapshots.union(window1h.snapshots).union(window24h.snapshots);
+    window5m.lateEvents
+        .union(window1h.lateEvents)
+        .union(window24h.lateEvents)
+        .map(event -> JSON.writeValueAsString(event.payload()))
+        .returns(String.class)
+        .sinkTo(
+            buildKafkaSink(
+                config.kafkaBootstrapServers, config.lateInteractionsTopic, null, config))
+        .name("late-interaction-quarantine");
 
     windowFeatures
         .addSink(new WindowFeatureRedisSink(config.redisConfig()))
@@ -217,19 +237,39 @@ public class InteractionFeatureJob {
     }
   }
 
-  private static DataStream<WindowFeatureSnapshot> buildWindow(
+  private static WindowStreams buildWindow(
       DataStream<EntityEvent> events,
       String windowName,
       Time size,
       Time slide,
       JobConfig config) {
-    return events
+    OutputTag<EntityEvent> lateTag =
+        new OutputTag<>("late-" + windowName, TypeInformation.of(EntityEvent.class));
+    SingleOutputStreamOperator<WindowFeatureSnapshot> snapshots =
+        events
         .keyBy((KeySelector<EntityEvent, EntityKey>) event -> event.key)
         .window(SlidingEventTimeWindows.of(size, slide))
         .allowedLateness(Time.seconds(config.allowedLatenessSeconds))
+        .sideOutputLateData(lateTag)
         .aggregate(new WindowCountsAggregate(), new WindowSnapshotFunction(windowName))
         .returns(WindowFeatureSnapshot.class)
-        .name("window-" + windowName);
+        .name("window-" + windowName)
+        .setUidHash(windowUidHash(windowName));
+    DataStream<LateInteractionEvent> lateEvents =
+        snapshots
+            .getSideOutput(lateTag)
+            .process(new LateInteractionMapper(windowName))
+            .returns(LateInteractionEvent.class)
+            .name("quarantine-late-" + windowName)
+            .uid("quarantine-late-" + windowName);
+    return new WindowStreams(snapshots, lateEvents);
+  }
+
+  static String windowUidHash(String windowName) {
+    if ("5m".equals(windowName)) return "cf0eeab4e18fc06c05154ab68936a8a3";
+    if ("1h".equals(windowName)) return "afd5ffb424d61a18dbb90f74ee3ad4b0";
+    if ("24h".equals(windowName)) return "95a9dff8bd5d7246318a578d3eb26e6e";
+    throw new IllegalArgumentException("Unknown window name: " + windowName);
   }
 
   private static org.apache.flink.streaming.api.functions.sink.SinkFunction<InteractionEvent>
@@ -622,7 +662,14 @@ public class InteractionFeatureJob {
 
   static final class UserFeatureAggregator
       extends KeyedProcessFunction<String, InteractionEvent, UserFeatureSnapshot> {
+    private final long stateEpoch;
     private transient ValueState<UserAccumulator> accumulatorState;
+    private transient Counter activeKeys;
+    private transient AtomicLong estimatedStateBytesPerUser;
+
+    UserFeatureAggregator(long stateEpoch) {
+      this.stateEpoch = stateEpoch;
+    }
 
     @Override
     public void open(Configuration parameters) {
@@ -630,6 +677,10 @@ public class InteractionFeatureJob {
           new ValueStateDescriptor<>(
               "user-feature-accumulator", TypeInformation.of(UserAccumulator.class));
       accumulatorState = getRuntimeContext().getState(descriptor);
+      var metrics = getRuntimeContext().getMetricGroup().addGroup("user_feature_state");
+      activeKeys = metrics.counter("active_keys");
+      estimatedStateBytesPerUser = new AtomicLong();
+      metrics.gauge("estimated_bytes_per_user", estimatedStateBytesPerUser::get);
     }
 
     @Override
@@ -638,10 +689,14 @@ public class InteractionFeatureJob {
       UserAccumulator accumulator = accumulatorState.value();
       if (accumulator == null) {
         accumulator = new UserAccumulator(event.userId);
+        activeKeys.inc();
       }
       accumulator.apply(event);
+      estimatedStateBytesPerUser.set(accumulator.estimatedBytes());
       accumulatorState.update(accumulator);
       UserFeatureSnapshot snapshot = accumulator.snapshot();
+      snapshot.stateEpoch = stateEpoch;
+      snapshot.snapshotDigest = snapshotDigest(snapshot);
       snapshot.availableAt = Instant.now().toEpochMilli() / 1000.0;
       out.collect(snapshot);
     }
@@ -655,6 +710,50 @@ public class InteractionFeatureJob {
       if (!event.productCategory.isBlank()) {
         out.collect(EntityEvent.from(event, "category", event.productCategory));
       }
+    }
+  }
+
+  static final class WindowStreams {
+    final DataStream<WindowFeatureSnapshot> snapshots;
+    final DataStream<LateInteractionEvent> lateEvents;
+
+    WindowStreams(
+        DataStream<WindowFeatureSnapshot> snapshots,
+        DataStream<LateInteractionEvent> lateEvents) {
+      this.snapshots = snapshots;
+      this.lateEvents = lateEvents;
+    }
+  }
+
+  static final class LateInteractionMapper
+      extends ProcessFunction<EntityEvent, LateInteractionEvent> {
+    private final String windowName;
+    private transient Counter lateEvents;
+    private transient Counter latePurchases;
+    private transient AtomicLong watermarkLagSeconds;
+
+    LateInteractionMapper(String windowName) {
+      this.windowName = windowName;
+    }
+
+    @Override
+    public void open(Configuration parameters) {
+      var metrics = getRuntimeContext().getMetricGroup().addGroup("late_interactions");
+      lateEvents = metrics.counter(windowName + "_total");
+      latePurchases = metrics.counter(windowName + "_purchase_total");
+      watermarkLagSeconds = new AtomicLong();
+      metrics.gauge(windowName + "_watermark_lag_seconds", watermarkLagSeconds::get);
+    }
+
+    @Override
+    public void processElement(
+        EntityEvent event, Context context, Collector<LateInteractionEvent> out) {
+      long watermark = context.timerService().currentWatermark();
+      LateInteractionEvent late = LateInteractionEvent.from(event, windowName, watermark);
+      lateEvents.inc();
+      if ("purchase".equals(event.action)) latePurchases.inc();
+      watermarkLagSeconds.set((long) late.latenessSeconds);
+      out.collect(late);
     }
   }
 
@@ -732,48 +831,95 @@ public class InteractionFeatureJob {
   }
 
   static final class UserFeatureRedisSink extends BaseRedisSink<UserFeatureSnapshot> {
+    private static final String ATOMIC_COMMIT_LUA =
+        "local epoch=tonumber(ARGV[1]); local generation=tonumber(ARGV[2]); "
+            + "if not epoch or not generation then return 'invalid' end; "
+            + "local oldEpoch=tonumber(redis.call('HGET',KEYS[5],'epoch') or '-1'); "
+            + "local oldGeneration=tonumber(redis.call('HGET',KEYS[5],'generation') or '-1'); "
+            + "local oldDigest=redis.call('HGET',KEYS[5],'digest'); "
+            + "if epoch<oldEpoch or (epoch==oldEpoch and generation<oldGeneration) then return 'stale' end; "
+            + "if epoch==oldEpoch and generation==oldGeneration and oldDigest and oldDigest~=ARGV[3] then return 'conflict' end; "
+            + "local duplicate=(epoch==oldEpoch and generation==oldGeneration and oldDigest==ARGV[3]); "
+            + "redis.call('SETEX',KEYS[1],ARGV[5],ARGV[4]); "
+            + "if ARGV[6]~='' then redis.call('ZADD',KEYS[2],ARGV[7],ARGV[6]); redis.call('ZREMRANGEBYRANK',KEYS[2],0,-1001); redis.call('EXPIRE',KEYS[2],ARGV[8]); end; "
+            + "if ARGV[9]=='1' then redis.call('ZADD',KEYS[3],ARGV[7],ARGV[6]); redis.call('ZREMRANGEBYRANK',KEYS[3],0,-201); redis.call('EXPIRE',KEYS[3],ARGV[8]); end; "
+            + "redis.call('SETEX',KEYS[4],ARGV[8],ARGV[10]); "
+            + "redis.call('HSET',KEYS[5],'epoch',ARGV[1],'generation',ARGV[2],'digest',ARGV[3]); redis.call('EXPIRE',KEYS[5],ARGV[8]); "
+            + "if duplicate then return 'duplicate' else return 'applied' end";
+
     UserFeatureRedisSink(RedisSinkConfig config) {
       super(config);
     }
 
     @Override
     public void invoke(UserFeatureSnapshot snapshot, Context context) throws Exception {
+      long started = System.nanoTime();
       byte[] featurePayload = packCachePayload("user_features", snapshot.userFeaturePayload());
-      commands.setex(bytes(config.key("uf:" + snapshot.userId)), config.userFeaturesTtlSeconds, featurePayload);
-
       String sequenceKey = config.key("uiz:" + snapshot.userId);
-      for (SequenceEvent event : snapshot.sequence) {
-        String eventPayload = JSON.writeValueAsString(event.payload());
-        commands.zadd(
-            bytes(sequenceKey),
-            event.occurredAtSeconds,
-            bytes(eventPayload));
-        String dinAction = dinAction(event.action);
-        if (dinAction != null) {
-          String actionSequenceKey = config.key("uiza:" + dinAction + ":" + snapshot.userId);
-          commands.zadd(bytes(actionSequenceKey), event.occurredAtSeconds, bytes(eventPayload));
-          commands.zremrangebyrank(bytes(actionSequenceKey), 0, -201);
-          commands.expire(bytes(actionSequenceKey), config.sequenceTtlSeconds);
-        }
-      }
-      commands.zremrangebyrank(bytes(sequenceKey), 0, -1001);
-      commands.expire(bytes(sequenceKey), config.sequenceTtlSeconds);
-
       String tokenKey = config.key("ust:200:" + snapshot.userId);
-      commands.setex(
-          bytes(tokenKey),
-          config.sequenceTtlSeconds,
-          bytes(JSON.writeValueAsString(snapshot.sequenceToken())));
+      SequenceEvent delta = snapshot.sequenceDelta;
+      String deltaPayload = delta == null ? "" : JSON.writeValueAsString(delta.payload());
+      String action = delta == null ? null : dinAction(delta.action);
+      String actionKey =
+          config.key("uiza:" + (action == null ? "none" : action) + ":" + snapshot.userId);
+      byte[] result;
+      try {
+        result = commands.eval(
+              bytes(ATOMIC_COMMIT_LUA),
+              ScriptOutputType.VALUE,
+              new byte[][] {
+                bytes(config.key("uf:" + snapshot.userId)),
+                bytes(sequenceKey),
+                bytes(actionKey),
+                bytes(tokenKey),
+                bytes(config.key("ufm:" + snapshot.userId))
+              },
+              bytes(Long.toString(snapshot.stateEpoch)),
+              bytes(Long.toString(snapshot.generation)),
+              bytes(snapshot.snapshotDigest),
+              featurePayload,
+              bytes(Integer.toString(config.userFeaturesTtlSeconds)),
+              bytes(deltaPayload),
+              bytes(Double.toString(delta == null ? 0.0 : delta.occurredAtSeconds)),
+              bytes(Integer.toString(config.sequenceTtlSeconds)),
+              bytes(action == null ? "0" : "1"),
+              bytes(JSON.writeValueAsString(snapshot.sequenceToken())));
+        networkRoundTrips.inc();
+        sequenceDeltas.inc(delta == null ? 0 : 1);
+      } catch (Exception exc) {
+        failures.inc();
+        throw exc;
+      } finally {
+        lastWriteLatencyMicros.set((System.nanoTime() - started) / 1_000L);
+      }
+      String status = result == null ? "" : new String(result, StandardCharsets.UTF_8);
+      recordStatus(status);
+      if ("conflict".equals(status) || "invalid".equals(status)) {
+        throw new IllegalStateException("Redis user snapshot commit failed: " + status);
+      }
     }
   }
 
   static final class WindowFeatureRedisSink extends BaseRedisSink<WindowFeatureSnapshot> {
+    private static final String ATOMIC_WINDOW_COMMIT_LUA =
+        "local windowEnd=tonumber(ARGV[1]); local revision=tonumber(ARGV[2]); "
+            + "local oldEnd=tonumber(redis.call('HGET',KEYS[2],'window_end') or '-1'); "
+            + "local oldRevision=tonumber(redis.call('HGET',KEYS[2],'revision') or '-1'); "
+            + "local oldDigest=redis.call('HGET',KEYS[2],'digest'); "
+            + "if windowEnd<oldEnd or (windowEnd==oldEnd and revision<oldRevision) then return 'stale' end; "
+            + "if windowEnd==oldEnd and revision==oldRevision and oldDigest and oldDigest~=ARGV[3] then return 'conflict' end; "
+            + "local duplicate=(windowEnd==oldEnd and revision==oldRevision and oldDigest==ARGV[3]); "
+            + "redis.call('SETEX',KEYS[1],ARGV[5],ARGV[4]); "
+            + "redis.call('HSET',KEYS[2],'window_end',ARGV[1],'revision',ARGV[2],'digest',ARGV[3]); redis.call('EXPIRE',KEYS[2],ARGV[5]); "
+            + "if duplicate then return 'duplicate' else return 'applied' end";
+
     WindowFeatureRedisSink(RedisSinkConfig config) {
       super(config);
     }
 
     @Override
     public void invoke(WindowFeatureSnapshot snapshot, Context context) throws Exception {
+      long started = System.nanoTime();
       String key =
           config.key(
               "rtwf:"
@@ -782,10 +928,39 @@ public class InteractionFeatureJob {
                   + snapshot.entityId
                   + ":"
                   + snapshot.window);
-      commands.setex(
-          bytes(key),
-          config.windowFeatureTtlSeconds,
-          bytes(JSON.writeValueAsString(snapshot.payload())));
+      String metadataKey =
+          config.key(
+              "rtwfm:"
+                  + snapshot.entityType
+                  + ":"
+                  + snapshot.entityId
+                  + ":"
+                  + snapshot.window);
+      String payload = JSON.writeValueAsString(snapshot.payload());
+      String digest = FeatureHistoryContract.payloadHash(snapshot.payload());
+      byte[] result;
+      try {
+        result = commands.eval(
+              bytes(ATOMIC_WINDOW_COMMIT_LUA),
+              ScriptOutputType.VALUE,
+              new byte[][] {bytes(key), bytes(metadataKey)},
+              bytes(Double.toString(snapshot.windowEnd)),
+              bytes(Long.toString(snapshot.totalEvents)),
+              bytes(digest),
+              bytes(payload),
+              bytes(Integer.toString(config.windowFeatureTtlSeconds)));
+        networkRoundTrips.inc();
+      } catch (Exception exc) {
+        failures.inc();
+        throw exc;
+      } finally {
+        lastWriteLatencyMicros.set((System.nanoTime() - started) / 1_000L);
+      }
+      String status = result == null ? "" : new String(result, StandardCharsets.UTF_8);
+      recordStatus(status);
+      if ("conflict".equals(status)) {
+        throw new IllegalStateException("Redis window snapshot split-brain conflict");
+      }
     }
   }
 
@@ -794,6 +969,14 @@ public class InteractionFeatureJob {
     protected transient RedisClient client;
     protected transient StatefulRedisConnection<byte[], byte[]> connection;
     protected transient RedisCommands<byte[], byte[]> commands;
+    protected transient Counter applied;
+    protected transient Counter duplicates;
+    protected transient Counter stale;
+    protected transient Counter conflicts;
+    protected transient Counter failures;
+    protected transient Counter networkRoundTrips;
+    protected transient Counter sequenceDeltas;
+    protected transient AtomicLong lastWriteLatencyMicros;
 
     BaseRedisSink(RedisSinkConfig config) {
       this.config = config;
@@ -813,6 +996,24 @@ public class InteractionFeatureJob {
       client = RedisClient.create(builder.build());
       connection = client.connect(ByteArrayCodec.INSTANCE);
       commands = connection.sync();
+      var metrics = getRuntimeContext().getMetricGroup().addGroup("redis_snapshot_sink");
+      applied = metrics.counter("applied");
+      duplicates = metrics.counter("duplicate");
+      stale = metrics.counter("stale");
+      conflicts = metrics.counter("conflict");
+      failures = metrics.counter("failure");
+      networkRoundTrips = metrics.counter("network_round_trips");
+      sequenceDeltas = metrics.counter("sequence_deltas");
+      lastWriteLatencyMicros = new AtomicLong();
+      metrics.gauge("last_write_latency_micros", lastWriteLatencyMicros::get);
+    }
+
+    protected void recordStatus(String status) {
+      if ("applied".equals(status)) applied.inc();
+      else if ("duplicate".equals(status)) duplicates.inc();
+      else if ("stale".equals(status)) stale.inc();
+      else if ("conflict".equals(status)) conflicts.inc();
+      else failures.inc();
     }
 
     @Override
@@ -899,6 +1100,45 @@ public class InteractionFeatureJob {
 
   static byte[] bytes(String value) {
     return value.getBytes(StandardCharsets.UTF_8);
+  }
+
+  static String snapshotDigest(UserFeatureSnapshot snapshot) {
+    try {
+      Map<String, Object> canonical = new HashMap<>();
+      canonical.put("state_epoch", snapshot.stateEpoch);
+      canonical.put("generation", snapshot.generation);
+      canonical.put("feature", snapshot.userFeaturePayload());
+      canonical.put("sequence_token", snapshot.sequenceToken());
+      canonical.put(
+          "sequence_delta",
+          snapshot.sequenceDelta == null ? null : snapshot.sequenceDelta.payload());
+      byte[] digest =
+          MessageDigest.getInstance("SHA-256")
+              .digest(FeatureHistoryContract.canonicalJson(canonical).getBytes(StandardCharsets.UTF_8));
+      StringBuilder result = new StringBuilder(digest.length * 2);
+      for (byte value : digest) {
+        result.append(String.format("%02x", value & 0xff));
+      }
+      return result.toString();
+    } catch (Exception exc) {
+      throw new IllegalStateException("Unable to hash user snapshot", exc);
+    }
+  }
+
+  static String deterministicId(String... parts) {
+    try {
+      return FeatureHistoryContract.deterministicId(parts);
+    } catch (Exception exc) {
+      throw new IllegalStateException("Unable to build deterministic event id", exc);
+    }
+  }
+
+  static String payloadHash(Map<String, Object> payload) {
+    try {
+      return FeatureHistoryContract.payloadHash(payload);
+    } catch (Exception exc) {
+      throw new IllegalStateException("Unable to hash event payload", exc);
+    }
   }
 
   static double ratio(long numerator, long denominator) {
@@ -1062,8 +1302,12 @@ public class InteractionFeatureJob {
     public String consumerGroupId;
     public String checkpointDir;
     public int watermarkOutOfOrdernessSeconds;
+    public int watermarkIdlenessSeconds;
     public int allowedLatenessSeconds;
     public int dedupStateTtlDays;
+    public int replayHorizonDays;
+    public long featureStateEpoch;
+    public String lateInteractionsTopic;
     public String outputNamespace;
     public String redisHost;
     public int redisPort;
@@ -1091,8 +1335,13 @@ public class InteractionFeatureJob {
       config.consumerGroupId = env("FLINK_INTERACTION_FEATURE_CONSUMER_GROUP", "video-commerce-flink-feature-v1");
       config.checkpointDir = env("FLINK_CHECKPOINT_DIR", "file:///flink/checkpoints/runtime");
       config.watermarkOutOfOrdernessSeconds = envInt("FLINK_WATERMARK_OUT_OF_ORDERNESS_SECONDS", 300);
+      config.watermarkIdlenessSeconds = envInt("FLINK_WATERMARK_IDLENESS_SECONDS", 60);
       config.allowedLatenessSeconds = envInt("FLINK_ALLOWED_LATENESS_SECONDS", 600);
-      config.dedupStateTtlDays = envInt("FLINK_EVENT_DEDUP_TTL_DAYS", 7);
+      config.dedupStateTtlDays = envInt("FLINK_EVENT_DEDUP_TTL_DAYS", 8);
+      config.replayHorizonDays = envInt("FLINK_REPLAY_HORIZON_DAYS", 7);
+      config.featureStateEpoch = envLong("FLINK_FEATURE_STATE_EPOCH", 1L);
+      config.lateInteractionsTopic =
+          env("KAFKA_LATE_INTERACTIONS_TOPIC", "late-interaction-events");
       config.outputNamespace = env("FLINK_FEATURE_OUTPUT_NAMESPACE", "official");
       config.redisHost = env("REDIS_HOST", "redis");
       config.redisPort = envInt("REDIS_PORT", 6379);
@@ -1108,7 +1357,31 @@ public class InteractionFeatureJob {
       config.jdbcBatchIntervalMs = envLong("FLINK_JDBC_BATCH_INTERVAL_MS", 2000L);
       config.jdbcMaxRetries = envInt("FLINK_JDBC_MAX_RETRIES", 5);
       config.kafkaTransactionTimeoutMs = envInt("FLINK_KAFKA_TRANSACTION_TIMEOUT_MS", 600_000);
+      config.validate();
+      validateProductionStateEpoch(
+          System.getenv("ENVIRONMENT"), System.getenv("FLINK_FEATURE_STATE_EPOCH"));
       return config;
+    }
+
+    static void validateProductionStateEpoch(String environment, String configuredEpoch) {
+      if ("production".equalsIgnoreCase(environment)
+          && (configuredEpoch == null || configuredEpoch.isBlank())) {
+        throw new IllegalArgumentException(
+            "Production requires explicit FLINK_FEATURE_STATE_EPOCH");
+      }
+    }
+
+    void validate() {
+      if (featureStateEpoch < 1) {
+        throw new IllegalArgumentException("FLINK_FEATURE_STATE_EPOCH must be at least 1");
+      }
+      if (watermarkIdlenessSeconds < 1) {
+        throw new IllegalArgumentException("FLINK_WATERMARK_IDLENESS_SECONDS must be positive");
+      }
+      if (replayHorizonDays < 1 || dedupStateTtlDays < replayHorizonDays + 1) {
+        throw new IllegalArgumentException(
+            "FLINK_EVENT_DEDUP_TTL_DAYS must be at least FLINK_REPLAY_HORIZON_DAYS + 1");
+      }
     }
 
     RedisSinkConfig redisConfig() {
@@ -1235,6 +1508,8 @@ public class InteractionFeatureJob {
     public List<SequenceEvent> sequence = new ArrayList<>();
     public double featureEventTime;
     public String featureSourceEventId;
+    public long generation;
+    public SequenceEvent lastSequenceDelta;
 
     public UserAccumulator() {}
 
@@ -1243,6 +1518,8 @@ public class InteractionFeatureJob {
     }
 
     void apply(InteractionEvent event) {
+      generation += 1;
+      lastSequenceDelta = null;
       totalInteractions += 1;
       lastActive = Math.max(lastActive, event.occurredAtSeconds);
       double sourceEventTime = event.eventTimeMillis / 1000.0;
@@ -1271,7 +1548,8 @@ public class InteractionFeatureJob {
         preferredCategories.add(event.productCategory);
       }
       if (isPositiveAction(action)) {
-        sequence.add(SequenceEvent.from(event));
+        lastSequenceDelta = SequenceEvent.from(event);
+        sequence.add(lastSequenceDelta);
         sequence.sort(Comparator.comparingDouble((SequenceEvent item) -> item.occurredAtSeconds)
             .thenComparing(item -> item.eventId == null ? "" : item.eventId));
         if (sequence.size() > 1000) {
@@ -1298,7 +1576,15 @@ public class InteractionFeatureJob {
       snapshot.sequence = new ArrayList<>(sequence);
       snapshot.eventTime = featureEventTime;
       snapshot.sourceEventId = featureSourceEventId;
+      snapshot.generation = generation;
+      snapshot.sequenceDelta = lastSequenceDelta;
       return snapshot;
+    }
+
+    long estimatedBytes() {
+      long categories = preferredCategories.stream().mapToLong(value -> value.length() * 2L).sum();
+      long events = sequence.size() * 256L;
+      return 160L + categories + events;
     }
   }
 
@@ -1319,6 +1605,10 @@ public class InteractionFeatureJob {
     public double eventTime;
     public double availableAt;
     public String sourceEventId;
+    public long stateEpoch;
+    public long generation;
+    public String snapshotDigest;
+    public SequenceEvent sequenceDelta;
 
     Map<String, Object> userFeaturePayload() {
       Map<String, Object> payload = new HashMap<>();
@@ -1348,6 +1638,9 @@ public class InteractionFeatureJob {
           sequence.size() > 200 ? sequence.subList(sequence.size() - 200, sequence.size()) : sequence;
       Map<String, Object> token = new HashMap<>();
       token.put("length", recent.size());
+      token.put("state_epoch", stateEpoch);
+      token.put("generation", generation);
+      token.put("snapshot_digest", snapshotDigest);
       if (recent.isEmpty()) {
         token.put("latest_event_id", null);
         token.put("latest_occurred_at", 0);
@@ -1411,12 +1704,74 @@ public class InteractionFeatureJob {
   public static final class EntityEvent implements Serializable {
     public EntityKey key;
     public String action;
+    public String eventId;
+    public String userId;
+    public String productId;
+    public long eventTimeMillis;
 
     static EntityEvent from(InteractionEvent event, String entityType, String entityId) {
       EntityEvent entityEvent = new EntityEvent();
       entityEvent.key = new EntityKey(entityType, entityId);
       entityEvent.action = event.action;
+      entityEvent.eventId = event.eventId;
+      entityEvent.userId = event.userId;
+      entityEvent.productId = event.productId;
+      entityEvent.eventTimeMillis = event.eventTimeMillis;
       return entityEvent;
+    }
+  }
+
+  public static final class LateInteractionEvent implements Serializable {
+    public String quarantineEventId;
+    public String sourceEventId;
+    public String userId;
+    public String productId;
+    public String action;
+    public String entityType;
+    public String entityId;
+    public String window;
+    public double eventTime;
+    public double currentWatermark;
+    public double latenessSeconds;
+
+    static LateInteractionEvent from(EntityEvent event, String window, long watermarkMillis) {
+      LateInteractionEvent result = new LateInteractionEvent();
+      result.sourceEventId = event.eventId;
+      result.userId = event.userId;
+      result.productId = event.productId;
+      result.action = event.action;
+      result.entityType = event.key.entityType;
+      result.entityId = event.key.entityId;
+      result.window = window;
+      result.eventTime = event.eventTimeMillis / 1000.0;
+      result.currentWatermark = watermarkMillis / 1000.0;
+      result.latenessSeconds = Math.max(0.0, result.currentWatermark - result.eventTime);
+      result.quarantineEventId =
+          deterministicId(
+              "late-interaction-v1",
+              result.sourceEventId,
+              result.entityType,
+              result.entityId,
+              result.window);
+      return result;
+    }
+
+    Map<String, Object> payload() {
+      Map<String, Object> payload = new HashMap<>();
+      payload.put("schema_version", 1);
+      payload.put("event_type", "late_interaction");
+      payload.put("event_id", quarantineEventId);
+      payload.put("source_event_id", sourceEventId);
+      payload.put("user_id", userId);
+      payload.put("product_id", productId);
+      payload.put("action", action);
+      payload.put("entity_type", entityType);
+      payload.put("entity_id", entityId);
+      payload.put("window", window);
+      payload.put("event_time", eventTime);
+      payload.put("current_watermark", currentWatermark);
+      payload.put("lateness_seconds", latenessSeconds);
+      return payload;
     }
   }
 
@@ -1529,11 +1884,21 @@ public class InteractionFeatureJob {
 
     Map<String, Object> payload() {
       Map<String, Object> payload = new HashMap<>();
-      payload.put("schema_version", 1);
-      payload.put("event_id", UUID.randomUUID().toString());
+      Map<String, Object> sourcePayload = new HashMap<>();
+      sourcePayload.put("source_value", rawValue);
+      payload.put("schema_version", 2);
+      payload.put(
+          "event_id",
+          deterministicId(
+              "flink-dlq-v2",
+              sourceTopic,
+              payloadHash(sourcePayload)));
       payload.put("event_type", "dead_letter");
       payload.put("source_topic", sourceTopic);
       payload.put("source_value", rawValue);
+      payload.put("source_partition", null);
+      payload.put("source_offset", null);
+      payload.put("source_headers", Collections.emptyList());
       payload.put("error_type", errorType);
       payload.put("error_message", errorMessage);
       payload.put("occurred_at", occurredAt);

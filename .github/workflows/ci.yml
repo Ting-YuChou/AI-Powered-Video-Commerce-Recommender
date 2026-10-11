@@ -130,3 +130,25 @@ jobs:
           name: flink-closed-loop-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/flink-closed-loop-artifacts
           if-no-files-found: warn
+
+  flink-recovery-drill:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      COMPOSE_PROJECT_NAME: vc-flink-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+      FLINK_RECOVERY_ARTIFACT_DIR: /tmp/flink-recovery-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Run isolated savepoint and DLQ recovery drill
+        run: scripts/run_flink_recovery_drill.sh
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flink-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/flink-recovery-artifacts
+          if-no-files-found: warn
