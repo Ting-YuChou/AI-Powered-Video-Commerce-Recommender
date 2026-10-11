@@ -11,6 +11,11 @@ cleanup() {
   curl -fsS http://127.0.0.1:8081/jobs/overview >"$ARTIFACT_DIR/jobs.json" 2>/dev/null || true
   docker compose --profile flink down -v --remove-orphans >/dev/null 2>&1 || true
 }
+report_failure() {
+  local line="$1" status="$2"
+  echo "Flink recovery drill failed at line ${line} (exit ${status})" >&2
+}
+trap 'report_failure "$LINENO" "$?"' ERR
 trap cleanup EXIT
 
 docker compose --profile flink up -d --build \
@@ -57,6 +62,11 @@ done
 savepoint="$(scripts/flink_realtime_ops.sh stop-with-savepoint)"
 [[ -n "$savepoint" ]]
 scripts/flink_realtime_ops.sh restore "$savepoint"
+for _ in $(seq 1 60); do
+  if scripts/flink_realtime_ops.sh verify >/dev/null 2>&1; then break; fi
+  sleep 2
+done
+scripts/flink_realtime_ops.sh verify
 
 produce recovery-1 click "$now"
 future="$(python3 -c "print(float('$now') + 7200)")"
@@ -73,7 +83,11 @@ for _ in $(seq 1 60); do
 done
 [[ "${generation:-}" == "3" ]]
 
-row_count="$(docker compose exec -T postgres psql -U video_commerce -d video_commerce -Atc "SELECT count(*) FROM interaction_events WHERE user_id='recovery-user'" | tr -d '\r')"
+for _ in $(seq 1 60); do
+  row_count="$(docker compose exec -T postgres psql -U video_commerce -d video_commerce -Atc "SELECT count(*) FROM interaction_events WHERE user_id='recovery-user'" | tr -d '\r')"
+  [[ "$row_count" == "3" ]] && break
+  sleep 2
+done
 [[ "$row_count" == "3" ]]
 
 docker compose exec -T kafka timeout 30 kafka-console-consumer \

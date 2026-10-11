@@ -669,3 +669,5 @@
   quarantine, DLQ dry-run, two executed replays, exactly-once feature effect,
   recent job health, and automatic `down -v` cleanup. The GitHub check must pass
   once on the hosted runner before it is added to repository required checks.
+  The hosted drill also waits for the restored job and eventual Postgres sink
+  state explicitly, and reports the failing shell line in uploaded diagnostics.
