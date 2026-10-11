@@ -667,7 +667,8 @@
   syntax, dashboard JSON, and diff checks passed. The isolated recovery drill
   passed savepoint restore, idle watermark progress, deterministic late purchase
   quarantine, DLQ dry-run, two executed replays, exactly-once feature effect,
-  recent job health, and automatic `down -v` cleanup. The GitHub check must pass
-  once on the hosted runner before it is added to repository required checks.
+  recent job health, and automatic `down -v` cleanup. The GitHub-hosted recovery
+  drill passed in 3m06s on PR #39, and `main` branch protection now requires the
+  `flink-recovery-drill` check with strict up-to-date branch enforcement.
   The hosted drill also waits for the restored job and eventual Postgres sink
   state explicitly, and reports the failing shell line in uploaded diagnostics.
