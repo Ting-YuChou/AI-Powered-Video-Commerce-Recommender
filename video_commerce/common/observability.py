@@ -945,6 +945,54 @@ class ObservabilityManager:
             ["operation"],
             registry=self.registry,
         )
+        self.model_artifact_activation_seconds = Histogram(
+            "model_artifact_activation_seconds",
+            "Time spent installing, validating, and activating a model generation",
+            ["model_name", "status"],
+            registry=self.registry,
+        )
+        self.model_artifact_activation_failures_total = Counter(
+            "model_artifact_activation_failures_total",
+            "Model artifact generation activation failures",
+            ["model_name", "reason"],
+            registry=self.registry,
+        )
+        self.model_artifact_local_generation_count = Gauge(
+            "model_artifact_local_generation_count",
+            "Verified local artifact generations",
+            ["model_name"],
+            registry=self.registry,
+        )
+        self.model_artifact_local_generation_bytes = Gauge(
+            "model_artifact_local_generation_bytes",
+            "Bytes occupied by verified local artifact generations",
+            ["model_name"],
+            registry=self.registry,
+        )
+        self.model_artifact_generation_cleanup_failures_total = Counter(
+            "model_artifact_generation_cleanup_failures_total",
+            "Failures while pruning unreferenced local generations",
+            ["model_name"],
+            registry=self.registry,
+        )
+        self.iceberg_maintenance_runs_total = Counter(
+            "iceberg_maintenance_runs_total",
+            "Iceberg maintenance runs by table, mode, and result",
+            ["table", "mode", "status"],
+            registry=self.registry,
+        )
+        self.iceberg_maintenance_candidates = Gauge(
+            "iceberg_maintenance_candidates",
+            "Planned Iceberg maintenance candidates",
+            ["table", "kind"],
+            registry=self.registry,
+        )
+        self.iceberg_maintenance_failed_runs = Gauge(
+            "iceberg_maintenance_failed_runs",
+            "Failed Iceberg maintenance runs during the operational lookback",
+            ["table"],
+            registry=self.registry,
+        )
         self.retrieval_release_active_generation = Gauge(
             "retrieval_release_active_generation",
             "Active Two-Tower retrieval release pointer generation",
@@ -961,6 +1009,43 @@ class ObservabilityManager:
             registry=self.registry,
         )
         self._process = psutil.Process()
+
+    def observe_model_artifact_activation(
+        self, *, model_name: str, status: str, duration_seconds: float
+    ) -> None:
+        self.model_artifact_activation_seconds.labels(
+            model_name=model_name, status=status
+        ).observe(max(0.0, float(duration_seconds)))
+
+    def record_model_artifact_activation_failure(
+        self, *, model_name: str, reason: str
+    ) -> None:
+        self.model_artifact_activation_failures_total.labels(
+            model_name=model_name, reason=reason
+        ).inc()
+
+    def update_model_artifact_generations(
+        self, *, model_name: str, count: int, size_bytes: int
+    ) -> None:
+        self.model_artifact_local_generation_count.labels(model_name=model_name).set(
+            count
+        )
+        self.model_artifact_local_generation_bytes.labels(model_name=model_name).set(
+            size_bytes
+        )
+
+    def record_iceberg_maintenance(
+        self, *, table: str, mode: str, status: str, snapshots: int, orphan_files: int
+    ) -> None:
+        self.iceberg_maintenance_runs_total.labels(
+            table=table, mode=mode, status=status
+        ).inc()
+        self.iceberg_maintenance_candidates.labels(table=table, kind="snapshots").set(
+            snapshots
+        )
+        self.iceberg_maintenance_candidates.labels(
+            table=table, kind="orphan_files"
+        ).set(orphan_files)
 
     def record_request(
         self, method: str, path: str, status_code: int, duration: float
@@ -1500,6 +1585,19 @@ class ObservabilityManager:
 
         if system_store:
             self.update_database_pool_metrics(system_store)
+            loader = getattr(system_store, "get_iceberg_maintenance_metrics", None)
+            if loader is not None:
+                maintenance = await loader()
+                for table, values in maintenance.items():
+                    self.iceberg_maintenance_failed_runs.labels(table=table).set(
+                        max(0, int(values.get("failed_runs", 0)))
+                    )
+                    self.iceberg_maintenance_candidates.labels(
+                        table=table, kind="snapshots"
+                    ).set(max(0, int(values.get("snapshot_candidates", 0))))
+                    self.iceberg_maintenance_candidates.labels(
+                        table=table, kind="orphan_files"
+                    ).set(max(0, int(values.get("orphan_candidates", 0))))
 
     async def _collect_redis_metrics(self, role: str, redis_client) -> None:
         try:

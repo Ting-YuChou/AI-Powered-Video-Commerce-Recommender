@@ -12,6 +12,7 @@ from video_commerce.common.config import DatabaseConfig, ModelReleaseConfig
 from video_commerce.data_plane.system_store import (
     ModelRelease,
     ModelReleaseEvaluation,
+    ModelReleaseInstanceObservation,
     ModelReleasePointer,
     ModelReleaseTransition,
     SystemStore,
@@ -43,6 +44,18 @@ def test_model_release_config_exposes_production_gate_defaults():
     assert config.bootstrap_samples == 2000
     assert config.min_impressions == 1000
     assert config.evaluation_max_age_hours == 168
+
+
+def test_model_config_exposes_generation_activation_defaults(monkeypatch):
+    from video_commerce.common.config import ModelConfig
+
+    monkeypatch.delenv("MODEL_ARTIFACT_GENERATION_ROOT", raising=False)
+    config = ModelConfig()
+
+    assert config.artifact_generation_root == ""
+    assert config.artifact_local_generations_to_keep == 3
+    assert config.artifact_generation_min_age_hours == 24
+    assert config.artifact_activation_poll_seconds == 30
 
 
 def test_model_release_config_rejects_unknown_gate_mode():
@@ -184,6 +197,28 @@ def test_release_migration_and_models_define_durable_state_machine():
         "slot",
     ]
     assert inspect(ModelReleaseTransition).primary_key[0].key == "id"
+
+
+def test_rollout_observation_migration_has_instance_identity_and_heartbeat():
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "migrations/postgres/011_artifact_rollout_and_iceberg_maintenance.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "CREATE TABLE IF NOT EXISTS model_release_instance_observations" in migration
+    assert "CREATE TABLE IF NOT EXISTS iceberg_maintenance_runs" in migration
+    assert (
+        "PRIMARY KEY (model_name, environment, service_name, instance_id)" in migration
+    )
+    assert {
+        column.key for column in inspect(ModelReleaseInstanceObservation).columns
+    } >= {
+        "desired_generation",
+        "observed_generation",
+        "bundle_digest",
+        "state",
+        "heartbeat_at",
+    }
 
 
 def test_disabled_store_has_no_active_checkpoint_fallback():

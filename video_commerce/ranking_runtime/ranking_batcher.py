@@ -21,6 +21,7 @@ from video_commerce.common.models import (
     UserFeatures,
 )
 from video_commerce.ml.ranking import RankingModel
+from video_commerce.ml.artifact_generation import AtomicModelReference
 from video_commerce.ml.din import DIN_SEQUENCE_CONTEXT_KEY
 from video_commerce.ranking_runtime.ranking_coordinator_client import MAX_FRAME_BYTES
 from video_commerce.ranking_runtime.ranking_payloads import (
@@ -440,6 +441,13 @@ class RankingBatcher:
         runner_pool: Optional[RankingRunnerClientPool] = None,
     ) -> None:
         self.ranking_model = ranking_model
+        self._model_reference = (
+            AtomicModelReference(
+                ranking_model, identity=self._model_identity(ranking_model)
+            )
+            if ranking_model is not None
+            else None
+        )
         self.observability = observability
         self.runner_pool = runner_pool
         self.enabled = config.enable_async_batching
@@ -533,6 +541,45 @@ class RankingBatcher:
         self._batch_execution_ewma_seconds = max(self.batch_wait_seconds, 0.001)
         self._runner_service_ewma_seconds = max(self.batch_wait_seconds, 0.001)
         self._dispatch_wait_ewma_seconds = 0.0
+
+    def replace_ranking_model(self, ranking_model: RankingModel) -> None:
+        """Atomically publish a fully initialized model for future batches."""
+        if self._process_executor is not None:
+            raise RuntimeError(
+                "in-process artifact swap is unavailable with ranking process workers; rolling restart is required"
+            )
+        if self._model_reference is None:
+            self._model_reference = AtomicModelReference(
+                ranking_model, identity=self._model_identity(ranking_model)
+            )
+        else:
+            self._model_reference.swap(
+                ranking_model, identity=self._model_identity(ranking_model)
+            )
+        self.ranking_model = ranking_model
+
+    @staticmethod
+    def _model_identity(ranking_model: RankingModel) -> tuple[str, int, str]:
+        metadata = getattr(ranking_model, "artifact_metadata", None) or {}
+        return (
+            str(
+                metadata.get("model_release_id")
+                or getattr(ranking_model, "model_version", "test")
+            ),
+            int(metadata.get("active_generation") or 0),
+            str(
+                metadata.get("bundle_digest")
+                or getattr(ranking_model, "artifact_sha256", None)
+                or "legacy"
+            ),
+        )
+
+    def inflight_generation_identities(self) -> set[tuple[str, int]]:
+        return (
+            self._model_reference.inflight_identities()
+            if self._model_reference is not None
+            else set()
+        )
 
     async def start(self) -> None:
         if not self.enabled or self._dispatcher_task:
@@ -884,17 +931,19 @@ class RankingBatcher:
         k: int,
         include_profile: bool,
     ):
-        if self.ranking_model is None:
+        reference = self._model_reference
+        if reference is None:
             raise RankingQueueTimeoutError("ranking_model_unavailable")
-        return await self._run_blocking(
-            self.ranking_model._rank_candidates_sync,
-            candidates,
-            user_features,
-            context,
-            k,
-            include_profile,
-            product_metadata_map,
-        )
+        with reference.snapshot() as ranking_model:
+            return await self._run_blocking(
+                ranking_model._rank_candidates_sync,
+                candidates,
+                user_features,
+                context,
+                k,
+                include_profile,
+                product_metadata_map,
+            )
 
     async def _run_blocking(self, func, *args):
         if self._executor is not None:
@@ -1367,18 +1416,20 @@ class RankingBatcher:
         batch: List[RankingBatchRequest],
         batch_started: float,
     ) -> List[Tuple[RankingBatchRequest, List[ProductRecommendation], Dict[str, Any]]]:
-        if self.ranking_model is None:
+        reference = self._model_reference
+        if reference is None:
             raise RankingQueueTimeoutError("ranking_model_unavailable")
         payloads = self._build_batch_payloads(
             batch,
             batch_started,
             serialize_models=False,
         )
-        process_result = run_ranking_batch_payloads(
-            self.ranking_model,
-            payloads,
-            profile_path="torch_microbatch",
-        )
+        with reference.snapshot() as ranking_model:
+            process_result = run_ranking_batch_payloads(
+                ranking_model,
+                payloads,
+                profile_path="torch_microbatch",
+            )
         for stage, duration_seconds in (process_result.get("stages") or {}).items():
             self._record_batch_stage(
                 path="microbatch",

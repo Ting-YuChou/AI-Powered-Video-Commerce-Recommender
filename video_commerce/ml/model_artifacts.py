@@ -8,11 +8,18 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
+import socket
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from video_commerce.common.config import ModelConfig, RecommendationConfig
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.data_plane.system_store import SystemStore
+from video_commerce.ml.artifact_generation import (
+    ArtifactGenerationInstaller,
+    ArtifactSpec,
+    ResolvedArtifactGeneration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +51,15 @@ class ModelArtifactManager:
         object_storage: Optional[ObjectStorage],
         model_config: ModelConfig,
         recommendation_config: RecommendationConfig,
+        observability: Any = None,
     ) -> None:
         self.system_store = system_store
         self.object_storage = object_storage
         self.model_config = model_config
         self.recommendation_config = recommendation_config
+        self.observability = observability
+        self.service_name = str(os.getenv("MODEL_ARTIFACT_SERVICE_NAME", "")).strip()
+        self.instance_id = f"{socket.gethostname()}-{os.getpid()}"
 
     @property
     def ranking_local_path(self) -> str:
@@ -323,6 +334,7 @@ class ModelArtifactManager:
                 )
         artifact_specs = [
             (
+                "checkpoint",
                 record.checkpoint_path,
                 self.ranking_local_path,
                 self._extract_artifact_sha256(
@@ -337,6 +349,7 @@ class ModelArtifactManager:
         if candidate:
             artifact_specs.append(
                 (
+                    "candidate_sidecar",
                     str(candidate["path"]),
                     self.ranking_candidate_sidecar_local_path,
                     str(candidate["sha256"]),
@@ -348,12 +361,44 @@ class ModelArtifactManager:
         if din_sidecar:
             artifact_specs.append(
                 (
+                    "din_embedding_sidecar",
                     str(din_sidecar["path"]),
                     self.ranking_din_sidecar_local_path,
                     str(din_sidecar["sha256"]),
                 )
             )
-        await self._sync_paths_to_local_atomically(artifact_specs)
+        if self.model_config.artifact_generation_root:
+            await self._record_generation_observation(
+                record, environment=environment, state="loading"
+            )
+            try:
+                resolved = await self._install_generation_bundle(record, artifact_specs)
+                record.checkpoint_path = str(resolved.artifact_paths["checkpoint"])
+                record.payload["bundle_digest"] = resolved.bundle_digest
+                record.payload["artifact_generation_root"] = str(resolved.root)
+                local_manifest = dict(manifest)
+                for name in ("candidate_sidecar", "din_embedding_sidecar"):
+                    if name in resolved.artifact_paths:
+                        local_manifest[name] = {
+                            **dict(local_manifest.get(name) or {}),
+                            "path": str(resolved.artifact_paths[name]),
+                        }
+                record.payload["artifact_manifest"] = local_manifest
+            except Exception as exc:
+                await self._record_generation_observation(
+                    record,
+                    environment=environment,
+                    state="failed",
+                    error=str(exc),
+                )
+                raise
+        else:
+            await self._sync_paths_to_local_atomically(
+                [
+                    (storage, local, digest)
+                    for _, storage, local, digest in artifact_specs
+                ]
+            )
         return record
 
     async def sync_selected_ranking_checkpoint(
@@ -536,8 +581,22 @@ class ModelArtifactManager:
         )
         if require_compatible:
             self._validate_two_tower_release_payload(record.payload)
-        if not await self._sync_two_tower_record(record):
-            raise ValueError("active Two-Tower artifact bundle is incomplete")
+        if self.model_config.artifact_generation_root:
+            await self._record_generation_observation(
+                record, environment=environment, state="loading"
+            )
+        try:
+            if not await self._sync_two_tower_record(record):
+                raise ValueError("active Two-Tower artifact bundle is incomplete")
+        except Exception as exc:
+            if self.model_config.artifact_generation_root:
+                await self._record_generation_observation(
+                    record,
+                    environment=environment,
+                    state="failed",
+                    error=str(exc),
+                )
+            raise
         return record
 
     async def sync_two_tower_checkpoint_version(
@@ -616,8 +675,9 @@ class ModelArtifactManager:
                 },
             )
             return False
-        artifact_specs: List[Tuple[str, str, Optional[str]]] = [
+        artifact_specs: List[Tuple[str, str, str, Optional[str]]] = [
             (
+                "checkpoint",
                 record.checkpoint_path,
                 self.two_tower_local_checkpoint_path,
                 self._extract_artifact_sha256(payload, "checkpoint"),
@@ -626,6 +686,7 @@ class ModelArtifactManager:
         if cf_index_path:
             artifact_specs.append(
                 (
+                    "cf_index",
                     cf_index_path,
                     self.two_tower_local_index_path,
                     self._extract_artifact_sha256(
@@ -636,6 +697,7 @@ class ModelArtifactManager:
         if cf_metadata_path:
             artifact_specs.append(
                 (
+                    "cf_index_metadata",
                     cf_metadata_path,
                     self.two_tower_local_metadata_path,
                     self._extract_artifact_sha256(
@@ -650,6 +712,7 @@ class ModelArtifactManager:
         if embedding_sidecar_path:
             artifact_specs.append(
                 (
+                    "cf_embedding_sidecar",
                     embedding_sidecar_path,
                     self.two_tower_local_embedding_sidecar_path,
                     self._extract_artifact_sha256(payload, "cf_embedding_sidecar"),
@@ -663,6 +726,7 @@ class ModelArtifactManager:
         if adapter_path:
             artifact_specs.append(
                 (
+                    "cf_adapter",
                     adapter_path,
                     self.two_tower_local_adapter_path,
                     self._extract_artifact_sha256(payload, "cf_adapter"),
@@ -670,9 +734,253 @@ class ModelArtifactManager:
             )
         else:
             stale_optional_local_paths.append(self.two_tower_local_adapter_path)
-        await self._sync_paths_to_local_atomically(artifact_specs)
-        self._remove_local_artifacts(stale_optional_local_paths)
+        if self.model_config.artifact_generation_root and record.payload.get(
+            "active_generation"
+        ):
+            resolved = await self._install_generation_bundle(record, artifact_specs)
+            record.checkpoint_path = str(resolved.artifact_paths["checkpoint"])
+            path_keys = {
+                "cf_index": "cf_index_path",
+                "cf_index_metadata": "cf_index_metadata_path",
+                "cf_embedding_sidecar": "cf_embedding_sidecar_path",
+                "cf_adapter": "cf_adapter_path",
+            }
+            for name, payload_key in path_keys.items():
+                if name in resolved.artifact_paths:
+                    record.payload[payload_key] = str(resolved.artifact_paths[name])
+            record.payload["bundle_digest"] = resolved.bundle_digest
+            record.payload["artifact_generation_root"] = str(resolved.root)
+        else:
+            await self._sync_paths_to_local_atomically(
+                [
+                    (storage, local, digest)
+                    for _, storage, local, digest in artifact_specs
+                ]
+            )
+            self._remove_local_artifacts(stale_optional_local_paths)
         return True
+
+    async def _install_generation_bundle(
+        self,
+        record: ModelArtifactRecord,
+        artifact_specs: List[Tuple[str, str, str, Optional[str]]],
+    ) -> ResolvedArtifactGeneration:
+        release_id = str(record.payload.get("model_release_id") or "").strip()
+        generation = record.payload.get("active_generation")
+        if not release_id or generation is None:
+            raise ValueError(
+                "generation activation requires model_release_id and active_generation"
+            )
+        if self.object_storage is None:
+            raise RuntimeError("generation activation requires object storage")
+        specs = []
+        for name, storage_path, local_path, expected_sha256 in artifact_specs:
+            if not expected_sha256:
+                raise ValueError(f"generation artifact {name!r} checksum is required")
+            specs.append(
+                ArtifactSpec(
+                    name=name,
+                    storage_path=storage_path,
+                    sha256=expected_sha256,
+                    filename=Path(local_path).name,
+                )
+            )
+        installer = ArtifactGenerationInstaller(
+            root=self.model_config.artifact_generation_root,
+            object_storage=self.object_storage,
+        )
+        started = time.perf_counter()
+        try:
+            resolved = await installer.install(
+                model_name=record.model_name,
+                release_id=release_id,
+                model_version=record.model_version,
+                active_generation=int(generation),
+                artifacts=tuple(specs),
+                metadata={
+                    "feature_schema_version": record.payload.get(
+                        "feature_schema_version"
+                    ),
+                    "score_policy_version": record.payload.get("score_policy_version"),
+                    "quality_gate_policy_version": record.payload.get(
+                        "quality_gate_policy_version"
+                    ),
+                    "eligibility_policy_version": record.payload.get(
+                        "eligibility_policy_version"
+                    ),
+                    "label_policy_version": record.payload.get("label_policy_version"),
+                    "embedding_dimension": record.payload.get("embedding_dimension"),
+                },
+            )
+        except Exception as exc:
+            if self.observability is not None:
+                self.observability.record_model_artifact_activation_failure(
+                    model_name=record.model_name,
+                    reason=type(exc).__name__,
+                )
+            raise
+        if self.observability is not None:
+            self.observability.observe_model_artifact_activation(
+                model_name=record.model_name,
+                status="installed",
+                duration_seconds=time.perf_counter() - started,
+            )
+        return resolved
+
+    async def _record_generation_observation(
+        self,
+        record: ModelArtifactRecord,
+        *,
+        environment: str,
+        state: str,
+        bundle_digest: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        if not self.service_name or self.system_store is None:
+            return
+        recorder = getattr(
+            self.system_store, "record_model_release_instance_observation", None
+        )
+        if recorder is None:
+            return
+        release_id = str(record.payload.get("model_release_id") or "") or None
+        generation = int(record.payload.get("active_generation") or 0)
+        await recorder(
+            model_name=record.model_name,
+            environment=str(environment),
+            service_name=self.service_name,
+            instance_id=self.instance_id,
+            desired_release_id=release_id,
+            desired_generation=generation,
+            desired_bundle_digest=bundle_digest,
+            observed_release_id=release_id if state == "ready" else None,
+            observed_generation=generation if state == "ready" else None,
+            observed_model_version=(record.model_version if state == "ready" else None),
+            bundle_digest=bundle_digest if state == "ready" else None,
+            state=state,
+            last_error=error,
+        )
+
+    async def record_generation_activation(
+        self,
+        record: ModelArtifactRecord,
+        *,
+        environment: str,
+        state: str,
+        error: Optional[str] = None,
+    ) -> None:
+        await self._record_generation_observation(
+            record,
+            environment=environment,
+            state=state,
+            bundle_digest=str(record.payload.get("bundle_digest") or "") or None,
+            error=error,
+        )
+
+    async def prepare_ranking_replacement(
+        self,
+        current_model: Any,
+        record: ModelArtifactRecord,
+        *,
+        environment: str,
+    ) -> Any:
+        """Load and smoke-check a replacement, recording failures durably."""
+        started = time.perf_counter()
+        try:
+            replacement = await current_model.build_artifact_replacement(record)
+        except Exception as exc:
+            await self.record_generation_activation(
+                record,
+                environment=environment,
+                state="failed",
+                error=str(exc),
+            )
+            if self.observability is not None:
+                self.observability.record_model_artifact_activation_failure(
+                    model_name=record.model_name,
+                    reason=type(exc).__name__,
+                )
+            raise
+        if self.observability is not None:
+            self.observability.observe_model_artifact_activation(
+                model_name=record.model_name,
+                status="ready",
+                duration_seconds=time.perf_counter() - started,
+            )
+        return replacement
+
+    async def cleanup_local_generations(
+        self,
+        record: ModelArtifactRecord,
+        *,
+        environment: str,
+        inflight_identities: Optional[set[tuple[str, int]]] = None,
+    ) -> tuple[Path, ...]:
+        if not self.model_config.artifact_generation_root:
+            return ()
+        release_id = str(record.payload.get("model_release_id") or "")
+        generation = int(record.payload.get("active_generation") or 0)
+        bundle_digest = str(record.payload.get("bundle_digest") or "")
+        if not release_id or generation < 1 or not bundle_digest:
+            return ()
+        protected: set[tuple[str, int]] = set()
+        if self.system_store is not None:
+            loader = getattr(
+                self.system_store, "list_model_release_pointer_identities", None
+            )
+            if loader is not None:
+                protected = await loader(
+                    model_name=record.model_name, environment=str(environment)
+                )
+        installer = ArtifactGenerationInstaller(
+            root=self.model_config.artifact_generation_root,
+            object_storage=self.object_storage,
+        )
+        try:
+            removed = installer.cleanup(
+                model_name=record.model_name,
+                current_identity=(release_id, generation, bundle_digest),
+                protected_identities=protected,
+                inflight_identities=set(inflight_identities or set()),
+                keep=self.model_config.artifact_local_generations_to_keep,
+                min_age_hours=self.model_config.artifact_generation_min_age_hours,
+            )
+        except Exception:
+            if self.observability is not None:
+                self.observability.model_artifact_generation_cleanup_failures_total.labels(
+                    model_name=record.model_name
+                ).inc()
+            logger.exception(
+                "model artifact generation cleanup failed",
+                extra={"model_name": record.model_name},
+            )
+            return ()
+
+        if self.observability is not None:
+            family_root = (
+                Path(self.model_config.artifact_generation_root) / record.model_name
+            )
+            generation_directories = (
+                [
+                    path
+                    for path in family_root.iterdir()
+                    if path.is_dir() and not path.name.startswith(".staging-")
+                ]
+                if family_root.exists()
+                else []
+            )
+            total_bytes = sum(
+                path.stat().st_size
+                for directory in generation_directories
+                for path in directory.rglob("*")
+                if path.is_file()
+            )
+            self.observability.update_model_artifact_generations(
+                model_name=record.model_name,
+                count=len(generation_directories),
+                size_bytes=total_bytes,
+            )
+        return removed
 
     async def sync_latest_sasrec_artifacts(self) -> Optional[ModelArtifactRecord]:
         record = await self.get_latest_model_checkpoint(self.SASREC_MODEL_NAME)

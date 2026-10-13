@@ -53,7 +53,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "11"
+          java-version: "17"
           cache: maven
           cache-dependency-path: flink-jobs/interaction-features/pom.xml
       - name: Run Flink Maven tests
@@ -166,3 +166,47 @@ jobs:
           docker run --rm --memory=2g --memory-swap=2g
           video-commerce-pit-benchmark:ci
           python scripts/pit_memory_benchmark.py --rows 100000 500000
+
+  artifact-rolling-activation-drill:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install focused backend dependencies
+        run: pip install -r requirements.txt
+      - name: Exercise immutable generation and rollout fencing
+        run: >-
+          python -m pytest -q
+          tests/test_artifact_generation.py
+          tests/test_artifact_activation_observation.py
+          tests/test_model_rollout.py
+          tests/test_model_release_cli.py
+
+  iceberg-maintenance-drill:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install focused backend dependencies
+        run: pip install -r requirements.txt
+      - name: Exercise plan hash and head-snapshot fencing
+        run: python -m pytest -q tests/test_iceberg_maintenance.py
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: flink-jobs/interaction-features/pom.xml
+      - name: Compile and test Iceberg maintenance job
+        working-directory: flink-jobs/interaction-features
+        run: mvn -B -ntp -Dtest=IcebergMaintenanceJobTest test

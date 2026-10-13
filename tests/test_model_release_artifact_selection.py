@@ -79,7 +79,9 @@ def test_sync_active_ranking_materializes_only_pointer_selected_checkpoint(tmp_p
     manager = ModelArtifactManager(
         system_store=store,
         object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
-        model_config=ModelConfig(ranking_model_path=str(destination)),
+        model_config=ModelConfig(
+            ranking_model_path=str(destination), artifact_generation_root=""
+        ),
         recommendation_config=RecommendationConfig(),
     )
 

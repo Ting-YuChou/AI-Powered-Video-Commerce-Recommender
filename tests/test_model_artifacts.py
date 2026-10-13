@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from pathlib import Path
 import numpy as np
 
 import pytest
@@ -207,7 +208,9 @@ def test_sync_active_ranking_checkpoint_never_selects_newer_registered_release(
     manager = ModelArtifactManager(
         system_store=store,
         object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
-        model_config=ModelConfig(ranking_model_path=str(local_path)),
+        model_config=ModelConfig(
+            ranking_model_path=str(local_path), artifact_generation_root=""
+        ),
         recommendation_config=RecommendationConfig(),
     )
 
@@ -222,6 +225,48 @@ def test_sync_active_ranking_checkpoint_never_selects_newer_registered_release(
     assert record.payload["model_release_id"] == "release-active"
     assert record.payload["active_generation"] == 7
     assert local_path.read_bytes() == b"active"
+
+
+def test_active_ranking_bundle_uses_immutable_generation_when_configured(tmp_path):
+    store = FakeSystemStore()
+    remote = tmp_path / "remote" / "ranking.pt"
+    remote.parent.mkdir()
+    remote.write_bytes(b"generation-seven")
+    store.active[("ranking_model", "production")] = {
+        "model_name": "ranking_model",
+        "model_version": "ranking-v7",
+        "checkpoint_path": str(remote),
+        "payload": {
+            "artifact_sha256": hashlib.sha256(b"generation-seven").hexdigest(),
+            "feature_schema_version": "ranking_v3_00_temporal_multimodal",
+            "model_release_id": "release-seven",
+            "active_generation": 7,
+        },
+        "created_at": 1.0,
+    }
+    fixed_path = tmp_path / "cache" / "ranking.pt"
+    manager = ModelArtifactManager(
+        system_store=store,
+        object_storage=ObjectStorage(ObjectStorageConfig(backend="local")),
+        model_config=ModelConfig(
+            ranking_model_path=str(fixed_path),
+            artifact_generation_root=str(tmp_path / "generations"),
+        ),
+        recommendation_config=RecommendationConfig(),
+    )
+
+    record = asyncio.run(
+        manager.sync_active_ranking_checkpoint(
+            environment="production",
+            expected_feature_schema_version="ranking_v3_00_temporal_multimodal",
+        )
+    )
+
+    checkpoint = Path(record.checkpoint_path)
+    assert checkpoint.read_bytes() == b"generation-seven"
+    assert checkpoint.parent.name == "7-release-seven"
+    assert record.payload["bundle_digest"]
+    assert fixed_path.exists() is False
 
 
 def test_persist_visual_product_index_records_complete_atomic_bundle(tmp_path):
@@ -570,6 +615,14 @@ def test_sync_active_two_tower_artifacts_ignores_newer_unpromoted_release(tmp_pa
         "label_policy_version": "retrieval_label_v1",
         "quality_gate_policy_version": "retrieval_quality_gate_v1",
         "embedding_dimension": 128,
+        "model_release_id": "release-two-tower-active",
+        "artifact_manifest": {
+            "checkpoint": {"sha256": hashlib.sha256(b"active-pt").hexdigest()},
+            "cf_index": {"sha256": hashlib.sha256(b"active-faiss").hexdigest()},
+            "cf_index_metadata": {
+                "sha256": hashlib.sha256(b'{"index_map": {}}').hexdigest()
+            },
+        },
     }
     fake_store.active[(ModelArtifactManager.TWO_TOWER_MODEL_NAME, "production")] = {
         "model_name": ModelArtifactManager.TWO_TOWER_MODEL_NAME,
@@ -592,7 +645,10 @@ def test_sync_active_two_tower_artifacts_ignores_newer_unpromoted_release(tmp_pa
                 backend="local", download_dir=str(tmp_path / "downloads")
             )
         ),
-        model_config=ModelConfig(cache_dir=str(tmp_path / "cache")),
+        model_config=ModelConfig(
+            cache_dir=str(tmp_path / "cache"),
+            artifact_generation_root=str(tmp_path / "generations"),
+        ),
         recommendation_config=RecommendationConfig(cf_index_path=str(local_index)),
     )
 
@@ -604,7 +660,9 @@ def test_sync_active_two_tower_artifacts_ignores_newer_unpromoted_release(tmp_pa
 
     assert record.model_version == "two-tower-active"
     assert record.payload["active_generation"] == 7
-    assert local_index.read_bytes() == b"active-faiss"
+    assert Path(record.payload["cf_index_path"]).read_bytes() == b"active-faiss"
+    assert record.checkpoint_path.startswith(str(tmp_path / "generations"))
+    assert not local_index.exists()
 
 
 def test_active_two_tower_artifact_requires_retrieval_lineage(tmp_path):

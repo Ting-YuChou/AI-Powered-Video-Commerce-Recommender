@@ -296,6 +296,7 @@ class ModelTrainerService:
             object_storage=self.object_storage,
             model_config=self.config.model_config,
             recommendation_config=self.config.recommendation_config,
+            observability=self.observability,
         )
         self.din_sidecar_lineage = None
         if self.config.ranking_config.din_enabled:

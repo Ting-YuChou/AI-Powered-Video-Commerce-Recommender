@@ -66,3 +66,25 @@ def test_model_release_cli_accepts_two_tower_family():
     assert args.model_name == "two_tower_retrieval"
     assert args.command == "status"
     assert args.as_json is True
+
+
+def test_model_release_cli_supports_rollout_status_and_wait():
+    parser = build_parser()
+    status = parser.parse_args(["rollout-status", "--generation", "7", "--json"])
+    wait = parser.parse_args(
+        [
+            "wait-rollout",
+            "--generation",
+            "7",
+            "--expected-service-count",
+            "ranking-runner=2",
+            "--expected-service-count",
+            "ranking-service=1",
+            "--timeout",
+            "300",
+        ]
+    )
+
+    assert status.generation == 7
+    assert status.as_json is True
+    assert wait.expected_service_count == ["ranking-runner=2", "ranking-service=1"]

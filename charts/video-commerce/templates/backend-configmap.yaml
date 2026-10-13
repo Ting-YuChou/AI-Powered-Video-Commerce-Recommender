@@ -88,6 +88,13 @@ data:
   FEATURE_LAKE_CANDIDATE_SIDECAR_MODEL_VERSION: {{ .Values.external.featureLake.candidateSidecarModelVersion | quote }}
   FEATURE_LAKE_CANDIDATE_SIDECAR_TRAINING_CUTOFF: {{ .Values.external.featureLake.candidateSidecarTrainingCutoff | quote }}
   FEATURE_LAKE_PIT_JOB_JAR_PATH: {{ .Values.external.featureLake.pitJobJarPath | quote }}
+  FEATURE_LAKE_ICEBERG_MAINTENANCE_ENABLED: {{ .Values.external.featureLake.icebergMaintenanceEnabled | quote }}
+  FEATURE_LAKE_ICEBERG_MAINTENANCE_EXECUTE: {{ .Values.external.featureLake.icebergMaintenanceExecute | quote }}
+  FEATURE_LAKE_ICEBERG_MAINTENANCE_SNAPSHOT_RETENTION_DAYS: {{ .Values.external.featureLake.icebergMaintenanceSnapshotRetentionDays | quote }}
+  FEATURE_LAKE_ICEBERG_MAINTENANCE_RETAIN_LAST_SNAPSHOTS: {{ .Values.external.featureLake.icebergMaintenanceRetainLastSnapshots | quote }}
+  FEATURE_LAKE_ICEBERG_MAINTENANCE_ORPHAN_MIN_AGE_DAYS: {{ .Values.external.featureLake.icebergMaintenanceOrphanMinAgeDays | quote }}
+  FEATURE_LAKE_ICEBERG_MAINTENANCE_DELETE_BATCH_SIZE: {{ .Values.external.featureLake.icebergMaintenanceDeleteBatchSize | quote }}
+  FEATURE_LAKE_ICEBERG_MAINTENANCE_RUN_SECONDS: {{ .Values.external.featureLake.icebergMaintenanceRunSeconds | quote }}
   DATABASE_ENABLE: {{ .Values.external.database.enable | quote }}
   DATABASE_POOL_SIZE: {{ .Values.external.database.poolSize | quote }}
   DATABASE_MAX_OVERFLOW: {{ .Values.external.database.maxOverflow | quote }}
@@ -98,6 +105,10 @@ data:
   DATABASE_IMPRESSION_RETENTION_DAYS: {{ .Values.external.database.impressionRetentionDays | quote }}
   DATABASE_AUTO_CREATE_SCHEMA: {{ .Values.external.database.autoCreateSchema | quote }}
   MODEL_CACHE_DIR: {{ .Values.appConfig.modelCacheDir | quote }}
+  MODEL_ARTIFACT_GENERATION_ROOT: {{ .Values.appConfig.modelArtifactGenerationRoot | quote }}
+  MODEL_ARTIFACT_LOCAL_GENERATIONS_TO_KEEP: {{ .Values.appConfig.modelArtifactLocalGenerationsToKeep | quote }}
+  MODEL_ARTIFACT_GENERATION_MIN_AGE_HOURS: {{ .Values.appConfig.modelArtifactGenerationMinAgeHours | quote }}
+  MODEL_ARTIFACT_ACTIVATION_POLL_SECONDS: {{ .Values.appConfig.modelArtifactActivationPollSeconds | quote }}
   MODEL_CONTENT_PIPELINE_VERSION: {{ .Values.appConfig.contentPipelineVersion | quote }}
   SERVICE_CONTENT_OUTBOX_BATCH_SIZE: {{ .Values.appConfig.contentOutboxBatchSize | quote }}
   SERVICE_CONTENT_OUTBOX_LEASE_SECONDS: {{ .Values.appConfig.contentOutboxLeaseSeconds | quote }}

@@ -93,6 +93,7 @@ class RankingRunner:
             object_storage=self.object_storage,
             model_config=self.config.model_config,
             recommendation_config=self.config.recommendation_config,
+            observability=self.runtime.observability,
         )
 
         self.ranking_model = RankingModel(
@@ -104,13 +105,27 @@ class RankingRunner:
             environment=self.config.model_release_config.environment,
             expected_feature_schema_version=self.ranking_model.feature_schema_version,
         )
-        await self.ranking_model.load_model(self.config.model_config.ranking_model_path)
         if ranking_checkpoint:
-            self.ranking_model.mark_artifact_record_verified(ranking_checkpoint)
+            self.ranking_model = (
+                await self.artifact_manager.prepare_ranking_replacement(
+                    self.ranking_model,
+                    ranking_checkpoint,
+                    environment=self.config.model_release_config.environment,
+                )
+            )
+            await self.artifact_manager.record_generation_activation(
+                ranking_checkpoint,
+                environment=self.config.model_release_config.environment,
+                state="ready",
+            )
             generation = ranking_checkpoint.payload.get("active_generation")
             self.runtime.observability.update_model_release_generation(
                 desired=generation,
                 observed=generation,
+            )
+        else:
+            await self.ranking_model.load_model(
+                self.config.model_config.ranking_model_path
             )
         self.ranking_model.enable_profiling_logs = (
             self.config.monitoring_config.enable_profiling_logs
@@ -377,7 +392,8 @@ class RankingRunner:
                     )
                     self._record_runner_batch("deadline_exceeded")
                     continue
-                if self.ranking_model is None or self._executor is None:
+                ranking_model = self.ranking_model
+                if ranking_model is None or self._executor is None:
                     self._complete_batch_future(
                         future,
                         503,
@@ -397,7 +413,7 @@ class RankingRunner:
                     self._executor,
                     functools.partial(
                         run_ranking_batch_payloads,
-                        self.ranking_model,
+                        ranking_model,
                         requests,
                         profile_path="torch_microbatch_runner",
                     ),
@@ -553,38 +569,64 @@ class RankingRunner:
             1,
             int(self.config.ranking_config.checkpoint_sync_interval_seconds),
         )
-        model_path = self.config.model_config.ranking_model_path
         last_ranking_identity = (
-            self.ranking_model.model_version if self.ranking_model else None,
+            self.ranking_model.artifact_metadata.get("model_release_id")
+            if self.ranking_model
+            else None,
             (
                 self.ranking_model.artifact_metadata.get("active_generation")
                 if self.ranking_model
                 else None
             ),
+            self.ranking_model.artifact_metadata.get("bundle_digest")
+            if self.ranking_model
+            else None,
         )
         while True:
             try:
                 await asyncio.sleep(interval_seconds)
-                if self.ranking_model and model_path and self.artifact_manager:
+                if self.ranking_model and self.artifact_manager:
                     selected_ranking = await self.artifact_manager.sync_selected_ranking_checkpoint(
                         gate_mode=self.config.model_release_config.gate_mode,
                         environment=self.config.model_release_config.environment,
                         expected_feature_schema_version=self.ranking_model.feature_schema_version,
                     )
                     selected_identity = (
-                        selected_ranking.model_version if selected_ranking else None,
+                        selected_ranking.payload.get("model_release_id")
+                        if selected_ranking
+                        else None,
                         (
                             selected_ranking.payload.get("active_generation")
                             if selected_ranking
                             else None
                         ),
+                        selected_ranking.payload.get("bundle_digest")
+                        if selected_ranking
+                        else None,
                     )
                     if selected_ranking and selected_identity != last_ranking_identity:
-                        if await self.ranking_model.reload_model_if_updated(model_path):
-                            self.ranking_model.mark_artifact_record_verified(
-                                selected_ranking
-                            )
-                            last_ranking_identity = selected_identity
+                        replacement = await self.artifact_manager.prepare_ranking_replacement(
+                            self.ranking_model,
+                            selected_ranking,
+                            environment=self.config.model_release_config.environment,
+                        )
+                        self.ranking_model = replacement
+                        await self.artifact_manager.record_generation_activation(
+                            selected_ranking,
+                            environment=self.config.model_release_config.environment,
+                            state="ready",
+                        )
+                        await self.artifact_manager.cleanup_local_generations(
+                            selected_ranking,
+                            environment=self.config.model_release_config.environment,
+                        )
+                        last_ranking_identity = selected_identity
+                    if selected_ranking and selected_identity == last_ranking_identity:
+                        await self.artifact_manager.record_generation_activation(
+                            selected_ranking,
+                            environment=self.config.model_release_config.environment,
+                            state="ready",
+                        )
             except asyncio.CancelledError:
                 break
             except Exception as exc:

@@ -1,0 +1,55 @@
+{{- if .Values.icebergMaintenance.enabled }}
+{{- if not .Values.external.featureLake.enabled }}
+{{- fail "external.featureLake.enabled=true is required for Iceberg maintenance" }}
+{{- end }}
+{{- $catalog := required "external.featureLake.catalogUri is required for Iceberg maintenance" .Values.external.featureLake.catalogUri -}}
+{{- $warehouse := required "external.featureLake.warehouseUri is required for Iceberg maintenance" .Values.external.featureLake.warehouseUri -}}
+{{- $flink := required "external.featureLake.flinkJobmanager is required for Iceberg maintenance" .Values.external.featureLake.flinkJobmanager -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "video-commerce.fullname" . }}-iceberg-maintenance
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: iceberg-maintenance
+spec:
+  schedule: {{ .Values.icebergMaintenance.schedule | quote }}
+  timeZone: Etc/UTC
+  concurrencyPolicy: {{ .Values.icebergMaintenance.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.icebergMaintenance.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.icebergMaintenance.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.icebergMaintenance.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.icebergMaintenance.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "video-commerce.selectorLabels" (dict "root" . "component" "iceberg-maintenance") | nindent 12 }}
+        spec:
+          serviceAccountName: {{ include "video-commerce.serviceAccountName" . }}
+          automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.securityContext.pod | nindent 12 }}
+          containers:
+            - name: iceberg-maintenance
+              image: {{ printf "%s:%s" .Values.images.pitOrchestrator.repository .Values.images.pitOrchestrator.tag | quote }}
+              imagePullPolicy: {{ .Values.images.pitOrchestrator.pullPolicy }}
+              command: ["python", "-m", "video_commerce.services.iceberg_maintenance.main"]
+              args:
+                - scheduled
+                {{- if .Values.external.featureLake.icebergMaintenanceExecute }}
+                - --execute
+                {{- end }}
+              envFrom:
+                - configMapRef:
+                    name: {{ include "video-commerce.fullname" . }}-backend-config
+              env:
+                {{- include "video-commerce.secretEnv" . | nindent 16 }}
+                {{- include "video-commerce.mapEnv" .Values.icebergMaintenance.env | nindent 16 }}
+              resources:
+                {{- toYaml .Values.icebergMaintenance.resources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.securityContext.container | nindent 16 }}
+{{- end }}

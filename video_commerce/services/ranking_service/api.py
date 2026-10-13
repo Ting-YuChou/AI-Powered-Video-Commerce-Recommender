@@ -116,6 +116,7 @@ async def startup_event():
         object_storage=object_storage,
         model_config=runtime.config.model_config,
         recommendation_config=runtime.config.recommendation_config,
+        observability=runtime.observability,
     )
 
     ranking_model = RankingModel(
@@ -129,9 +130,19 @@ async def startup_event():
             environment=runtime.config.model_release_config.environment,
             expected_feature_schema_version=ranking_model.feature_schema_version,
         )
-    await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
     if ranking_checkpoint:
-        ranking_model.mark_artifact_record_verified(ranking_checkpoint)
+        ranking_model = await artifact_manager.prepare_ranking_replacement(
+            ranking_model,
+            ranking_checkpoint,
+            environment=runtime.config.model_release_config.environment,
+        )
+        await artifact_manager.record_generation_activation(
+            ranking_checkpoint,
+            environment=runtime.config.model_release_config.environment,
+            state="ready",
+        )
+    else:
+        await ranking_model.load_model(runtime.config.model_config.ranking_model_path)
     ranking_model.enable_profiling_logs = (
         runtime.config.monitoring_config.enable_profiling_logs
     )
@@ -439,29 +450,69 @@ def _conservative_deadline(existing_deadline: Any, local_deadline: float) -> flo
 
 
 async def _periodic_ranking_checkpoint_sync(runtime) -> None:
+    global ranking_model
     interval_seconds = max(
         1, int(runtime.config.ranking_config.checkpoint_sync_interval_seconds)
     )
-    model_path = runtime.config.model_config.ranking_model_path
-    last_ranking_version: Optional[str] = (
-        ranking_model.model_version if ranking_model else None
+    last_ranking_identity = (
+        ranking_model.artifact_metadata.get("model_release_id")
+        if ranking_model
+        else None,
+        ranking_model.artifact_metadata.get("active_generation")
+        if ranking_model
+        else None,
+        ranking_model.artifact_metadata.get("bundle_digest") if ranking_model else None,
     )
     while True:
         try:
             await asyncio.sleep(interval_seconds)
-            if ranking_model and model_path and artifact_manager:
+            if ranking_model and artifact_manager:
                 latest_ranking = await artifact_manager.sync_selected_ranking_checkpoint(
                     gate_mode=runtime.config.model_release_config.gate_mode,
                     environment=runtime.config.model_release_config.environment,
                     expected_feature_schema_version=ranking_model.feature_schema_version,
                 )
-                if (
-                    latest_ranking
-                    and latest_ranking.model_version != last_ranking_version
-                ):
-                    if await ranking_model.reload_model_if_updated(model_path):
-                        ranking_model.mark_artifact_record_verified(latest_ranking)
-                        last_ranking_version = latest_ranking.model_version
+                selected_identity = (
+                    latest_ranking.payload.get("model_release_id")
+                    if latest_ranking
+                    else None,
+                    latest_ranking.payload.get("active_generation")
+                    if latest_ranking
+                    else None,
+                    latest_ranking.payload.get("bundle_digest")
+                    if latest_ranking
+                    else None,
+                )
+                if latest_ranking and selected_identity != last_ranking_identity:
+                    replacement = await artifact_manager.prepare_ranking_replacement(
+                        ranking_model,
+                        latest_ranking,
+                        environment=runtime.config.model_release_config.environment,
+                    )
+                    if ranking_batcher is not None:
+                        ranking_batcher.replace_ranking_model(replacement)
+                    ranking_model = replacement
+                    await artifact_manager.record_generation_activation(
+                        latest_ranking,
+                        environment=runtime.config.model_release_config.environment,
+                        state="ready",
+                    )
+                    await artifact_manager.cleanup_local_generations(
+                        latest_ranking,
+                        environment=runtime.config.model_release_config.environment,
+                        inflight_identities=(
+                            ranking_batcher.inflight_generation_identities()
+                            if ranking_batcher is not None
+                            else set()
+                        ),
+                    )
+                    last_ranking_identity = selected_identity
+                if latest_ranking and selected_identity == last_ranking_identity:
+                    await artifact_manager.record_generation_activation(
+                        latest_ranking,
+                        environment=runtime.config.model_release_config.environment,
+                        state="ready",
+                    )
         except asyncio.CancelledError:
             break
         except Exception as exc:

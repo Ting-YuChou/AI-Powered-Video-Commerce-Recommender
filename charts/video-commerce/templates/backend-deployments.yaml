@@ -76,6 +76,8 @@ spec:
             - configMapRef:
                 name: {{ include "video-commerce.fullname" $ }}-backend-config
           env:
+            - name: MODEL_ARTIFACT_SERVICE_NAME
+              value: {{ $workload.name | quote }}
             {{- include "video-commerce.secretEnv" $ | nindent 12 }}
             {{- include "video-commerce.mapEnv" $workload.env | nindent 12 }}
           resources:

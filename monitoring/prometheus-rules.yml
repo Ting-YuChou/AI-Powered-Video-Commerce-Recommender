@@ -575,3 +575,30 @@ groups:
         annotations:
           summary: A validated Two-Tower release remains in staging
           description: Review retrieval gate evidence and either promote or retire the release.
+
+      - alert: ModelArtifactActivationFailures
+        expr: increase(model_artifact_activation_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Model artifact generation activation failed
+          description: The previous verified generation remains active; inspect checksum, schema, policy, and smoke validation errors.
+
+      - alert: ModelArtifactGenerationCleanupFailure
+        expr: increase(model_artifact_generation_cleanup_failures_total[1h]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Local model generation cleanup failed
+          description: Inspect filesystem capacity and protected generation references before manual cleanup.
+
+      - alert: IcebergMaintenanceFailure
+        expr: iceberg_maintenance_failed_runs > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Iceberg maintenance failed
+          description: Keep execute mode disabled until plan hash, table head, protected lineage, and post-cleanup reads are reconciled.
