@@ -19,7 +19,10 @@ from video_commerce.ml.retrieval_pit_dataset import RetrievalPitDatasetReader
 from video_commerce.ml.retrieval_release_training import (
     RetrievalReleaseTrainingRunner,
 )
-from video_commerce.ml.retrieval_training import build_retrieval_training_inputs
+from video_commerce.ml.retrieval_training import (
+    build_retrieval_streaming_inputs,
+    build_retrieval_training_inputs,
+)
 from video_commerce.ml.two_tower import TwoTowerTrainer
 from video_commerce.ml.vector_search import VectorSearchEngine
 
@@ -83,7 +86,18 @@ async def _run(args: argparse.Namespace):
     await storage.initialize()
     await store.initialize()
     try:
-        dataset = await RetrievalPitDatasetReader(storage).read(dataset_uri)
+        reader = RetrievalPitDatasetReader(storage)
+        streaming = config.feature_lake_config.pit_reader_mode == "streaming"
+        if streaming:
+            dataset = await reader.validate_and_stage(
+                dataset_uri,
+                staging_dir=config.feature_lake_config.pit_staging_dir,
+                batch_rows=config.feature_lake_config.pit_batch_rows,
+                max_group_rows=config.feature_lake_config.pit_max_group_rows,
+                max_bytes=config.feature_lake_config.pit_staging_max_bytes,
+            )
+        else:
+            dataset = await reader.read(dataset_uri)
         if (
             dataset.manifest.eligibility_policy_version
             != config.recommendation_config.retrieval_eligibility_policy_version
@@ -93,12 +107,20 @@ async def _run(args: argparse.Namespace):
             raise RuntimeError(
                 "retrieval PIT policies are incompatible with trainer config"
             )
-        inputs = build_retrieval_training_inputs(
-            dataset,
-            holdout_days=config.recommendation_config.retrieval_holdout_days,
-            ranker_rejected_mode=(
-                config.recommendation_config.retrieval_ranker_rejected_mode
-            ),
+        inputs = (
+            build_retrieval_streaming_inputs(
+                dataset,
+                holdout_days=config.recommendation_config.retrieval_holdout_days,
+                batch_rows=config.feature_lake_config.pit_batch_rows,
+            )
+            if streaming
+            else build_retrieval_training_inputs(
+                dataset,
+                holdout_days=config.recommendation_config.retrieval_holdout_days,
+                ranker_rejected_mode=(
+                    config.recommendation_config.retrieval_ranker_rejected_mode
+                ),
+            )
         )
         version = str(
             args.model_version
@@ -138,6 +160,14 @@ async def _run(args: argparse.Namespace):
             },
             "embedding_source_dimension": dataset.catalog.embedding_dimension,
             "embedding_model_revision": dataset.catalog.embedding_model_revision,
+            "pit_reader_mode": "streaming" if streaming else "materialized",
+            "pit_stream_contract_version": (
+                dataset.lineage.get("pit_stream_contract_version")
+                if streaming
+                else None
+            ),
+            "verified_row_count": dataset.row_count if streaming else len(dataset.rows),
+            "verified_group_count": dataset.group_count if streaming else None,
         }
         outcome = await runner.run_inputs(
             inputs,

@@ -5,8 +5,32 @@ import pytest
 
 from video_commerce.ml.candidate_embedding_sidecar import (
     CandidateEmbeddingSidecar,
+    CandidateEmbeddingSidecar,
     write_candidate_embedding_sidecar,
 )
+
+
+def test_candidate_sidecar_converts_verified_npz_to_read_only_memmaps(tmp_path):
+    source = tmp_path / "candidates.npz"
+    digest = write_candidate_embedding_sidecar(
+        source,
+        {"p1": {"image": [1.0] * 512, "available_at": 10.0}},
+        model_version="ranking-v1",
+    )
+
+    target = tmp_path / "mapped"
+    CandidateEmbeddingSidecar.materialize_memmap(
+        source,
+        target,
+        expected_sha256=digest,
+        expected_model_version="ranking-v1",
+        expected_training_cutoff=0.0,
+    )
+    loaded = CandidateEmbeddingSidecar.load_memmap(target)
+
+    assert isinstance(loaded._arrays["image"], __import__("numpy").memmap)
+    assert loaded._arrays["image"].flags.writeable is False
+    assert loaded.get("p1", as_of_ts=10.0)["image"].shape == (512,)
 
 
 def test_candidate_sidecar_round_trips_presence_without_random_fallback(tmp_path):

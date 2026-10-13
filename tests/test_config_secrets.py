@@ -196,6 +196,12 @@ def test_config_reads_feature_lake_pit_training_env(monkeypatch):
     monkeypatch.setenv("FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED", "true")
     monkeypatch.setenv("FEATURE_LAKE_PIT_SCHEDULE_HOUR_UTC", "2")
     monkeypatch.setenv("FEATURE_LAKE_PIT_ORCHESTRATOR_LEASE_SECONDS", "7200")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_READER_MODE", "streaming")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_STAGING_DIR", "/tmp/pit-staging")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_STAGING_MAX_BYTES", "1048576")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_BATCH_ROWS", "256")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_MAX_GROUP_ROWS", "2048")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_CONTENT_CACHE_BYTES", "65536")
     monkeypatch.setenv("FEATURE_LAKE_FLINK_JOBMANAGER", "flink-jobmanager:8081")
     monkeypatch.setenv(
         "FEATURE_LAKE_PIT_EXPORT_URI",
@@ -215,6 +221,12 @@ def test_config_reads_feature_lake_pit_training_env(monkeypatch):
     assert config.feature_lake_config.pit_schedule_hour_utc == 2
     assert config.feature_lake_config.pit_orchestrator_lease_seconds == 7200
     assert config.feature_lake_config.flink_jobmanager == "flink-jobmanager:8081"
+    assert config.feature_lake_config.pit_reader_mode == "streaming"
+    assert config.feature_lake_config.pit_staging_dir == "/tmp/pit-staging"
+    assert config.feature_lake_config.pit_staging_max_bytes == 1048576
+    assert config.feature_lake_config.pit_batch_rows == 256
+    assert config.feature_lake_config.pit_max_group_rows == 2048
+    assert config.feature_lake_config.pit_content_cache_bytes == 65536
 
     reset_config()
 
@@ -401,6 +413,8 @@ def test_production_config_accepts_secret_files(monkeypatch, tmp_path):
     monkeypatch.setenv("RETRIEVAL_TRAINING_SOURCE", "pit")
     monkeypatch.setenv("RETRIEVAL_RELEASE_GATE_MODE", "enforced")
     monkeypatch.setenv("RECOMMENDATION_ONLINE_RETRAINING_ENABLED", "false")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_READER_MODE", "streaming")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_STAGING_MAX_BYTES", "1073741824")
     monkeypatch.setenv("SECURITY_AUTH_MODE", "api_key")
     monkeypatch.setenv("API_API_KEY_FILE", str(api_key_file))
     monkeypatch.setenv("SECURITY_INTERNAL_SERVICE_KEY_FILE", str(internal_key_file))
@@ -417,4 +431,64 @@ def test_production_config_accepts_secret_files(monkeypatch, tmp_path):
     assert config.security_config.internal_service_key == "internal-key"
     assert config.redis_config.password == "redis-password"
 
+    reset_config()
+
+
+def test_production_config_rejects_materialized_pit_reader(monkeypatch, tmp_path):
+    api_key_file = tmp_path / "api_key.txt"
+    internal_key_file = tmp_path / "internal_key.txt"
+    redis_password_file = tmp_path / "redis_password.txt"
+    api_key_file.write_text("api-key\n", encoding="utf-8")
+    internal_key_file.write_text("internal-key\n", encoding="utf-8")
+    redis_password_file.write_text("redis-password\n", encoding="utf-8")
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("VECTOR_BOOTSTRAP_MODE", "required")
+    monkeypatch.setenv("MODEL_RELEASE_GATE_MODE", "enforced")
+    monkeypatch.setenv("RETRIEVAL_TRAINING_SOURCE", "pit")
+    monkeypatch.setenv("RETRIEVAL_RELEASE_GATE_MODE", "enforced")
+    monkeypatch.setenv("RECOMMENDATION_ONLINE_RETRAINING_ENABLED", "false")
+    monkeypatch.setenv("SECURITY_AUTH_MODE", "api_key")
+    monkeypatch.setenv("API_API_KEY_FILE", str(api_key_file))
+    monkeypatch.setenv("SECURITY_INTERNAL_SERVICE_KEY_FILE", str(internal_key_file))
+    monkeypatch.setenv("REDIS_PASSWORD_FILE", str(redis_password_file))
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://video_commerce:strong-password@postgres:5432/video_commerce",
+    )
+    monkeypatch.setenv("FEATURE_LAKE_PIT_READER_MODE", "materialized")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_STAGING_MAX_BYTES", "1073741824")
+
+    reset_config()
+    with pytest.raises(ValueError):
+        Config()
+    reset_config()
+
+
+def test_production_config_requires_explicit_pit_staging_limit(monkeypatch, tmp_path):
+    api_key_file = tmp_path / "api_key.txt"
+    internal_key_file = tmp_path / "internal_key.txt"
+    redis_password_file = tmp_path / "redis_password.txt"
+    api_key_file.write_text("api-key\n", encoding="utf-8")
+    internal_key_file.write_text("internal-key\n", encoding="utf-8")
+    redis_password_file.write_text("redis-password\n", encoding="utf-8")
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("VECTOR_BOOTSTRAP_MODE", "required")
+    monkeypatch.setenv("MODEL_RELEASE_GATE_MODE", "enforced")
+    monkeypatch.setenv("RETRIEVAL_TRAINING_SOURCE", "pit")
+    monkeypatch.setenv("RETRIEVAL_RELEASE_GATE_MODE", "enforced")
+    monkeypatch.setenv("RECOMMENDATION_ONLINE_RETRAINING_ENABLED", "false")
+    monkeypatch.setenv("SECURITY_AUTH_MODE", "api_key")
+    monkeypatch.setenv("API_API_KEY_FILE", str(api_key_file))
+    monkeypatch.setenv("SECURITY_INTERNAL_SERVICE_KEY_FILE", str(internal_key_file))
+    monkeypatch.setenv("REDIS_PASSWORD_FILE", str(redis_password_file))
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://video_commerce:strong-password@postgres:5432/video_commerce",
+    )
+    monkeypatch.setenv("FEATURE_LAKE_PIT_READER_MODE", "streaming")
+    monkeypatch.delenv("FEATURE_LAKE_PIT_STAGING_MAX_BYTES", raising=False)
+
+    reset_config()
+    with pytest.raises(ValueError):
+        Config()
     reset_config()

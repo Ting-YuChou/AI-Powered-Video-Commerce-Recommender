@@ -211,6 +211,77 @@ def test_ranking_loss_contract_errors_fail_fast():
         ranking._compute_loss({}, {})
 
 
+def test_ranking_source_training_builds_tensors_per_batch():
+    from video_commerce.common.config import RankingConfig
+    from video_commerce.ml.ranking import RankingModel
+
+    def example(index: int) -> RankingTrainingExample:
+        impression_id = f"imp-{index // 2}"
+        bundle = FeatureBundle(
+            as_of_ts=100.0 + index,
+            feature_definition_version="ranking_ltr_v1",
+            user_features=UserFeatures(user_id="u1", last_active=90.0),
+            product_metadata={"price": 9.0, "created_at": 50.0},
+            context={},
+            candidate=CandidateProduct(
+                product_id=f"p{index}", combined_score=0.5, source="pit"
+            ),
+        )
+        return RankingTrainingExample(
+            observation_id=f"{impression_id}:p{index}",
+            impression_id=impression_id,
+            bundle=bundle,
+            attribution=AttributionFacts(
+                "click" if index % 2 == 0 else "view",
+                index % 2 == 0,
+                False,
+            ),
+        )
+
+    class Source:
+        row_count = 6
+
+        def reindex_value_buckets(self, _resolver):
+            return None
+
+        def compute_value_transform_stats(self, **_kwargs):
+            return {
+                "global": {"count": 0, "clip": 0.0, "mean": 0.0, "std": 1.0},
+                "buckets": {},
+                "algorithm_version": "exact_linear_quantile_welford_v1",
+            }
+
+        def iter_example_batches(self, *, split, **_kwargs):
+            if split == "training":
+                yield [example(0), example(1)]
+                yield [example(2), example(3)]
+            elif split == "validation":
+                yield [example(4), example(5)]
+
+    ranking = RankingModel(
+        RankingConfig(
+            architecture="dcn",
+            hidden_dims=[8],
+            training_min_samples=1,
+            epochs=1,
+            batch_size=2,
+        )
+    )
+    prepared_sizes = []
+    original = ranking._prepare_training_tensors
+
+    def tracked(examples, **kwargs):
+        prepared_sizes.append(len(examples))
+        return original(examples, **kwargs)
+
+    ranking._prepare_training_tensors = tracked
+    ranking._train_model_source_sync(Source(), batch_rows=2)
+
+    assert ranking.is_trained is True
+    assert prepared_sizes
+    assert max(prepared_sizes) == 2
+
+
 def test_trimodal_training_config_requires_joint_finetune_epoch():
     from video_commerce.common.config import RankingConfig
 

@@ -43,6 +43,11 @@ manually rewrite pointer rows.
 Two-Tower retrieval has a separate family-specific workflow in
 `docs/operations/retrieval-pit-release-runbook.md`. Keep its PIT and catalog
 artifacts immutable and roll back through the generation-fenced CLI.
+For PIT reader rollback, keep the verified manifest and model release fixed,
+set `FEATURE_LAKE_PIT_READER_MODE=materialized` only in a non-production shadow
+trainer, and compare split IDs, normalization, mapping, loss, and gate evidence.
+Production rejects materialized mode; restore the previous trainer image if the
+streaming implementation itself must be rolled back.
 If rolling back the publisher or worker, first stop new uploads, wait for
 in-flight processing leases to expire or complete, and record the remaining
 `pending_publish` rows. Do not delete their objects or outbox rows. A compatible

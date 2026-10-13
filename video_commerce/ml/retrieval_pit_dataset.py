@@ -6,10 +6,18 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import pyarrow as pa
 import pyarrow.parquet as pq
+
+from video_commerce.ml.pit_streaming import (
+    PitSpoolBuilder,
+    VerifiedPitSource,
+    iter_arrow_batch_rows,
+)
 
 
 RETRIEVAL_PIT_SCHEMA_VERSION = "retrieval_training_pit_v1"
@@ -137,6 +145,76 @@ class RetrievalHoldoutWindow:
     end_ts: float
 
 
+class RetrievalTrainingSource:
+    """Re-iterable retrieval rows backed by a verified disk spool."""
+
+    def __init__(
+        self,
+        source: VerifiedPitSource,
+        *,
+        manifest: RetrievalPitManifest,
+        catalog: RetrievalCatalog,
+        raw_manifest: Mapping[str, Any],
+    ) -> None:
+        self.source = source
+        self.manifest = manifest
+        self.catalog = catalog
+        self.raw_manifest = dict(raw_manifest)
+
+    @property
+    def path(self) -> Path:
+        return self.source.path
+
+    @property
+    def work_dir(self) -> Path:
+        return self.source.path.parent.parent / "work"
+
+    @property
+    def row_count(self) -> int:
+        return self.source.row_count
+
+    @property
+    def group_count(self) -> int:
+        return self.source.group_count
+
+    @property
+    def lineage(self) -> Mapping[str, Any]:
+        return dict(self.source.metadata.get("lineage") or {})
+
+    def assign_holdout(self, *, holdout_days: int) -> RetrievalHoldoutWindow:
+        self.source.assign_ranking_splits(
+            holdout_days=holdout_days,
+            attribution_cutoff=self.manifest.attribution_cutoff,
+            validation_fraction=0.0,
+        )
+        end_ts = self.manifest.max_as_of_ts
+        return RetrievalHoldoutWindow(
+            start_ts=end_ts - int(holdout_days) * 86400.0,
+            end_ts=end_ts,
+        )
+
+    def iter_row_batches(
+        self,
+        *,
+        split: str,
+        batch_rows: int,
+        seed: int,
+        epoch: int = 0,
+    ):
+        for rows in self.source.iter_group_batches(
+            split=split,
+            batch_rows=batch_rows,
+            seed=seed,
+            epoch=epoch,
+        ):
+            yield [
+                RetrievalPitDatasetReader._parse_row(
+                    row, self.raw_manifest, self.catalog
+                )
+                for row in rows
+            ]
+
+
 class RetrievalPitDatasetReader:
     """Read latest -> manifest -> checksummed shards and catalog generation."""
 
@@ -214,6 +292,159 @@ class RetrievalPitDatasetReader:
             manifest_sha256=_sha256(manifest_bytes),
         )
         return RetrievalPitDataset(parsed_manifest, catalog, tuple(rows))
+
+    async def validate_and_stage(
+        self,
+        latest_pointer_uri: str,
+        *,
+        staging_dir: str | Path,
+        batch_rows: int,
+        max_group_rows: int,
+        max_bytes: int,
+    ) -> RetrievalTrainingSource:
+        latest = await self._read_json(latest_pointer_uri, "latest pointer")
+        manifest_uri = str(latest.get("manifest_uri") or "")
+        if not manifest_uri:
+            raise RetrievalPitDatasetUnavailable(
+                "retrieval latest pointer is missing manifest_uri"
+            )
+        manifest_bytes = await self._read_bytes(manifest_uri)
+        try:
+            raw_manifest = json.loads(manifest_bytes)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RetrievalPitDatasetError(
+                "retrieval manifest is invalid JSON"
+            ) from exc
+        self._validate_manifest(raw_manifest, latest)
+        catalog_ref = dict(raw_manifest["catalog_generation"])
+        catalog_bytes = await self._read_bytes(str(catalog_ref["uri"]))
+        if _sha256(catalog_bytes) != str(catalog_ref["sha256"]):
+            raise RetrievalPitDatasetError("retrieval catalog checksum mismatch")
+        catalog = self._parse_catalog(catalog_bytes, raw_manifest, catalog_ref)
+        sidecar_ref = dict(raw_manifest["item_feature_sidecar"])
+        sidecar_bytes = await self._read_bytes(str(sidecar_ref["uri"]))
+        if _sha256(sidecar_bytes) != str(sidecar_ref["sha256"]):
+            raise RetrievalPitDatasetError("retrieval item feature checksum mismatch")
+        catalog = self._attach_item_features(catalog, sidecar_bytes, sidecar_ref)
+        manifest_sha = _sha256(manifest_bytes)
+        parsed_manifest = self._parsed_manifest(
+            raw_manifest, catalog_ref, manifest_uri, manifest_sha
+        )
+        lineage = {
+            "manifest_uri": manifest_uri,
+            "manifest_sha256": manifest_sha,
+            "materialization_run_id": parsed_manifest.materialization_run_id,
+            "dataset_version": parsed_manifest.dataset_version,
+            "catalog_generation_id": parsed_manifest.catalog_generation_id,
+            "catalog_manifest_sha256": parsed_manifest.catalog_sha256,
+            "attribution_cutoff": parsed_manifest.attribution_cutoff,
+            "min_as_of_ts": parsed_manifest.min_as_of_ts,
+            "max_as_of_ts": parsed_manifest.max_as_of_ts,
+            "pit_reader_mode": "streaming",
+            "pit_stream_contract_version": "pit_stream_v1",
+        }
+        builder = PitSpoolBuilder(
+            staging_dir,
+            generation_id=f"retrieval-{manifest_sha}",
+            kind="retrieval",
+            max_group_rows=max_group_rows,
+            max_bytes=max_bytes,
+            lineage=lineage,
+        )
+        seen_rows = 0
+        pinned_schema = None
+        try:
+            for shard_ref in raw_manifest["shards"]:
+                uri = str(shard_ref.get("uri") or "")
+                (
+                    local_path,
+                    cleanup,
+                ) = await self.object_storage.materialize_for_processing(
+                    uri, suggested_suffix=".parquet"
+                )
+                try:
+                    if os.path.getsize(local_path) != int(
+                        shard_ref.get("byte_size", -1)
+                    ):
+                        raise RetrievalPitDatasetError(
+                            "retrieval shard byte size does not match manifest"
+                        )
+                    if _sha256_path(local_path) != str(shard_ref.get("sha256") or ""):
+                        raise RetrievalPitDatasetError(
+                            "retrieval shard checksum mismatch"
+                        )
+                    parquet = pq.ParquetFile(local_path)
+                    schema = parquet.schema_arrow
+                    expected_schema = str(raw_manifest.get("schema_hash") or "")
+                    if (
+                        expected_schema
+                        and _arrow_schema_sha256(schema) != expected_schema
+                    ):
+                        raise RetrievalPitDatasetError(
+                            "retrieval shard schema mismatch"
+                        )
+                    if pinned_schema is None:
+                        pinned_schema = schema
+                    elif pinned_schema != schema:
+                        raise RetrievalPitDatasetError(
+                            "retrieval shard schema mismatch"
+                        )
+                    for batch in parquet.iter_batches(
+                        batch_size=max(1, int(batch_rows))
+                    ):
+                        spool_rows = []
+                        for raw in iter_arrow_batch_rows(batch):
+                            row = self._parse_row(raw, raw_manifest, catalog)
+                            if not row.query_id or not row.user_id:
+                                raise RetrievalPitDatasetError(
+                                    "retrieval row query and user identity are required"
+                                )
+                            spool_rows.append(
+                                {
+                                    "group_id": row.query_id,
+                                    "row_id": (
+                                        f"{row.product_id}:{row.label_source}:"
+                                        f"{row.label_type}:{seen_rows + len(spool_rows)}"
+                                    ),
+                                    "as_of_ts": row.as_of_ts,
+                                    "payload": raw,
+                                }
+                            )
+                        builder.add_rows(spool_rows)
+                        seen_rows += len(spool_rows)
+                finally:
+                    if cleanup:
+                        Path(local_path).unlink(missing_ok=True)
+            verified = builder.finalize(expected_rows=int(raw_manifest["row_count"]))
+            return RetrievalTrainingSource(
+                verified,
+                manifest=parsed_manifest,
+                catalog=catalog,
+                raw_manifest=raw_manifest,
+            )
+        except Exception:
+            builder.abort()
+            raise
+
+    @staticmethod
+    def _parsed_manifest(raw_manifest, catalog_ref, manifest_uri, manifest_sha):
+        return RetrievalPitManifest(
+            materialization_run_id=str(raw_manifest["materialization_run_id"]),
+            dataset_version=str(raw_manifest["dataset_version"]),
+            attribution_cutoff=float(raw_manifest["attribution_cutoff"]),
+            attribution_window_hours=int(raw_manifest["attribution_window_hours"]),
+            allowed_lateness_hours=int(raw_manifest["allowed_lateness_hours"]),
+            min_as_of_ts=float(raw_manifest["min_as_of_ts"]),
+            max_as_of_ts=float(raw_manifest["max_as_of_ts"]),
+            row_count=int(raw_manifest["row_count"]),
+            label_policy_version=str(raw_manifest["label_policy_version"]),
+            eligibility_policy_version=str(raw_manifest["eligibility_policy_version"]),
+            catalog_generation_id=str(catalog_ref["generation_id"]),
+            catalog_uri=str(catalog_ref["uri"]),
+            catalog_sha256=str(catalog_ref["sha256"]),
+            manifest_uri=manifest_uri,
+            manifest_sha256=manifest_sha,
+        )
 
     async def _read_json(self, uri: str, kind: str) -> Mapping[str, Any]:
         try:
@@ -522,6 +753,18 @@ def split_retrieval_holdout(
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _sha256_path(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _arrow_schema_sha256(schema: pa.Schema) -> str:
+    return hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
 
 
 def _finite_float(value: Any, field: str) -> float:

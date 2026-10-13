@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import json
 import math
+from pathlib import Path
+import sqlite3
 from typing import Dict, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -57,6 +60,68 @@ class RankingPrediction:
     ctr: float
     ctcvr: float
     predicted_value: float
+
+
+class RankingEvaluationSpool:
+    """Compact disk record; multimodal training objects never enter gate state."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.unlink(missing_ok=True)
+        self.connection = sqlite3.connect(self.path)
+        self.connection.execute(
+            "CREATE TABLE evaluation (observation_id TEXT PRIMARY KEY, "
+            "row_json TEXT NOT NULL, champion_json TEXT NOT NULL, "
+            "challenger_json TEXT NOT NULL)"
+        )
+
+    def add(
+        self,
+        row: RankingEvaluationRow,
+        champion: RankingPrediction,
+        challenger: RankingPrediction,
+    ) -> None:
+        from dataclasses import asdict
+
+        self.connection.execute(
+            "INSERT INTO evaluation VALUES (?,?,?,?)",
+            (
+                row.observation_id,
+                json.dumps(asdict(row), sort_keys=True, separators=(",", ":")),
+                json.dumps(asdict(champion), sort_keys=True, separators=(",", ":")),
+                json.dumps(asdict(challenger), sort_keys=True, separators=(",", ":")),
+            ),
+        )
+
+    def load(self):
+        self.connection.commit()
+        rows = []
+        champion = {}
+        challenger = {}
+        for (
+            observation_id,
+            raw_row,
+            raw_champion,
+            raw_challenger,
+        ) in self.connection.execute(
+            "SELECT observation_id,row_json,champion_json,challenger_json "
+            "FROM evaluation ORDER BY observation_id"
+        ):
+            row_payload = json.loads(raw_row)
+            row_payload["modality_presence"] = dict(
+                row_payload.get("modality_presence") or {}
+            )
+            rows.append(RankingEvaluationRow(**row_payload))
+            champion[str(observation_id)] = RankingPrediction(
+                **json.loads(raw_champion)
+            )
+            challenger[str(observation_id)] = RankingPrediction(
+                **json.loads(raw_challenger)
+            )
+        return rows, champion, challenger
+
+    def close(self) -> None:
+        self.connection.close()
 
 
 @dataclass(frozen=True)

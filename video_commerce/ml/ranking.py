@@ -2329,6 +2329,227 @@ class RankingModel:
             logger.error(f"Error training model: {e}")
             raise
 
+    async def train_model_source(
+        self,
+        source,
+        *,
+        batch_rows: int,
+        training_sample_source: str = "feature_lake_pit",
+        cancellation_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Train from a re-iterable PIT source without materializing all examples."""
+        cancel_requested = cancellation_event or threading.Event()
+        training_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._train_model_source_sync,
+                source,
+                batch_rows=batch_rows,
+                training_sample_source=training_sample_source,
+                cancellation_event=cancel_requested,
+            )
+        )
+        try:
+            saved_model_path = await asyncio.shield(training_task)
+            if not saved_model_path:
+                return False
+            await self.save_model(saved_model_path)
+            return True
+        except asyncio.CancelledError:
+            cancel_requested.set()
+            try:
+                await training_task
+            except RankingTrainingCancelled:
+                pass
+            raise
+        except Exception as exc:
+            logger.error("Error training model from PIT source: %s", exc)
+            raise
+
+    def _train_model_source_sync(
+        self,
+        source,
+        *,
+        batch_rows: int,
+        training_sample_source: str = "feature_lake_pit",
+        cancellation_event: Optional[threading.Event] = None,
+    ) -> Optional[str]:
+        """Bounded-memory ranking loop; tensors live for one source batch only."""
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise RankingTrainingCancelled("ranking training was cancelled")
+        training_rows = (
+            int(source.row_count_for_split("training"))
+            if hasattr(source, "row_count_for_split")
+            else int(source.row_count)
+        )
+        if training_rows < int(self.config.training_min_samples):
+            logger.warning("Insufficient PIT data for ranking model training")
+            return None
+
+        target_architecture = normalize_architecture(
+            getattr(self.config, "architecture", "dcn"),
+            supported=RANKING_ARCHITECTURES,
+        )
+        if self.model is None:
+            self._initialize_model(architecture=target_architecture)
+        elif getattr(self.model, "architecture", "mlp") != target_architecture:
+            previous_state = self.model.state_dict()
+            self._initialize_model(architecture=target_architecture)
+            self._load_shape_compatible_state_dict(previous_state)
+        elif self.optimizer is None:
+            previous_state = self.model.state_dict()
+            self._initialize_model(
+                architecture=target_architecture,
+                hidden_dims=getattr(self.model, "hidden_dims", None),
+                cross_layers=getattr(self.model, "cross_layers", None),
+                low_rank_dim=getattr(self.model, "low_rank_dim", None),
+            )
+            self._load_shape_compatible_state_dict(previous_state)
+
+        source.reindex_value_buckets(
+            lambda metadata: self._value_bucket_id(dict(metadata))
+        )
+        self.value_transform_stats = source.compute_value_transform_stats(
+            split="training",
+            quantile=float(getattr(self.config, "value_clip_quantile", 0.99) or 0.99),
+            min_bucket_purchases=max(
+                1, int(getattr(self.config, "value_min_bucket_purchases", 20) or 20)
+            ),
+        )
+        self._clear_compiled_model()
+        self.model.train()
+        seed = int(getattr(self.config, "training_seed", 42))
+        avg_loss = 0.0
+        validation_loss: Optional[float] = None
+        best_validation_loss = float("inf")
+        best_state_dict = None
+        epochs_without_improvement = 0
+        epochs_completed = 0
+        metrics_tensors = None
+        warmup_epochs = (
+            int(getattr(self.config, "trimodal_warmup_epochs", 1))
+            if isinstance(self.model, TemporalTrimodalRankingModel)
+            else 0
+        )
+        minimum_epochs = max(
+            int(getattr(self.config, "training_min_epochs", 1)), warmup_epochs + 1
+        )
+
+        for epoch in range(int(self.config.epochs)):
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise RankingTrainingCancelled("ranking training was cancelled")
+            if isinstance(self.model, TemporalTrimodalRankingModel):
+                base_trainable = epoch >= warmup_epochs
+                for parameter in self.model.ranker.parameters():
+                    parameter.requires_grad_(base_trainable)
+                self.model.ranker.train(base_trainable)
+            dropout_generator = torch.Generator(device=self.device.type)
+            dropout_generator.manual_seed(seed + epoch)
+            epoch_loss = 0.0
+            batch_count = 0
+            for examples in source.iter_example_batches(
+                split="training", batch_rows=int(batch_rows), seed=seed, epoch=epoch
+            ):
+                tensors = self._prepare_training_tensors(
+                    examples, fit_value_transform=False
+                )
+                metrics_tensors = tensors
+                for batch in self._iter_structured_training_batches(tensors):
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise RankingTrainingCancelled("ranking training was cancelled")
+                    self.optimizer.zero_grad()
+                    trimodal_inputs = self._apply_trimodal_modality_dropout(
+                        batch.trimodal_inputs,
+                        probability=float(
+                            getattr(self.config, "trimodal_modality_dropout", 0.1)
+                        ),
+                        generator=dropout_generator,
+                    )
+                    predictions = self.model(
+                        batch.base_features,
+                        **trimodal_inputs,
+                        **batch.din_inputs,
+                    )
+                    loss = self._compute_loss(predictions, batch.labels)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=1.0
+                    )
+                    self.optimizer.step()
+                    epoch_loss += float(loss.item())
+                    batch_count += 1
+                del tensors
+            if batch_count == 0:
+                logger.warning("No valid PIT training batches prepared")
+                return None
+            avg_loss = epoch_loss / batch_count
+            epochs_completed = epoch + 1
+
+            weighted_validation_loss = 0.0
+            validation_rows = 0
+            for examples in source.iter_example_batches(
+                split="validation", batch_rows=int(batch_rows), seed=seed, epoch=0
+            ):
+                tensors = self._prepare_training_tensors(
+                    examples, fit_value_transform=False
+                )
+                metrics_tensors = tensors
+                rows = int(tensors.base_features.size(0))
+                weighted_validation_loss += self._evaluate_training_loss(tensors) * rows
+                validation_rows += rows
+            if validation_rows:
+                validation_loss = weighted_validation_loss / validation_rows
+                self.model.train()
+                if epoch >= warmup_epochs:
+                    minimum_delta = float(
+                        getattr(self.config, "early_stopping_min_delta", 1e-4)
+                    )
+                    if validation_loss < best_validation_loss - minimum_delta:
+                        best_validation_loss = validation_loss
+                        best_state_dict = copy.deepcopy(self.model.state_dict())
+                        epochs_without_improvement = 0
+                    else:
+                        epochs_without_improvement += 1
+                    patience = max(
+                        1, int(getattr(self.config, "early_stopping_patience", 10))
+                    )
+                    if (
+                        epochs_completed >= minimum_epochs
+                        and epochs_without_improvement >= patience
+                    ):
+                        break
+
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise RankingTrainingCancelled("ranking training was cancelled")
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
+            validation_loss = best_validation_loss
+        self.model.eval()
+        if metrics_tensors is not None:
+            metrics = self._training_quality_metrics(
+                metrics_tensors,
+                loss=avg_loss,
+                validation_loss=validation_loss,
+                epochs_completed=epochs_completed,
+            )
+            metrics.update(
+                {
+                    "training_sample_source": training_sample_source,
+                    "pit_reader_mode": "streaming",
+                    "training_input_rows": training_rows,
+                }
+            )
+            self.training_history.append(metrics)
+        self.is_trained = True
+        self.last_training_time = time.time()
+        self.ranking_objective_version = RANKING_OBJECTIVE_VERSION
+        self.model_version = f"ranking-{int(self.last_training_time)}"
+        if isinstance(self.model, TemporalTrimodalRankingModel):
+            for parameter in self.model.ranker.parameters():
+                parameter.requires_grad_(True)
+        self._compile_model_for_inference()
+        logger.info("PIT source model training completed")
+        return self.loaded_model_path
+
     def _train_model_sync(
         self,
         training_data,

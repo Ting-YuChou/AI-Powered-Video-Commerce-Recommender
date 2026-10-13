@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 
@@ -357,6 +358,64 @@ async def test_pit_training_dataset_reader_pins_pointer_and_validates_parquet(tm
     assert example.bundle.product_metadata == {"price": 9.0}
     assert example.bundle.candidate.collaborative_score == 0.8
     assert example.attribution.attributed_action == "click"
+
+
+def test_pit_streaming_reader_stages_batches_without_reading_full_table(
+    tmp_path, monkeypatch
+):
+    latest, _, _ = _write_dataset(tmp_path / "dataset")
+    reader = PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    )
+
+    monkeypatch.setattr(
+        pq,
+        "read_table",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("streaming reader must not call read_table")
+        ),
+    )
+    source = asyncio.run(
+        reader.validate_and_stage(
+            str(latest),
+            staging_dir=tmp_path / "staging",
+            batch_rows=1,
+            max_group_rows=16,
+            max_bytes=10_000_000,
+        )
+    )
+
+    assert source.row_count == 1
+    assert source.group_count == 1
+    batches = list(source.iter_example_batches(split="all", batch_rows=1, seed=42))
+    assert batches[0][0].impression_id == "imp-1"
+    assert batches[0][0].bundle.user_features.total_interactions == 3
+    assert source.lineage["pit_stream_contract_version"] == "pit_stream_v1"
+
+
+def test_pit_streaming_reader_does_not_publish_corrupt_generation(tmp_path):
+    latest, manifest_path, _ = _write_dataset(tmp_path / "dataset")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["shards"][0]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    reader = PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    )
+
+    with pytest.raises(PitTrainingDatasetError, match="checksum"):
+        asyncio.run(
+            reader.validate_and_stage(
+                str(latest),
+                staging_dir=tmp_path / "staging",
+                batch_rows=1,
+                max_group_rows=16,
+                max_bytes=10_000_000,
+            )
+        )
+
+    assert not list((tmp_path / "staging").glob("verified/*"))
 
 
 @pytest.mark.asyncio

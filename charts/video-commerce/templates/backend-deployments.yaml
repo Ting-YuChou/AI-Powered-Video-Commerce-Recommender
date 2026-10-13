@@ -97,6 +97,10 @@ spec:
               mountPath: /app/logs
             - name: tmp
               mountPath: /tmp
+            {{- if eq $workload.name "model-trainer" }}
+            - name: pit-staging
+              mountPath: /var/lib/video-commerce/pit
+            {{- end }}
           {{- if hasKey $workload.probes "livenessType" }}
           livenessProbe:
             {{- if eq $workload.probes.livenessType "tcp" }}
@@ -186,5 +190,10 @@ spec:
         - name: tmp
           emptyDir:
             {{- toYaml $.Values.backend.emptyDirs.tmp | nindent 12 }}
+        {{- if eq $workload.name "model-trainer" }}
+        - name: pit-staging
+          emptyDir:
+            {{- toYaml $.Values.backend.emptyDirs.pitStaging | nindent 12 }}
+        {{- end }}
 {{- end }}
 {{- end }}

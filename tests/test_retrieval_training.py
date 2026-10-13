@@ -17,7 +17,10 @@ from video_commerce.ml.retrieval_pit_dataset import (
     RetrievalPitManifest,
     RetrievalPitRow,
 )
-from video_commerce.ml.retrieval_training import build_retrieval_training_inputs
+from video_commerce.ml.retrieval_training import (
+    build_retrieval_streaming_inputs,
+    build_retrieval_training_inputs,
+)
 
 
 def _row(query_id, product_id, label_type, as_of_ts, *, source="viewed_impression"):
@@ -149,3 +152,63 @@ def test_ranker_rejected_experiment_modes_are_explicit():
         if value["source"] == "ranker_rejected"
     )
     assert rejected["teacher_target"] < 0.5
+
+
+def test_two_tower_streaming_source_keeps_event_samples_on_disk(tmp_path):
+    from video_commerce.ml.two_tower import DiskTrainingSampleStore, TwoTowerTrainer
+
+    dataset = _dataset()
+
+    class Source:
+        path = tmp_path
+        work_dir = tmp_path / "work"
+        catalog = dataset.catalog
+
+        def iter_row_batches(self, *, split, batch_rows, **_kwargs):
+            assert split == "training"
+            rows = dataset.rows[:-1]
+            for start in range(0, len(rows), batch_rows):
+                yield list(rows[start : start + batch_rows])
+
+    trainer = TwoTowerTrainer(
+        clip_dim=2,
+        output_dim=2,
+        batch_size=1,
+        epochs=1,
+        num_hard_negatives=0,
+        num_random_negatives=1,
+    )
+
+    prepared = trainer.prepare_streaming_source(Source(), batch_rows=2)
+
+    assert prepared["num_samples"] == 1
+    assert isinstance(trainer._train_samples, DiskTrainingSampleStore)
+    assert trainer._train_samples.path.parent == Source.work_dir
+    assert not (Source.path / "two_tower_training.sqlite3").exists()
+    assert trainer._train_samples.negatives_for_user(1, 20.0)
+    assert trainer.train()["num_samples"] == 1
+    sample_store_path = trainer._train_samples.path
+    trainer._train_samples.cleanup()
+    assert not sample_store_path.exists()
+
+
+def test_streaming_inputs_build_compact_holdout_without_rows_tuple():
+    dataset = _dataset()
+
+    class Source:
+        catalog = dataset.catalog
+
+        def assign_holdout(self, *, holdout_days):
+            assert holdout_days == 7
+            from video_commerce.ml.retrieval_pit_dataset import RetrievalHoldoutWindow
+
+            return RetrievalHoldoutWindow(295200.0, 900000.0)
+
+        def iter_row_batches(self, *, split, **_kwargs):
+            yield list(dataset.rows[:-1] if split == "training" else dataset.rows[-1:])
+
+    inputs = build_retrieval_streaming_inputs(Source(), holdout_days=7, batch_rows=2)
+
+    assert not hasattr(inputs, "training_rows")
+    assert [query.query_id for query in inputs.holdout_queries] == ["q3"]
+    assert set(inputs.product_metadata) == {"p1", "p2", "p3"}

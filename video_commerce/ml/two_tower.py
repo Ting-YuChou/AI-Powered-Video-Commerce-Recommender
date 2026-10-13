@@ -21,8 +21,10 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+import uuid
 
 import faiss
 import numpy as np
@@ -42,6 +44,181 @@ NEGATIVE_SOURCE_RANDOM = "random"
 NEGATIVE_SOURCE_ANN_HARD = "ann_hard"
 NEGATIVE_SOURCE_IMPRESSION_NO_CLICK = "impression_no_click"
 NEGATIVE_SOURCE_RANKER_REJECTED = "ranker_rejected"
+
+
+class DiskTrainingSampleStore:
+    """SQLite-backed positive samples, histories, and exposure negatives."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.connection = sqlite3.connect(self.path)
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS samples (
+              sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_idx INTEGER NOT NULL,
+              item_idx INTEGER NOT NULL,
+              weight REAL NOT NULL,
+              user_features_json TEXT NOT NULL,
+              as_of_ts REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS positives (
+              user_idx INTEGER NOT NULL,
+              item_idx INTEGER NOT NULL,
+              as_of_ts REAL NOT NULL,
+              PRIMARY KEY(user_idx, item_idx, as_of_ts)
+            );
+            CREATE TABLE IF NOT EXISTS negatives (
+              user_idx INTEGER NOT NULL,
+              item_idx INTEGER NOT NULL,
+              product_id TEXT NOT NULL,
+              source TEXT NOT NULL,
+              weight REAL NOT NULL,
+              exposed INTEGER NOT NULL,
+              sample_prob REAL NOT NULL,
+              rank_position INTEGER,
+              as_of_ts REAL,
+              teacher_target REAL
+            );
+            CREATE INDEX IF NOT EXISTS positives_cutoff_idx
+              ON positives(user_idx, as_of_ts, item_idx);
+            CREATE INDEX IF NOT EXISTS negatives_cutoff_idx
+              ON negatives(user_idx, as_of_ts);
+            """
+        )
+
+    def add_positive(
+        self,
+        *,
+        user_idx: int,
+        item_idx: int,
+        weight: float,
+        user_features: Mapping[str, Any],
+        as_of_ts: float,
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO samples(user_idx,item_idx,weight,user_features_json,as_of_ts) "
+            "VALUES (?,?,?,?,?)",
+            (
+                int(user_idx),
+                int(item_idx),
+                float(weight),
+                json.dumps(dict(user_features), sort_keys=True, separators=(",", ":")),
+                float(as_of_ts),
+            ),
+        )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO positives(user_idx,item_idx,as_of_ts) VALUES (?,?,?)",
+            (int(user_idx), int(item_idx), float(as_of_ts)),
+        )
+
+    def add_negative(self, *, user_idx: int, candidate: NegativeSample) -> None:
+        self.connection.execute(
+            "INSERT INTO negatives VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                int(user_idx),
+                int(candidate.item_idx),
+                candidate.product_id,
+                candidate.source,
+                float(candidate.weight),
+                1 if candidate.exposed else 0,
+                float(candidate.sample_prob),
+                candidate.rank_position,
+                candidate.as_of_ts,
+                candidate.teacher_target,
+            ),
+        )
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def __len__(self) -> int:
+        return int(
+            self.connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        )
+
+    def __getitem__(self, index: int):
+        row = self.connection.execute(
+            "SELECT user_idx,item_idx,weight,user_features_json,as_of_ts "
+            "FROM samples WHERE sample_id=?",
+            (int(index) + 1,),
+        ).fetchone()
+        if row is None:
+            raise IndexError(index)
+        user_idx, item_idx, weight, raw_features, as_of_ts = row
+        positives = frozenset(
+            int(value[0])
+            for value in self.connection.execute(
+                "SELECT DISTINCT item_idx FROM positives "
+                "WHERE user_idx=? AND as_of_ts<=?",
+                (int(user_idx), float(as_of_ts)),
+            )
+        )
+        return (
+            int(user_idx),
+            int(item_idx),
+            float(weight),
+            UserFeatureEncoder.encode(
+                json.loads(raw_features), current_time=float(as_of_ts)
+            ),
+            float(as_of_ts),
+            positives,
+        )
+
+    def iter_batch_indices(self, *, epoch: int, batch_size: int, seed: int = 42):
+        self.connection.create_function(
+            "sample_order",
+            1,
+            lambda sample_id: int.from_bytes(
+                hashlib.blake2b(
+                    f"{seed}:{epoch}:{int(sample_id)}".encode(), digest_size=8
+                ).digest(),
+                "big",
+            )
+            & ((1 << 63) - 1),
+            deterministic=True,
+        )
+        batch = []
+        for (sample_id,) in self.connection.execute(
+            "SELECT sample_id FROM samples ORDER BY sample_order(sample_id), sample_id"
+        ):
+            batch.append(int(sample_id) - 1)
+            if len(batch) >= int(batch_size):
+                yield np.asarray(batch, dtype=np.int64)
+                batch = []
+        if batch:
+            yield np.asarray(batch, dtype=np.int64)
+
+    def negatives_for_user(
+        self, user_idx: int, as_of_ts: float
+    ) -> list[NegativeSample]:
+        rows = self.connection.execute(
+            "SELECT item_idx,product_id,source,weight,exposed,sample_prob,"
+            "rank_position,as_of_ts,teacher_target FROM negatives "
+            "WHERE user_idx=? AND (as_of_ts IS NULL OR as_of_ts<=?)",
+            (int(user_idx), float(as_of_ts)),
+        )
+        return [
+            NegativeSample(
+                item_idx=int(row[0]),
+                product_id=str(row[1]),
+                source=str(row[2]),
+                weight=float(row[3]),
+                exposed=bool(row[4]),
+                sample_prob=float(row[5]),
+                rank_position=int(row[6]) if row[6] is not None else None,
+                as_of_ts=float(row[7]) if row[7] is not None else None,
+                teacher_target=float(row[8]) if row[8] is not None else None,
+            )
+            for row in rows
+        ]
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def cleanup(self) -> None:
+        self.close()
+        self.path.unlink(missing_ok=True)
 
 
 def logq_correct_logits(
@@ -994,6 +1171,187 @@ class TwoTowerTrainer:
             random_negative_weight=self.random_negative_weight,
         )
 
+    def prepare_streaming_source(
+        self,
+        source,
+        *,
+        batch_rows: int,
+        ranker_rejected_mode: str = "weak",
+    ) -> Dict[str, Any]:
+        """Prepare mappings and a disk-backed event index from retrieval PIT."""
+        rejected_mode = str(ranker_rejected_mode).strip().lower()
+        if rejected_mode not in {"disabled", "weak", "teacher_soft"}:
+            raise ValueError(
+                "ranker_rejected_mode must be disabled, weak, or teacher_soft"
+            )
+        users: Set[str] = set()
+        item_counts_by_id: Dict[str, int] = defaultdict(int)
+        latest_user_features: Dict[str, Tuple[float, Mapping[str, Any]]] = {}
+        training_as_of_ts = 0.0
+        positive_labels = {"click", "add_to_cart", "purchase"}
+        for rows in source.iter_row_batches(
+            split="training", batch_rows=int(batch_rows), seed=42, epoch=0
+        ):
+            for row in rows:
+                users.add(str(row.user_id))
+                training_as_of_ts = max(training_as_of_ts, float(row.as_of_ts))
+                previous = latest_user_features.get(str(row.user_id))
+                if previous is None or float(row.as_of_ts) >= previous[0]:
+                    latest_user_features[str(row.user_id)] = (
+                        float(row.as_of_ts),
+                        dict(row.user_features),
+                    )
+                if row.label_type in positive_labels:
+                    item_counts_by_id[str(row.product_id)] += 1
+
+        eligible = source.catalog.eligible_products
+        product_ids = sorted(product.product_id for product in eligible)
+        self.user_mapping = {u: idx + 1 for idx, u in enumerate(sorted(users))}
+        self.item_mapping = {p: idx + 1 for idx, p in enumerate(product_ids)}
+        self.reverse_item_mapping = {idx: p for p, idx in self.item_mapping.items()}
+        num_users = len(self.user_mapping)
+        num_items = len(self.item_mapping)
+        self._item_clip_embs = np.zeros(
+            (num_items + 1, self.clip_dim), dtype=np.float32
+        )
+        self._item_side_feats = np.zeros(
+            (num_items + 1, ItemFeatureEncoder.FEATURE_DIM), dtype=np.float32
+        )
+        self._item_metadata_by_idx = {}
+        products_by_id = {product.product_id: product for product in eligible}
+        for product_id, idx in self.item_mapping.items():
+            product = products_by_id[product_id]
+            feature = source.catalog.item_features[product_id]
+            if feature.clip_embedding is not None:
+                embedding = np.asarray(feature.clip_embedding, dtype=np.float32)
+                if embedding.shape != (self.clip_dim,):
+                    raise ValueError("retrieval catalog embedding dimension mismatch")
+                self._item_clip_embs[idx] = embedding
+            metadata = {
+                **dict(product.metadata),
+                "active": product.active,
+                "in_stock": product.in_stock,
+                "modality_presence": dict(product.modality_presence),
+            }
+            self._item_metadata_by_idx[idx] = metadata
+            self._item_side_feats[idx] = ItemFeatureEncoder.encode(
+                metadata, current_time=training_as_of_ts
+            )
+        self._user_side_feats = {
+            self.user_mapping[user_id]: UserFeatureEncoder.encode(
+                values[1], current_time=values[0]
+            )
+            for user_id, values in latest_user_features.items()
+        }
+
+        work_dir = Path(
+            getattr(source, "work_dir", Path(source.path).parent.parent / "work")
+        )
+        work_dir.mkdir(parents=True, exist_ok=True)
+        store_path = work_dir / f"two-tower-training-{uuid.uuid4().hex}.sqlite3"
+        store = DiskTrainingSampleStore(store_path)
+        # Publish ownership immediately so the caller can clean up even if a
+        # later row fails validation while the store is being populated.
+        self._train_samples = store
+        for rows in source.iter_row_batches(
+            split="training", batch_rows=int(batch_rows), seed=42, epoch=0
+        ):
+            for row in rows:
+                user_idx = self.user_mapping.get(str(row.user_id))
+                item_idx = self.item_mapping.get(str(row.product_id))
+                if user_idx is None or item_idx is None:
+                    continue
+                if row.label_type in positive_labels:
+                    store.add_positive(
+                        user_idx=user_idx,
+                        item_idx=item_idx,
+                        weight=INTERACTION_WEIGHTS.get(row.label_type, 1.0),
+                        user_features=row.user_features,
+                        as_of_ts=row.as_of_ts,
+                    )
+                else:
+                    source_name = (
+                        NEGATIVE_SOURCE_RANKER_REJECTED
+                        if row.label_source == NEGATIVE_SOURCE_RANKER_REJECTED
+                        or row.label_type == NEGATIVE_SOURCE_RANKER_REJECTED
+                        else NEGATIVE_SOURCE_IMPRESSION_NO_CLICK
+                    )
+                    if (
+                        source_name == NEGATIVE_SOURCE_RANKER_REJECTED
+                        and rejected_mode == "disabled"
+                    ):
+                        continue
+                    teacher_target = None
+                    if (
+                        source_name == NEGATIVE_SOURCE_RANKER_REJECTED
+                        and rejected_mode == "teacher_soft"
+                    ):
+                        raw_score = max(
+                            -30.0, min(30.0, float(row.ranker_score or 0.0))
+                        )
+                        teacher_target = 1.0 / (1.0 + np.exp(-raw_score))
+                    store.add_negative(
+                        user_idx=user_idx,
+                        candidate=NegativeSample(
+                            item_idx=item_idx,
+                            product_id=str(row.product_id),
+                            source=source_name,
+                            weight=float(row.label_weight),
+                            exposed=source_name == NEGATIVE_SOURCE_IMPRESSION_NO_CLICK,
+                            sample_prob=0.0,
+                            as_of_ts=float(row.as_of_ts),
+                            teacher_target=(
+                                float(teacher_target)
+                                if teacher_target is not None
+                                else None
+                            ),
+                        ),
+                    )
+        store.commit()
+        self.user_positives = defaultdict(set)
+        self._external_negatives_by_user = defaultdict(list)
+        item_counts = np.ones(num_items + 1, dtype=np.float64)
+        item_counts[0] = 0.0
+        for product_id, count in item_counts_by_id.items():
+            if product_id in self.item_mapping:
+                item_counts[self.item_mapping[product_id]] += int(count)
+        total = float(item_counts.sum())
+        self._item_sampling_probabilities = (
+            item_counts / total if total > 0 else np.zeros_like(item_counts)
+        ).astype(np.float32)
+        self.model = TwoTowerModel(
+            num_users=num_users,
+            num_items=num_items,
+            clip_dim=self.clip_dim,
+            output_dim=self.output_dim,
+            temperature=self.temperature,
+            user_hidden_dims=self.user_hidden_dims,
+            item_hidden_dims=self.item_hidden_dims,
+            architecture=self.architecture,
+            cross_layers=self.cross_layers,
+        ).to(self.device)
+        self.negative_sampler = NegativeSampler(
+            num_items=num_items,
+            num_hard=self.num_hard_negatives,
+            num_random=self.num_random_negatives,
+            hard_ratio_start=self.hard_ratio_start,
+            hard_ratio_end=self.hard_ratio_end,
+            hard_ratio_cap=self.hard_ratio_cap,
+            impression_negative_ratio=self.impression_negative_ratio,
+            ranker_rejected_negative_ratio=self.ranker_rejected_negative_ratio,
+            hard_negative_weight=self.hard_negative_weight,
+            impression_negative_weight=self.impression_negative_weight,
+            ranker_rejected_negative_weight=self.ranker_rejected_negative_weight,
+            random_negative_weight=self.random_negative_weight,
+        )
+        return {
+            "num_samples": len(store),
+            "num_users": num_users,
+            "num_items": num_items,
+            "training_as_of_ts": training_as_of_ts,
+            "sample_store_path": str(store_path),
+        }
+
     def train(self, existing_cf_index: Optional[faiss.Index] = None) -> Dict[str, Any]:
         if self.model is None or not self._train_samples:
             logger.warning("Model or training data not prepared; skipping training")
@@ -1025,13 +1383,22 @@ class TwoTowerTrainer:
         start_time = time.time()
 
         for epoch in range(self.epochs):
-            indices = np.random.permutation(num_samples)
             epoch_loss = 0.0
             epoch_acc = 0.0
             num_batches = 0
 
-            for batch_start in range(0, num_samples, self.batch_size):
-                batch_indices = indices[batch_start : batch_start + self.batch_size]
+            batch_indices_iter = (
+                self._train_samples.iter_batch_indices(
+                    epoch=epoch,
+                    batch_size=self.batch_size,
+                )
+                if isinstance(self._train_samples, DiskTrainingSampleStore)
+                else (
+                    np.random.permutation(num_samples)[start : start + self.batch_size]
+                    for start in range(0, num_samples, self.batch_size)
+                )
+            )
+            for batch_indices in batch_indices_iter:
                 actual_bs = len(batch_indices)
 
                 user_ids_np = np.zeros(actual_bs, dtype=np.int64)
@@ -1134,12 +1501,21 @@ class TwoTowerTrainer:
                         sample_as_of_ts,
                         known_positives,
                     ) = self._train_samples[sample_idx]
-                    available_external_negatives = [
-                        candidate
-                        for candidate in self._external_negatives_by_user.get(u_idx, [])
-                        if candidate.as_of_ts is None
-                        or candidate.as_of_ts <= sample_as_of_ts
-                    ]
+                    if isinstance(self._train_samples, DiskTrainingSampleStore):
+                        available_external_negatives = (
+                            self._train_samples.negatives_for_user(
+                                u_idx, sample_as_of_ts
+                            )
+                        )
+                    else:
+                        available_external_negatives = [
+                            candidate
+                            for candidate in self._external_negatives_by_user.get(
+                                u_idx, []
+                            )
+                            if candidate.as_of_ts is None
+                            or candidate.as_of_ts <= sample_as_of_ts
+                        ]
                     neg_indices = self.negative_sampler.sample(
                         user_embedding=(
                             user_embeddings_np[i]

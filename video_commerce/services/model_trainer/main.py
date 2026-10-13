@@ -14,11 +14,14 @@ import signal
 import socket
 import threading
 import torch
+import uuid
 
 from video_commerce.common.config import Config, RankingConfig
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.ml.model_release_quality import (
+    HoldoutWindow,
+    RankingEvaluationSpool,
     RankingQualityGateConfig,
     evaluate_quality_gate,
     evaluation_rows_from_examples,
@@ -480,15 +483,30 @@ class ModelTrainerService:
         training_sample_source = "interaction_events"
         interactions = []
         pit_dataset = None
+        pit_streaming = bool(
+            use_pit_dataset
+            and getattr(feature_lake_config, "pit_reader_mode", "materialized")
+            == "streaming"
+        )
         if use_pit_dataset:
             if not self.pit_dataset_reader:
                 raise RuntimeError(
                     "PIT ranking training is configured but the dataset reader is unavailable"
                 )
             try:
-                pit_dataset = await self.pit_dataset_reader.read(
-                    feature_lake_config.ranking_pit_dataset_uri
-                )
+                if pit_streaming:
+                    pit_dataset = await self.pit_dataset_reader.validate_and_stage(
+                        feature_lake_config.ranking_pit_dataset_uri,
+                        staging_dir=feature_lake_config.pit_staging_dir,
+                        batch_rows=feature_lake_config.pit_batch_rows,
+                        max_group_rows=feature_lake_config.pit_max_group_rows,
+                        max_bytes=feature_lake_config.pit_staging_max_bytes,
+                        content_cache_bytes=feature_lake_config.pit_content_cache_bytes,
+                    )
+                else:
+                    pit_dataset = await self.pit_dataset_reader.read(
+                        feature_lake_config.ranking_pit_dataset_uri
+                    )
             except PitTrainingDatasetUnavailable:
                 self.observability.record_training_run(
                     trigger,
@@ -512,7 +530,8 @@ class ModelTrainerService:
             if pit_dataset.materialization_run_id == getattr(
                 self, "last_trained_pit_run_id", None
             ):
-                await self._maybe_train_visual_retrieval_shadow(pit_dataset)
+                if not pit_streaming:
+                    await self._maybe_train_visual_retrieval_shadow(pit_dataset)
                 self.observability.record_training_run(
                     trigger,
                     "skipped_duplicate_manifest",
@@ -521,9 +540,11 @@ class ModelTrainerService:
                 if hasattr(self.observability, "record_pit_duplicate_manifest_skip"):
                     self.observability.record_pit_duplicate_manifest_skip()
                 return
-            interactions = pit_dataset.examples
+            interactions = [] if pit_streaming else pit_dataset.examples
             training_sample_source = "feature_lake_pit"
-            if getattr(self.config.ranking_config, "din_enabled", False):
+            if not pit_streaming and getattr(
+                self.config.ranking_config, "din_enabled", False
+            ):
                 sequence_coverage = self._din_sequence_coverage(interactions)
                 if (
                     sequence_coverage
@@ -574,7 +595,12 @@ class ModelTrainerService:
             interactions = await self.system_store.get_training_interactions(
                 limit=50000
             )
-        if len(interactions) < self.config.ranking_config.training_min_samples:
+        available_rows = (
+            int(pit_dataset.row_count)
+            if pit_streaming and pit_dataset is not None
+            else len(interactions)
+        )
+        if available_rows < self.config.ranking_config.training_min_samples:
             self.observability.record_training_run(
                 trigger,
                 "skipped_insufficient_samples",
@@ -584,7 +610,7 @@ class ModelTrainerService:
                 "Skipping ranking retrain due to insufficient samples",
                 extra={
                     "trigger": trigger,
-                    "sample_count": len(interactions),
+                    "sample_count": available_rows,
                     "training_sample_source": training_sample_source,
                     "min_samples": self.config.ranking_config.training_min_samples,
                 },
@@ -656,7 +682,7 @@ class ModelTrainerService:
             "Starting ranking retrain",
             extra={
                 "trigger": trigger,
-                "sample_count": len(interactions),
+                "sample_count": available_rows,
                 "training_sample_source": training_sample_source,
                 "model_path": self.config.model_config.ranking_model_path,
             },
@@ -668,7 +694,28 @@ class ModelTrainerService:
         try:
             if use_pit_dataset:
                 release_config = getattr(self.config, "model_release_config", None)
-                if release_config is not None and hasattr(
+                if pit_streaming:
+                    holdout_days = int(
+                        getattr(release_config, "holdout_days", 7)
+                        if release_config is not None
+                        else 7
+                    )
+                    pit_dataset.assign_splits(
+                        holdout_days=holdout_days,
+                        attribution_cutoff=float(pit_dataset.attribution_cutoff),
+                        validation_fraction=float(
+                            getattr(
+                                self.config.ranking_config, "validation_fraction", 0.0
+                            )
+                        ),
+                    )
+                    release_holdout_window = HoldoutWindow(
+                        start_ts=float(pit_dataset.max_as_of_ts)
+                        - holdout_days * 86400.0,
+                        end_ts=float(pit_dataset.max_as_of_ts),
+                    )
+                    training_examples = []
+                elif release_config is not None and hasattr(
                     pit_dataset, "attribution_cutoff"
                 ):
                     (
@@ -698,9 +745,10 @@ class ModelTrainerService:
                     interactions,
                     training_sample_source=training_sample_source,
                 )
-            training_examples = await self._attach_trimodal_candidate_embeddings(
-                self.ranking_model, training_examples
-            )
+            if not pit_streaming:
+                training_examples = await self._attach_trimodal_candidate_embeddings(
+                    self.ranking_model, training_examples
+                )
             active_checkpoint = getattr(self, "loaded_ranking_checkpoint", None)
             if (
                 use_pit_dataset
@@ -715,9 +763,16 @@ class ModelTrainerService:
             training_kwargs = {"training_sample_source": training_sample_source}
             if pit_training_cancel_event is not None:
                 training_kwargs["cancellation_event"] = pit_training_cancel_event
-            trained_this_attempt = await self.ranking_model.train_model(
-                training_examples, **training_kwargs
-            )
+            if pit_streaming:
+                trained_this_attempt = await self.ranking_model.train_model_source(
+                    pit_dataset,
+                    batch_rows=int(feature_lake_config.pit_batch_rows),
+                    **training_kwargs,
+                )
+            else:
+                trained_this_attempt = await self.ranking_model.train_model(
+                    training_examples, **training_kwargs
+                )
             if not trained_this_attempt:
                 status = "skipped_insufficient_training_split"
                 logger.info(
@@ -740,7 +795,9 @@ class ModelTrainerService:
                     pit_training_claimed = False
                 return
             din_metrics = None
-            if getattr(self.config.ranking_config, "din_enabled", False):
+            if not pit_streaming and getattr(
+                self.config.ranking_config, "din_enabled", False
+            ):
                 din_metrics = self._din_training_metrics(
                     training_examples,
                     self.ranking_model.din_product_index,
@@ -768,7 +825,11 @@ class ModelTrainerService:
                     label_reconciliation_ratio=1.0,
                     current_state_calls=0,
                     invalid_rows=0,
-                    value_mask_coverage=self._value_mask_coverage(training_examples),
+                    value_mask_coverage=(
+                        pit_dataset.value_mask_coverage("training")
+                        if pit_streaming
+                        else self._value_mask_coverage(training_examples)
+                    ),
                 )
             if self.ranking_model.is_trained and self.artifact_manager:
                 ranking_checkpoint_path = (
@@ -818,7 +879,7 @@ class ModelTrainerService:
                             else {}
                         ),
                         "trigger": trigger,
-                        "sample_count": len(interactions),
+                        "sample_count": available_rows,
                         "last_training_time": self.ranking_model.last_training_time,
                         "feature_schema_version": self.ranking_model.feature_schema_version,
                         "training_data_source": self.ranking_model.training_data_source,
@@ -868,8 +929,16 @@ class ModelTrainerService:
                             "version",
                             None,
                         ),
-                        "training_input_rows": len(training_examples),
-                        "quality_gate_holdout_rows": len(release_holdout_examples),
+                        "training_input_rows": (
+                            pit_dataset.row_count_for_split("training")
+                            if pit_streaming
+                            else len(training_examples)
+                        ),
+                        "quality_gate_holdout_rows": (
+                            pit_dataset.row_count_for_split("holdout")
+                            if pit_streaming
+                            else len(release_holdout_examples)
+                        ),
                         "quality_gate_holdout_start": (
                             release_holdout_window.start_ts
                             if release_holdout_window
@@ -890,8 +959,31 @@ class ModelTrainerService:
                             if pit_dataset
                             else 0
                         ),
-                        "training_value_mask_coverage": self._value_mask_coverage(
-                            training_examples
+                        "training_value_mask_coverage": (
+                            pit_dataset.value_mask_coverage("training")
+                            if pit_streaming
+                            else self._value_mask_coverage(training_examples)
+                        ),
+                        "pit_reader_mode": (
+                            "streaming" if pit_streaming else "materialized"
+                        ),
+                        "pit_stream_contract_version": (
+                            pit_dataset.lineage.get("pit_stream_contract_version")
+                            if pit_streaming
+                            else None
+                        ),
+                        "pit_verified_row_count": (
+                            pit_dataset.row_count if pit_streaming else None
+                        ),
+                        "pit_verified_group_count": (
+                            pit_dataset.group_count if pit_streaming else None
+                        ),
+                        "value_normalization_algorithm_version": (
+                            self.ranking_model.value_transform_stats.get(
+                                "algorithm_version"
+                            )
+                            if pit_streaming
+                            else None
                         ),
                         "training_quality_metrics": (
                             getattr(self.ranking_model, "training_history", [])[-1]
@@ -916,7 +1008,7 @@ class ModelTrainerService:
                     if (
                         use_pit_dataset
                         and champion_model is not None
-                        and release_holdout_examples
+                        and (release_holdout_examples or pit_streaming)
                         and record.payload.get("model_release_id")
                     ):
                         quality_config = RankingQualityGateConfig(
@@ -928,19 +1020,35 @@ class ModelTrainerService:
                                 if hasattr(self.config.model_release_config, field.name)
                             }
                         )
-                        evaluation_rows = evaluation_rows_from_examples(
-                            training_examples,
-                            release_holdout_examples,
-                            feature_schema_version=self.ranking_model.feature_schema_version,
-                        )
+                        if pit_streaming:
+                            (
+                                evaluation_rows,
+                                champion_predictions,
+                                challenger_predictions,
+                            ) = self._streaming_ranking_evaluation_inputs(
+                                pit_dataset,
+                                champion_model,
+                            )
+                        else:
+                            evaluation_rows = evaluation_rows_from_examples(
+                                training_examples,
+                                release_holdout_examples,
+                                feature_schema_version=self.ranking_model.feature_schema_version,
+                            )
+                            champion_predictions = (
+                                champion_model.predict_release_examples(
+                                    release_holdout_examples
+                                )
+                            )
+                            challenger_predictions = (
+                                self.ranking_model.predict_release_examples(
+                                    release_holdout_examples
+                                )
+                            )
                         gate_result = evaluate_quality_gate(
                             evaluation_rows,
-                            champion_model.predict_release_examples(
-                                release_holdout_examples
-                            ),
-                            self.ranking_model.predict_release_examples(
-                                release_holdout_examples
-                            ),
+                            champion_predictions,
+                            challenger_predictions,
                             quality_config,
                         )
                         evaluation = (
@@ -996,7 +1104,7 @@ class ModelTrainerService:
                         )
                 elif use_pit_dataset:
                     raise RuntimeError("PIT ranking artifact was not persisted")
-            if use_pit_dataset and pit_dataset is not None:
+            if use_pit_dataset and pit_dataset is not None and not pit_streaming:
                 await self._maybe_train_visual_retrieval_shadow(pit_dataset)
             if (
                 getattr(self.config.ranking_config, "trimodal_shadow", False)
@@ -1038,6 +1146,47 @@ class ModelTrainerService:
                 status,
                 asyncio.get_running_loop().time() - started_at,
             )
+
+    def _streaming_ranking_evaluation_inputs(self, source, champion_model):
+        stats = source.evaluation_slice_stats()
+        exposures = dict(stats["exposures"])
+        head_products = set(stats["head_products"])
+        high_price_threshold = float(stats["high_price_threshold"])
+        work_dir = source.work_dir
+        work_dir.mkdir(parents=True, exist_ok=True)
+        spool = RankingEvaluationSpool(
+            work_dir / f"ranking-evaluation-{uuid.uuid4().hex}.sqlite3"
+        )
+        try:
+            for examples in source.iter_example_batches(
+                split="holdout",
+                batch_rows=int(self.config.feature_lake_config.pit_batch_rows),
+                seed=int(getattr(self.config.ranking_config, "training_seed", 42)),
+                epoch=0,
+            ):
+                rows = evaluation_rows_from_examples(
+                    [],
+                    examples,
+                    feature_schema_version=self.ranking_model.feature_schema_version,
+                )
+                champion = champion_model.predict_release_examples(examples)
+                challenger = self.ranking_model.predict_release_examples(examples)
+                for row in rows:
+                    adjusted = replace(
+                        row,
+                        pre_holdout_exposures=int(exposures.get(row.product_id, 0)),
+                        is_long_tail=row.product_id not in head_products,
+                        is_high_price=row.price > high_price_threshold,
+                    )
+                    spool.add(
+                        adjusted,
+                        champion[row.observation_id],
+                        challenger[row.observation_id],
+                    )
+            return spool.load()
+        finally:
+            spool.close()
+            spool.path.unlink(missing_ok=True)
 
     @staticmethod
     def _value_mask_coverage(training_examples) -> float:

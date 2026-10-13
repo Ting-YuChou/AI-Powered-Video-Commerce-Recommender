@@ -158,6 +158,12 @@ external:
     pitScheduleHourUtc: 2
     pitOrchestratorLeaseSeconds: 7200
     pitTrainingLeaseSeconds: 21600
+    pitReaderMode: streaming
+    pitStagingDir: /var/lib/video-commerce/pit
+    pitStagingMaxBytes: 21474836480
+    pitBatchRows: 1024
+    pitMaxGroupRows: 4096
+    pitContentCacheBytes: 536870912
     flinkJobmanager: ""
     pitExportUri: ""
     candidateSidecarUri: ""
@@ -445,6 +451,8 @@ backend:
     objectStorage: {}
     logs: {}
     tmp: {}
+    pitStaging:
+      sizeLimit: 20Gi
   workloads:
     gatewayApi:
       enabled: true
@@ -920,6 +928,7 @@ backend:
         RANKING_ENABLE_PERIODIC_TRAINING: "true"
         SERVICE_TRAINER_INTERVAL_SECONDS: "3600"
         MONITORING_WORKER_METRICS_PORT: "9103"
+        FEATURE_LAKE_PIT_STAGING_DIR: /var/lib/video-commerce/pit
       service:
         enabled: true
         port: 9103
@@ -937,8 +946,10 @@ backend:
         requests:
           cpu: "1"
           memory: 2Gi
+          ephemeral-storage: 22Gi
         limits:
           memory: 4Gi
+          ephemeral-storage: 24Gi
       hpa:
         enabled: false
       pdb:
