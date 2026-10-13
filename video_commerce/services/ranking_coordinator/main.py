@@ -105,6 +105,7 @@ class RankingCoordinator:
                 object_storage=self.object_storage,
                 model_config=self.config.model_config,
                 recommendation_config=self.config.recommendation_config,
+                observability=self.runtime.observability,
             )
 
             self.ranking_model = RankingModel(
@@ -116,11 +117,23 @@ class RankingCoordinator:
                 environment=self.config.model_release_config.environment,
                 expected_feature_schema_version=self.ranking_model.feature_schema_version,
             )
-            await self.ranking_model.load_model(
-                self.config.model_config.ranking_model_path
-            )
             if ranking_checkpoint:
-                self.ranking_model.mark_artifact_record_verified(ranking_checkpoint)
+                self.ranking_model = (
+                    await self.artifact_manager.prepare_ranking_replacement(
+                        self.ranking_model,
+                        ranking_checkpoint,
+                        environment=self.config.model_release_config.environment,
+                    )
+                )
+                await self.artifact_manager.record_generation_activation(
+                    ranking_checkpoint,
+                    environment=self.config.model_release_config.environment,
+                    state="ready",
+                )
+            else:
+                await self.ranking_model.load_model(
+                    self.config.model_config.ranking_model_path
+                )
             self.ranking_model.enable_profiling_logs = (
                 self.config.monitoring_config.enable_profiling_logs
             )
@@ -463,29 +476,67 @@ class RankingCoordinator:
         interval_seconds = max(
             1, int(self.config.ranking_config.checkpoint_sync_interval_seconds)
         )
-        model_path = self.config.model_config.ranking_model_path
-        last_ranking_version: Optional[str] = (
-            self.ranking_model.model_version if self.ranking_model else None
+        last_ranking_identity = (
+            self.ranking_model.artifact_metadata.get("model_release_id")
+            if self.ranking_model
+            else None,
+            self.ranking_model.artifact_metadata.get("active_generation")
+            if self.ranking_model
+            else None,
+            self.ranking_model.artifact_metadata.get("bundle_digest")
+            if self.ranking_model
+            else None,
         )
         while True:
             try:
                 await asyncio.sleep(interval_seconds)
-                if self.ranking_model and model_path and self.artifact_manager:
+                if self.ranking_model and self.artifact_manager:
                     latest_ranking = await self.artifact_manager.sync_selected_ranking_checkpoint(
                         gate_mode=self.config.model_release_config.gate_mode,
                         environment=self.config.model_release_config.environment,
                         expected_feature_schema_version=self.ranking_model.feature_schema_version,
                     )
-                    if (
-                        latest_ranking
-                        and latest_ranking.model_version != last_ranking_version
-                    ):
-                        if await self.ranking_model.reload_model_if_updated(model_path):
-                            if latest_ranking:
-                                self.ranking_model.mark_artifact_record_verified(
-                                    latest_ranking
-                                )
-                            last_ranking_version = latest_ranking.model_version
+                    selected_identity = (
+                        latest_ranking.payload.get("model_release_id")
+                        if latest_ranking
+                        else None,
+                        latest_ranking.payload.get("active_generation")
+                        if latest_ranking
+                        else None,
+                        latest_ranking.payload.get("bundle_digest")
+                        if latest_ranking
+                        else None,
+                    )
+                    if latest_ranking and selected_identity != last_ranking_identity:
+                        replacement = await self.artifact_manager.prepare_ranking_replacement(
+                            self.ranking_model,
+                            latest_ranking,
+                            environment=self.config.model_release_config.environment,
+                        )
+                        if self.ranking_batcher is not None:
+                            self.ranking_batcher.replace_ranking_model(replacement)
+                        self.ranking_model = replacement
+                        await self.artifact_manager.record_generation_activation(
+                            latest_ranking,
+                            environment=self.config.model_release_config.environment,
+                            state="ready",
+                        )
+                        await self.artifact_manager.cleanup_local_generations(
+                            latest_ranking,
+                            environment=self.config.model_release_config.environment,
+                            inflight_identities=(
+                                self.ranking_batcher.inflight_generation_identities()
+                                if self.ranking_batcher is not None
+                                else set()
+                            ),
+                        )
+                        last_ranking_identity = selected_identity
+                    if latest_ranking and selected_identity == last_ranking_identity:
+                        await self.artifact_manager.record_generation_activation(
+                            latest_ranking,
+                            environment=self.config.model_release_config.environment,
+                            state="ready",
+                        )
             except asyncio.CancelledError:
                 break
             except Exception as exc:

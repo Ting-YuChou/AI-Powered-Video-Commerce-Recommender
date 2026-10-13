@@ -1,4 +1,17 @@
+import asyncio
+
 from video_commerce.common.observability import ObservabilityManager
+
+
+class _MaintenanceMetricStore:
+    async def get_iceberg_maintenance_metrics(self):
+        return {
+            "ranking_training_pit": {
+                "failed_runs": 2,
+                "snapshot_candidates": 4,
+                "orphan_candidates": 1,
+            }
+        }
 
 
 def test_observability_manager_exposes_app_worker_and_dependency_metrics():
@@ -87,6 +100,22 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
         active_generation=7,
     )
     manager.update_model_release_generation(desired=8, observed=7)
+    manager.observe_model_artifact_activation(
+        model_name="ranking_model", status="ready", duration_seconds=0.5
+    )
+    manager.record_model_artifact_activation_failure(
+        model_name="ranking_model", reason="checksum"
+    )
+    manager.update_model_artifact_generations(
+        model_name="ranking_model", count=3, size_bytes=1024
+    )
+    manager.record_iceberg_maintenance(
+        table="ranking_training_pit",
+        mode="dry_run",
+        status="planned",
+        snapshots=2,
+        orphan_files=1,
+    )
 
     payload = manager.prometheus_payload().decode("utf-8")
 
@@ -157,3 +186,35 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "model_release_staging_age_seconds 30.0" in payload
     assert "model_release_active_generation 7.0" in payload
     assert "model_release_runner_generation_mismatch 1.0" in payload
+    assert "model_artifact_activation_seconds" in payload
+    assert (
+        'model_artifact_activation_failures_total{model_name="ranking_model",reason="checksum"} 1.0'
+        in payload
+    )
+    assert (
+        'model_artifact_local_generation_count{model_name="ranking_model"} 3.0'
+        in payload
+    )
+    assert (
+        'iceberg_maintenance_runs_total{mode="dry_run",status="planned",table="ranking_training_pit"} 1.0'
+        in payload
+    )
+
+
+def test_runtime_metrics_export_durable_iceberg_maintenance_state():
+    manager = ObservabilityManager()
+
+    asyncio.run(manager.collect_runtime_metrics(system_store=_MaintenanceMetricStore()))
+    payload = manager.prometheus_payload().decode("utf-8")
+
+    assert (
+        'iceberg_maintenance_failed_runs{table="ranking_training_pit"} 2.0' in payload
+    )
+    assert (
+        'iceberg_maintenance_candidates{kind="snapshots",table="ranking_training_pit"} 4.0'
+        in payload
+    )
+    assert (
+        'iceberg_maintenance_candidates{kind="orphan_files",table="ranking_training_pit"} 1.0'
+        in payload
+    )

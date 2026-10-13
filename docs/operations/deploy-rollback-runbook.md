@@ -8,9 +8,14 @@ See [Flink realtime feature recovery](flink-realtime-recovery.md) for
 interaction-feature savepoints, state epochs, late-event quarantine, and
 bounded DLQ replay.
 
+See [Model artifact rolling activation](model-artifact-rolling-activation.md)
+for generation convergence and rollback, and
+[Iceberg maintenance](iceberg-maintenance.md) for dry-run, execute, and
+post-cleanup verification.
+
 ## Deploy
 1. Apply additive migrations in order through
-   `migrations/postgres/010_model_release_quality_gate.sql`. The gateway must not
+   `migrations/postgres/011_artifact_rollout_and_iceberg_maintenance.sql`. The gateway must not
    accept production uploads until the content outbox and processing-run tables
    exist.
 2. Build and verify images:
@@ -63,3 +68,7 @@ do not run old and new content workers concurrently.
 - Prometheus shows no active critical alerts after deployment.
 - A real mature retrieval PIT baseline exists before enabling required
   Two-Tower retrieval; synthetic smoke evidence cannot satisfy this gate.
+- Every expected model-serving instance reports the active release,
+  generation, and bundle digest before the rollout is complete.
+- Iceberg execute mode remains disabled until one week of dry-run plans has
+  reconciled with protected release and PIT lineage.

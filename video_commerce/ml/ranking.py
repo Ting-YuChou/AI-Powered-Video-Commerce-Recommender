@@ -1511,6 +1511,31 @@ class RankingModel:
             )
             return True
 
+    def apply_artifact_runtime_paths(self, record: Any) -> None:
+        """Point one model instance at sidecars inside its immutable generation."""
+        payload = getattr(record, "payload", None) or {}
+        manifest = payload.get("artifact_manifest") or {}
+        din_sidecar = manifest.get("din_embedding_sidecar") or {}
+        if din_sidecar.get("path"):
+            self.config.din_embedding_sidecar_path = str(din_sidecar["path"])
+
+    async def build_artifact_replacement(self, record: Any) -> "RankingModel":
+        """Fully load and smoke-check a fresh instance before a reference swap."""
+        replacement_config = self.config.copy(deep=True)
+        replacement = RankingModel(replacement_config, observability=self.observability)
+        replacement.apply_artifact_runtime_paths(record)
+        await replacement.load_model(str(record.checkpoint_path))
+        if not replacement.mark_artifact_record_verified(record):
+            raise RuntimeError("replacement ranking artifact lineage is invalid")
+        replacement.enable_profiling_logs = self.enable_profiling_logs
+        replacement.profiling_log_min_duration_ms = self.profiling_log_min_duration_ms
+        health = replacement.health_check(run_inference_test=True)
+        if health.get("status") != "healthy":
+            raise RuntimeError(
+                f"replacement ranking inference smoke failed: {health.get('failure_reason') or health.get('error')}"
+            )
+        return replacement
+
     def prepare_request_matrix(
         self,
         candidates: List[CandidateProduct],

@@ -415,6 +415,7 @@ def test_production_config_accepts_secret_files(monkeypatch, tmp_path):
     monkeypatch.setenv("RECOMMENDATION_ONLINE_RETRAINING_ENABLED", "false")
     monkeypatch.setenv("FEATURE_LAKE_PIT_READER_MODE", "streaming")
     monkeypatch.setenv("FEATURE_LAKE_PIT_STAGING_MAX_BYTES", "1073741824")
+    monkeypatch.setenv("MODEL_ARTIFACT_GENERATION_ROOT", str(tmp_path / "generations"))
     monkeypatch.setenv("SECURITY_AUTH_MODE", "api_key")
     monkeypatch.setenv("API_API_KEY_FILE", str(api_key_file))
     monkeypatch.setenv("SECURITY_INTERNAL_SERVICE_KEY_FILE", str(internal_key_file))

@@ -1156,6 +1156,84 @@ class ModelReleaseTransition(Base):
     )
 
 
+class ModelReleaseInstanceObservation(Base):
+    __tablename__ = "model_release_instance_observations"
+
+    model_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(64), primary_key=True)
+    service_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    desired_release_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    desired_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    desired_bundle_digest: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    observed_release_id: Mapped[Optional[str]] = mapped_column(
+        String(36), nullable=True
+    )
+    observed_generation: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    observed_model_version: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    bundle_digest: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    activated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class IcebergMaintenanceRun(Base):
+    __tablename__ = "iceberg_maintenance_runs"
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    table_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    plan_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    head_snapshot_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    plan: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    before_counts: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    after_counts: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    deleted_counts: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 Index(
     "ix_model_release_transitions_release",
     ModelReleaseTransition.release_id,
@@ -3955,6 +4033,343 @@ class SystemStore:
             ),
             "active_generation": int(generation or 0),
         }
+
+    async def record_model_release_instance_observation(
+        self,
+        *,
+        model_name: str,
+        environment: str,
+        service_name: str,
+        instance_id: str,
+        desired_release_id: Optional[str],
+        desired_generation: int,
+        desired_bundle_digest: Optional[str],
+        observed_release_id: Optional[str],
+        observed_generation: Optional[int],
+        observed_model_version: Optional[str],
+        bundle_digest: Optional[str],
+        state: str,
+        last_error: Optional[str] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        normalized_state = str(state or "").strip().lower()
+        if normalized_state not in {"loading", "ready", "failed", "draining"}:
+            raise ValueError("model release observation state is invalid")
+        now = _utc_now()
+        identity = (
+            str(model_name),
+            str(environment),
+            str(service_name),
+            str(instance_id),
+        )
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(ModelReleaseInstanceObservation)
+                .where(
+                    ModelReleaseInstanceObservation.model_name == identity[0],
+                    ModelReleaseInstanceObservation.environment == identity[1],
+                    ModelReleaseInstanceObservation.service_name == identity[2],
+                    ModelReleaseInstanceObservation.instance_id == identity[3],
+                )
+                .with_for_update()
+            )
+            observation = result.scalar_one_or_none()
+            values = {
+                "desired_release_id": desired_release_id,
+                "desired_generation": int(desired_generation),
+                "desired_bundle_digest": desired_bundle_digest,
+                "observed_release_id": observed_release_id,
+                "observed_generation": observed_generation,
+                "observed_model_version": observed_model_version,
+                "bundle_digest": bundle_digest,
+                "state": normalized_state,
+                "last_error": last_error,
+                "heartbeat_at": now,
+                "updated_at": now,
+            }
+            if normalized_state == "ready":
+                values["activated_at"] = now
+            if observation is None:
+                observation = ModelReleaseInstanceObservation(
+                    model_name=identity[0],
+                    environment=identity[1],
+                    service_name=identity[2],
+                    instance_id=identity[3],
+                    **values,
+                )
+                session.add(observation)
+            else:
+                for key, value in values.items():
+                    setattr(observation, key, value)
+
+    async def list_model_release_instance_observations(
+        self, *, model_name: str, environment: str
+    ) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ModelReleaseInstanceObservation)
+                .where(
+                    ModelReleaseInstanceObservation.model_name == str(model_name),
+                    ModelReleaseInstanceObservation.environment == str(environment),
+                )
+                .order_by(
+                    ModelReleaseInstanceObservation.service_name,
+                    ModelReleaseInstanceObservation.instance_id,
+                )
+            )
+            rows = result.scalars().all()
+        return [
+            {
+                "model_name": row.model_name,
+                "environment": row.environment,
+                "service_name": row.service_name,
+                "instance_id": row.instance_id,
+                "desired_release_id": row.desired_release_id,
+                "desired_generation": int(row.desired_generation),
+                "desired_bundle_digest": row.desired_bundle_digest,
+                "observed_release_id": row.observed_release_id,
+                "observed_generation": (
+                    int(row.observed_generation)
+                    if row.observed_generation is not None
+                    else None
+                ),
+                "observed_model_version": row.observed_model_version,
+                "bundle_digest": row.bundle_digest,
+                "state": row.state,
+                "last_error": row.last_error,
+                "activated_at": (
+                    row.activated_at.timestamp() if row.activated_at else None
+                ),
+                "heartbeat_at": row.heartbeat_at.timestamp(),
+            }
+            for row in rows
+        ]
+
+    async def list_model_release_pointer_identities(
+        self, *, model_name: str, environment: str
+    ) -> Set[tuple[str, int]]:
+        if not self.enabled:
+            return set()
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    ModelReleasePointer.release_id, ModelReleasePointer.generation
+                ).where(
+                    ModelReleasePointer.model_name == str(model_name),
+                    ModelReleasePointer.environment == str(environment),
+                )
+            )
+            return {
+                (str(release_id), int(generation))
+                for release_id, generation in result.all()
+            }
+
+    async def save_iceberg_maintenance_plan(
+        self,
+        *,
+        run_id: str,
+        table_name: str,
+        mode: str,
+        plan_sha256: str,
+        head_snapshot_id: str,
+        plan: Dict[str, Any],
+        before_counts: Dict[str, Any],
+    ) -> None:
+        if not self.enabled:
+            return
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            session.add(
+                IcebergMaintenanceRun(
+                    run_id=str(run_id),
+                    table_name=str(table_name),
+                    mode=str(mode),
+                    status="planned",
+                    plan_sha256=str(plan_sha256),
+                    head_snapshot_id=str(head_snapshot_id),
+                    plan=dict(plan),
+                    before_counts=dict(before_counts),
+                    after_counts={},
+                    deleted_counts={},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    async def get_iceberg_maintenance_run(
+        self, run_id: str
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        async with self.session_factory() as session:
+            row = await session.get(IcebergMaintenanceRun, str(run_id))
+        if row is None:
+            return None
+        return {
+            "run_id": row.run_id,
+            "table_name": row.table_name,
+            "mode": row.mode,
+            "status": row.status,
+            "plan_sha256": row.plan_sha256,
+            "head_snapshot_id": row.head_snapshot_id,
+            "plan": dict(row.plan or {}),
+            "before_counts": dict(row.before_counts or {}),
+            "after_counts": dict(row.after_counts or {}),
+            "deleted_counts": dict(row.deleted_counts or {}),
+            "last_error": row.last_error,
+        }
+
+    async def get_iceberg_maintenance_metrics(
+        self, *, lookback_days: int = 7
+    ) -> Dict[str, Dict[str, int]]:
+        if not self.enabled:
+            return {}
+        cutoff = _utc_now() - timedelta(days=max(1, int(lookback_days)))
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(IcebergMaintenanceRun)
+                .where(IcebergMaintenanceRun.created_at >= cutoff)
+                .order_by(
+                    IcebergMaintenanceRun.table_name,
+                    desc(IcebergMaintenanceRun.created_at),
+                )
+            )
+            rows = result.scalars().all()
+        metrics: Dict[str, Dict[str, int]] = {}
+        latest_seen: Set[str] = set()
+        for row in rows:
+            table = str(row.table_name)
+            values = metrics.setdefault(
+                table,
+                {
+                    "failed_runs": 0,
+                    "snapshot_candidates": 0,
+                    "orphan_candidates": 0,
+                },
+            )
+            if row.status == "failed":
+                values["failed_runs"] += 1
+            if table not in latest_seen:
+                plan = dict(row.plan or {})
+                values["snapshot_candidates"] = len(
+                    plan.get("expire_snapshot_ids") or []
+                )
+                values["orphan_candidates"] = len(plan.get("delete_orphan_files") or [])
+                latest_seen.add(table)
+        return metrics
+
+    async def update_iceberg_maintenance_run(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        after_counts: Optional[Dict[str, Any]] = None,
+        deleted_counts: Optional[Dict[str, Any]] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        normalized = str(status).strip().lower()
+        if normalized not in {"planned", "running", "completed", "failed", "rejected"}:
+            raise ValueError("Iceberg maintenance run status is invalid")
+        values: Dict[str, Any] = {
+            "status": normalized,
+            "last_error": last_error,
+            "updated_at": _utc_now(),
+        }
+        if after_counts is not None:
+            values["after_counts"] = dict(after_counts)
+        if deleted_counts is not None:
+            values["deleted_counts"] = dict(deleted_counts)
+        if normalized in {"completed", "failed", "rejected"}:
+            values["completed_at"] = _utc_now()
+            values["owner_token"] = None
+            values["lease_expires_at"] = None
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(IcebergMaintenanceRun)
+                .where(IcebergMaintenanceRun.run_id == str(run_id))
+                .values(**values)
+            )
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError("Iceberg maintenance run does not exist")
+
+    async def claim_iceberg_maintenance_run(
+        self, *, run_id: str, owner_token: str, lease_seconds: int
+    ) -> bool:
+        if not self.enabled:
+            return False
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(IcebergMaintenanceRun)
+                .where(
+                    IcebergMaintenanceRun.run_id == str(run_id),
+                    or_(
+                        IcebergMaintenanceRun.status == "planned",
+                        (
+                            (IcebergMaintenanceRun.status == "running")
+                            & (IcebergMaintenanceRun.lease_expires_at < now)
+                        ),
+                    ),
+                )
+                .values(
+                    status="running",
+                    owner_token=str(owner_token),
+                    lease_expires_at=now
+                    + timedelta(seconds=max(60, int(lease_seconds))),
+                    updated_at=now,
+                )
+            )
+            return int(result.rowcount or 0) == 1
+
+    async def list_protected_iceberg_snapshots(
+        self, *, rollback_horizon_days: int = 30
+    ) -> Dict[str, Set[int]]:
+        """Return snapshots referenced by live or rollback-eligible lineage."""
+        from video_commerce.ml.iceberg_maintenance import collect_snapshot_references
+
+        if not self.enabled:
+            return {}
+        cutoff = _utc_now() - timedelta(days=max(1, int(rollback_horizon_days)))
+        payloads: List[Dict[str, Any]] = []
+        async with self.session_factory() as session:
+            releases = await session.execute(
+                select(ModelRelease.bundle_manifest).where(
+                    or_(
+                        ModelRelease.lifecycle_state.in_(("active", "staging")),
+                        (ModelRelease.lifecycle_state == "retired")
+                        & (ModelRelease.updated_at >= cutoff),
+                    )
+                )
+            )
+            payloads.extend(dict(value or {}) for value in releases.scalars().all())
+            runs = await session.execute(
+                select(PitMaterializationRun).where(
+                    or_(
+                        PitMaterializationRun.status.in_(
+                            ("pending", "running", "waiting_for_eligible_rows")
+                        ),
+                        PitMaterializationRun.completed_at >= cutoff,
+                    )
+                )
+            )
+            for run in runs.scalars().all():
+                if run.snapshot_id:
+                    payloads.append(
+                        {
+                            "iceberg_table_id": "ranking_training_pit",
+                            "iceberg_snapshot_id": run.snapshot_id,
+                        }
+                    )
+        protected: Dict[str, Set[int]] = {}
+        for payload in payloads:
+            for table, snapshot_ids in collect_snapshot_references(payload).items():
+                protected.setdefault(table, set()).update(snapshot_ids)
+        return protected
 
     async def renew_pit_training_lease(
         self, *, run_id: str, worker_id: str, lease_seconds: int

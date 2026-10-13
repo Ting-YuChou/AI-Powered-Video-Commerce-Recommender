@@ -171,6 +171,13 @@ external:
     candidateSidecarModelVersion: ""
     candidateSidecarTrainingCutoff: ""
     pitJobJarPath: /opt/flink/usrlib/interaction-features.jar
+    icebergMaintenanceEnabled: false
+    icebergMaintenanceExecute: false
+    icebergMaintenanceSnapshotRetentionDays: 30
+    icebergMaintenanceRetainLastSnapshots: 20
+    icebergMaintenanceOrphanMinAgeDays: 7
+    icebergMaintenanceDeleteBatchSize: 1000
+    icebergMaintenanceRunSeconds: 300
 
 pitOrchestrator:
   enabled: false
@@ -182,6 +189,22 @@ pitOrchestrator:
   activeDeadlineSeconds: 7200
   env:
     MONITORING_WORKER_METRICS_PORT: "9105"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+icebergMaintenance:
+  enabled: false
+  schedule: "30 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  backoffLimit: 1
+  activeDeadlineSeconds: 3600
+  env: {}
   resources:
     requests:
       cpu: 250m
@@ -210,6 +233,10 @@ appConfig:
   featurePipelineMode: flink
   flinkFeatureOutputNamespace: official
   modelCacheDir: /app/models
+  modelArtifactGenerationRoot: /app/models/generations
+  modelArtifactLocalGenerationsToKeep: 3
+  modelArtifactGenerationMinAgeHours: 24
+  modelArtifactActivationPollSeconds: 30
   clipRevision: 57c216476eefef5ab752ec549e440a49ae4ae5f3
   contentPipelineVersion: temporal-multimodal-v3
   contentOutboxBatchSize: 50

@@ -1383,6 +1383,7 @@ class RecommendationEngine:
         self.loaded_two_tower_version: Optional[str] = None
         self.loaded_two_tower_release_id: Optional[str] = None
         self.loaded_two_tower_generation: Optional[int] = None
+        self.loaded_two_tower_bundle_digest: Optional[str] = None
         self.loaded_two_tower_gate_policy: Optional[str] = None
         self.loaded_sasrec_version: Optional[str] = None
         self.loaded_swing_itemcf_version: Optional[str] = None
@@ -1475,9 +1476,14 @@ class RecommendationEngine:
                     )
                 )
 
+            index_path = (
+                str(checkpoint_record.payload.get("cf_index_path"))
+                if checkpoint_record
+                else self.config.cf_index_path
+            )
             result = await asyncio.to_thread(
                 VectorSearchEngine.load_cf_index,
-                self.config.cf_index_path,
+                index_path,
             )
             if result is not None:
                 index, metadata = result
@@ -1506,11 +1512,24 @@ class RecommendationEngine:
                     )
 
                 checkpoint_path = (
-                    self.artifact_manager.two_tower_local_checkpoint_path
-                    if self.artifact_manager
+                    checkpoint_record.checkpoint_path
+                    if checkpoint_record
                     else self.config.cf_index_path.replace(".faiss", ".pt")
                 )
-                loaded_engine = TwoTowerRetrievalEngine(self.config, self.vector_search)
+                loaded_config = self.config.copy(deep=True)
+                if checkpoint_record:
+                    loaded_config.cf_index_path = index_path
+                    if checkpoint_record.payload.get("cf_embedding_sidecar_path"):
+                        loaded_config.cf_embedding_sidecar_path = str(
+                            checkpoint_record.payload["cf_embedding_sidecar_path"]
+                        )
+                    if checkpoint_record.payload.get("cf_adapter_path"):
+                        loaded_config.cf_adapter_path = str(
+                            checkpoint_record.payload["cf_adapter_path"]
+                        )
+                loaded_engine = TwoTowerRetrievalEngine(
+                    loaded_config, self.vector_search
+                )
                 loaded_engine.cf_index = index
                 loaded_engine.cf_index_map = index_map
                 loaded_engine._base_cf_index = index
@@ -1539,6 +1558,15 @@ class RecommendationEngine:
                 self.cf_engine.close()
                 self.cf_engine = loaded_engine
                 if checkpoint_record:
+                    await self.artifact_manager.record_generation_activation(
+                        checkpoint_record,
+                        environment=self.config.retrieval_release_environment,
+                        state="ready",
+                    )
+                    await self.artifact_manager.cleanup_local_generations(
+                        checkpoint_record,
+                        environment=self.config.retrieval_release_environment,
+                    )
                     self.loaded_two_tower_version = checkpoint_record.model_version
                     self.loaded_two_tower_release_id = checkpoint_record.payload.get(
                         "model_release_id"
@@ -1547,6 +1575,10 @@ class RecommendationEngine:
                     self.loaded_two_tower_generation = (
                         int(generation) if generation is not None else None
                     )
+                    self.loaded_two_tower_bundle_digest = (
+                        str(checkpoint_record.payload.get("bundle_digest") or "")
+                        or None
+                    )
                     self.loaded_two_tower_gate_policy = checkpoint_record.payload.get(
                         "quality_gate_policy_version"
                     )
@@ -1554,12 +1586,20 @@ class RecommendationEngine:
                     self.loaded_two_tower_version = loaded_engine.model_version
                     self.loaded_two_tower_release_id = None
                     self.loaded_two_tower_generation = None
+                    self.loaded_two_tower_bundle_digest = None
                     self.loaded_two_tower_gate_policy = None
                 logger.info("Loaded pre-existing Two-Tower model and CF index")
                 return True
             if self.config.retrieval_release_gate_mode == "enforced":
                 raise RuntimeError("active Two-Tower ANN index failed validation")
         except Exception as e:
+            if checkpoint_record and self.artifact_manager:
+                await self.artifact_manager.record_generation_activation(
+                    checkpoint_record,
+                    environment=self.config.retrieval_release_environment,
+                    state="failed",
+                    error=str(e),
+                )
             logger.warning(f"Could not load pre-existing CF index: {e}")
             if self.config.retrieval_release_gate_mode == "enforced":
                 raise
@@ -1987,14 +2027,47 @@ class RecommendationEngine:
                 if active
                 else None
             )
-        if (
-            latest_two_tower
-            and latest_two_tower.model_version != self.loaded_two_tower_version
-        ):
+            if latest_two_tower and active:
+                generation = active.get("generation")
+                if generation is None:
+                    generation = active.get("active_generation")
+                if generation is not None:
+                    latest_two_tower.payload.setdefault(
+                        "active_generation", int(generation)
+                    )
+        desired_two_tower_identity = (
+            latest_two_tower.model_version if latest_two_tower else None,
+            latest_two_tower.payload.get("model_release_id")
+            if latest_two_tower
+            else None,
+            latest_two_tower.payload.get("active_generation")
+            if latest_two_tower
+            else None,
+        )
+        loaded_two_tower_identity = (
+            self.loaded_two_tower_version,
+            self.loaded_two_tower_release_id,
+            self.loaded_two_tower_generation,
+        )
+        if latest_two_tower and desired_two_tower_identity != loaded_two_tower_identity:
             await self._try_load_cf_index()
             updated = (
                 updated
-                or self.loaded_two_tower_version == latest_two_tower.model_version
+                or (
+                    self.loaded_two_tower_version,
+                    self.loaded_two_tower_release_id,
+                    self.loaded_two_tower_generation,
+                )
+                == desired_two_tower_identity
+            )
+        elif latest_two_tower and self.loaded_two_tower_bundle_digest:
+            latest_two_tower.payload[
+                "bundle_digest"
+            ] = self.loaded_two_tower_bundle_digest
+            await self.artifact_manager.record_generation_activation(
+                latest_two_tower,
+                environment=self.config.retrieval_release_environment,
+                state="ready",
             )
 
         if self.config.enable_sasrec:

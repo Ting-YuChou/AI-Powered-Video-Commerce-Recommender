@@ -158,6 +158,16 @@ class ModelConfig(BaseSettings):
 
     # Processing settings
     cache_dir: str = Field("/tmp/models", description="Model cache directory")
+    artifact_generation_root: str = Field(
+        "",
+        description=(
+            "Immutable local model-generation root. Production serving must set "
+            "this instead of replacing fixed artifact paths."
+        ),
+    )
+    artifact_local_generations_to_keep: int = Field(3, ge=2)
+    artifact_generation_min_age_hours: int = Field(24, ge=1)
+    artifact_activation_poll_seconds: int = Field(30, ge=1)
     device: str = Field("auto", description="Compute device (cpu/cuda/auto)")
     batch_size: int = Field(32, description="Processing batch size")
     max_video_length: int = Field(300, description="Maximum video length in seconds")
@@ -1981,6 +1991,17 @@ class FeatureLakeConfig(BaseSettings):
     catalog_outbox_retention_days: int = Field(
         7, description="Published catalog outbox retention"
     )
+    iceberg_maintenance_enabled: bool = Field(
+        False, description="Enable scheduled Iceberg snapshot and orphan maintenance"
+    )
+    iceberg_maintenance_execute: bool = Field(
+        False, description="Execute approved maintenance plans instead of dry-run only"
+    )
+    iceberg_maintenance_snapshot_retention_days: int = Field(30)
+    iceberg_maintenance_retain_last_snapshots: int = Field(20)
+    iceberg_maintenance_orphan_min_age_days: int = Field(7)
+    iceberg_maintenance_delete_batch_size: int = Field(1000)
+    iceberg_maintenance_run_seconds: int = Field(300)
 
     @validator("training_source")
     def validate_training_source(cls, value: str) -> str:
@@ -2007,6 +2028,11 @@ class FeatureLakeConfig(BaseSettings):
         "pit_batch_rows",
         "pit_max_group_rows",
         "pit_content_cache_bytes",
+        "iceberg_maintenance_snapshot_retention_days",
+        "iceberg_maintenance_retain_last_snapshots",
+        "iceberg_maintenance_orphan_min_age_days",
+        "iceberg_maintenance_delete_batch_size",
+        "iceberg_maintenance_run_seconds",
     )
     def validate_positive_feature_lake_ints(cls, value: int) -> int:
         if value <= 0:
@@ -2712,6 +2738,10 @@ class Config:
         if self.kafka_config.consumer_max_poll_interval_ms <= 0:
             errors.append("Kafka consumer maximum poll interval must be positive")
         if os.getenv("ENVIRONMENT", "").lower() == "production":
+            if not self.model_config.artifact_generation_root:
+                errors.append(
+                    "MODEL_ARTIFACT_GENERATION_ROOT must be set in production"
+                )
             if self.vector_config.bootstrap_mode != "required":
                 errors.append(
                     "VECTOR_BOOTSTRAP_MODE=required is mandatory in production"
@@ -2832,6 +2862,15 @@ class Config:
             if not self.feature_lake_config.pit_export_uri:
                 errors.append(
                     "FEATURE_LAKE_PIT_EXPORT_URI is required when FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED=true"
+                )
+        if self.feature_lake_config.iceberg_maintenance_enabled:
+            if not self.feature_lake_config.enabled:
+                errors.append(
+                    "FEATURE_LAKE_ENABLED=true is required when FEATURE_LAKE_ICEBERG_MAINTENANCE_ENABLED=true"
+                )
+            if not self.feature_lake_config.flink_jobmanager:
+                errors.append(
+                    "FEATURE_LAKE_FLINK_JOBMANAGER is required when Iceberg maintenance is enabled"
                 )
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":

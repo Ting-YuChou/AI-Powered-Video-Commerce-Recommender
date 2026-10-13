@@ -1,5 +1,48 @@
 # Progress
 
+## 2026-10-13 — Atomic model generations and guarded Iceberg maintenance
+
+- Added immutable Ranking and Two-Tower generation bundles. Artifacts are
+  staged, streamed through checksum validation, durably flushed, and exposed by
+  one directory rename. Serving builds and smoke-tests a new model or retrieval
+  engine before swapping the process-local reference; in-flight work retains
+  its original generation and a failed activation leaves the previous one
+  serving.
+- Added durable per-instance rollout observations keyed by release, active
+  generation, and bundle digest, plus rollout status/wait CLI commands,
+  activation/cleanup metrics, alerts, and protected local-generation pruning.
+  Periodic artifact polls refresh ready heartbeats even when the pointer does
+  not change.
+- Added hash-fenced Iceberg maintenance planning and audit records, explicit
+  snapshot expiration, protected release/PIT lineage, table-head revalidation
+  in both the control plane and Flink job, bounded orphan cleanup with prefix
+  mismatch failure, and post-run verification. The weekly Helm CronJob remains
+  dry-run by default.
+- Added the `artifact-rolling-activation-drill` and
+  `iceberg-maintenance-drill` CI contracts, Java 17 for Iceberg 1.11, migration
+  `011_artifact_rollout_and_iceberg_maintenance.sql`, and model activation and
+  Iceberg operation runbooks.
+- Key files: `video_commerce/ml/artifact_generation.py`,
+  `video_commerce/ml/model_rollout.py`,
+  `video_commerce/ml/iceberg_maintenance.py`,
+  `video_commerce/ml/model_artifacts.py`,
+  `video_commerce/services/iceberg_maintenance/main.py`, and
+  `flink-jobs/interaction-features/src/main/java/com/videocommerce/flink/IcebergMaintenanceJob.java`.
+- Verification: latest-workspace Docker backend suite `756 passed, 12 skipped`;
+  focused artifact, rollout, release, service, configuration, and maintenance
+  suite `105 passed, 1 skipped`; Flink Maven `38 passed`; production backend
+  image build, Compose validation, Helm lint, strict kubeconform `36/36`,
+  Prometheus rule tests, Python compilation, Black, and diff checks passed.
+- Known gaps: a live REST-catalog/S3 cleanup execution and a multi-instance
+  v1→v2→corrupt-v3→rollback Compose drill still require seeded external
+  infrastructure. The two new GitHub jobs must pass remotely before they can be
+  made required checks. Orphan discovery remains inside Iceberg's bounded
+  `DeleteOrphanFiles` action, so the durable pre-execution plan does not yet
+  enumerate orphan object IDs or record the action's exact deleted-file count;
+  PIT snapshot tags also remain follow-up defense in depth beyond the enforced
+  Postgres lineage protections. No fixed-Linux capacity test was run, so this
+  work makes no performance-regression claim.
+
 ## 2026-10-11 — PIT streaming datasets and bounded-memory training
 
 - Added a two-phase ranking and retrieval PIT reader that pins one manifest,
@@ -78,7 +121,7 @@
 
 ## 2026-10-08 — Automated deployment gates, Flink closed loop, and outbox A/B harness
 
-- Expanded PR CI with Node 20 frontend tests/lint/build, Java 11 Flink Maven
+- Expanded PR CI with Node 20 frontend tests/lint/build, Java 17 Flink Maven
   tests, pinned Helm/kubeconform/promtool deployment validation, and an isolated
   `flink-closed-loop` check with failure artifacts and project-scoped cleanup.
 - Added a real interaction-to-serving smoke: one stable click becomes one
