@@ -4869,12 +4869,7 @@ class SystemStore:
                 session.add(evaluation)
                 await session.flush()
             previous_state = release.lifecycle_state
-            if evaluation_was_existing and previous_state in {
-                "validated",
-                "staging",
-                "active",
-                "retired",
-            }:
+            if evaluation_was_existing:
                 self._update_pool_metrics()
                 return {
                     "evaluation_id": evaluation.evaluation_id,
@@ -4978,6 +4973,7 @@ class SystemStore:
         reason: str,
         bootstrap: bool,
         rollback: bool,
+        performance_evidence: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Atomically update the active pointer with generation fencing."""
         async with self.session_factory.begin() as session:
@@ -5049,6 +5045,102 @@ class SystemStore:
                     hours=max_age_hours
                 ):
                     return None
+                if target_compatibility.policy_version == "ranking_quality_gate_v2":
+                    from video_commerce.ml.phase_c_evidence import (
+                        performance_evidence_valid,
+                        quality_gate_snapshot_valid,
+                    )
+
+                    if (
+                        not quality_gate_snapshot_valid(
+                            dict(evaluation.gate_config or {})
+                        )
+                        or dict(evaluation.metrics or {}).get("onnx_holdout_parity")
+                        is not True
+                    ):
+                        return None
+                    gate_snapshot = dict(evaluation.gate_config or {})
+                    prerequisites = dict(
+                        gate_snapshot.get("prerequisite_evaluations") or {}
+                    )
+                    catalog_sha = dict(
+                        gate_snapshot.get("candidate_recall_evidence") or {}
+                    ).get("catalog_manifest_sha256")
+                    if (
+                        set(prerequisites) != {"features", "fusion", "calibration"}
+                        or not catalog_sha
+                    ):
+                        return None
+                    for kind, prerequisite_id in prerequisites.items():
+                        prerequisite_result = await session.execute(
+                            select(ModelReleaseEvaluation).where(
+                                ModelReleaseEvaluation.evaluation_id
+                                == str(prerequisite_id),
+                                ModelReleaseEvaluation.policy_version
+                                == "ranking_quality_gate_v2",
+                                ModelReleaseEvaluation.decision == "passed",
+                                ModelReleaseEvaluation.champion_release_id
+                                == evaluation.champion_release_id,
+                                ModelReleaseEvaluation.dataset_manifest_sha256
+                                == evaluation.dataset_manifest_sha256,
+                            )
+                        )
+                        prerequisite = prerequisite_result.scalar_one_or_none()
+                        if (
+                            prerequisite is None
+                            or not quality_gate_snapshot_valid(
+                                dict(prerequisite.gate_config or {}),
+                                experiment_kind=kind,
+                            )
+                            or dict(prerequisite.metrics or {}).get(
+                                "onnx_holdout_parity"
+                            )
+                            is not True
+                        ):
+                            return None
+                        prerequisite_catalog = dict(
+                            dict(prerequisite.gate_config or {}).get(
+                                "candidate_recall_evidence"
+                            )
+                            or {}
+                        ).get("catalog_manifest_sha256")
+                        if prerequisite_catalog != catalog_sha:
+                            return None
+
+                    if rollback and performance_evidence is None:
+                        previous_activation = await session.execute(
+                            select(ModelReleaseTransition)
+                            .where(
+                                ModelReleaseTransition.release_id == target.release_id,
+                                ModelReleaseTransition.to_state == "active",
+                            )
+                            .order_by(desc(ModelReleaseTransition.created_at))
+                            .limit(1)
+                        )
+                        previous_audit = previous_activation.scalar_one_or_none()
+                        if previous_audit is not None:
+                            try:
+                                audit_payload = json.loads(previous_audit.reason)
+                            except (TypeError, ValueError):
+                                audit_payload = {}
+                            if isinstance(audit_payload, dict):
+                                performance_evidence = audit_payload.get(
+                                    "performance_evidence"
+                                )
+
+                    if not performance_evidence_valid(
+                        performance_evidence
+                        or dict(evaluation.metrics or {}).get("performance_evidence"),
+                        release_id=target.release_id,
+                        manifest=target_manifest,
+                    ):
+                        return None
+            elif (
+                target_manifest.get("feature_definition_version")
+                == "ranking_ltr_v3_categorical_sources"
+            ):
+                # Bootstrap cannot bypass the new feature and performance gates.
+                return None
 
             next_generation = current_generation + 1
             if pointer is not None:
@@ -5102,7 +5194,17 @@ class SystemStore:
                     from_state=previous_target_state,
                     to_state="active",
                     actor=str(actor),
-                    reason=str(reason),
+                    reason=(
+                        json.dumps(
+                            {
+                                "reason": str(reason),
+                                "performance_evidence": performance_evidence,
+                            },
+                            sort_keys=True,
+                        )
+                        if performance_evidence
+                        else str(reason)
+                    ),
                     pointer_generation=next_generation,
                 )
             )

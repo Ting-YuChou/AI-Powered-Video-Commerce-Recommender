@@ -354,6 +354,21 @@ class RecommendationConfig(BaseSettings):
         100, description="Candidates per recommendation source"
     )
     max_total_candidates: int = Field(500, description="Maximum total candidates")
+    candidate_fusion_mode: str = Field(
+        "legacy",
+        env="CANDIDATE_FUSION_MODE",
+        description="Candidate fusion policy: legacy weighted scores or source-aware RRF",
+    )
+    candidate_rrf_k: int = Field(
+        60,
+        env="CANDIDATE_RRF_K",
+        description="Rank constant used by reciprocal-rank candidate fusion",
+    )
+    candidate_source_registry_version: str = Field(
+        "retrieval_sources_v1",
+        env="CANDIDATE_SOURCE_REGISTRY_VERSION",
+        description="Canonical source registry required by source-aware fusion",
+    )
     cold_start_random_candidate_cap: int = Field(
         50,
         description="Maximum random fallback candidates when no stronger retrieval source is available",
@@ -821,6 +836,25 @@ class RecommendationConfig(BaseSettings):
             raise ValueError("retrieval_training_source must be legacy or pit")
         return normalized
 
+    @validator("candidate_fusion_mode")
+    def validate_candidate_fusion_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"legacy", "rrf"}:
+            raise ValueError("candidate_fusion_mode must be legacy or rrf")
+        return normalized
+
+    @validator("candidate_source_registry_version")
+    def validate_candidate_source_registry_version(cls, value: str) -> str:
+        if value != "retrieval_sources_v1":
+            raise ValueError("unsupported candidate source registry version")
+        return value
+
+    @validator("candidate_rrf_k")
+    def validate_candidate_rrf_k(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("candidate_rrf_k must be positive")
+        return value
+
     @validator("retrieval_release_gate_mode")
     def validate_retrieval_release_gate_mode(cls, value: str) -> str:
         normalized = str(value or "").strip().lower()
@@ -1041,6 +1075,12 @@ class RecommendationConfig(BaseSettings):
 
 class RankingConfig(BaseSettings):
     """Ranking model configuration."""
+
+    feature_contract_version: str = Field(
+        "ranking_ltr_v1",
+        description="Versioned ranking feature contract used by the active bundle",
+    )
+    categorical_vocab_min_frequency: int = Field(5, ge=1)
 
     model_type: str = Field("neural", description="Ranking model type")
     inference_backend: str = Field(
@@ -1303,6 +1343,17 @@ class RankingConfig(BaseSettings):
         ["margin", "profit", "gross_margin", "value", "gmv", "purchase_value", "price"],
         description="Ordered fields used to choose the purchase business-value label",
     )
+    value_target_policy: str = Field(
+        "gross_revenue_v1",
+        description="Versioned business-value label contract",
+    )
+    value_currency: str = Field(
+        "USD", description="Currency required by the ranking value target"
+    )
+    probability_calibration: str = Field(
+        "none",
+        description="Probability calibration policy: none or temperature_v1",
+    )
     ltr_pairwise_enabled: bool = Field(
         False,
         description=(
@@ -1365,6 +1416,15 @@ class RankingConfig(BaseSettings):
         ge=0.0,
         lt=1.0,
         description="Newest impression fraction reserved for ranking validation",
+    )
+    calibration_fraction: float = Field(
+        0.1,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "Newest pre-holdout impression fraction reserved exclusively for "
+            "probability calibration"
+        ),
     )
     training_seed: int = Field(
         42,
@@ -1523,8 +1583,57 @@ class RankingConfig(BaseSettings):
             raise ValueError("din_min_nonempty_ratio must be between 0 and 1")
         return value
 
+    @validator("value_target_policy")
+    def validate_value_target_policy(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"legacy_preference", "gross_revenue_v1"}:
+            raise ValueError(
+                "value_target_policy must be legacy_preference or gross_revenue_v1"
+            )
+        return normalized
+
+    @validator("value_currency")
+    def validate_value_currency(cls, value: str) -> str:
+        normalized = str(value or "").strip().upper()
+        if len(normalized) != 3 or not normalized.isalpha():
+            raise ValueError("value_currency must be a three-letter currency code")
+        return normalized
+
+    @validator("probability_calibration")
+    def validate_probability_calibration(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"none", "temperature_v1"}:
+            raise ValueError("probability_calibration must be none or temperature_v1")
+        return normalized
+
+    @validator("feature_contract_version")
+    def validate_feature_contract_version(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        supported = {
+            "ranking_ltr_v1",
+            "ranking_ltr_v2_din",
+            "ranking_ltr_v3_categorical_sources",
+        }
+        if normalized not in supported:
+            raise ValueError("unsupported ranking feature contract version")
+        return normalized
+
     @root_validator(skip_on_failure=True)
     def validate_din_replaces_averaged_history(cls, values):
+        if (
+            float(values.get("validation_fraction", 0.0))
+            + float(values.get("calibration_fraction", 0.0))
+            >= 1.0
+        ):
+            raise ValueError(
+                "validation_fraction plus calibration_fraction must be below 1"
+            )
+        if values.get("feature_contract_version") == (
+            "ranking_ltr_v3_categorical_sources"
+        ) and (values.get("din_enabled") or values.get("trimodal_enabled")):
+            raise ValueError(
+                "ranking v3 categorical challenger cannot enable DIN or trimodal"
+            )
         if values.get("din_enabled") and values.get("history_embeddings_enabled"):
             raise ValueError(
                 "DIN replaces averaged ranking history embeddings; enable only one"
@@ -2738,6 +2847,20 @@ class Config:
         if self.kafka_config.consumer_max_poll_interval_ms <= 0:
             errors.append("Kafka consumer maximum poll interval must be positive")
         if os.getenv("ENVIRONMENT", "").lower() == "production":
+            if not (
+                os.getenv("RANKING_VALUE_CURRENCY")
+                or os.getenv("RANKING_VALUE_CURRENCY_FILE")
+            ):
+                errors.append(
+                    "RANKING_VALUE_CURRENCY must be explicitly set in production"
+                )
+            if (
+                self.recommendation_config.candidate_fusion_mode == "rrf"
+                and self.recommendation_config.candidate_rrf_k != 60
+            ):
+                errors.append(
+                    "retrieval_sources_v1 production RRF requires CANDIDATE_RRF_K=60"
+                )
             if not self.model_config.artifact_generation_root:
                 errors.append(
                     "MODEL_ARTIFACT_GENERATION_ROOT must be set in production"

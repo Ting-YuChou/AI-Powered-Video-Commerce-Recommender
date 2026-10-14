@@ -1,5 +1,44 @@
 # Progress
 
+## 2026-10-14 — Phase C ranking contracts and experiment gates (acceptance pending)
+
+- Added training-only categorical vocabularies/embeddings and clipped dense
+  normalization for `ranking_ltr_v3_categorical_sources`, bounded SQLite fitting,
+  four explicit crosses, source features and matching Torch/ONNX DCN/DCNv2 input
+  assembly. Frozen feature manifests are checksummed and compared to checkpoints.
+  Failed direct reload restores the complete previous model/configuration.
+- Added source-preserving legacy lineage and deterministic shadow RRF fusion
+  (k=60, max 500, no pre-ranking category cap). Impression/Flink/PIT retain source
+  signals and categorical context; raw history remains `ranking_ltr_v1`, distinct
+  from learned v3 model inputs. Production still defaults to legacy fusion.
+- Added same-currency `gross_revenue_v1` purchase/GMV labels with conflict/missing
+  masks and rejection metrics. Calibration owns a reserved pre-holdout split;
+  optional temperature scaling feeds canonical CTCVR business scoring. Training,
+  normalization and vocab never read calibration/holdout groups.
+- Added v2 quality gates (ECE, Recall@500 and independent experiment thresholds),
+  pinned training/evaluation CLIs, holdout ONNX parity and immutable prerequisite
+  evidence. Combined manual CAS promotion requires passed feature/fusion/
+  calibration evaluations on the same PIT/catalog/champion plus checksum-bound
+  fixed-Linux performance proof. V1 releases remain compatible; v3 cannot bypass
+  evaluation through bootstrap-active.
+- Key files: `ranking_categorical.py`, `candidate_fusion.py`,
+  `probability_calibration.py`, `phase_c_evidence.py`, `ranking.py`,
+  `model_release_quality.py`, `system_store.py`, `scripts/train_phase_c.py`,
+  `scripts/evaluate_phase_c.py`, PIT readers/materializer, Compose/Helm settings;
+  runbook: `docs/operations/phase-c-ranking.md`.
+- Verification: affected host Python suite `305 passed, 1 skipped, 2 deselected`
+  (unrelated visual FAISS cases excluded after a macOS native abort); v3 DCN/DCNv2
+  ONNX parity included. Compose config, Helm lint/template, strict kubeconform
+  `36/36`, Prometheus rules, selected Ruff, Python compilation and diff checks
+  passed. Ranking runtime/service suite `89 passed`; final Flink Maven `39 passed`.
+- Acceptance gaps: no real complete catalog/mature PIT baseline or five-model
+  comparison was available; Recall@500 evidence remains externally supplied.
+  Fixed-Linux latency/QPS evidence, live Postgres promotion integration, full
+  backend suite, production image build and isolated Compose release smoke are
+  not complete. Docker/OrbStack stay paused per user instruction. Do not claim
+  retrieval/ranking uplift, performance non-regression or Phase C acceptance.
+  No active pointer or production fusion setting was changed.
+
 ## 2026-10-13 — Atomic model generations and guarded Iceberg maintenance
 
 - Added immutable Ranking and Two-Tower generation bundles. Artifacts are

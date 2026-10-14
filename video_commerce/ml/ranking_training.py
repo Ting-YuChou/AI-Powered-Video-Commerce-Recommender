@@ -14,6 +14,7 @@ from video_commerce.ml.ranking_features import FeatureBundle
 
 
 RANKING_LABEL_DEFINITION_VERSION = "ranking_labels_v1"
+GROSS_REVENUE_LABEL_DEFINITION_VERSION = "ranking_labels_v2_gross_revenue"
 _ATTRIBUTION_ACTIONS = {"view", "click", "add_to_cart", "purchase"}
 
 
@@ -24,6 +25,8 @@ class AttributionFacts:
     attributed_purchase: bool
     attributed_value: Optional[float] = None
     attributed_value_source: Optional[str] = None
+    attributed_value_currency: Optional[str] = None
+    attributed_value_conflict: bool = False
 
     def __post_init__(self) -> None:
         action = str(self.attributed_action or "").strip().lower()
@@ -57,6 +60,7 @@ class TrainingLabels:
     business_value: float
     value_mask: float
     relevance: float
+    value_rejection_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -114,10 +118,44 @@ class RankingLabelBuilder:
 
     version = RANKING_LABEL_DEFINITION_VERSION
 
+    def __init__(
+        self,
+        *,
+        target_policy: str = "legacy_preference",
+        value_currency: str = "USD",
+    ) -> None:
+        normalized_policy = str(target_policy or "").strip().lower()
+        if normalized_policy not in {"legacy_preference", "gross_revenue_v1"}:
+            raise ValueError("unsupported ranking value target policy")
+        normalized_currency = str(value_currency or "").strip().upper()
+        if not normalized_currency:
+            raise ValueError("ranking value currency is required")
+        self.target_policy = normalized_policy
+        self.value_currency = normalized_currency
+        self.version = (
+            GROSS_REVENUE_LABEL_DEFINITION_VERSION
+            if normalized_policy == "gross_revenue_v1"
+            else RANKING_LABEL_DEFINITION_VERSION
+        )
+
     def build(self, facts: AttributionFacts) -> TrainingLabels:
         clicked = bool(facts.attributed_click)
         purchased = bool(facts.attributed_purchase)
         has_value = purchased and facts.attributed_value is not None
+        rejection_reason: Optional[str] = None
+        if purchased and not has_value and self.target_policy == "gross_revenue_v1":
+            rejection_reason = "missing_value"
+        if has_value and self.target_policy == "gross_revenue_v1":
+            source = str(facts.attributed_value_source or "").strip().lower()
+            currency = str(facts.attributed_value_currency or "").strip().upper()
+            if facts.attributed_value_conflict:
+                rejection_reason = "conflicting_gross_revenue_values"
+            elif source not in {"purchase_value", "gmv"}:
+                rejection_reason = "unsupported_value_source"
+            elif currency != self.value_currency:
+                rejection_reason = "currency_mismatch"
+            if rejection_reason is not None:
+                has_value = False
         value = float(facts.attributed_value) if has_value else 0.0
         relevance = {
             "view": 1.0,
@@ -134,6 +172,7 @@ class RankingLabelBuilder:
             business_value=value,
             value_mask=1.0 if has_value else 0.0,
             relevance=relevance,
+            value_rejection_reason=rejection_reason,
         )
         values = (
             labels.ctr,

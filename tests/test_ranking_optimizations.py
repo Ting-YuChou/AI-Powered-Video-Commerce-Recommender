@@ -1207,7 +1207,7 @@ async def test_ranking_checkpoint_persists_business_objective_metadata(tmp_path)
 
     assert checkpoint["config"]["ranking_objective_version"] == "business_v1"
     assert checkpoint["config"]["feature_definition_version"] == "ranking_ltr_v1"
-    assert checkpoint["config"]["label_definition_version"] == "ranking_labels_v1"
+    assert checkpoint["config"]["label_definition_version"] == "ranking_labels_v2_gross_revenue"
     assert (
         checkpoint["config"]["feature_assembler_version"]
         == "ranking_feature_assembler_v1"

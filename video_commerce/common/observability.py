@@ -913,6 +913,12 @@ class ObservabilityManager:
             "Ranking requests served by combined-score fallback before a valid artifact",
             registry=self.registry,
         )
+        self.ranking_value_label_rejections_total = Counter(
+            "ranking_value_label_rejections_total",
+            "Purchase value labels masked by the gross revenue contract",
+            ["reason"],
+            registry=self.registry,
+        )
         self.model_release_evaluations_total = Counter(
             "model_release_evaluations_total",
             "Offline ranking release quality-gate decisions",
@@ -1170,6 +1176,12 @@ class ObservabilityManager:
     def record_training_run(self, trigger: str, status: str, duration: float) -> None:
         self.worker_training_runs_total.labels(trigger=trigger, status=status).inc()
         self.worker_training_duration_seconds.labels(trigger=trigger).observe(duration)
+
+    def record_ranking_value_label_rejections(self, counts) -> None:
+        for reason, count in counts.items():
+            self.ranking_value_label_rejections_total.labels(reason=reason).inc(
+                max(0, int(count))
+            )
 
     def update_catalog_outbox(self, *, pending: int, oldest_age_seconds: float) -> None:
         self.catalog_outbox_pending.set(max(0, int(pending)))

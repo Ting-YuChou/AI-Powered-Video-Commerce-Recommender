@@ -51,6 +51,7 @@ from video_commerce.ranking_runtime.ranking_coordinator_client import (
 )
 from video_commerce.ml.ranking import RankingModel, RankingModelNotReadyError
 from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
+from video_commerce.ml.candidate_fusion import retrieval_lineage_snapshot
 from video_commerce.ml.ranking_history import (
     RANKING_HISTORY_CONTEXT_KEY,
     build_ranking_history_context,
@@ -490,6 +491,9 @@ def _refresh_serving_version_context(runtime) -> Dict[str, Any]:
 def _ranking_release_lineage(serving_versions: Dict[str, Any]) -> Dict[str, Any]:
     lineage = {
         "model_release_id": serving_versions.get("model_release_id"),
+        "ranking_feature_contract_version": serving_versions.get(
+            "ranking_feature_contract"
+        ),
         "active_generation": serving_versions.get("active_generation"),
         "quality_gate_policy_version": serving_versions.get(
             "quality_gate_policy_version"
@@ -548,6 +552,26 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
     )
     return {
         "ranking_model": ranking_model.model_version if ranking_model else None,
+        "ranking_feature_contract": (
+            getattr(
+                getattr(ranking_model, "config", None), "feature_contract_version", None
+            )
+            or getattr(
+                getattr(runtime.config, "ranking_config", None),
+                "feature_contract_version",
+                RANKING_LTR_FEATURE_DEFINITION_VERSION,
+            )
+        ),
+        "candidate_fusion_mode": getattr(
+            getattr(runtime.config, "recommendation_config", None),
+            "candidate_fusion_mode",
+            "legacy",
+        ),
+        "candidate_rrf_k": getattr(
+            getattr(runtime.config, "recommendation_config", None),
+            "candidate_rrf_k",
+            60,
+        ),
         "model_release_id": (ranking_artifact_metadata.get("model_release_id")),
         "active_generation": (ranking_artifact_metadata.get("active_generation")),
         "quality_gate_policy_version": (
@@ -865,6 +889,7 @@ def _candidate_score_snapshot(candidate: Optional[CandidateProduct]) -> Dict[str
         "content_similarity_score": candidate.content_similarity_score,
         "popularity_score": candidate.popularity_score,
         "combined_score": candidate.combined_score,
+        **retrieval_lineage_snapshot(candidate),
     }
 
 
@@ -878,6 +903,7 @@ def _build_displayed_item_snapshots(
     user_features: Optional[UserFeatures] = None,
     observation_context: Optional[Dict[str, Any]] = None,
     as_of_ts: Optional[float] = None,
+    feature_definition_version: str = RANKING_LTR_FEATURE_DEFINITION_VERSION,
 ) -> List[Dict[str, Any]]:
     """Build bounded top-k item snapshots for impression-backed LTR."""
     if max_items <= 0:
@@ -993,7 +1019,7 @@ def _build_displayed_item_snapshots(
                 "as_of_ts": float(as_of_ts),
                 "candidate_features": scores,
                 "context": dict(observation_context or {}),
-                "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                "feature_definition_version": feature_definition_version,
                 "product_id": product_id,
                 "product_metadata": feature_snapshot,
                 "user_features": user_feature_snapshot,
@@ -1002,7 +1028,7 @@ def _build_displayed_item_snapshots(
             item_snapshot.update(
                 {
                     "as_of_ts": float(as_of_ts),
-                    "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+                    "feature_definition_version": feature_definition_version,
                     "feature_bundle_hash": payload_sha256(bundle),
                 }
             )
@@ -1184,6 +1210,25 @@ async def startup_event():
         )
         await system_store.initialize()
 
+    if (
+        os.getenv("ENVIRONMENT", "").lower() == "production"
+        and runtime.config.recommendation_config.candidate_fusion_mode == "rrf"
+    ):
+        from video_commerce.ml.phase_c_evidence import active_rrf_release_valid
+
+        active = (
+            await system_store.get_active_model_checkpoint(
+                ModelArtifactManager.RANKING_MODEL_NAME,
+                environment=runtime.config.model_release_config.environment,
+            )
+            if system_store is not None
+            else None
+        )
+        if not active_rrf_release_valid(active):
+            raise RuntimeError(
+                "production RRF requires a promoted ranking_quality_gate_v2 release with matching fusion policy"
+            )
+
     object_storage = ObjectStorage(runtime.config.object_storage_config)
     await object_storage.initialize()
     artifact_manager = ModelArtifactManager(
@@ -1236,7 +1281,7 @@ async def startup_event():
 
     if _should_initialize_local_ranker(runtime):
         ranking_model = RankingModel(
-            runtime.config.ranking_config,
+            getattr(runtime.config, "ranking_config", None),
             observability=runtime.observability,
         )
         ranking_checkpoint = None
@@ -1276,7 +1321,7 @@ async def startup_event():
     ):
         ranking_batcher = RankingBatcher(
             ranking_model,
-            runtime.config.ranking_config,
+            getattr(runtime.config, "ranking_config", None),
             observability=runtime.observability,
         )
         await ranking_batcher.start()
@@ -1647,6 +1692,7 @@ async def get_recommendations(
                     user_features=user_features,
                     observation_context=dict(payload.context or {}),
                     as_of_ts=start_time,
+                    feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
                 )
             client_connected = not await _is_request_disconnected(http_request)
             if kafka_manager and client_connected:
@@ -1754,6 +1800,7 @@ async def get_recommendations(
                     user_features=user_features,
                     observation_context=dict(payload.context or {}),
                     as_of_ts=start_time,
+                    feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
                 )
             if kafka_manager and not await _is_request_disconnected(http_request):
                 join_tracking_durable = await _stage_served_impression_event(
@@ -2142,6 +2189,7 @@ async def get_recommendations(
                 user_features=user_features,
                 observation_context=ranking_context,
                 as_of_ts=start_time,
+                feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
             )
             ranked_recommendation_payloads = _attach_displayed_item_snapshot_metadata(
                 ranked_recommendation_payloads,

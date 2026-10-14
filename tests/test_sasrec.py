@@ -70,8 +70,16 @@ async def test_sasrec_train_save_load_and_infer_candidates(tmp_path):
     config = _small_sasrec_config()
     engine = SASRecCandidateEngine(config)
     sequences = {
-        "u1": [_event("p1", timestamp=1), _event("p2", timestamp=2), _event("p3", timestamp=3)],
-        "u2": [_event("p1", timestamp=1), _event("p2", timestamp=2), _event("p4", timestamp=3)],
+        "u1": [
+            _event("p1", timestamp=1),
+            _event("p2", timestamp=2),
+            _event("p3", timestamp=3),
+        ],
+        "u2": [
+            _event("p1", timestamp=1),
+            _event("p2", timestamp=2),
+            _event("p4", timestamp=3),
+        ],
     }
     catalog = {"p1", "p2", "p3", "p4"}
 
@@ -138,19 +146,27 @@ async def test_sasrec_training_failure_preserves_existing_state(monkeypatch):
 async def test_sasrec_returns_empty_for_cold_or_unknown_sequence():
     engine = SASRecCandidateEngine(_small_sasrec_config())
 
-    assert await engine.get_candidates([], k=5, exclude_items=set(), catalog_product_ids={"p1"}) == []
+    assert (
+        await engine.get_candidates(
+            [], k=5, exclude_items=set(), catalog_product_ids={"p1"}
+        )
+        == []
+    )
 
     trained = await engine.train_model(
         {"u1": [_event("p1", timestamp=1), _event("p2", timestamp=2)]},
         catalog_product_ids={"p1", "p2"},
     )
     assert trained is True
-    assert await engine.get_candidates(
-        [_event("unknown", timestamp=1)],
-        k=5,
-        exclude_items=set(),
-        catalog_product_ids={"p1", "p2"},
-    ) == []
+    assert (
+        await engine.get_candidates(
+            [_event("unknown", timestamp=1)],
+            k=5,
+            exclude_items=set(),
+            catalog_product_ids={"p1", "p2"},
+        )
+        == []
+    )
 
 
 class FakeFeatureStore:
@@ -701,7 +717,9 @@ async def test_speech_categories_feed_category_pools_after_explicit_context():
         "u1",
         content_features=features,
         context={"category": "request-category"},
-        user_features=UserFeatures(user_id="u1", preferred_categories=["user-category"]),
+        user_features=UserFeatures(
+            user_id="u1", preferred_categories=["user-category"]
+        ),
         user_interactions=[],
         include_profile=True,
     )
@@ -778,7 +796,9 @@ async def test_failed_asr_does_not_enable_content_categories_when_speech_flag_en
                 "speech_categories": [],
             },
         ),
-        user_features=UserFeatures(user_id="u1", preferred_categories=["user-category"]),
+        user_features=UserFeatures(
+            user_id="u1", preferred_categories=["user-category"]
+        ),
         user_interactions=[],
         include_profile=True,
     )
@@ -792,7 +812,9 @@ async def test_generate_candidates_merges_sasrec_source_when_enabled():
     engine = RecommendationEngine(
         FakeFeatureStore(interactions=[_event("seen")]),
         FakeVectorSearch(),
-        RecommendationConfig(enable_sasrec=True, candidates_per_source=2, max_total_candidates=10),
+        RecommendationConfig(
+            enable_sasrec=True, candidates_per_source=2, max_total_candidates=10
+        ),
     )
     engine.sasrec_engine = FakeSASRec()
 
@@ -825,7 +847,11 @@ async def test_generate_candidates_passes_chronological_positive_sequence_to_sas
 
     _, profile = await engine.generate_candidates("u1", include_profile=True)
 
-    assert [event["product_id"] for event in sasrec.calls[0]["sequence"]] == ["p1", "p2", "p3"]
+    assert [event["product_id"] for event in sasrec.calls[0]["sequence"]] == [
+        "p1",
+        "p2",
+        "p3",
+    ]
     assert "noisy" not in [event["product_id"] for event in sasrec.calls[0]["sequence"]]
     assert "noisy" in sasrec.calls[0]["exclude_items"]
     assert profile["sasrec_sequence_length"] == 3
@@ -834,7 +860,9 @@ async def test_generate_candidates_passes_chronological_positive_sequence_to_sas
 class FakeCFEngine:
     is_trained = True
 
-    async def get_user_recommendations(self, user_id, k, exclude_items, user_features=None):
+    async def get_user_recommendations(
+        self, user_id, k, exclude_items, user_features=None
+    ):
         return [
             CandidateProduct(
                 product_id="seq",
@@ -851,14 +879,18 @@ async def test_generate_candidates_profiles_sasrec_overlap_after_merge():
     engine = RecommendationEngine(
         FakeFeatureStore(interactions=[_event("seen")]),
         FakeVectorSearch(),
-        RecommendationConfig(enable_sasrec=True, candidates_per_source=2, max_total_candidates=10),
+        RecommendationConfig(
+            enable_sasrec=True, candidates_per_source=2, max_total_candidates=10
+        ),
     )
     engine.cf_engine = FakeCFEngine()
     engine.sasrec_engine = sasrec
 
     candidates, profile = await engine.generate_candidates("u1", include_profile=True)
 
-    seq_candidate = next(candidate for candidate in candidates if candidate.product_id == "seq")
+    seq_candidate = next(
+        candidate for candidate in candidates if candidate.product_id == "seq"
+    )
     assert seq_candidate.source == "cf+sasrec"
     assert profile["source_counts"]["sasrec"] == 1
     assert profile["source_overlap_counts"]["sasrec"] == 1
@@ -867,11 +899,66 @@ async def test_generate_candidates_profiles_sasrec_overlap_after_merge():
 
 
 @pytest.mark.asyncio
+async def test_generate_candidates_rrf_preserves_overlap_and_skips_prerank_diversity():
+    sasrec = FakeSASRec()
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[_event("seen")]),
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_sasrec=True,
+            candidate_fusion_mode="rrf",
+            candidate_rrf_k=60,
+            candidates_per_source=2,
+            max_total_candidates=10,
+        ),
+    )
+    engine.cf_engine = FakeCFEngine()
+    engine.sasrec_engine = sasrec
+
+    async def unexpected_diversity(*_args, **_kwargs):
+        raise AssertionError("RRF candidates must reach the ranker before diversity")
+
+    engine._apply_diversity_filter = unexpected_diversity
+    candidates, profile = await engine.generate_candidates("u1", include_profile=True)
+
+    shared = next(
+        candidate for candidate in candidates if candidate.product_id == "seq"
+    )
+    assert set(shared.retrieval_signals) == {"two_tower", "sasrec"}
+    assert shared.source == "two_tower+sasrec"
+    assert profile["fusion_policy_version"] == "candidate_rrf_v1"
+
+
+@pytest.mark.asyncio
+async def test_legacy_fusion_keeps_source_lineage_for_feature_only_experiments():
+    engine = RecommendationEngine(
+        FakeFeatureStore(interactions=[_event("seen")]),
+        FakeVectorSearch(),
+        RecommendationConfig(
+            enable_sasrec=True,
+            candidate_fusion_mode="legacy",
+            candidates_per_source=2,
+            max_total_candidates=10,
+        ),
+    )
+    engine.cf_engine = FakeCFEngine()
+    engine.sasrec_engine = FakeSASRec()
+    candidates = await engine.generate_candidates("u1")
+    shared = next(
+        candidate for candidate in candidates if candidate.product_id == "seq"
+    )
+    assert set(shared.retrieval_signals) == {"two_tower", "sasrec"}
+    assert shared.fusion_policy_version == "candidate_legacy_v1"
+
+
+@pytest.mark.asyncio
 async def test_generate_candidates_falls_back_when_sasrec_errors():
     engine = RecommendationEngine(
         FakeFeatureStore(interactions=[_event("seen")]),
         FakeVectorSearch(),
-        RecommendationConfig(enable_sasrec=True, candidates_per_source=2, max_total_candidates=10),
+        RecommendationConfig(
+            enable_sasrec=True, candidates_per_source=2, max_total_candidates=10
+        ),
     )
     engine.sasrec_engine = FailingSASRec()
 

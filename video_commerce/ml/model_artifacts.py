@@ -1244,6 +1244,23 @@ class ModelArtifactManager:
             ),
             "score_policy_version": record_payload.get("score_policy_version"),
             "value_transform_stats": record_payload.get("value_transform_stats"),
+            "categorical_vocabulary": record_payload.get("categorical_vocabulary"),
+            "dense_normalization": record_payload.get("dense_normalization"),
+            "probability_calibration": record_payload.get("probability_calibration"),
+            "value_target_policy": record_payload.get("value_target_policy"),
+            "value_currency": record_payload.get("value_currency"),
+            "candidate_fusion_policy_version": record_payload.get(
+                "candidate_fusion_policy_version"
+            ),
+            "candidate_rrf_k": record_payload.get("candidate_rrf_k"),
+            "candidate_source_registry_version": record_payload.get(
+                "candidate_source_registry_version"
+            ),
+            "training_pit_materialization_run_id": record_payload.get(
+                "training_pit_materialization_run_id"
+            ),
+            "training_seed": record_payload.get("training_seed"),
+            "experiment_kind": record_payload.get("experiment_kind"),
             "feature_lake_manifest_uri": record_payload.get(
                 "feature_lake_manifest_uri"
             ),
@@ -1359,7 +1376,7 @@ class ModelArtifactManager:
         valid = all(
             (
                 input_dim > 0,
-                contract.get("model_architecture") == "dcn",
+                contract.get("model_architecture") in {"dcn", "dcn_v2_low_rank"},
                 contract.get("feature_schema_version") == feature_schema_version,
                 contract.get("input_contract") == expected_inputs,
                 contract.get("output_contract") == expected_outputs,

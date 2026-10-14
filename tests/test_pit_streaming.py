@@ -102,6 +102,41 @@ def test_spool_split_and_order_are_reproducible(tmp_path):
     assert first == second
 
 
+def test_ranking_split_reserves_calibration_after_validation_and_before_holdout(
+    tmp_path,
+):
+    builder = PitSpoolBuilder(
+        tmp_path,
+        generation_id="manifest-calibration",
+        kind="ranking",
+        max_group_rows=10,
+        max_bytes=10_000_000,
+    )
+    builder.add_rows(
+        [
+            _row("train-1", "a", 1.0),
+            _row("train-2", "b", 2.0),
+            _row("train-3", "c", 3.0),
+            _row("validation", "d", 4.0),
+            _row("calibration", "e", 5.0),
+            _row("holdout", "f", 900_000.0),
+        ]
+    )
+    source = builder.finalize(expected_rows=6)
+
+    source.assign_ranking_splits(
+        holdout_days=7,
+        attribution_cutoff=1_000_000.0,
+        validation_fraction=0.25,
+        calibration_fraction=0.20,
+    )
+
+    assert source.group_ids("training") == ("train-1", "train-2", "train-3")
+    assert source.group_ids("validation") == ("validation",)
+    assert source.group_ids("calibration") == ("calibration",)
+    assert source.group_ids("holdout") == ("holdout",)
+
+
 def test_spool_value_stats_match_numpy_linear_quantile(tmp_path):
     builder = PitSpoolBuilder(
         tmp_path,

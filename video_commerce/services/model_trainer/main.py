@@ -355,16 +355,32 @@ class ModelTrainerService:
             )
         ranking_checkpoint = None
         if self.artifact_manager:
-            ranking_checkpoint = await self.artifact_manager.sync_selected_ranking_checkpoint(
-                gate_mode=self.config.model_release_config.gate_mode,
-                environment=self.config.model_release_config.environment,
-                expected_feature_schema_version=self.ranking_model.feature_schema_version,
+            ranking_checkpoint = (
+                await self.artifact_manager.sync_selected_ranking_checkpoint(
+                    gate_mode=self.config.model_release_config.gate_mode,
+                    environment=self.config.model_release_config.environment,
+                    expected_feature_schema_version=(
+                        None
+                        if self.config.ranking_config.feature_contract_version
+                        == "ranking_ltr_v3_categorical_sources"
+                        else self.ranking_model.feature_schema_version
+                    ),
+                )
             )
         loaded_existing_checkpoint = False
         try:
-            await self.ranking_model.load_model(
-                self.config.model_config.ranking_model_path
-            )
+            if (
+                self.config.ranking_config.feature_contract_version
+                == "ranking_ltr_v3_categorical_sources"
+            ):
+                # The challenger vocabulary is fit from its training partition.
+                self.ranking_model.loaded_model_path = (
+                    self.config.model_config.ranking_model_path
+                )
+            else:
+                await self.ranking_model.load_model(
+                    self.config.model_config.ranking_model_path
+                )
             loaded_existing_checkpoint = True
         except RuntimeError:
             if (
@@ -709,6 +725,13 @@ class ModelTrainerService:
                                 self.config.ranking_config, "validation_fraction", 0.0
                             )
                         ),
+                        calibration_fraction=float(
+                            getattr(
+                                self.config.ranking_config,
+                                "calibration_fraction",
+                                0.0,
+                            )
+                        ),
                     )
                     release_holdout_window = HoldoutWindow(
                         start_ts=float(pit_dataset.max_as_of_ts)
@@ -753,11 +776,23 @@ class ModelTrainerService:
             active_checkpoint = getattr(self, "loaded_ranking_checkpoint", None)
             if (
                 use_pit_dataset
-                and release_holdout_examples
+                and (release_holdout_examples or pit_streaming)
                 and active_checkpoint is not None
                 and active_checkpoint.payload.get("active_generation") is not None
             ):
-                champion_model = RankingModel(self.config.ranking_config)
+                champion_config = self.config.ranking_config.copy(deep=True)
+                checkpoint_definition = active_checkpoint.payload.get(
+                    "feature_definition_version"
+                )
+                champion_config.feature_contract_version = (
+                    checkpoint_definition or "ranking_ltr_v1"
+                )
+                champion_config.probability_calibration = (
+                    "temperature_v1"
+                    if active_checkpoint.payload.get("probability_calibration")
+                    else "none"
+                )
+                champion_model = RankingModel(champion_config)
                 await champion_model.load_model(
                     self.config.model_config.ranking_model_path
                 )
@@ -869,6 +904,56 @@ class ModelTrainerService:
                     model_version=self.ranking_model.model_version,
                     **persist_options,
                     payload={
+                        "candidate_fusion_policy_version": (
+                            "candidate_rrf_v1"
+                            if getattr(
+                                getattr(self.config, "recommendation_config", None),
+                                "candidate_fusion_mode",
+                                "legacy",
+                            )
+                            == "rrf"
+                            else "candidate_legacy_v1"
+                        ),
+                        "candidate_rrf_k": getattr(
+                            getattr(self.config, "recommendation_config", None),
+                            "candidate_rrf_k",
+                            60,
+                        ),
+                        "candidate_source_registry_version": "retrieval_sources_v1",
+                        "categorical_vocabulary": (
+                            self.ranking_model.categorical_vocabulary.to_manifest()
+                            if getattr(
+                                self.ranking_model, "categorical_vocabulary", None
+                            )
+                            else None
+                        ),
+                        "dense_normalization": (
+                            self.ranking_model.feature_assembler.dense_normalization.to_manifest()
+                            if getattr(
+                                getattr(self.ranking_model, "feature_assembler", None),
+                                "dense_normalization",
+                                None,
+                            )
+                            else None
+                        ),
+                        "probability_calibration": (
+                            self.ranking_model.probability_calibration.to_manifest()
+                            if getattr(
+                                self.config.ranking_config,
+                                "probability_calibration",
+                                "none",
+                            )
+                            == "temperature_v1"
+                            else None
+                        ),
+                        "value_target_policy": getattr(
+                            self.config.ranking_config,
+                            "value_target_policy",
+                            "legacy_preference",
+                        ),
+                        "value_currency": getattr(
+                            self.config.ranking_config, "value_currency", "USD"
+                        ),
                         **({"onnx_export": onnx_export} if onnx_export else {}),
                         **(
                             {
@@ -892,9 +977,16 @@ class ModelTrainerService:
                             pit_dataset.materialization_run_id if pit_dataset else None
                         ),
                         "feature_definition_version": (
-                            getattr(pit_dataset, "feature_definition_version", None)
-                            if pit_dataset
-                            else None
+                            "ranking_ltr_v3_categorical_sources"
+                            if getattr(
+                                self.config.ranking_config,
+                                "feature_contract_version",
+                                "ranking_ltr_v1",
+                            )
+                            == "ranking_ltr_v3_categorical_sources"
+                            else getattr(
+                                pit_dataset, "feature_definition_version", None
+                            )
                         ),
                         "feature_lake_manifest_uri": (
                             getattr(pit_dataset, "manifest_uri", None)
@@ -921,7 +1013,19 @@ class ModelTrainerService:
                             else None
                         ),
                         "label_definition_version": (
-                            getattr(pit_dataset, "label_definition_version", None)
+                            getattr(
+                                getattr(
+                                    getattr(
+                                        self.ranking_model,
+                                        "training_tensor_builder",
+                                        None,
+                                    ),
+                                    "label_builder",
+                                    None,
+                                ),
+                                "version",
+                                getattr(pit_dataset, "label_definition_version", None),
+                            )
                             if pit_dataset
                             else None
                         ),
@@ -1035,6 +1139,8 @@ class ModelTrainerService:
                                 training_examples,
                                 release_holdout_examples,
                                 feature_schema_version=self.ranking_model.feature_schema_version,
+                                value_target_policy=self.config.ranking_config.value_target_policy,
+                                value_currency=self.config.ranking_config.value_currency,
                             )
                             champion_predictions = (
                                 champion_model.predict_release_examples(
@@ -1169,6 +1275,8 @@ class ModelTrainerService:
                     [],
                     examples,
                     feature_schema_version=self.ranking_model.feature_schema_version,
+                    value_target_policy=self.config.ranking_config.value_target_policy,
+                    value_currency=self.config.ranking_config.value_currency,
                 )
                 champion = champion_model.predict_release_examples(examples)
                 challenger = self.ranking_model.predict_release_examples(examples)

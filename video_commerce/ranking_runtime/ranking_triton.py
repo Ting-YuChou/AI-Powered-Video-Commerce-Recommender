@@ -171,7 +171,10 @@ def materialize_triton_repository(
     input_dim = int(onnx_model.get("input_dim") or 0)
     if input_dim <= 0:
         raise ValueError("ONNX input dimension is missing or invalid")
-    if str(onnx_model.get("model_architecture") or "dcn") != "dcn":
+    if str(onnx_model.get("model_architecture") or "dcn") not in {
+        "dcn",
+        "dcn_v2_low_rank",
+    }:
         raise ValueError("unsupported ONNX model architecture")
     expected_inputs = {"base_features": [None, input_dim]}
     if bool(onnx_model.get("din_enabled")):

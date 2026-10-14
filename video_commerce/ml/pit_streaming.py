@@ -267,8 +267,16 @@ class VerifiedPitSource:
         holdout_days: int,
         attribution_cutoff: float,
         validation_fraction: float,
+        calibration_fraction: float = 0.0,
     ) -> None:
-        if int(holdout_days) <= 0 or not 0.0 <= float(validation_fraction) < 1.0:
+        validation_fraction = float(validation_fraction)
+        calibration_fraction = float(calibration_fraction)
+        if (
+            int(holdout_days) <= 0
+            or not 0.0 <= validation_fraction < 1.0
+            or not 0.0 <= calibration_fraction < 1.0
+            or validation_fraction + calibration_fraction >= 1.0
+        ):
             raise PitSpoolError("PIT split settings are invalid")
         connection = self._connect()
         try:
@@ -288,10 +296,29 @@ class VerifiedPitSource:
                     "SELECT COUNT(*) FROM groups WHERE split='training'"
                 ).fetchone()[0]
             )
-            if pre_holdout >= 2 and validation_fraction > 0.0:
-                validation_count = min(
+            if pre_holdout >= 2 and calibration_fraction > 0.0:
+                calibration_count = min(
                     pre_holdout - 1,
-                    max(1, int(pre_holdout * float(validation_fraction))),
+                    max(1, int(pre_holdout * calibration_fraction)),
+                )
+                connection.execute(
+                    """
+                    UPDATE groups SET split='calibration' WHERE group_id IN (
+                        SELECT group_id FROM groups WHERE split='training'
+                        ORDER BY max_as_of_ts DESC, group_id DESC LIMIT ?
+                    )
+                    """,
+                    (calibration_count,),
+                )
+            remaining_training = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM groups WHERE split='training'"
+                ).fetchone()[0]
+            )
+            if remaining_training >= 2 and validation_fraction > 0.0:
+                validation_count = min(
+                    remaining_training - 1,
+                    max(1, int(remaining_training * validation_fraction)),
                 )
                 connection.execute(
                     """
@@ -360,6 +387,21 @@ class VerifiedPitSource:
             if updates:
                 connection.executemany(
                     "UPDATE rows SET value_bucket=? WHERE sequence_id=?", updates
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def reindex_value_labels(self, resolver) -> None:
+        connection = self._connect()
+        try:
+            for sequence_id, payload_json in connection.execute(
+                "SELECT sequence_id, payload_json FROM rows"
+            ):
+                value, mask = resolver(json.loads(payload_json))
+                connection.execute(
+                    "UPDATE rows SET business_value=?,is_purchase=? WHERE sequence_id=?",
+                    (float(value), int(bool(mask)), int(sequence_id)),
                 )
             connection.commit()
         finally:

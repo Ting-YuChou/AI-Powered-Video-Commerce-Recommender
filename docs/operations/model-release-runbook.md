@@ -4,8 +4,10 @@ Ranking serving is governed by a durable release registry. Persisting a new
 checkpoint creates a `registered` release; it does not change production
 serving. The model trainer reserves the latest seven mature PIT days as a fixed
 holdout, compares the challenger with the current active release, records the
-versioned `ranking_quality_gate_v1` evidence, and moves passing bundles to
-`staging`. Activation remains a manual, audited operation.
+versioned quality-gate evidence (v1 remains loadable; new Phase C releases use v2), and moves passing bundles to
+`staging`. Activation remains a manual, audited operation. Phase C requires separate
+feature/fusion/calibration results, a combined v2 evaluation and release-bound
+Linux performance proof; see [Phase C experiments](phase-c-ranking.md).
 
 ## Deployment order
 

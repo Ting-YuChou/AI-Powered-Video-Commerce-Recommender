@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
+import numpy as np
 
 from video_commerce.common.feature_history_contracts import (
     RANKING_LTR_FEATURE_DEFINITION_VERSION,
@@ -101,11 +102,51 @@ class LegacyTrainingDatasetAdapter:
             action, clicked, purchased = self._attribution_state(sample)
             value = None
             value_source = None
+            value_currency = None
+            value_conflict = False
             if purchased:
-                value = self.ranking_model._training_business_value_label(
-                    sample, product_metadata, action
-                )
-                value_source = "legacy_heuristic"
+                if (
+                    getattr(
+                        getattr(self.ranking_model, "config", None),
+                        "value_target_policy",
+                        "legacy_preference",
+                    )
+                    == "gross_revenue_v1"
+                ):
+                    purchase_value = sample.get(
+                        "purchase_value", context.get("purchase_value")
+                    )
+                    gross_value = sample.get("gmv", context.get("gmv"))
+                    value = (
+                        purchase_value if purchase_value is not None else gross_value
+                    )
+                    value_source = (
+                        "purchase_value"
+                        if purchase_value is not None
+                        else "gmv"
+                        if gross_value is not None
+                        else None
+                    )
+                    value_currency = (
+                        sample.get("currency")
+                        or context.get("currency")
+                        or context.get("value_currency")
+                    )
+                    value_conflict = (
+                        purchase_value is not None
+                        and gross_value is not None
+                        and not np.isclose(
+                            float(purchase_value),
+                            float(gross_value),
+                            rtol=0.0,
+                            atol=1e-9,
+                        )
+                    )
+                else:
+                    value = self.ranking_model._training_business_value_label(
+                        sample, product_metadata, action
+                    )
+                    value_source = "legacy_heuristic"
             impression_id = str(
                 sample.get("impression_id") or context.get("impression_id") or ""
             ).strip()
@@ -141,6 +182,8 @@ class LegacyTrainingDatasetAdapter:
                         attributed_purchase=purchased,
                         attributed_value=value,
                         attributed_value_source=value_source,
+                        attributed_value_currency=value_currency,
+                        attributed_value_conflict=value_conflict,
                     ),
                     is_slate_sample=is_slate,
                 )

@@ -48,6 +48,10 @@ from video_commerce.ml.cf_cold_start import (
     normalize_vector,
     save_item_embedding_sidecar,
 )
+from video_commerce.ml.candidate_fusion import (
+    FUSION_POLICY_VERSION,
+    merge_candidates_rrf,
+)
 from video_commerce.ml.content_clusters import (
     build_content_cluster_artifact,
     save_content_cluster_artifact,
@@ -2399,6 +2403,7 @@ class RecommendationEngine:
             logger.debug(f"Generating candidates for user {user_id}")
             context = context or {}
             all_candidates: Dict[str, CandidateProduct] = {}
+            source_candidate_pools: Dict[str, List[CandidateProduct]] = {}
             started_at = time.perf_counter()
             profile = {
                 "user_interactions_ms": 0.0,
@@ -2424,6 +2429,7 @@ class RecommendationEngine:
                 "swing_itemcf_seed_count": 0,
                 "has_transcript": False,
                 "speech_category_candidates_used": False,
+                "fusion_policy_version": "legacy_weighted_v1",
             }
 
             async def timed_stage(
@@ -2817,6 +2823,9 @@ class RecommendationEngine:
             def merge_source(
                 source_name: str, candidates: List[CandidateProduct]
             ) -> None:
+                source_candidate_pools[source_name] = [
+                    candidate.copy(deep=True) for candidate in candidates
+                ]
                 overlaps = 0
                 for candidate in candidates:
                     if self._merge_candidate(all_candidates, candidate):
@@ -2876,6 +2885,11 @@ class RecommendationEngine:
                         profile["source_overlap_counts"]["random"] = (
                             profile["source_overlap_counts"].get("random", 0) + 1
                         )
+                source_candidate_pools["random"] = [
+                    candidate.copy(deep=True)
+                    for candidate in random_candidates
+                    if candidate.product_id not in exclude_items
+                ]
                 profile["source_counts"]["random"] = len(random_candidates)
                 profile["source_overlap_counts"].setdefault("random", 0)
             elif profile["random_candidates_ms"] == 0.0:
@@ -2889,29 +2903,60 @@ class RecommendationEngine:
             profile["merged_source_counts"] = self._count_source_tokens(
                 list(all_candidates.values())
             )
-            final_candidates: List[CandidateProduct] = []
-            for candidate in all_candidates.values():
-                cf_score = candidate.collaborative_score or 0.0
-                content_score = candidate.content_similarity_score or 0.0
-                popularity_score = candidate.popularity_score or 0.0
-
-                combined_score = (
-                    cf_score * self.config.cf_weight
-                    + content_score * self.config.content_weight
-                    + popularity_score * self.config.popularity_weight
+            if self.config.candidate_fusion_mode == "rrf":
+                final_candidates = merge_candidates_rrf(
+                    source_candidate_pools,
+                    limit=min(500, self.config.max_total_candidates),
+                    rrf_k=self.config.candidate_rrf_k,
                 )
-                candidate.combined_score = combined_score
-                final_candidates.append(candidate)
-
-            # Apply diversity if enabled
-            if self.config.enable_diversity:
-                final_candidates = await self._apply_diversity_filter(
-                    final_candidates, context
+                profile["fusion_policy_version"] = FUSION_POLICY_VERSION
+                profile["merged_source_counts"] = self._count_source_tokens(
+                    final_candidates
                 )
+            else:
+                final_candidates = []
+                for candidate in all_candidates.values():
+                    cf_score = candidate.collaborative_score or 0.0
+                    content_score = candidate.content_similarity_score or 0.0
+                    popularity_score = candidate.popularity_score or 0.0
 
-            # Sort by combined score
-            final_candidates.sort(key=lambda x: x.combined_score, reverse=True)
-            final_candidates = final_candidates[: self.config.max_total_candidates]
+                    combined_score = (
+                        cf_score * self.config.cf_weight
+                        + content_score * self.config.content_weight
+                        + popularity_score * self.config.popularity_weight
+                    )
+                    candidate.combined_score = combined_score
+                    final_candidates.append(candidate)
+
+                if self.config.enable_diversity:
+                    final_candidates = await self._apply_diversity_filter(
+                        final_candidates, context
+                    )
+
+                final_candidates.sort(
+                    key=lambda candidate: (
+                        -float(candidate.combined_score),
+                        candidate.product_id,
+                    )
+                )
+                final_candidates = final_candidates[: self.config.max_total_candidates]
+                lineage = {
+                    candidate.product_id: candidate
+                    for candidate in merge_candidates_rrf(
+                        source_candidate_pools,
+                        limit=len(all_candidates),
+                        rrf_k=self.config.candidate_rrf_k,
+                    )
+                }
+                for position, candidate in enumerate(final_candidates, start=1):
+                    source_snapshot = lineage.get(candidate.product_id)
+                    if source_snapshot is not None:
+                        candidate.retrieval_signals = source_snapshot.retrieval_signals
+                    candidate.fusion_policy_version = "candidate_legacy_v1"
+                    candidate.source_registry_version = (
+                        self.config.candidate_source_registry_version
+                    )
+                    candidate.candidate_pool_position = position
             profile["score_merge_ms"] = round(
                 (time.perf_counter() - stage_started) * 1000, 2
             )
