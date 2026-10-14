@@ -1,0 +1,146 @@
+# Phase C ranking experiments and activation
+
+Phase C adds the `ranking_ltr_v3_categorical_sources` model input contract,
+source-aware candidate fusion, `gross_revenue_v1` value labels, and optional
+`temperature_v1` calibration. Production retains legacy fusion and the existing
+active model until an operator promotes a fully evidenced combined release.
+DIN, trimodal, SASRec and MMoE are separate experiments.
+
+## Data and feature contracts
+
+The raw Flink feature-history/PIT contract remains `ranking_ltr_v1`. It now
+preserves category, brand, tags, request context, per-source retrieval signals,
+and attributed purchase value, GMV and currency as additive fields. The learned
+model input contract is v3; do not change the raw materializer contract to v3.
+Older shards without currency retain purchase labels but have masked value
+labels under `gross_revenue_v1`.
+
+Only matching-currency `purchase_value` or `gmv` contributes to value loss.
+Conflicting values are masked and counted; margin, profit and product price are
+not substitutes. Production must explicitly set `RANKING_VALUE_CURRENCY`.
+
+The latest seven mature PIT days are the holdout. Before that boundary, the
+latest 10% of impression groups form calibration; early-stopping validation is
+selected from the remaining pre-holdout groups. Training alone determines
+vocabularies and clipped p1/p99 population normalization. Entire impression
+groups stay together across shards and splits. SQLite accumulators bound
+vocabulary and normalization memory; calibration accumulates a fixed likelihood
+grid rather than retaining predictions.
+
+V3 freezes PAD=0, MISSING=1, OOV=2 and deterministic token vocabularies. Category,
+brand and pooled tags/preferences use 16-dimensional embeddings; device,
+surface and UTC time-of-day use eight dimensions. Packed integer IDs share the
+existing FP32 ranking batch protocol, then become learned embeddings inside
+Torch/ONNX. Bundle and checkpoint vocab/normalization must agree.
+
+`retrieval_sources_v1` maps aliases to nine known sources plus unknown. Legacy
+fusion retains its existing ranking/diversity behavior and records all source
+signals. RRF sums `1/(60 + source_rank)`, sorts ties by product ID, retains at
+most 500 candidates, and does not apply a category cap before ranking. MMR
+still runs after ranking. Raw scores remain source-specific audit values.
+
+## Produce independent bundles
+
+Use one immutable ranking PIT pointer, the same verified catalog, seed 42 and
+independent model versions. The following creates and registers a feature-only
+release; registration does not change the active pointer:
+
+```bash
+PYTHONPATH=. python scripts/train_phase_c.py \
+  --pit-pointer /data/ranking-pit/latest.json \
+  --experiment features --model-version phase-c-features-1 \
+  --output-dir /data/phase-c --register
+```
+
+Repeat with `--experiment combined` for the combined v3/temperature bundle.
+`fusion` clones the pinned champion without an optimizer; `calibration` clones
+it and fits temperatures only on reserved calibration groups. Both require
+`--champion-bundle` and `--champion-bundle-sha256`. Feature/combined training uses
+v3 with DIN/trimodal disabled; feature-only disables calibration.
+
+The CLI saves checkpoint, parity-checked ONNX and a pinned bundle JSON. Its
+`training_pit_materialization_run_id` records data provenance without reusing the
+production trainer's single-winner `feature_lake_materialization_run_id` claim;
+independent model versions can therefore compare the same PIT run. Failed or
+insufficient runs never activate a release. Inspect and remove unpublished
+partial output directories before retrying with a fresh version.
+
+## Evaluate and preserve evidence
+
+First obtain real retrieval baseline evidence from the existing retrieval PIT
+trainer/evaluator: popularity, active Two-Tower and challenger on the full
+eligible catalog, mature labels, Recall@50/100/200, MRR and coverage. Synthetic
+fixtures do not satisfy this requirement.
+
+Candidate Recall@500 evidence must be supplied from a real candidate-pool
+comparison; the ranking evaluator does not invent unseen candidates from
+served rows. The evidence JSON includes `pit_manifest_sha256`,
+`catalog_manifest_sha256`, `champion_bundle_digest`, `challenger_bundle_digest`,
+`candidate_limit: 500`, `seed: 42`, `champion_recall_at_500` and
+`challenger_recall_at_500`. Missing evidence produces `insufficient_evidence`.
+Here a bundle digest is SHA-256 of sorted compact JSON of the immutable registry
+bundle manifest. It is distinct from the generation installer's local digest.
+
+Replace digest placeholders with the SHA-256 of each JSON file:
+
+```bash
+PYTHONPATH=. python scripts/evaluate_phase_c.py \
+  --pit-pointer /data/ranking-pit/latest.json \
+  --champion-bundle /data/champion.json --champion-bundle-sha256 CHAMPION_JSON_SHA \
+  --challenger-bundle /data/phase-c/phase-c-features-1/bundle.json \
+  --challenger-bundle-sha256 CHALLENGER_JSON_SHA \
+  --experiment features --candidate-recall-evidence /data/recall-features.json \
+  --output /data/evaluations/features.json --register
+```
+
+Evaluate features, fusion and calibration separately. Each has its own v2
+improvement threshold. Combined evaluation repeats the full gate and adds
+`--prerequisite-evaluation-id features=UUID`, `fusion=UUID`, `calibration=UUID`.
+Promotion checks that all three passed using the same champion, PIT and catalog.
+All comparisons use the same holdout rows, canonical score and deterministic
+product-ID tie breaking. ONNX output scores/top-k are checked on holdout batches.
+Passed evaluation may stage a bundle; it never promotes it.
+
+Evaluation records are immutable per release/PIT/policy. Do not reinterpret an
+existing insufficient/failed evaluation with new thresholds. Use a new model
+version when evidence or an experiment changes. The general trainer's automatic
+v2 evaluation cannot supply external Recall@500 evidence; use these independent
+experiment CLI runs for Phase C.
+
+## Performance proof and promotion
+
+Run the full gateway/recommendation path on fixed Linux CPU/memory allocations,
+comparing against the active champion in hot and unique modes. Archive raw
+results. Performance proof JSON must contain the target `release_id`, registry
+`bundle_digest`, raw `results_sha256`, `platform: linux`, and
+`resources: {cpus, memory_bytes}`. Both mode entries must include fractional
+`error_rate`, `five_xx_rate`, millisecond `successful_p95_ms`,
+`successful_p99_ms`, and relative `p95_relative_regression`,
+`successful_qps_relative_regression` (positive means regression).
+
+The gate requires error <0.5%, 5xx <0.1%, p95 <1000ms, p99 <2000ms and both
+regressions <=10%. Do not write placeholder evidence for missing measurements.
+The CLI verifies the raw result file SHA before passing evidence to the
+transactional promotion gate. The proof is archived in transition audit data.
+
+```bash
+PYTHONPATH=. python scripts/model_release.py promote \
+  --version phase-c-combined-1 --expected-generation GENERATION \
+  --actor OPERATOR --reason "Phase C offline and Linux gates passed" \
+  --performance-evidence /data/performance-proof.json \
+  --performance-results /data/raw-performance.json
+```
+
+V3 cannot use bootstrap-active. Rollback to a previously active compatible
+release uses CAS; its archived performance proof can be reused. Production RRF
+startup requires an active promoted v2 bundle with `candidate_rrf_v1`, k=60 and
+`retrieval_sources_v1`. Deploy model and fusion configuration together. Observe
+rollout generations and preserve the prior verified bundle on load failure.
+
+## Current acceptance boundary
+
+Unit/contract tests and synthetic ONNX parity establish engineering behavior.
+Real ranking/retrieval baselines, the four challengers, Linux performance,
+Postgres release integration and the isolated release smoke are separate
+acceptance evidence. Without them, retain legacy fusion/active selection and
+report Phase C as pending acceptance rather than model improvement.

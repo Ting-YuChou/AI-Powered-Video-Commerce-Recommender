@@ -393,6 +393,7 @@ def test_production_config_rejects_insecure_defaults(monkeypatch):
 
 
 def test_production_config_accepts_secret_files(monkeypatch, tmp_path):
+    monkeypatch.setenv("RANKING_VALUE_CURRENCY", "USD")
     api_key_file = tmp_path / "api_key.txt"
     internal_key_file = tmp_path / "internal_key.txt"
     redis_password_file = tmp_path / "redis_password.txt"

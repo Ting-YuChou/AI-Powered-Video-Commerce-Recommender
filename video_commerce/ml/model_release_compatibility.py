@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Any
 
-from video_commerce.ml.model_release_quality import QUALITY_GATE_POLICY_VERSION
+from video_commerce.ml.model_release_quality import (
+    QUALITY_GATE_POLICY_VERSION,
+    SUPPORTED_QUALITY_GATE_POLICY_VERSIONS,
+)
 from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
 from video_commerce.ml.retrieval_evaluation import RETRIEVAL_QUALITY_GATE_VERSION
 from video_commerce.ml.retrieval_pit_dataset import (
@@ -32,6 +35,45 @@ def model_release_compatibility(
     if len(str(checkpoint.get("sha256") or "")) != 64:
         return _failed("invalid_checkpoint_sha256")
     if model_name == "ranking_model":
+        if (
+            manifest.get("feature_definition_version")
+            == "ranking_ltr_v3_categorical_sources"
+            or manifest.get("feature_schema_version")
+            == "ranking_ltr_v3_categorical_sources"
+        ):
+            if (
+                manifest.get("feature_definition_version")
+                != "ranking_ltr_v3_categorical_sources"
+            ):
+                return _failed("missing_v3_feature_definition_version")
+            from video_commerce.ml.ranking_categorical import (
+                RankingCategoricalVocabulary,
+                DenseFeatureNormalization,
+            )
+
+            try:
+                RankingCategoricalVocabulary.from_manifest(
+                    manifest.get("categorical_vocabulary") or {}
+                )
+                DenseFeatureNormalization.from_manifest(
+                    manifest.get("dense_normalization") or {}
+                )
+            except (ValueError, TypeError, KeyError):
+                return _failed("invalid_v3_feature_artifacts")
+            if (
+                manifest.get("quality_gate_policy_version")
+                != QUALITY_GATE_POLICY_VERSION
+            ):
+                return _failed("missing_or_incompatible_quality_gate_policy_version")
+        if manifest.get("probability_calibration"):
+            from video_commerce.ml.probability_calibration import TemperatureCalibration
+
+            try:
+                TemperatureCalibration.from_manifest(
+                    manifest["probability_calibration"]
+                )
+            except (ValueError, TypeError):
+                return _failed("invalid_probability_calibration")
         requirements = {
             "feature_schema_version": bool(manifest.get("feature_schema_version")),
             "score_policy_version": manifest.get("score_policy_version")
@@ -40,7 +82,7 @@ def model_release_compatibility(
                 manifest.get("value_transform_stats"), dict
             ),
             "quality_gate_policy_version": manifest.get("quality_gate_policy_version")
-            == QUALITY_GATE_POLICY_VERSION,
+            in SUPPORTED_QUALITY_GATE_POLICY_VERSIONS,
         }
         failed = next((key for key, valid in requirements.items() if not valid), None)
         return (
@@ -49,7 +91,7 @@ def model_release_compatibility(
             else ModelReleaseCompatibility(
                 True,
                 None,
-                QUALITY_GATE_POLICY_VERSION,
+                str(manifest.get("quality_gate_policy_version")),
                 ("feature_schema_version", "score_policy_version"),
             )
         )

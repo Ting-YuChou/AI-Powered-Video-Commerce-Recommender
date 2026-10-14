@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -133,11 +133,13 @@ class RankingTrainingSource:
         holdout_days: int,
         attribution_cutoff: float,
         validation_fraction: float,
+        calibration_fraction: float = 0.0,
     ) -> None:
         self.source.assign_ranking_splits(
             holdout_days=holdout_days,
             attribution_cutoff=attribution_cutoff,
             validation_fraction=validation_fraction,
+            calibration_fraction=calibration_fraction,
         )
 
     def row_count_for_split(self, split: str) -> int:
@@ -154,6 +156,21 @@ class RankingTrainingSource:
 
     def compute_value_transform_stats(self, **kwargs):
         return self.source.compute_value_transform_stats(**kwargs)
+
+    def reindex_value_labels(self, label_builder):
+        rejected = Counter()
+
+        def resolve(payload):
+            example = PitTrainingDatasetReader._normalize_training_row(
+                payload, self.feature_definition_version, self.label_definition_version
+            )
+            labels = label_builder.build(example.attribution)
+            if labels.value_rejection_reason:
+                rejected[labels.value_rejection_reason] += 1
+            return labels.business_value, labels.value_mask
+
+        self.source.reindex_value_labels(resolve)
+        return dict(rejected)
 
     def value_mask_coverage(self, split: str = "training") -> float:
         return self.source.value_mask_coverage(split)
@@ -1083,15 +1100,42 @@ class PitTrainingDatasetReader:
             )
         user_payload = dict(user_payload)
         user_payload.setdefault("user_id", user_id)
+        user_payload.setdefault("last_active", float(normalized["as_of_ts"]))
+        purchase_value = normalized.get("attributed_purchase_value")
+        gross_value = normalized.get("attributed_gmv")
+        if purchase_value is not None or gross_value is not None:
+            normalized["attributed_value"] = (
+                purchase_value if purchase_value is not None else gross_value
+            )
+            normalized["attributed_value_source"] = (
+                "purchase_value" if purchase_value is not None else "gmv"
+            )
+            normalized["attributed_value_conflict"] = (
+                purchase_value is not None
+                and gross_value is not None
+                and not np.isclose(
+                    float(purchase_value), float(gross_value), rtol=0.0, atol=1e-9
+                )
+            )
         try:
             user_features = UserFeatures(**user_payload)
             candidate = CandidateProduct(
                 product_id=product_id,
-                collaborative_score=float(scores["collaborative_score"]),
-                content_similarity_score=float(scores["content_similarity_score"]),
-                popularity_score=float(scores["popularity_score"]),
+                collaborative_score=float(scores["collaborative_score"])
+                if scores["collaborative_score"] is not None
+                else None,
+                content_similarity_score=float(scores["content_similarity_score"])
+                if scores["content_similarity_score"] is not None
+                else None,
+                popularity_score=float(scores["popularity_score"])
+                if scores["popularity_score"] is not None
+                else None,
                 combined_score=float(scores["combined_score"]),
                 source="pit_observation",
+                retrieval_signals=scores.get("retrieval_signals") or {},
+                fusion_policy_version=scores.get("fusion_policy_version"),
+                source_registry_version=scores.get("source_registry_version"),
+                candidate_pool_position=scores.get("candidate_pool_position"),
             )
             attribution = AttributionFacts(
                 attributed_action=str(normalized.get("attributed_action") or ""),
@@ -1099,6 +1143,10 @@ class PitTrainingDatasetReader:
                 attributed_purchase=bool(normalized.get("attributed_purchase")),
                 attributed_value=normalized.get("attributed_value"),
                 attributed_value_source=normalized.get("attributed_value_source"),
+                attributed_value_currency=normalized.get("attributed_value_currency"),
+                attributed_value_conflict=bool(
+                    normalized.get("attributed_value_conflict", False)
+                ),
             )
             bundle = FeatureBundle(
                 as_of_ts=float(normalized["as_of_ts"]),

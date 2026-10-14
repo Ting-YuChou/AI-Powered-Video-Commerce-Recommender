@@ -124,6 +124,7 @@ def _small_config() -> RankingQualityGateConfig:
         min_slice_impressions=1,
         min_slice_users=1,
         min_slice_positives=1,
+        require_candidate_recall=False,
     )
 
 
@@ -172,7 +173,7 @@ def test_quality_gate_passes_non_regressing_challenger_deterministically():
     assert first.decision is GateDecision.PASSED
     assert first.overall["ndcg_at_10_delta"] == pytest.approx(0.0)
     assert first.bootstrap == second.bootstrap
-    assert first.policy_version == "ranking_quality_gate_v1"
+    assert first.policy_version == "ranking_quality_gate_v2"
 
 
 def test_quality_gate_rejects_serving_order_regression():
@@ -213,3 +214,42 @@ def test_quality_gate_rejects_missing_or_non_finite_predictions():
 
     assert result.decision is GateDecision.FAILED
     assert result.reasons == ("non_finite_prediction",)
+
+
+def test_quality_gate_v2_rejects_ece_regression():
+    rows = _fixture_rows()[-6:]
+    champion = {row.observation_id: _prediction(row, correct=True) for row in rows}
+    challenger = {
+        row.observation_id: replace(
+            champion[row.observation_id],
+            ctr=0.6 if row.clicked else 0.4,
+            ctcvr=0.6 if row.purchased else 0.4,
+        )
+        for row in rows
+    }
+
+    result = evaluate_quality_gate(rows, champion, challenger, _small_config())
+
+    assert result.decision is GateDecision.FAILED
+    assert "overall_ctr_ece_absolute_regression" in result.reasons
+    assert result.overall["ctr_ece_absolute_regression"] > 0.005
+
+
+def test_quality_gate_v2_requires_candidate_recall_evidence_when_enabled():
+    rows = _fixture_rows()[-6:]
+    predictions = {row.observation_id: _prediction(row, correct=True) for row in rows}
+    config = replace(_small_config(), require_candidate_recall=True)
+
+    result = evaluate_quality_gate(rows, predictions, predictions, config)
+
+    assert result.decision is GateDecision.INSUFFICIENT_EVIDENCE
+    assert "candidate_recall_at_500" in result.reasons
+
+
+def test_quality_gate_ties_use_product_id_independently_of_row_order():
+    from video_commerce.ml.model_release_quality import _mean_ndcg
+    rows = [_row(impression="i1", user="u1", product="a", timestamp=1.0, relevance=4.0),
+            _row(impression="i1", user="u1", product="b", timestamp=1.0, relevance=1.0)]
+    predictions = {row.observation_id: RankingPrediction(0.5, 0.5, 0.5, 1.0) for row in rows}
+    assert _mean_ndcg(rows, predictions) == pytest.approx(1.0)
+    assert _mean_ndcg(list(reversed(rows)), predictions) == pytest.approx(1.0)

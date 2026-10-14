@@ -203,7 +203,7 @@ public final class PointInTimeFeatureJoinJob {
             + "context_json STRING,behavior_sequences_json STRING,candidate_features_json STRING,online_feature_bundle_hash STRING,"
             + "feature_bundle_hash STRING,"
             + "attributed_action STRING,attributed_click INT,attributed_purchase INT,"
-            + "attributed_value DOUBLE,attributed_value_source STRING,"
+            + "attributed_value DOUBLE,attributed_value_source STRING,attributed_purchase_value DOUBLE,attributed_gmv DOUBLE,attributed_value_currency STRING,"
             + "feature_definition_version STRING,label_definition_version STRING,"
             + "materialized_at TIMESTAMP_LTZ(3),materialization_date DATE) "
             + "PARTITIONED BY (materialization_date) WITH ('format-version'='2')",
@@ -245,6 +245,9 @@ public final class PointInTimeFeatureJoinJob {
     additions.put("attributed_action", "STRING");
     additions.put("attributed_value", "DOUBLE");
     additions.put("attributed_value_source", "STRING");
+    additions.put("attributed_purchase_value", "DOUBLE");
+    additions.put("attributed_gmv", "DOUBLE");
+    additions.put("attributed_value_currency", "STRING");
     additions.put("label_definition_version", "STRING");
     additions.put("behavior_sequences_json", "STRING");
     return additions;
@@ -302,7 +305,7 @@ public final class PointInTimeFeatureJoinJob {
             "action", "as_of_ts", "user_features_json", "product_metadata_json", "context_json",
             "behavior_sequences_json", "candidate_features_json", "online_feature_bundle_hash", "feature_bundle_hash",
             "attributed_action", "attributed_click", "attributed_purchase", "attributed_value",
-            "attributed_value_source", "feature_definition_version", "label_definition_version",
+            "attributed_value_source", "attributed_purchase_value", "attributed_gmv", "attributed_value_currency", "feature_definition_version", "label_definition_version",
             "materialized_at", "materialization_date"));
   }
 
@@ -381,6 +384,9 @@ public final class PointInTimeFeatureJoinJob {
         case "attributed_purchase": expressions.add("COALESCE(f.attributed_purchase,0)"); break;
         case "attributed_value": expressions.add("f.attributed_value"); break;
         case "attributed_value_source": expressions.add("f.attributed_value_source"); break;
+        case "attributed_purchase_value": expressions.add("f.attributed_purchase_value"); break;
+        case "attributed_gmv": expressions.add("f.attributed_gmv"); break;
+        case "attributed_value_currency": expressions.add("f.attributed_value_currency"); break;
         case "feature_definition_version": expressions.add("'" + version + "'"); break;
         case "label_definition_version": expressions.add("'" + LABEL_DEFINITION_VERSION + "'"); break;
         case "materialized_at": expressions.add("CURRENT_TIMESTAMP"); break;
@@ -502,12 +508,15 @@ public final class PointInTimeFeatureJoinJob {
             + "WHEN JSON_VALUE(context_json,'$.gmv') IS NOT NULL THEN 'gmv' "
             + "WHEN JSON_VALUE(context_json,'$.purchase_value') IS NOT NULL THEN 'purchase_value' "
             + "WHEN JSON_VALUE(context_json,'$.price') IS NOT NULL THEN 'price' END "
-            + "attributed_value_source,ROW_NUMBER() OVER (PARTITION BY observation_id "
+            + "attributed_value_source,TRY_CAST(JSON_VALUE(context_json,'$.purchase_value') AS DOUBLE) attributed_purchase_value,"
+            + "TRY_CAST(JSON_VALUE(context_json,'$.gmv') AS DOUBLE) attributed_gmv,"
+            + "COALESCE(JSON_VALUE(context_json,'$.currency'),JSON_VALUE(context_json,'$.value_currency')) attributed_value_currency,"
+            + "ROW_NUMBER() OVER (PARTITION BY observation_id "
             + "ORDER BY event_time_epoch DESC,available_at_epoch DESC,source_event_id DESC) purchase_rank "
             + "FROM feedback_events i WHERE action='purchase'\n"
             + "),feedback AS (\n"
             + " SELECT a.observation_id,a.attributed_action,a.attributed_click,a.attributed_purchase,"
-            + "p.attributed_value,p.attributed_value_source FROM feedback_aggregated a "
+            + "p.attributed_value,p.attributed_value_source,p.attributed_purchase_value,p.attributed_gmv,p.attributed_value_currency FROM feedback_aggregated a "
             + "LEFT JOIN purchase_ranked p ON p.observation_id=a.observation_id AND p.purchase_rank=1\n"
             + ")",
         ns,
@@ -541,7 +550,7 @@ public final class PointInTimeFeatureJoinJob {
             + "product_metadata_json STRING,context_json STRING,behavior_sequences_json STRING,candidate_features_json STRING,"
             + "online_feature_bundle_hash STRING,feature_bundle_hash STRING,"
             + "attributed_action STRING,attributed_click INT,attributed_purchase INT,"
-            + "attributed_value DOUBLE,attributed_value_source STRING,"
+            + "attributed_value DOUBLE,attributed_value_source STRING,attributed_purchase_value DOUBLE,attributed_gmv DOUBLE,attributed_value_currency STRING,"
             + "feature_definition_version STRING,label_definition_version STRING) "
             + "WITH ('connector'='filesystem','path'='%s',"
             + "'format'='parquet','sink.rolling-policy.file-size'='128mb')",
@@ -559,7 +568,7 @@ public final class PointInTimeFeatureJoinJob {
             + "action,as_of_ts,"
             + "user_features_json,product_metadata_json,context_json,behavior_sequences_json,candidate_features_json,"
             + "online_feature_bundle_hash,feature_bundle_hash,attributed_action,"
-            + "attributed_click,attributed_purchase,attributed_value,attributed_value_source,"
+            + "attributed_click,attributed_purchase,attributed_value,attributed_value_source,attributed_purchase_value,attributed_gmv,attributed_value_currency,"
             + "feature_definition_version,label_definition_version "
             + "FROM `%s`.`ranking_training_pit` WHERE materialization_run_id='%s'",
         identifier(namespace), literal(runId));

@@ -79,6 +79,7 @@ class ModelReleaseController:
         expected_generation: int,
         actor: str,
         reason: str,
+        performance_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_actor = str(actor or "").strip()
         normalized_reason = str(reason or "").strip()
@@ -95,6 +96,11 @@ class ModelReleaseController:
             reason=normalized_reason,
             rollback=False,
             bootstrap=False,
+            **(
+                {"performance_evidence": performance_evidence}
+                if performance_evidence is not None
+                else {}
+            ),
         )
         if result is None:
             raise ReleasePromotionError(
@@ -111,6 +117,7 @@ class ModelReleaseController:
         expected_generation: int,
         actor: str,
         reason: str,
+        performance_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_actor = str(actor or "").strip()
         normalized_reason = str(reason or "").strip()
@@ -127,6 +134,11 @@ class ModelReleaseController:
             reason=normalized_reason,
             rollback=True,
             bootstrap=False,
+            **(
+                {"performance_evidence": performance_evidence}
+                if performance_evidence is not None
+                else {}
+            ),
         )
         if result is None:
             raise ReleasePromotionError(

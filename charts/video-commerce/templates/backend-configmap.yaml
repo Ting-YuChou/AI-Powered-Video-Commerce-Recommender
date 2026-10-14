@@ -7,6 +7,14 @@ metadata:
     {{- include "video-commerce.labels" . | nindent 4 }}
 data:
   ENVIRONMENT: {{ .Values.appConfig.environment | quote }}
+  RANKING_FEATURE_CONTRACT_VERSION: {{ .Values.appConfig.ranking.featureContractVersion | quote }}
+  RANKING_VALUE_TARGET_POLICY: {{ .Values.appConfig.ranking.valueTargetPolicy | quote }}
+  RANKING_VALUE_CURRENCY: {{ .Values.appConfig.ranking.valueCurrency | quote }}
+  RANKING_PROBABILITY_CALIBRATION: {{ .Values.appConfig.ranking.probabilityCalibration | quote }}
+  RANKING_CALIBRATION_FRACTION: {{ .Values.appConfig.ranking.calibrationFraction | quote }}
+  CANDIDATE_FUSION_MODE: {{ .Values.appConfig.ranking.candidateFusionMode | quote }}
+  CANDIDATE_RRF_K: {{ .Values.appConfig.ranking.candidateRrfK | quote }}
+  CANDIDATE_SOURCE_REGISTRY_VERSION: {{ .Values.appConfig.ranking.candidateSourceRegistryVersion | quote }}
   MODEL_RELEASE_GATE_MODE: {{ .Values.appConfig.modelRelease.gateMode | quote }}
   MODEL_RELEASE_ENVIRONMENT: {{ .Values.appConfig.modelRelease.environment | quote }}
   MODEL_RELEASE_HOLDOUT_DAYS: {{ .Values.appConfig.modelRelease.holdoutDays | quote }}

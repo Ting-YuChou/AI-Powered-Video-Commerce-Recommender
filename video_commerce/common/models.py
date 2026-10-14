@@ -15,6 +15,7 @@ except ImportError:
 from typing import List, Dict, Optional, Any, Union, TYPE_CHECKING
 from enum import Enum
 import time
+import math
 from uuid import UUID
 
 
@@ -171,7 +172,9 @@ class ProductRecommendation(BaseModel):
     raw_ranking_score: Optional[float] = Field(
         None, description="Model ranking score before the canonical serving policy"
     )
-    ctcvr: Optional[float] = Field(None, description="Predicted click-through conversion")
+    ctcvr: Optional[float] = Field(
+        None, description="Predicted click-through conversion"
+    )
     predicted_value: Optional[float] = Field(
         None, description="Inverse-transformed predicted business value"
     )
@@ -553,6 +556,27 @@ class ProductData(BaseModel):
     )
 
 
+class RetrievalSourceSignal(BaseModel):
+    """One source-specific candidate observation retained through ranking."""
+
+    raw_source: str = Field(..., description="Original candidate source name")
+    raw_score: float = Field(..., description="Uncalibrated source-native score")
+    source_rank: int = Field(..., ge=1, description="One-based rank in source pool")
+    source_count: int = Field(..., ge=1, description="Source pool size")
+    normalized_rank: float = Field(
+        ..., ge=0, le=1, description="Rank percentile within source pool"
+    )
+    reciprocal_rank: float = Field(
+        ..., ge=0, description="Reciprocal-rank contribution used by fusion"
+    )
+
+    @validator("raw_score")
+    def validate_finite_raw_score(cls, value):
+        if not math.isfinite(value):
+            raise ValueError("retrieval raw score must be finite")
+        return value
+
+
 class CandidateProduct(BaseModel):
     """Candidate product with scores from different sources."""
 
@@ -569,6 +593,19 @@ class CandidateProduct(BaseModel):
     combined_score: float = Field(0.0, description="Combined candidate score")
     source: str = Field(
         ..., description="Recommendation source (cf, content, trending)"
+    )
+    retrieval_signals: Dict[str, RetrievalSourceSignal] = Field(
+        default_factory=dict,
+        description="Versioned source-specific retrieval lineage",
+    )
+    fusion_policy_version: Optional[str] = Field(
+        None, description="Candidate fusion policy used to build the pool"
+    )
+    source_registry_version: Optional[str] = Field(
+        None, description="Canonical source registry used by fusion"
+    )
+    candidate_pool_position: Optional[int] = Field(
+        None, ge=1, description="One-based position after candidate fusion"
     )
 
 

@@ -334,6 +334,14 @@ appConfig:
     impressionLoggingEnabled: true
     impressionMaxItems: 100
   ranking:
+    featureContractVersion: ranking_ltr_v1
+    valueTargetPolicy: gross_revenue_v1
+    valueCurrency: USD
+    probabilityCalibration: none
+    calibrationFraction: 0.1
+    candidateFusionMode: legacy
+    candidateRrfK: 60
+    candidateSourceRegistryVersion: retrieval_sources_v1
     inferenceBackend: legacy
     requiredModelVersion: ""
     tritonGrpcUrl: ""

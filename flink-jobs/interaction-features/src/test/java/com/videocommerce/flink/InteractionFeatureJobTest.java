@@ -315,6 +315,9 @@ class InteractionFeatureJobTest {
     assertTrue(sql.contains("attributed_value"));
     assertTrue(sql.contains("attributed_value_source"));
     assertTrue(sql.contains("JSON_VALUE(context_json,'$.purchase_value')"));
+    assertTrue(sql.contains("attributed_purchase_value"));
+    assertTrue(sql.contains("attributed_gmv"));
+    assertTrue(sql.contains("JSON_VALUE(context_json,'$.currency')"));
     assertTrue(sql.contains("recommendation_view_history"));
     assertTrue(sql.contains("v.observation_id IS NOT NULL OR COALESCE(f.attributed_click,0)=1"));
     assertTrue(sql.contains("\nWITH eligible_observations"));
@@ -336,6 +339,9 @@ class InteractionFeatureJobTest {
         .contains("label_definition_version STRING"));
     assertEquals("STRING",
         PointInTimeFeatureJoinJob.trainingTableAdditions().get("behavior_sequences_json"));
+    assertEquals("DOUBLE", PointInTimeFeatureJoinJob.trainingTableAdditions().get("attributed_purchase_value"));
+    assertEquals("DOUBLE", PointInTimeFeatureJoinJob.trainingTableAdditions().get("attributed_gmv"));
+    assertEquals("STRING", PointInTimeFeatureJoinJob.trainingTableAdditions().get("attributed_value_currency"));
     assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql("s3://bucket/pit", "run-1")
         .contains("attributed_action STRING"));
     assertTrue(PointInTimeFeatureJoinJob.buildParquetExportTableSql(

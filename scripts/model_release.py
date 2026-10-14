@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import hashlib
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import time
 from typing import Any
@@ -47,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--expected-generation", type=int, required=True)
         child.add_argument("--actor", required=True)
         child.add_argument("--reason", required=True)
+        child.add_argument("--performance-evidence")
+        child.add_argument("--performance-results")
     bootstrap = subparsers.add_parser("bootstrap-active")
     bootstrap.add_argument("--version", required=True)
     bootstrap.add_argument("--actor", required=True)
@@ -230,6 +234,21 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         operation = (
             controller.promote if args.command == "promote" else controller.rollback
         )
+        performance_evidence = None
+        if getattr(args, "performance_evidence", None):
+            if not getattr(args, "performance_results", None):
+                raise ValueError(
+                    "--performance-results is required with --performance-evidence"
+                )
+            performance_evidence = json.loads(
+                Path(args.performance_evidence).read_text()
+            )
+            digest = hashlib.sha256()
+            with Path(args.performance_results).open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != performance_evidence.get("results_sha256"):
+                raise ValueError("performance results checksum mismatch")
         return await operation(
             model_name=model_name,
             model_version=args.version,
@@ -237,6 +256,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             expected_generation=args.expected_generation,
             actor=args.actor,
             reason=args.reason,
+            **(
+                {"performance_evidence": performance_evidence}
+                if performance_evidence
+                else {}
+            ),
         )
     finally:
         await store.close()

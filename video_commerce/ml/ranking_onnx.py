@@ -105,8 +105,8 @@ def export_ranking_onnx(
     if bool(getattr(ranking_model.config, "trimodal_enabled", False)):
         raise ValueError("trimodal ranking is not supported by ONNX export")
     architecture = str(getattr(ranking_model.model, "architecture", ""))
-    if architecture != "dcn":
-        raise ValueError("ONNX export currently supports the DCN architecture only")
+    if architecture not in {"dcn", "dcn_v2_low_rank"}:
+        raise ValueError("ONNX export supports DCN and low-rank DCNv2 architectures")
     if int(opset) != 17:
         raise ValueError("ranking ONNX export requires opset 17")
     try:
@@ -121,7 +121,12 @@ def export_ranking_onnx(
         _DinOnnxWrapper(model) if din_enabled else _BaseOnnxWrapper(model)
     )
     wrapper.eval()
-    input_dim = int(ranking_model.feature_extractor.total_feature_dim)
+    assembler = getattr(ranking_model, "feature_assembler", None)
+    input_dim = int(
+        assembler.output_dim
+        if assembler
+        else ranking_model.feature_extractor.total_feature_dim
+    )
     item_count = (
         int(model.din.item_embedding.num_embeddings)
         if din_enabled and getattr(model, "din", None) is not None
@@ -134,6 +139,16 @@ def export_ranking_onnx(
         history_mode="full",
         item_count=item_count,
     )
+
+    def prepare_categorical(inputs):
+        if getattr(model, "categorical_encoder", None) is not None:
+            from video_commerce.ml.ranking_categorical import PACKED_INPUT_DIM
+
+            inputs[0][:, -PACKED_INPUT_DIM:-4] = 2.0
+            inputs[0][:, -2:] = 0.0
+        return inputs
+
+    sample = prepare_categorical(sample)
     input_names = ["base_features"]
     if din_enabled:
         input_names.extend(
@@ -180,6 +195,7 @@ def export_ranking_onnx(
                     history_mode=history_mode,
                     item_count=item_count,
                 )
+                inputs = prepare_categorical(inputs)
                 expected = _torch_outputs(wrapper, inputs)
                 actual = session.run(
                     OUTPUT_NAMES,

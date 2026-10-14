@@ -36,6 +36,69 @@ class LocalObjectStorage:
         return storage_path, False
 
 
+def test_pit_row_preserves_retrieval_signals_and_masks_conflicting_gross_values(
+    tmp_path,
+):
+    from video_commerce.ml.ranking_training import RankingLabelBuilder
+
+    _, _, shard = _write_dataset(tmp_path)
+    row = pq.read_table(shard).to_pylist()[0]
+    scores = json.loads(row["candidate_features_json"])
+    scores["retrieval_signals"] = {
+        "two_tower": {
+            "raw_source": "cf",
+            "raw_score": 0.8,
+            "source_rank": 1,
+            "source_count": 2,
+            "normalized_rank": 1.0,
+            "reciprocal_rank": 1 / 61,
+        }
+    }
+    scores["fusion_policy_version"] = "candidate_rrf_v1"
+    scores["candidate_pool_position"] = 1
+    row["candidate_features_json"] = json.dumps(scores)
+    row["feature_bundle_hash"] = payload_sha256(
+        {
+            "as_of_ts": row["as_of_ts"],
+            "candidate_features": scores,
+            "context": {},
+            "feature_definition_version": "ranking_ltr_v1",
+            "product_id": "p1",
+            "product_metadata": {"price": 9.0},
+            "user_features": {"total_interactions": 3},
+            "user_id": "u1",
+        }
+    )
+    row.update(
+        attributed_action="purchase",
+        attributed_click=1,
+        attributed_purchase=1,
+        attributed_value=99.0,
+        attributed_value_source="margin",
+        attributed_purchase_value=12.0,
+        attributed_gmv=10.0,
+        attributed_value_currency="USD",
+    )
+    example = PitTrainingDatasetReader._normalize_training_row(
+        row, "ranking_ltr_v1", "ranking_labels_v1"
+    )
+    assert example.bundle.candidate.retrieval_signals["two_tower"].source_rank == 1
+    assert example.bundle.candidate.fusion_policy_version == "candidate_rrf_v1"
+    labels = RankingLabelBuilder(target_policy="gross_revenue_v1").build(
+        example.attribution
+    )
+    assert labels.ctcvr == 1.0
+    assert labels.value_mask == 0.0
+    assert labels.value_rejection_reason == "conflicting_gross_revenue_values"
+
+
+def test_missing_pit_recency_uses_observation_time_instead_of_current_clock(tmp_path):
+    _, _, shard = _write_dataset(tmp_path)
+    row = pq.read_table(shard).to_pylist()[0]
+    example = PitTrainingDatasetReader._normalize_training_row(row, "ranking_ltr_v1", "ranking_labels_v1")
+    assert example.bundle.user_features.last_active == example.bundle.as_of_ts
+
+
 class DownloadedObjectStorage:
     def __init__(self, local_path):
         self.local_path = str(local_path)

@@ -31,6 +31,19 @@ from video_commerce.ml.ranking_score import (
     canonical_score_numpy,
     canonical_score_torch,
 )
+from video_commerce.ml.probability_calibration import (
+    TemperatureCalibration,
+    StreamingTemperatureFitter,
+)
+from video_commerce.ml.ranking_categorical import (
+    FEATURE_CONTRACT_VERSION,
+    PACKED_INPUT_DIM,
+    RankingCategoricalVocabulary,
+    RankingCategoricalEncoder,
+    DenseFeatureNormalization,
+    categorical_record_from_bundle,
+    unpack_categorical_inputs,
+)
 
 # Local imports
 from video_commerce.common.models import (
@@ -63,6 +76,7 @@ from video_commerce.ml.ranking_training import (
     RankingTrainingBatch,
     RankingTrainingExample,
     RankingTrainingTensors,
+    RankingLabelBuilder,
     TrainingTensorBuilder,
 )
 from video_commerce.ml.temporal_multimodal import (
@@ -154,16 +168,24 @@ class MultiObjectiveRankingModel(nn.Module):
         cross_layers: Optional[int] = None,
         low_rank_dim: Optional[int] = None,
         din_item_embeddings: Optional[torch.Tensor] = None,
+        categorical_vocabulary: Optional[RankingCategoricalVocabulary] = None,
     ):
         super().__init__()
-        self.config = config
+        self.config = config.copy(deep=True)
         self.input_dim = input_dim
         self.din = (
             DeepInterestNetwork(din_item_embeddings)
             if din_item_embeddings is not None
             else None
         )
+        self.categorical_encoder = (
+            RankingCategoricalEncoder(categorical_vocabulary)
+            if categorical_vocabulary is not None
+            else None
+        )
         model_input_dim = input_dim + (140 if self.din is not None else 0)
+        if self.categorical_encoder is not None:
+            model_input_dim += self.categorical_encoder.output_dim - PACKED_INPUT_DIM
         self.architecture = normalize_architecture(
             architecture or getattr(config, "architecture", "dcn"),
             supported=RANKING_ARCHITECTURES,
@@ -295,6 +317,11 @@ class MultiObjectiveRankingModel(nn.Module):
         summary_features=None,
     ):
         """Forward pass through the model."""
+        if self.categorical_encoder is not None:
+            encoded = self.categorical_encoder(
+                unpack_categorical_inputs(x[:, -PACKED_INPUT_DIM:])
+            )
+            x = torch.cat([x[:, :-PACKED_INPUT_DIM], encoded], dim=1)
         if self.din is not None:
             if any(
                 value is None
@@ -356,6 +383,11 @@ class MultiObjectiveRankingModel(nn.Module):
         summary_features: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Forward pass with a branch-free DIN subgraph for ONNX export."""
+        if self.categorical_encoder is not None:
+            encoded = self.categorical_encoder(
+                unpack_categorical_inputs(x[:, -PACKED_INPUT_DIM:])
+            )
+            x = torch.cat([x[:, :-PACKED_INPUT_DIM], encoded], dim=1)
         if self.din is not None:
             if any(
                 value is None
@@ -858,7 +890,7 @@ class RankingModel:
     """
 
     def __init__(self, config: RankingConfig, *, observability: Any = None):
-        self.config = config
+        self.config = config.copy(deep=True)
         self.observability = observability
         self.feature_extractor = FeatureExtractor(
             enable_realtime_window_features=config.realtime_window_features_enabled,
@@ -871,6 +903,7 @@ class RankingModel:
                 config, "product_feature_cache_size", 50000
             ),
         )
+        self.categorical_vocabulary = None
         self.din_product_index: Dict[str, int] = {}
         self.din_item_embeddings: Optional[torch.Tensor] = None
         self.din_sidecar_metadata: Dict[str, Any] = {}
@@ -897,7 +930,9 @@ class RankingModel:
         self.artifact_metadata: Dict[str, Any] = {}
         self.last_training_time = 0
         self.feature_schema_version = (
-            RANKING_TRIMODAL_FEATURE_SCHEMA_VERSION
+            FEATURE_CONTRACT_VERSION
+            if config.feature_contract_version == FEATURE_CONTRACT_VERSION
+            else RANKING_TRIMODAL_FEATURE_SCHEMA_VERSION
             if getattr(config, "trimodal_enabled", False)
             else RANKING_DIN_FEATURE_SCHEMA_VERSION
             if getattr(config, "din_enabled", False)
@@ -909,6 +944,8 @@ class RankingModel:
             str, Any
         ] = self._default_value_transform_stats()
         self.value_bucket_mapping: Dict[str, int] = {}
+        self.probability_calibration = TemperatureCalibration()
+        self.value_label_rejection_counts = {}
 
         # Performance tracking
         self.training_history = []
@@ -947,12 +984,46 @@ class RankingModel:
         self.training_tensor_builder = TrainingTensorBuilder(
             self.feature_assembler,
             device=self.device,
+            label_builder=RankingLabelBuilder(
+                target_policy=getattr(
+                    config, "value_target_policy", "gross_revenue_v1"
+                ),
+                value_currency=getattr(config, "value_currency", "USD"),
+            ),
             value_bucket_id=lambda metadata: self._value_bucket_id(metadata),
             fit_value_transform=self._fit_value_transform,
             transform_value=self._transform_business_value,
         )
 
         logger.info(f"RankingModel initialized on device: {self.device}")
+
+    def fit_categorical_features(self, bundles) -> None:
+        if self.config.feature_contract_version != FEATURE_CONTRACT_VERSION:
+            return
+        self.categorical_vocabulary = RankingCategoricalVocabulary.build(
+            (categorical_record_from_bundle(bundle) for bundle in bundles),
+            min_frequency=self.config.categorical_vocab_min_frequency,
+        )
+        self.feature_assembler.categorical_vocabulary = self.categorical_vocabulary
+        self.feature_assembler.version = (
+            "ranking_feature_assembler_v3_categorical_sources"
+        )
+
+    def fit_dense_normalization(self, bundles) -> None:
+        vocabulary = self.feature_assembler.categorical_vocabulary
+        self.feature_assembler.categorical_vocabulary = None
+        try:
+            self.feature_assembler.dense_normalization = DenseFeatureNormalization.fit(
+                (
+                    self.feature_assembler.v3_dense_vector(
+                        bundle, self.feature_assembler.build(bundle)
+                    )
+                    for bundle in bundles
+                ),
+                dimension=self.feature_extractor.total_feature_dim,
+            )
+        finally:
+            self.feature_assembler.categorical_vocabulary = vocabulary
 
     def configure_candidate_sidecar_for_training(
         self,
@@ -998,7 +1069,12 @@ class RankingModel:
         cross_layers: Optional[int] = None,
         low_rank_dim: Optional[int] = None,
     ) -> Tuple[nn.Module, optim.Optimizer]:
-        input_dim = self.feature_extractor.total_feature_dim
+        if (
+            self.config.feature_contract_version == FEATURE_CONTRACT_VERSION
+            and self.categorical_vocabulary is None
+        ):
+            raise RuntimeError("v3 ranking requires a frozen categorical vocabulary")
+        input_dim = self.feature_assembler.output_dim
         model_options = {
             "architecture": architecture,
             "hidden_dims": hidden_dims,
@@ -1034,6 +1110,7 @@ class RankingModel:
                 input_dim,
                 self.config,
                 din_item_embeddings=self.din_item_embeddings,
+                categorical_vocabulary=self.categorical_vocabulary,
                 **model_options,
             ).to(self.device)
             optimizer = optim.Adam(
@@ -1108,7 +1185,7 @@ class RankingModel:
             )
             dummy_features = torch.zeros(
                 warmup_batch_size,
-                self.feature_extractor.total_feature_dim,
+                self.feature_assembler.output_dim,
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -1217,10 +1294,11 @@ class RankingModel:
             getattr(self.config, "history_embeddings_enabled", False)
             or getattr(self.config, "trimodal_enabled", False)
             or getattr(self.config, "din_enabled", False)
+            or self.config.feature_contract_version == FEATURE_CONTRACT_VERSION
         )
         if not strict_schema:
             return
-        expected_input_dim = self.feature_extractor.total_feature_dim
+        expected_input_dim = self.feature_assembler.output_dim
         expected_schema = self.feature_schema_version
         checkpoint_input_dim = checkpoint_config.get("input_dim")
         checkpoint_schema = checkpoint_config.get("feature_schema_version")
@@ -1332,11 +1410,12 @@ class RankingModel:
 
     async def load_model(self, model_path: str = None):
         """Load or initialize the ranking model."""
-        previous_din_state = (
-            self.din_item_embeddings,
-            self.din_product_index,
-            self.din_sidecar_metadata,
-        )
+        # Legacy direct reloads must retain the complete serving generation when
+        # any checkpoint metadata, sidecar, or tensor validation fails.
+        previous_state = self.__dict__.copy()
+        previous_config = copy.deepcopy(self.config.__dict__)
+        previous_assembler = self.feature_assembler.__dict__.copy()
+        previous_tensor_builder = self.training_tensor_builder.__dict__.copy()
         try:
             if getattr(self.config, "din_enabled", False):
                 sidecar_path = getattr(self.config, "din_embedding_sidecar_path", "")
@@ -1359,6 +1438,42 @@ class RankingModel:
                     checkpoint_config,
                     is_legacy_raw,
                 ) = self._checkpoint_state_and_config(checkpoint)
+                if (
+                    checkpoint_config.get("feature_definition_version")
+                    == FEATURE_CONTRACT_VERSION
+                ):
+                    self.config.feature_contract_version = FEATURE_CONTRACT_VERSION
+                    self.feature_schema_version = FEATURE_CONTRACT_VERSION
+                if checkpoint_config.get("probability_calibration"):
+                    self.config.probability_calibration = "temperature_v1"
+                for field in (
+                    "value_target_policy",
+                    "value_currency",
+                    "business_score_enabled",
+                ):
+                    if field in checkpoint_config:
+                        setattr(self.config, field, checkpoint_config[field])
+                self.training_tensor_builder.label_builder = RankingLabelBuilder(
+                    target_policy=self.config.value_target_policy,
+                    value_currency=self.config.value_currency,
+                )
+                if self.config.feature_contract_version == FEATURE_CONTRACT_VERSION:
+                    self.categorical_vocabulary = (
+                        RankingCategoricalVocabulary.from_manifest(
+                            checkpoint_config.get("categorical_vocabulary") or {}
+                        )
+                    )
+                    self.feature_assembler.categorical_vocabulary = (
+                        self.categorical_vocabulary
+                    )
+                    self.feature_assembler.dense_normalization = (
+                        DenseFeatureNormalization.from_manifest(
+                            checkpoint_config.get("dense_normalization") or {}
+                        )
+                    )
+                    self.feature_assembler.version = (
+                        "ranking_feature_assembler_v3_categorical_sources"
+                    )
                 self._validate_checkpoint_feature_schema(
                     checkpoint_config,
                     model_path=str(checkpoint_path),
@@ -1392,6 +1507,8 @@ class RankingModel:
                     next_model,
                     state_dict,
                 )
+                if self.config.feature_contract_version == FEATURE_CONTRACT_VERSION:
+                    next_model.load_state_dict(state_dict, strict=True)
                 if loaded_tensors == 0:
                     raise RuntimeError(
                         f"No compatible tensors found in ranking checkpoint {resolved_model_path}"
@@ -1443,6 +1560,9 @@ class RankingModel:
                 self.value_bucket_mapping = dict(
                     checkpoint_config.get("value_bucket_mapping") or {}
                 )
+                self.probability_calibration = TemperatureCalibration.from_manifest(
+                    checkpoint_config.get("probability_calibration")
+                )
                 self.loaded_checkpoint_mtime = checkpoint_path.stat().st_mtime
             elif getattr(self.config, "history_embeddings_enabled", False):
                 raise RuntimeError(
@@ -1470,11 +1590,14 @@ class RankingModel:
             logger.info("Ranking model loaded successfully")
 
         except Exception as e:
-            (
-                self.din_item_embeddings,
-                self.din_product_index,
-                self.din_sidecar_metadata,
-            ) = previous_din_state
+            self.__dict__.clear()
+            self.__dict__.update(previous_state)
+            self.config.__dict__.clear()
+            self.config.__dict__.update(previous_config)
+            self.feature_assembler.__dict__.clear()
+            self.feature_assembler.__dict__.update(previous_assembler)
+            self.training_tensor_builder.__dict__.clear()
+            self.training_tensor_builder.__dict__.update(previous_tensor_builder)
             logger.error(f"Error loading ranking model: {e}")
             raise
 
@@ -1572,7 +1695,7 @@ class RankingModel:
     ) -> Tuple[Optional[np.ndarray], List[Dict[str, Any]], float]:
         """Prepare one feature matrix for multiple ranking requests."""
         feature_stage_started = time.perf_counter()
-        total_dim = self.feature_extractor.total_feature_dim
+        total_dim = self.feature_assembler.output_dim
         total_candidates = sum(
             len(request.get("candidates") or []) for request in requests
         )
@@ -1628,7 +1751,10 @@ class RankingModel:
                         FeatureBundle(
                             as_of_ts=current_time,
                             feature_definition_version=(
-                                RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+                                FEATURE_CONTRACT_VERSION
+                                if self.config.feature_contract_version
+                                == FEATURE_CONTRACT_VERSION
+                                else RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
                                 if getattr(self.config, "din_enabled", False)
                                 else RANKING_LTR_FEATURE_DEFINITION_VERSION
                             ),
@@ -1871,12 +1997,28 @@ class RankingModel:
         predictions: Dict[str, np.ndarray],
         value_bucket_ids: Optional[Sequence[Optional[int]]] = None,
     ) -> None:
-        if not getattr(self.config, "business_score_enabled", True):
-            return
         raw_values = np.asarray(predictions.get("gmv", []), dtype=np.float64).reshape(
             -1
         )
         if raw_values.size == 0:
+            return
+        ctr = np.asarray(
+            predictions.get("ctr", np.zeros_like(raw_values)), dtype=np.float32
+        ).reshape(-1)
+        cvr = np.asarray(
+            predictions.get("cvr", np.zeros_like(raw_values)), dtype=np.float32
+        ).reshape(-1)
+        ctcvr = np.asarray(
+            predictions.get("ctcvr", ctr * cvr), dtype=np.float32
+        ).reshape(-1)
+        if getattr(self.config, "probability_calibration", "none") == "temperature_v1":
+            predictions["raw_ctr"] = ctr.copy()
+            predictions["raw_ctcvr"] = ctcvr.copy()
+            ctr = self.probability_calibration.apply_numpy(ctr, head="ctr")
+            ctcvr = self.probability_calibration.apply_numpy(ctcvr, head="ctcvr")
+        predictions["ctr"] = np.clip(ctr, 0.0, 1.0).astype(np.float32)
+        predictions["ctcvr"] = np.clip(ctcvr, 0.0, 1.0).astype(np.float32)
+        if not getattr(self.config, "business_score_enabled", True):
             return
         bucket_ids: List[Optional[int]]
         if value_bucket_ids is None:
@@ -1904,14 +2046,6 @@ class RankingModel:
         )
         predictions["predicted_value"] = predicted_values
         predictions["gmv"] = predicted_values
-        ctr = np.asarray(
-            predictions.get("ctr", np.zeros_like(predicted_values))
-        ).reshape(-1)
-        cvr = np.asarray(
-            predictions.get("cvr", np.zeros_like(predicted_values))
-        ).reshape(-1)
-        ctcvr = np.asarray(predictions.get("ctcvr", ctr * cvr)).reshape(-1)
-        predictions["ctcvr"] = np.clip(ctcvr, 0.0, 1.0).astype(np.float32)
         predictions["business_score"] = canonical_score_numpy(
             ctcvr=predictions["ctcvr"],
             predicted_value=predicted_values,
@@ -1963,7 +2097,7 @@ class RankingModel:
             )
 
             if getattr(self.config, "business_score_enabled", True):
-                confidence_score = max(0.0, min(ctr_score * cvr_score, 1.0))
+                confidence_score = max(0.0, min(ctcvr_score, 1.0))
             elif self.config.enable_multi_objective:
                 confidence_score = (
                     ctr_score * self.config.ctr_weight
@@ -2410,6 +2544,25 @@ class RankingModel:
             logger.warning("Insufficient PIT data for ranking model training")
             return None
 
+        if self.config.feature_contract_version == FEATURE_CONTRACT_VERSION:
+
+            def training_bundles():
+                for examples in source.iter_example_batches(
+                    split="training",
+                    batch_rows=int(batch_rows),
+                    seed=self.config.training_seed,
+                    epoch=0,
+                ):
+                    for example in examples:
+                        yield example.bundle
+
+            self.fit_categorical_features(training_bundles())
+            self.fit_dense_normalization(training_bundles())
+            # A new training vocabulary changes embedding row semantics.
+            self.model = None
+            self.optimizer = None
+            torch.manual_seed(int(self.config.training_seed))
+
         target_architecture = normalize_architecture(
             getattr(self.config, "architecture", "dcn"),
             supported=RANKING_ARCHITECTURES,
@@ -2433,6 +2586,16 @@ class RankingModel:
         source.reindex_value_buckets(
             lambda metadata: self._value_bucket_id(dict(metadata))
         )
+        if hasattr(source, "reindex_value_labels"):
+            self.value_label_rejection_counts = source.reindex_value_labels(
+                self.training_tensor_builder.label_builder
+            )
+            if self.observability is not None and hasattr(
+                self.observability, "record_ranking_value_label_rejections"
+            ):
+                self.observability.record_ranking_value_label_rejections(
+                    self.value_label_rejection_counts
+                )
         self.value_transform_stats = source.compute_value_transform_stats(
             split="training",
             quantile=float(getattr(self.config, "value_clip_quantile", 0.99) or 0.99),
@@ -2549,6 +2712,11 @@ class RankingModel:
             self.model.load_state_dict(best_state_dict)
             validation_loss = best_validation_loss
         self.model.eval()
+        self._fit_probability_calibration_from_source(
+            source,
+            batch_rows=int(batch_rows),
+            seed=seed,
+        )
         if metrics_tensors is not None:
             metrics = self._training_quality_metrics(
                 metrics_tensors,
@@ -2575,6 +2743,57 @@ class RankingModel:
         logger.info("PIT source model training completed")
         return self.loaded_model_path
 
+    def _fit_probability_calibration_from_source(
+        self,
+        source,
+        *,
+        batch_rows: int,
+        seed: int,
+    ) -> None:
+        """Fit scalar temperatures only from the reserved calibration split."""
+        self.probability_calibration = TemperatureCalibration()
+        if getattr(self.config, "probability_calibration", "none") != "temperature_v1":
+            return
+        ctr_fitter = StreamingTemperatureFitter()
+        ctcvr_fitter = StreamingTemperatureFitter()
+        with torch.no_grad():
+            for examples in source.iter_example_batches(
+                split="calibration",
+                batch_rows=batch_rows,
+                seed=seed,
+                epoch=0,
+            ):
+                tensors = self._prepare_training_tensors(
+                    examples,
+                    fit_value_transform=False,
+                )
+                outputs = self.model(
+                    tensors.base_features,
+                    **tensors.trimodal_inputs,
+                    **tensors.din_inputs,
+                )
+                ctcvr = outputs.get("ctcvr", outputs["ctr"] * outputs["cvr"])
+                ctr_fitter.add(
+                    outputs["ctr"].detach().cpu().numpy().reshape(-1),
+                    tensors.labels["ctr"].detach().cpu().numpy().reshape(-1),
+                )
+                ctcvr_fitter.add(
+                    ctcvr.detach().cpu().numpy().reshape(-1),
+                    tensors.labels["ctcvr"].detach().cpu().numpy().reshape(-1),
+                )
+        ctr_temperature = ctr_fitter.fit()
+        ctcvr_temperature = ctcvr_fitter.fit()
+        self.probability_calibration = TemperatureCalibration(
+            ctr_temperature=ctr_temperature,
+            ctcvr_temperature=ctcvr_temperature,
+        )
+        self.artifact_metadata["probability_calibration_evidence"] = {
+            "split": "calibration",
+            "row_count": ctr_fitter.row_count,
+            "ctr_has_both_classes": ctr_fitter.has_both_classes,
+            "ctcvr_has_both_classes": ctcvr_fitter.has_both_classes,
+        }
+
     def _train_model_sync(
         self,
         training_data,
@@ -2591,6 +2810,10 @@ class RankingModel:
         if len(training_data) < self.config.training_min_samples:
             logger.warning("Insufficient data for ranking model training")
             return None
+        if self.config.feature_contract_version == FEATURE_CONTRACT_VERSION:
+            raise ValueError(
+                "v3 categorical training requires the verified streaming PIT source"
+            )
 
         target_architecture = normalize_architecture(
             getattr(self.config, "architecture", "dcn"),
@@ -2956,6 +3179,13 @@ class RankingModel:
                 **tensors.din_inputs,
             )
             ctcvr = outputs.get("ctcvr", outputs["ctr"] * outputs["cvr"])
+            ctr = outputs["ctr"]
+            if (
+                getattr(self.config, "probability_calibration", "none")
+                == "temperature_v1"
+            ):
+                ctr = self.probability_calibration.apply_torch(ctr, head="ctr")
+                ctcvr = self.probability_calibration.apply_torch(ctcvr, head="ctcvr")
             predicted_values = self._inverse_transform_business_value_tensor(
                 outputs["gmv"], tensors.labels.get("value_bucket")
             )
@@ -2972,7 +3202,7 @@ class RankingModel:
             return tensor.detach().cpu().reshape(-1).tolist()
 
         score_values = values(serving_scores)
-        ctr_values = values(outputs["ctr"])
+        ctr_values = values(ctr)
         ctcvr_values = values(ctcvr)
         predicted_value_values = values(predicted_values)
         return {
@@ -3299,7 +3529,7 @@ class RankingModel:
                     )
                 )
                 feature_vector = np.asarray(feature_vector, dtype=np.float32)
-                if feature_vector.shape != (self.feature_extractor.total_feature_dim,):
+                if feature_vector.shape != (self.feature_assembler.output_dim,):
                     logger.warning(
                         "Skipping ranking training sample with invalid feature shape",
                         extra={
@@ -4160,19 +4390,40 @@ class RankingModel:
                     "cross_layers": self.model.cross_layers,
                     "low_rank_dim": self.model.low_rank_dim,
                     "hidden_dims": self.model.hidden_dims,
-                    "input_dim": self.feature_extractor.total_feature_dim,
+                    "input_dim": self.feature_assembler.output_dim,
                     "feature_schema_version": self.feature_schema_version,
                     "feature_definition_version": (
-                        RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+                        FEATURE_CONTRACT_VERSION
+                        if self.config.feature_contract_version
+                        == FEATURE_CONTRACT_VERSION
+                        else RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
                         if getattr(self.config, "din_enabled", False)
                         else RANKING_LTR_FEATURE_DEFINITION_VERSION
                     ),
-                    "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
+                    "label_definition_version": self.training_tensor_builder.label_builder.version,
+                    "value_target_policy": self.config.value_target_policy,
+                    "value_currency": self.config.value_currency,
+                    "business_score_enabled": self.config.business_score_enabled,
                     "feature_assembler_version": self.feature_assembler.version,
                     "ranking_objective_version": self.ranking_objective_version,
                     "score_policy_version": SCORE_POLICY_VERSION,
                     "value_transform_stats": self.value_transform_stats,
                     "value_bucket_mapping": self.value_bucket_mapping,
+                    "categorical_vocabulary": (
+                        self.categorical_vocabulary.to_manifest()
+                        if self.categorical_vocabulary
+                        else None
+                    ),
+                    "dense_normalization": (
+                        self.feature_assembler.dense_normalization.to_manifest()
+                        if self.feature_assembler.dense_normalization
+                        else None
+                    ),
+                    "probability_calibration": (
+                        self.probability_calibration.to_manifest()
+                        if self.config.probability_calibration == "temperature_v1"
+                        else None
+                    ),
                     "trimodal_enabled": bool(
                         getattr(self.config, "trimodal_enabled", False)
                     ),
@@ -4220,7 +4471,7 @@ class RankingModel:
             "model_parameters": sum(p.numel() for p in self.model.parameters())
             if self.model
             else 0,
-            "feature_dim": self.feature_extractor.total_feature_dim,
+            "feature_dim": self.feature_assembler.output_dim,
             "untrained_fallback_count": self.untrained_fallback_count,
             "architecture": getattr(self.model, "architecture", None)
             if self.model
@@ -4267,6 +4518,16 @@ class RankingModel:
         )
         feature_schema_version = str(payload.get("feature_schema_version") or "")
         try:
+            if self.config.feature_contract_version == FEATURE_CONTRACT_VERSION:
+                if (
+                    self.categorical_vocabulary is None
+                    or self.feature_assembler.dense_normalization is None
+                    or payload.get("categorical_vocabulary")
+                    != self.categorical_vocabulary.to_manifest()
+                    or payload.get("dense_normalization")
+                    != self.feature_assembler.dense_normalization.to_manifest()
+                ):
+                    raise ValueError("checkpoint and bundle frozen features differ")
             self.mark_artifact_verified(
                 model_version=str(getattr(record, "model_version", "") or ""),
                 artifact_sha256=artifact_sha256,
@@ -4325,7 +4586,7 @@ class RankingModel:
                 "loaded_checkpoint_mtime": self.loaded_checkpoint_mtime,
                 "checkpoint_reload_count": self.checkpoint_reload_count,
                 "device": str(self.device),
-                "feature_dim": self.feature_extractor.total_feature_dim,
+                "feature_dim": self.feature_assembler.output_dim,
                 "architecture": getattr(self.model, "architecture", None)
                 if self.model
                 else None,
@@ -4341,10 +4602,20 @@ class RankingModel:
             if self.model and run_inference_test:
                 try:
                     dummy_features = torch.randn(
-                        1, self.feature_extractor.total_feature_dim
+                        1, self.feature_assembler.output_dim
                     ).to(self.device)
+                    if self.categorical_vocabulary is not None:
+                        dummy_features[:, -PACKED_INPUT_DIM:-4] = 2.0
+                        dummy_features[:, -2:] = 0.0
                     with torch.no_grad():
                         outputs = self.model(dummy_features)
+                        if any(
+                            not torch.isfinite(value).all()
+                            for value in outputs.values()
+                        ):
+                            raise RuntimeError(
+                                "ranking inference smoke returned non-finite predictions"
+                            )
 
                     status["inference_test_passed"] = True
                     status["output_keys"] = list(outputs.keys())

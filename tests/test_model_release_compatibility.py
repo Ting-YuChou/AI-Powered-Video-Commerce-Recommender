@@ -70,3 +70,17 @@ def test_unknown_model_family_cannot_be_activated():
 
     assert result.compatible is False
     assert result.reason == "unsupported_model_family"
+
+
+def test_v3_release_rejects_missing_frozen_feature_artifacts():
+    manifest = {
+        **_checkpoint_manifest(),
+        "feature_schema_version": "ranking_ltr_v3_categorical_sources",
+        "feature_definition_version": "ranking_ltr_v3_categorical_sources",
+        "score_policy_version": "business-value-v1",
+        "value_transform_stats": {},
+        "quality_gate_policy_version": "ranking_quality_gate_v2",
+    }
+    result = model_release_compatibility("ranking_model", manifest)
+    assert not result.compatible
+    assert result.reason == "invalid_v3_feature_artifacts"

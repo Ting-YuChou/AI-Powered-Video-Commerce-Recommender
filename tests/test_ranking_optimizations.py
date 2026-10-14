@@ -104,6 +104,37 @@ def test_ranking_request_body_normalizes_non_string_mapping_keys():
     assert payload["product_metadata_map"]["p1"] == {"4": "metadata"}
 
 
+def test_ranking_request_body_preserves_nested_retrieval_signals():
+    from video_commerce.ml.candidate_fusion import merge_candidates_rrf
+
+    candidate = merge_candidates_rrf(
+        {
+            "cf": [CandidateProduct(product_id="p1", cf_score=0.9, source="cf")],
+            "trending_pool": [
+                CandidateProduct(
+                    product_id="p1", popularity_score=0.4, source="trending_pool"
+                )
+            ],
+        },
+        limit=500,
+    )[0]
+    body = recommendation_api_module._ranking_request_body(
+        candidates=[candidate],
+        user_features=UserFeatures(user_id="u1"),
+        context={},
+        product_metadata_map={"p1": {}},
+        k=1,
+        request_id="source-test",
+    )
+    payload = json.loads(body)
+    encoded = payload["candidates"][0]
+    restored = CandidateProduct(**encoded)
+    assert restored.retrieval_signals == candidate.retrieval_signals
+    assert set(encoded["retrieval_signals"]) == {"two_tower", "trending"}
+    assert encoded["retrieval_signals"]["two_tower"]["source_rank"] == 1
+    assert encoded["fusion_policy_version"] == candidate.fusion_policy_version
+
+
 def test_ranking_request_body_rejects_mapping_key_collisions():
     with pytest.raises(ValueError, match="JSON object key collision"):
         recommendation_api_module._ranking_request_body(
@@ -1207,7 +1238,10 @@ async def test_ranking_checkpoint_persists_business_objective_metadata(tmp_path)
 
     assert checkpoint["config"]["ranking_objective_version"] == "business_v1"
     assert checkpoint["config"]["feature_definition_version"] == "ranking_ltr_v1"
-    assert checkpoint["config"]["label_definition_version"] == "ranking_labels_v1"
+    assert (
+        checkpoint["config"]["label_definition_version"]
+        == "ranking_labels_v2_gross_revenue"
+    )
     assert (
         checkpoint["config"]["feature_assembler_version"]
         == "ranking_feature_assembler_v1"

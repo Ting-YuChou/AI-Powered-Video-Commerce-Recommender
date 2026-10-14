@@ -15,6 +15,13 @@ from video_commerce.common.feature_history_contracts import (
 )
 from video_commerce.common.models import CandidateProduct, UserFeatures
 from video_commerce.ml.din import DINBehaviorSequences
+from video_commerce.ml.ranking_categorical import (
+    FEATURE_CONTRACT_VERSION,
+    PACKED_INPUT_DIM,
+    categorical_record_from_bundle,
+    pack_categorical_inputs,
+)
+from video_commerce.ml.candidate_fusion import CANONICAL_SOURCES
 
 if TYPE_CHECKING:
     from video_commerce.ml.ranking import FeatureExtractor
@@ -36,13 +43,15 @@ class FeatureBundle:
         if self.feature_definition_version not in {
             RANKING_LTR_FEATURE_DEFINITION_VERSION,
             RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION,
+            FEATURE_CONTRACT_VERSION,
         }:
             raise ValueError(
                 "unsupported ranking feature definition version: "
                 f"{self.feature_definition_version}"
             )
         if (
-            self.feature_definition_version == RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
+            self.feature_definition_version
+            == RANKING_LTR_DIN_FEATURE_DEFINITION_VERSION
             and self.behavior_sequences is None
         ):
             raise ValueError("DIN ranking feature bundle requires behavior sequences")
@@ -64,6 +73,81 @@ class RankingFeatureAssembler:
             tuple[str, tuple[Any, ...]], tuple[np.ndarray, float]
         ] = OrderedDict()
         self._product_feature_cache_lock = threading.RLock()
+        self.categorical_vocabulary = None
+        self.dense_normalization = None
+
+    @property
+    def output_dim(self):
+        base = self.extractor.total_feature_dim
+        return (
+            base
+            if self.categorical_vocabulary is None
+            else base * 2 + len(CANONICAL_SOURCES) * 3 + PACKED_INPUT_DIM
+        )
+
+    def _v3_vector(self, bundle, vector):
+        if self.categorical_vocabulary is None:
+            return vector
+        if self.dense_normalization is None:
+            raise ValueError("v3 normalization is unavailable")
+        vector = self.v3_dense_vector(bundle, vector)
+        record = categorical_record_from_bundle(bundle)
+        record["normalized_log_price"] = float(
+            self.dense_normalization.apply(vector)[self.extractor.user_feature_dim]
+        )
+        signals = bundle.candidate.retrieval_signals
+        source_features = []
+        for source in CANONICAL_SOURCES:
+            signal = signals.get(source)
+            source_features.extend(
+                [
+                    float(signal is not None),
+                    float(signal.normalized_rank) if signal else 0.0,
+                    float(signal.reciprocal_rank) if signal else 0.0,
+                ]
+            )
+        return np.concatenate(
+            [
+                self.dense_normalization.apply(vector),
+                np.asarray(source_features, dtype=np.float32),
+                pack_categorical_inputs(self.categorical_vocabulary, [record])[0],
+            ]
+        ).astype(np.float32)
+
+    def v3_dense_vector(self, bundle, vector):
+        vector = np.asarray(vector, dtype=np.float32).copy()
+        # Source-native score scales and the old brand hash are audit fields.
+        vector[17] = 0.0
+        vector[24:28] = 0.0
+        from datetime import datetime, timezone
+
+        observed = datetime.fromtimestamp(bundle.as_of_ts, tz=timezone.utc)
+        vector[18:21] = [
+            observed.hour / 24.0,
+            observed.weekday() / 6.0,
+            float(observed.weekday() >= 5),
+        ]
+        product_fields = (
+            "price",
+            "rating",
+            "num_reviews",
+            "in_stock",
+            "created_at",
+            "tags",
+        )
+        for offset, field in enumerate(product_fields):
+            if bundle.product_metadata.get(field) is None:
+                vector[10 + offset] = np.nan
+        if bundle.product_metadata.get("price") is None:
+            vector[16] = np.nan
+        for offset, field in (
+            (21, "session_position"),
+            (22, "device"),
+            (23, "time_on_page"),
+        ):
+            if bundle.context.get(field) is None:
+                vector[offset] = np.nan
+        return vector
 
     def build(self, bundle: FeatureBundle) -> np.ndarray:
         as_of_ts = float(bundle.as_of_ts)
@@ -107,11 +191,11 @@ class RankingFeatureAssembler:
             )
         if not np.isfinite(vector).all():
             raise ValueError("ranking feature vector contains NaN or infinity")
-        return vector
+        return self._v3_vector(bundle, vector)
 
     def build_many(self, bundles: Sequence[FeatureBundle]) -> np.ndarray:
         if not bundles:
-            return np.empty((0, self.extractor.total_feature_dim), dtype=np.float32)
+            return np.empty((0, self.output_dim), dtype=np.float32)
         user_segments: dict[tuple[int, float], np.ndarray] = {}
         context_segments: dict[tuple[int, float], np.ndarray] = {}
         vectors = []
@@ -162,6 +246,7 @@ class RankingFeatureAssembler:
         self, product_id: str, metadata: Mapping[str, Any], as_of_ts: float
     ) -> np.ndarray:
         metadata_dict = dict(metadata)
+        created_at_missing = metadata_dict.get("created_at") is None
         cache_key = (str(product_id), self._metadata_fingerprint(metadata_dict))
         with self._product_feature_cache_lock:
             cached = self._product_feature_cache.get(cache_key)
@@ -171,7 +256,10 @@ class RankingFeatureAssembler:
             else:
                 static_features = None
         if static_features is None:
-            if metadata_dict.get("_ranking_fallback_metadata") is True:
+            if (
+                created_at_missing
+                or metadata_dict.get("_ranking_fallback_metadata") is True
+            ):
                 metadata_dict["created_at"] = as_of_ts
             (
                 static_features,
@@ -188,7 +276,10 @@ class RankingFeatureAssembler:
                         > self._product_feature_cache_size
                     ):
                         self._product_feature_cache.popitem(last=False)
-        elif metadata_dict.get("_ranking_fallback_metadata") is True:
+        elif (
+            created_at_missing
+            or metadata_dict.get("_ranking_fallback_metadata") is True
+        ):
             created_at = as_of_ts
         product_features = static_features.copy()
         product_features[4] = (as_of_ts - created_at) / 86400

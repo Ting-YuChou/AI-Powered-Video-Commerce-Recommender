@@ -15,11 +15,18 @@ from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
     log_loss,
-    ndcg_score,
+)
+from video_commerce.ml.probability_calibration import (
+    expected_calibration_error,
+    reliability_table,
 )
 
 
-QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v1"
+QUALITY_GATE_POLICY_V1 = "ranking_quality_gate_v1"
+QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v2"
+SUPPORTED_QUALITY_GATE_POLICY_VERSIONS = frozenset(
+    {QUALITY_GATE_POLICY_V1, QUALITY_GATE_POLICY_VERSION}
+)
 
 
 class GateDecision(str, Enum):
@@ -52,6 +59,9 @@ class RankingEvaluationRow:
     modality_presence: Mapping[str, bool] = field(default_factory=dict)
     is_long_tail: bool = False
     is_high_price: bool = False
+    value_mask: bool = True
+    category: str = ""
+    retrieval_sources: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,6 +121,9 @@ class RankingEvaluationSpool:
             row_payload["modality_presence"] = dict(
                 row_payload.get("modality_presence") or {}
             )
+            row_payload["retrieval_sources"] = tuple(
+                row_payload.get("retrieval_sources") or ()
+            )
             rows.append(RankingEvaluationRow(**row_payload))
             champion[str(observation_id)] = RankingPrediction(
                 **json.loads(raw_champion)
@@ -144,6 +157,14 @@ class RankingQualityGateConfig:
     probability_error_max_relative_regression: float = 0.02
     value_wape_max_relative_regression: float = 0.05
     slice_error_max_relative_regression: float = 0.05
+    ece_bins: int = 15
+    ece_max_absolute_regression: float = 0.005
+    slice_ece_max_absolute_regression: float = 0.01
+    candidate_recall_max_absolute_regression: float = 0.005
+    require_candidate_recall: bool = True
+    candidate_recall_at_500_champion: float | None = None
+    candidate_recall_at_500_challenger: float | None = None
+    experiment_kind: str = "combined"
     cold_user_max_interactions: int = 4
     cold_item_max_age_days: int = 30
     cold_item_max_exposures: int = 5
@@ -210,6 +231,8 @@ def evaluation_rows_from_examples(
     holdout_examples: Sequence[object],
     *,
     feature_schema_version: str = "",
+    value_target_policy: str = "legacy_preference",
+    value_currency: str = "USD",
 ) -> list[RankingEvaluationRow]:
     """Build immutable evaluation rows using pre-holdout slice statistics."""
     exposures: Dict[str, int] = {}
@@ -232,9 +255,15 @@ def evaluation_rows_from_examples(
     )
 
     rows = []
+    from video_commerce.ml.ranking_training import RankingLabelBuilder
+
+    label_builder = RankingLabelBuilder(
+        target_policy=value_target_policy, value_currency=value_currency
+    )
     for example in holdout_examples:
         bundle = example.bundle
         facts = example.attribution
+        labels = label_builder.build(facts)
         product_id = str(bundle.candidate.product_id)
         metadata = dict(bundle.product_metadata)
         context = dict(bundle.context)
@@ -243,12 +272,7 @@ def evaluation_rows_from_examples(
             getattr(example, "candidate_embeddings", None) or {}
         )
         price = float(metadata.get("price", 0.0) or 0.0)
-        relevance = {
-            "view": 1.0,
-            "click": 2.0,
-            "add_to_cart": 3.0,
-            "purchase": 4.0 + math.log1p(float(facts.attributed_value or 0.0)),
-        }[facts.attributed_action]
+        relevance = labels.relevance
         audio = (
             getattr(content, "audio_features", None) if content is not None else None
         )
@@ -272,7 +296,10 @@ def evaluation_rows_from_examples(
                 relevance=relevance,
                 clicked=bool(facts.attributed_click),
                 purchased=bool(facts.attributed_purchase),
-                business_value=float(facts.attributed_value or 0.0),
+                business_value=labels.business_value,
+                value_mask=bool(labels.value_mask),
+                category=str(metadata.get("category") or ""),
+                retrieval_sources=tuple(sorted(bundle.candidate.retrieval_signals)),
                 total_interactions=int(bundle.user_features.total_interactions),
                 price=price,
                 product_created_at=float(
@@ -293,7 +320,19 @@ def evaluate_quality_gate(
     challenger: Mapping[str, RankingPrediction],
     config: RankingQualityGateConfig,
 ) -> QualityGateResult:
+    if config.experiment_kind not in {"features", "fusion", "calibration", "combined"}:
+        raise ValueError("unsupported Phase C experiment kind")
     invalid_reason = _prediction_validation_reason(rows, champion, challenger)
+    recall_values = (
+        config.candidate_recall_at_500_champion,
+        config.candidate_recall_at_500_challenger,
+    )
+    if any(
+        value is not None
+        and (not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0)
+        for value in recall_values
+    ):
+        invalid_reason = "invalid_candidate_recall"
     if invalid_reason:
         return QualityGateResult(
             decision=GateDecision.FAILED,
@@ -305,7 +344,31 @@ def evaluate_quality_gate(
         )
 
     evidence_reasons = _evidence_reasons(rows, config, slice_name=None)
-    overall = _comparison_metrics(rows, champion, challenger)
+    if not rows:
+        return QualityGateResult(
+            decision=GateDecision.INSUFFICIENT_EVIDENCE,
+            reasons=tuple(evidence_reasons),
+            policy_version=QUALITY_GATE_POLICY_VERSION,
+            overall={},
+            slices={},
+            bootstrap={},
+        )
+    overall = _comparison_metrics(rows, champion, challenger, ece_bins=config.ece_bins)
+    if (
+        config.candidate_recall_at_500_champion is not None
+        and config.candidate_recall_at_500_challenger is not None
+    ):
+        champion_recall = float(config.candidate_recall_at_500_champion)
+        challenger_recall = float(config.candidate_recall_at_500_challenger)
+        overall.update(
+            {
+                "candidate_recall_at_500_champion": champion_recall,
+                "candidate_recall_at_500_challenger": challenger_recall,
+                "candidate_recall_at_500_absolute_regression": (
+                    champion_recall - challenger_recall
+                ),
+            }
+        )
     bootstrap = _cluster_bootstrap_ndcg(rows, champion, challenger, config)
     overall = {**overall, **bootstrap}
     slice_results: Dict[str, Mapping[str, object]] = {}
@@ -323,7 +386,9 @@ def evaluate_quality_gate(
             }
             insufficient_slices.append(name)
             continue
-        metrics = _comparison_metrics(selected, champion, challenger)
+        metrics = _comparison_metrics(
+            selected, champion, challenger, ece_bins=config.ece_bins
+        )
         ci = _cluster_bootstrap_ndcg(selected, champion, challenger, config)
         metrics = {**metrics, **ci}
         failures = _metric_failures(metrics, config, slice_name=name)
@@ -344,6 +409,29 @@ def evaluate_quality_gate(
         decision = GateDecision.INSUFFICIENT_EVIDENCE
     else:
         failures = _metric_failures(overall, config, slice_name=None)
+        if config.experiment_kind == "features":
+            cold = dict(slice_results.get("cold_user", {}).get("metrics") or {})
+            if (
+                float(overall["ndcg_at_10_delta"]) < 0.005
+                and float(cold.get("ndcg_at_10_delta", float("-inf"))) < 0.01
+            ):
+                failures.append("feature_challenger_minimum_improvement")
+        elif config.experiment_kind == "fusion":
+            recall_delta = -float(
+                overall.get("candidate_recall_at_500_absolute_regression", 0.0)
+            )
+            if recall_delta < 0.005 and float(overall["ndcg_at_10_delta"]) < 0.005:
+                failures.append("fusion_challenger_minimum_improvement")
+        elif config.experiment_kind == "calibration":
+            for head in ("ctr", "ctcvr"):
+                old = float(overall[f"{head}_ece_champion"])
+                new = float(overall[f"{head}_ece_challenger"])
+                if old <= 0.0 or new > old * 0.9:
+                    failures.append(f"calibration_{head}_minimum_improvement")
+                if float(overall[f"{head}_brier_relative_regression"]) > 0.0:
+                    failures.append(f"calibration_{head}_brier_regression")
+            if float(overall["ndcg_at_10_delta"]) < 0.0:
+                failures.append("calibration_ndcg_regression")
         failures.extend(f"slice_{name}" for name in failed_slices)
         reasons = tuple(failures)
         decision = GateDecision.FAILED if failures else GateDecision.PASSED
@@ -407,6 +495,13 @@ def _evidence_reasons(
         reasons.append("overall_clicks")
     if purchases < config.min_purchases:
         reasons.append("overall_purchases")
+    if sum(row.purchased and row.value_mask for row in rows) < config.min_purchases:
+        reasons.append("overall_value_labels")
+    if config.require_candidate_recall and (
+        config.candidate_recall_at_500_champion is None
+        or config.candidate_recall_at_500_challenger is None
+    ):
+        reasons.append("candidate_recall_at_500")
     return reasons
 
 
@@ -416,6 +511,8 @@ def _quality_slices(
     selectors = {
         "cold_user": lambda row: row.total_interactions
         <= config.cold_user_max_interactions,
+        "warm_user": lambda row: row.total_interactions
+        > config.cold_user_max_interactions,
         "cold_item": lambda row: (
             (row.as_of_ts - row.product_created_at)
             <= config.cold_item_max_age_days * 86400.0
@@ -427,6 +524,21 @@ def _quality_slices(
     for name, selector in selectors.items():
         selected = [row for row in rows if selector(row)]
         yield name, selected, bool(selected)
+    for name, lower, upper in (
+        ("price_low", 0.0, 50.0),
+        ("price_mid", 50.0, 200.0),
+        ("price_high", 200.0, float("inf")),
+    ):
+        selected = [row for row in rows if lower <= row.price < upper]
+        yield name, selected, bool(selected)
+    for category in sorted({row.category for row in rows if row.category}):
+        yield f"category_{category}", [
+            row for row in rows if row.category == category
+        ], True
+    for source in sorted({source for row in rows for source in row.retrieval_sources}):
+        yield f"retrieval_{source}", [
+            row for row in rows if source in row.retrieval_sources
+        ], True
     for modality in (
         "visual",
         "ocr",
@@ -444,9 +556,11 @@ def _quality_slices(
         yield f"missing_{modality}", selected, applicable and bool(selected)
 
 
-def _comparison_metrics(rows, champion, challenger) -> Dict[str, float | int | None]:
-    champion_metrics = _model_metrics(rows, champion)
-    challenger_metrics = _model_metrics(rows, challenger)
+def _comparison_metrics(
+    rows, champion, challenger, *, ece_bins: int = 15
+) -> Dict[str, float | int | None]:
+    champion_metrics = _model_metrics(rows, champion, ece_bins=ece_bins)
+    challenger_metrics = _model_metrics(rows, challenger, ece_bins=ece_bins)
 
     def delta(name: str) -> float:
         return float(challenger_metrics[name]) - float(champion_metrics[name])
@@ -479,6 +593,16 @@ def _comparison_metrics(rows, champion, challenger) -> Dict[str, float | int | N
         "ctcvr_brier_relative_regression": relative_regression(
             "ctcvr_brier", lower_is_better=True
         ),
+        "ctr_ece_champion": champion_metrics["ctr_ece"],
+        "ctr_ece_challenger": challenger_metrics["ctr_ece"],
+        "ctr_ece_absolute_regression": delta("ctr_ece"),
+        "ctcvr_ece_champion": champion_metrics["ctcvr_ece"],
+        "ctcvr_ece_challenger": challenger_metrics["ctcvr_ece"],
+        "ctcvr_ece_absolute_regression": delta("ctcvr_ece"),
+        "ctr_reliability_champion": champion_metrics["ctr_reliability"],
+        "ctr_reliability_challenger": challenger_metrics["ctr_reliability"],
+        "ctcvr_reliability_champion": champion_metrics["ctcvr_reliability"],
+        "ctcvr_reliability_challenger": challenger_metrics["ctcvr_reliability"],
         "value_wape_relative_regression": relative_regression(
             "value_wape", lower_is_better=True
         ),
@@ -487,7 +611,7 @@ def _comparison_metrics(rows, champion, challenger) -> Dict[str, float | int | N
     }
 
 
-def _model_metrics(rows, predictions):
+def _model_metrics(rows, predictions, *, ece_bins: int = 15):
     clicked = np.asarray([float(row.clicked) for row in rows], dtype=np.float64)
     purchased = np.asarray([float(row.purchased) for row in rows], dtype=np.float64)
     ctr = np.clip(
@@ -500,7 +624,7 @@ def _model_metrics(rows, predictions):
         1e-7,
         1 - 1e-7,
     )
-    purchase_rows = [row for row in rows if row.purchased]
+    purchase_rows = [row for row in rows if row.purchased and row.value_mask]
     actual_values = np.asarray(
         [row.business_value for row in purchase_rows], dtype=np.float64
     )
@@ -517,6 +641,10 @@ def _model_metrics(rows, predictions):
         "ctcvr_log_loss": float(log_loss(purchased, ctcvr, labels=[0.0, 1.0])),
         "ctr_brier": float(brier_score_loss(clicked, ctr)),
         "ctcvr_brier": float(brier_score_loss(purchased, ctcvr)),
+        "ctr_ece": expected_calibration_error(ctr, clicked, bins=ece_bins),
+        "ctcvr_ece": expected_calibration_error(ctcvr, purchased, bins=ece_bins),
+        "ctr_reliability": reliability_table(ctr, clicked, bins=ece_bins),
+        "ctcvr_reliability": reliability_table(ctcvr, purchased, bins=ece_bins),
         "value_wape": float(value_errors.sum() / max(actual_values.sum(), 1e-12)),
         "value_mae": float(value_errors.mean()) if len(value_errors) else 0.0,
     }
@@ -530,11 +658,25 @@ def _mean_ndcg(rows, predictions) -> float:
     for impression_rows in grouped.values():
         if len(impression_rows) < 2:
             continue
-        relevance = [row.relevance for row in impression_rows]
-        scores = [
-            predictions[row.observation_id].serving_score for row in impression_rows
-        ]
-        values.append(float(ndcg_score([relevance], [scores], k=10)))
+        ranked = sorted(
+            impression_rows,
+            key=lambda row: (
+                -predictions[row.observation_id].serving_score,
+                row.product_id,
+            ),
+        )[:10]
+        ideal = sorted(
+            impression_rows, key=lambda row: (-row.relevance, row.product_id)
+        )[:10]
+
+        def dcg(selected):
+            return sum(
+                float(row.relevance) / math.log2(position + 2)
+                for position, row in enumerate(selected)
+            )
+
+        ideal_gain = dcg(ideal)
+        values.append(dcg(ranked) / ideal_gain if ideal_gain > 0.0 else 0.0)
     return float(np.mean(values)) if values else 0.0
 
 
@@ -596,6 +738,21 @@ def _metric_failures(metrics, config, *, slice_name: str | None) -> list[str]:
     ):
         if float(metrics[name]) > error_limit:
             failures.append(f"{prefix}_{name}")
+    ece_limit = (
+        config.slice_ece_max_absolute_regression
+        if slice_name
+        else config.ece_max_absolute_regression
+    )
+    for name in ("ctr_ece_absolute_regression", "ctcvr_ece_absolute_regression"):
+        if float(metrics[name]) > ece_limit:
+            failures.append(f"{prefix}_{name}")
+    if (
+        slice_name is None
+        and "candidate_recall_at_500_absolute_regression" in metrics
+        and float(metrics["candidate_recall_at_500_absolute_regression"])
+        > config.candidate_recall_max_absolute_regression
+    ):
+        failures.append("overall_candidate_recall_at_500_absolute_regression")
     value_limit = (
         config.slice_error_max_relative_regression
         if slice_name
