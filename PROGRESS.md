@@ -7,6 +7,9 @@
   four explicit crosses, source features and matching Torch/ONNX DCN/DCNv2 input
   assembly. Frozen feature manifests are checksummed and compared to checkpoints.
   Failed direct reload restores the complete previous model/configuration.
+  Coordinator payload serialization uses recursive Pydantic conversion so nested
+  retrieval signals survive JSON transport; regression test reproduces the
+  original hosted closed-loop failure.
 - Added source-preserving legacy lineage and deterministic shadow RRF fusion
   (k=60, max 500, no pre-ranking category cap). Impression/Flink/PIT retain source
   signals and categorical context; raw history remains `ranking_ltr_v1`, distinct
@@ -30,7 +33,7 @@
   (unrelated visual FAISS cases excluded after a macOS native abort); v3 DCN/DCNv2
   ONNX parity included. Compose config, Helm lint/template, strict kubeconform
   `36/36`, Prometheus rules, selected Ruff, Python compilation and diff checks
-  passed. Ranking runtime/service suite `89 passed`; final Flink Maven `39 passed`.
+  passed. Ranking runtime/service suite `89 passed`; final Flink Maven `39 passed`. Follow-up serialization suite `106 passed`.
 - Acceptance gaps: no real complete catalog/mature PIT baseline or five-model
   comparison was available; Recall@500 evidence remains externally supplied.
   Fixed-Linux latency/QPS evidence, live Postgres promotion integration, full

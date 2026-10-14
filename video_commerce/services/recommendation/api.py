@@ -2429,11 +2429,13 @@ def _recommendation_payload(
 def _recommendation_item_payload(item: Any) -> Dict[str, Any]:
     if isinstance(item, dict):
         return item
+    # Pydantic serialization recursively converts nested models such as the
+    # candidate's per-source retrieval signals; __dict__ is only shallow.
+    if hasattr(item, "dict"):
+        return item.dict()
     raw = getattr(item, "__dict__", None)
     if isinstance(raw, dict):
         return dict(raw)
-    if hasattr(item, "dict"):
-        return item.dict()
     return dict(item)
 
 
