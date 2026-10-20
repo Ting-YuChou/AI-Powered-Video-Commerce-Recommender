@@ -1128,28 +1128,8 @@ services:
     build:
       context: ./flink-jobs/interaction-features
       dockerfile: Dockerfile
-    command:
-      - sh
-      - -lc
-      - |
-        until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
-        running_count="$$(flink list -m flink-jobmanager:8081 -r 2>/dev/null | grep -c 'video-commerce-interaction-features' || true)"
-        if [ "$${running_count}" -gt 1 ]; then
-          echo "multiple running video-commerce-interaction-features jobs detected" >&2
-          exit 1
-        fi
-        if [ "$${running_count}" -eq 0 ]; then
-          restore_args=""
-          if [ -n "$${FLINK_RESTORE_SAVEPOINT_PATH:-}" ]; then
-            restore_args="-s $${FLINK_RESTORE_SAVEPOINT_PATH}"
-          fi
-          flink run -d \
-            -m flink-jobmanager:8081 \
-            $${restore_args} \
-            -c com.videocommerce.flink.InteractionFeatureJob \
-            /opt/flink/usrlib/interaction-features.jar
-        fi
-        until [ "$$(flink list -m flink-jobmanager:8081 -r 2>/dev/null | grep -c 'video-commerce-interaction-features' || true)" -eq 1 ]; do sleep 2; done
+    # Restores from FLINK_RESTORE_SAVEPOINT_PATH or the newest retained checkpoint.
+    command: ["/opt/flink/vc-bin/submit-interaction-job.sh"]
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -1168,6 +1148,7 @@ services:
       FLINK_REPLAY_HORIZON_DAYS: ${FLINK_REPLAY_HORIZON_DAYS:-7}
       FLINK_FEATURE_STATE_EPOCH: ${FLINK_FEATURE_STATE_EPOCH:-}
       FLINK_RESTORE_SAVEPOINT_PATH: ${FLINK_RESTORE_SAVEPOINT_PATH:-}
+      FLINK_RESTORE_FROM_LATEST_CHECKPOINT: ${FLINK_RESTORE_FROM_LATEST_CHECKPOINT:-true}
       FLINK_KAFKA_TRANSACTION_TIMEOUT_MS: ${FLINK_KAFKA_TRANSACTION_TIMEOUT_MS:-600000}
       REDIS_HOST: redis
       REDIS_PORT: 6379

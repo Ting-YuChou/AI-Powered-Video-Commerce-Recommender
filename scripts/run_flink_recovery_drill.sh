@@ -116,4 +116,37 @@ for _ in $(seq 1 60); do
 done
 [[ "${generation:-}" == "4" ]]
 scripts/flink_realtime_ops.sh verify
+
+# Routine restart without a savepoint (./startup.sh restart is compose down/up):
+# the submitter must restore the newest retained checkpoint so generations stay
+# continuous instead of restarting at 1 and crash-looping on digest conflicts.
+job_id="$(scripts/flink_realtime_ops.sh verify | awk '{print $2}')"
+for _ in $(seq 1 60); do
+  completed="$(curl -fsS "http://127.0.0.1:8081/jobs/${job_id}/checkpoints" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("latest") or {}).get("completed") is not None)')"
+  [[ "$completed" == "True" ]] && break
+  sleep 2
+done
+[[ "$completed" == "True" ]]
+# Let a checkpoint that includes generation 4 complete.
+sleep 35
+docker compose --profile flink down --remove-orphans
+docker compose --profile flink up -d \
+  redis postgres zookeeper kafka kafka-init flink-jobmanager flink-taskmanager flink-interaction-features
+for _ in $(seq 1 180); do
+  if scripts/flink_realtime_ops.sh verify >/dev/null 2>&1; then break; fi
+  sleep 2
+done
+scripts/flink_realtime_ops.sh verify
+docker compose logs --no-color flink-interaction-features | grep -q "restoring video-commerce-interaction-features from latest retained checkpoint"
+
+produce recovery-after-restart click "$(python3 -c 'import time; print(time.time())')"
+for _ in $(seq 1 60); do
+  generation="$(docker compose exec -T redis redis-cli HGET ufm:recovery-user generation | tr -d '\r')"
+  [[ "$generation" == "5" ]] && break
+  sleep 2
+done
+[[ "${generation:-}" == "5" ]]
+# Still RUNNING (not RESTARTING) after the post-restart write.
+sleep 10
+scripts/flink_realtime_ops.sh verify
 echo "Flink recovery drill passed"

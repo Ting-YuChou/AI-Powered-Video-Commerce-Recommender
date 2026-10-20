@@ -15,3 +15,4 @@ FROM flink:1.20.1-scala_2.12-java17
 
 COPY --from=build /src/hadoop-libs/ /opt/flink/lib/
 COPY --from=build /src/target/interaction-features-1.0.0.jar /opt/flink/usrlib/interaction-features.jar
+COPY --chmod=0755 bin/submit-interaction-job.sh /opt/flink/vc-bin/submit-interaction-job.sh

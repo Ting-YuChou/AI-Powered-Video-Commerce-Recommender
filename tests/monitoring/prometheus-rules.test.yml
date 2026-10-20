@@ -6,6 +6,22 @@ evaluation_interval: 1m
 tests:
   - interval: 1m
     input_series:
+      - series: 'flink_taskmanager_job_task_operator_redis_snapshot_sink_stale{job="flink"}'
+        values: '0+10x40'
+      - series: 'flink_taskmanager_job_task_operator_redis_snapshot_sink_applied{job="flink"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: FlinkRedisSnapshotStaleWrites
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Most Flink Redis snapshot writes are rejected as stale"
+              description: "The job is likely running from empty state under an epoch that already wrote Redis; restore from the latest checkpoint or bump FLINK_FEATURE_STATE_EPOCH."
+
+  - interval: 1m
+    input_series:
       - series: 'video_commerce_http_requests_total{job="gateway-api",status="500"}'
         values: '0+10x20'
       - series: 'video_commerce_http_requests_total{job="gateway-api",status="200"}'
