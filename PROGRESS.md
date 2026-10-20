@@ -1,5 +1,34 @@
 # Progress
 
+## 2026-10-20 — Stage A WS-D: clamp client event times at ingest (review item 28)
+
+- Views: ingest clamps the client `viewed_at` into `[served_at,
+  server_received_at]`. `served_at` comes from
+  `get_recommendation_impression_slate` (impression `created_at`, or the outbox
+  payload's served timestamp). The clamped value is the Kafka
+  `event_time`/`viewed_at` and the Postgres `viewed_at`. Events also carry
+  `client_viewed_at`, `served_at` and `server_received_at`.
+- Interactions: `event_time` is clamped to at most `server_received_at`, and the
+  raw value is kept as `client_event_time` (null when the server filled it).
+  Ingest does no lower-bound lookup; WS-A bounds feedback with server
+  `available_at`. Idempotency hashes the client value, so retries that clamp
+  differently stay duplicates.
+- Metrics: `video_commerce_public_event_clock_skew_seconds{kind}` (signed
+  buckets, so no `_sum`) and `video_commerce_public_event_time_clamped_total{kind,bound}`.
+  The new event fields are additive; the Flink parsers read events as maps.
+- Key files: `video_commerce/common/{event_time,observability}.py`,
+  `video_commerce/data_plane/{kafka_client,system_store}.py`,
+  `video_commerce/services/interaction_ingest/api.py`,
+  `docs/operations/event-and-artifact-reliability.md`, tests
+  `test_interaction_event_time.py`, `test_interaction_ingest.py`,
+  `test_recommendation_event_contract.py`.
+- Verification: py3.10 venv full backend suite 844 passed, 12 skipped.
+  `scripts/run_flink_closed_loop_smoke.sh` passed (project `vc-stagea-time-smoke`;
+  ingest → Kafka → Flink with the new fields).
+- Gaps: views are not lower-bounded when Postgres is disabled (no slate). The
+  PIT acceptance check from item 28 (identical rows/labels under ±60s skew,
+  zero leakage) still depends on WS-A's `available_at` switch.
+
 ## 2026-10-20 — Phase 0 hardening (review items 24, 25, 26, 36, 45, 67, 68, 70, 04)
 
 - Measurement: Two-Tower, content, and CF FAISS indexes use inner product.
