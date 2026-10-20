@@ -103,9 +103,28 @@ Passed evaluation may stage a bundle; it never promotes it.
 
 Evaluation records are immutable per release/PIT/policy. Do not reinterpret an
 existing insufficient/failed evaluation with new thresholds. Use a new model
-version when evidence or an experiment changes. The general trainer's automatic
-v2 evaluation cannot supply external Recall@500 evidence; use these independent
-experiment CLI runs for Phase C.
+version when evidence or an experiment changes.
+
+`ranking_quality_gate_v4` slice policy:
+
+- Only the pre-registered slices block the gate: `cold_user`, `cold_item`, and
+  `price_low`/`price_mid`/`price_high`. Their NDCG CIs are Bonferroni-adjusted
+  across the blocking slices that are tested.
+- Category and retrieval-source slices are capped to the top 10 by impressions,
+  plus an `other` bucket. Missing-modality slices are also report-only. All of
+  these are recorded with `"blocking": false` and never change the decision.
+
+The general trainer evaluates every periodic retrain with experiment kind
+`retrain`:
+
+- The champion is the active release, loaded from its own installed checkpoint
+  and refreshed every round. Challengers go to `<ranking_model>.challenger.pt`.
+- Candidate recall is not required, because the candidate generator does not
+  change.
+- A pass may stage the release. Activation still requires the full Phase C
+  evidence from these CLI runs (prerequisites and ONNX parity).
+- Activation rejects any evaluation whose `champion_release_id` is not the
+  current active release (`champion_not_active`).
 
 ## Performance proof and promotion
 

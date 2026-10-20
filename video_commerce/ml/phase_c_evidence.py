@@ -13,19 +13,27 @@ def quality_gate_snapshot_valid(
 ) -> bool:
     """A Phase C (v2+) promotion cannot silently weaken the versioned policy."""
     from dataclasses import asdict
-    from video_commerce.ml.model_release_quality import RankingQualityGateConfig
+    from video_commerce.ml.model_release_quality import default_gate_config
 
-    expected = asdict(RankingQualityGateConfig())
-    expected["experiment_kind"] = experiment_kind
+    expected = asdict(default_gate_config(experiment_kind))
     dynamic_fields = {
         "candidate_recall_at_500_champion",
         "candidate_recall_at_500_challenger",
     }
+    # Fields added in ranking_quality_gate_v4 are absent from v2/v3 snapshots;
+    # those policies behaved as if the v4 defaults applied.
+    missing = object()
     return all(
-        gate_config.get(key) == value
+        gate_config.get(
+            key, value if key in _V4_GATE_FIELDS else missing
+        )
+        == value
         for key, value in expected.items()
         if key not in dynamic_fields
     )
+
+
+_V4_GATE_FIELDS = frozenset({"slice_top_n_categories", "slice_top_n_retrieval_sources"})
 
 
 def bundle_digest(manifest: Mapping) -> str:

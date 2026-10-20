@@ -27,14 +27,32 @@ QUALITY_GATE_POLICY_V1 = "ranking_quality_gate_v1"
 QUALITY_GATE_POLICY_V2 = "ranking_quality_gate_v2"
 # v3: NDCG gains exclude view-only relevance and skip slates with no
 # engagement, so all-view impressions no longer dilute the delta.
-QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v3"
+QUALITY_GATE_POLICY_V3 = "ranking_quality_gate_v3"
+# v4: only pre-registered slices block the gate; category and retrieval-source
+# slices are capped to the top-N by impressions plus "other" and are reported
+# without blocking; blocking-slice NDCG CIs are Bonferroni-adjusted; adds the
+# "retrain" experiment kind (ranking-only change, candidates unchanged).
+QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v4"
 SUPPORTED_QUALITY_GATE_POLICY_VERSIONS = frozenset(
-    {QUALITY_GATE_POLICY_V1, QUALITY_GATE_POLICY_V2, QUALITY_GATE_POLICY_VERSION}
+    {
+        QUALITY_GATE_POLICY_V1,
+        QUALITY_GATE_POLICY_V2,
+        QUALITY_GATE_POLICY_V3,
+        QUALITY_GATE_POLICY_VERSION,
+    }
 )
 # Policies that carry Phase C promotion evidence (prerequisites, ONNX parity,
 # RRF fusion policy).
 PHASE_C_QUALITY_GATE_POLICY_VERSIONS = frozenset(
-    {QUALITY_GATE_POLICY_V2, QUALITY_GATE_POLICY_VERSION}
+    {QUALITY_GATE_POLICY_V2, QUALITY_GATE_POLICY_V3, QUALITY_GATE_POLICY_VERSION}
+)
+EXPERIMENT_KINDS = frozenset({"features", "fusion", "calibration", "combined", "retrain"})
+# Pre-registered slices whose missing evidence or regression blocks the gate.
+# Every other slice is reported only, so a long-tail category cannot hold the
+# whole release hostage and dozens of point thresholds do not multiply false
+# failures.
+BLOCKING_SLICES = frozenset(
+    {"cold_user", "cold_item", "price_low", "price_mid", "price_high"}
 )
 
 
@@ -177,6 +195,20 @@ class RankingQualityGateConfig:
     cold_user_max_interactions: int = 4
     cold_item_max_age_days: int = 30
     cold_item_max_exposures: int = 5
+    slice_top_n_categories: int = 10
+    slice_top_n_retrieval_sources: int = 10
+
+
+def default_gate_config(experiment_kind: str = "combined") -> RankingQualityGateConfig:
+    """The frozen policy defaults for one experiment kind."""
+    if experiment_kind not in EXPERIMENT_KINDS:
+        raise ValueError("unsupported Phase C experiment kind")
+    # A retrain keeps the candidate generator fixed, so there is no candidate
+    # recall change to evidence.
+    return RankingQualityGateConfig(
+        experiment_kind=experiment_kind,
+        require_candidate_recall=experiment_kind != "retrain",
+    )
 
 
 @dataclass(frozen=True)
@@ -194,6 +226,7 @@ def split_fixed_holdout(
     *,
     holdout_days: int,
     attribution_cutoff: float,
+    purge_seconds: float = 0.0,
 ) -> tuple[list[RankingEvaluationRow], list[RankingEvaluationRow], HoldoutWindow]:
     if not rows:
         raise ValueError("ranking quality gate requires at least one row")
@@ -203,7 +236,10 @@ def split_fixed_holdout(
     if end_ts > float(attribution_cutoff):
         raise ValueError("holdout contains labels newer than attribution cutoff")
     start_ts = end_ts - int(holdout_days) * 86400.0
-    training = [row for row in rows if float(row.as_of_ts) < start_ts]
+    # Rows within one attribution window (plus lateness) of the holdout can be
+    # labelled by the same events as holdout rows; purge them from training.
+    training_end = start_ts - max(0.0, float(purge_seconds))
+    training = [row for row in rows if float(row.as_of_ts) < training_end]
     holdout = [row for row in rows if start_ts <= float(row.as_of_ts) <= end_ts]
     return training, holdout, HoldoutWindow(start_ts=start_ts, end_ts=end_ts)
 
@@ -213,6 +249,7 @@ def split_training_examples_fixed_holdout(
     *,
     holdout_days: int,
     attribution_cutoff: float,
+    purge_seconds: float = 0.0,
 ) -> tuple[list[object], list[object], HoldoutWindow]:
     """Split typed ranking examples without fitting on the release holdout."""
     if not examples:
@@ -224,8 +261,11 @@ def split_training_examples_fixed_holdout(
     if end_ts > float(attribution_cutoff):
         raise ValueError("holdout contains labels newer than attribution cutoff")
     start_ts = end_ts - int(holdout_days) * 86400.0
+    training_end = start_ts - max(0.0, float(purge_seconds))
     training = [
-        example for example in examples if float(example.bundle.as_of_ts) < start_ts
+        example
+        for example in examples
+        if float(example.bundle.as_of_ts) < training_end
     ]
     holdout = [
         example
@@ -329,7 +369,7 @@ def evaluate_quality_gate(
     challenger: Mapping[str, RankingPrediction],
     config: RankingQualityGateConfig,
 ) -> QualityGateResult:
-    if config.experiment_kind not in {"features", "fusion", "calibration", "combined"}:
+    if config.experiment_kind not in EXPERIMENT_KINDS:
         raise ValueError("unsupported Phase C experiment kind")
     invalid_reason = _prediction_validation_reason(rows, champion, challenger)
     recall_values = (
@@ -383,22 +423,38 @@ def evaluate_quality_gate(
     slice_results: Dict[str, Mapping[str, object]] = {}
     insufficient_slices: list[str] = []
     failed_slices: list[str] = []
-    for name, selected, applicable in _quality_slices(rows, config):
+    slices = list(_quality_slices(rows, config))
+    # Bonferroni across the blocking slices that will be tested, so the
+    # family-wise false-failure rate of their NDCG CIs stays near 5%.
+    blocking_tests = max(
+        1,
+        sum(1 for name, _, applicable in slices if applicable and name in BLOCKING_SLICES),
+    )
+    for name, selected, applicable in slices:
+        blocking = name in BLOCKING_SLICES
         if not applicable:
-            slice_results[name] = {"status": "not_applicable"}
+            slice_results[name] = {"status": "not_applicable", "blocking": blocking}
             continue
         slice_evidence = _evidence_reasons(selected, config, slice_name=name)
         if slice_evidence:
             slice_results[name] = {
                 "status": GateDecision.INSUFFICIENT_EVIDENCE.value,
                 "reasons": slice_evidence,
+                "blocking": blocking,
             }
-            insufficient_slices.append(name)
+            if blocking:
+                insufficient_slices.append(name)
             continue
         metrics = _comparison_metrics(
             selected, champion, challenger, ece_bins=config.ece_bins
         )
-        ci = _cluster_bootstrap_ndcg(selected, champion, challenger, config)
+        ci = _cluster_bootstrap_ndcg(
+            selected,
+            champion,
+            challenger,
+            config,
+            alpha=0.05 / blocking_tests if blocking else 0.05,
+        )
         metrics = {**metrics, **ci}
         failures = _metric_failures(metrics, config, slice_name=name)
         slice_results[name] = {
@@ -407,8 +463,9 @@ def evaluate_quality_gate(
             else GateDecision.PASSED.value,
             "reasons": failures,
             "metrics": metrics,
+            "blocking": blocking,
         }
-        if failures:
+        if failures and blocking:
             failed_slices.append(name)
 
     if evidence_reasons or insufficient_slices:
@@ -540,14 +597,18 @@ def _quality_slices(
     ):
         selected = [row for row in rows if lower <= row.price < upper]
         yield name, selected, bool(selected)
-    for category in sorted({row.category for row in rows if row.category}):
-        yield f"category_{category}", [
-            row for row in rows if row.category == category
-        ], True
-    for source in sorted({source for row in rows for source in row.retrieval_sources}):
-        yield f"retrieval_{source}", [
-            row for row in rows if source in row.retrieval_sources
-        ], True
+    yield from _top_n_slices(
+        rows,
+        prefix="category",
+        values_of=lambda row: (row.category,) if row.category else (),
+        top_n=config.slice_top_n_categories,
+    )
+    yield from _top_n_slices(
+        rows,
+        prefix="retrieval",
+        values_of=lambda row: tuple(row.retrieval_sources),
+        top_n=config.slice_top_n_retrieval_sources,
+    )
     for modality in (
         "visual",
         "ocr",
@@ -563,6 +624,27 @@ def _quality_slices(
             if modality in row.modality_presence and not row.modality_presence[modality]
         ]
         yield f"missing_{modality}", selected, applicable and bool(selected)
+
+
+def _top_n_slices(rows, *, prefix: str, values_of, top_n: int):
+    """Top-N values by impression count, plus one "other" bucket for the rest."""
+    impressions: Dict[str, set] = {}
+    for row in rows:
+        for value in values_of(row):
+            impressions.setdefault(str(value), set()).add(row.impression_id)
+    ranked = sorted(impressions, key=lambda value: (-len(impressions[value]), value))
+    kept = set(ranked[: max(0, int(top_n))])
+    for value in sorted(kept):
+        yield f"{prefix}_{value}", [
+            row for row in rows if value in {str(item) for item in values_of(row)}
+        ], True
+    if len(ranked) > len(kept):
+        selected = [
+            row
+            for row in rows
+            if any(str(item) not in kept for item in values_of(row))
+        ]
+        yield f"{prefix}_other", selected, bool(selected)
 
 
 def _comparison_metrics(
@@ -706,7 +788,7 @@ def _mean_ndcg(rows, predictions) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
-def _cluster_bootstrap_ndcg(rows, champion, challenger, config):
+def _cluster_bootstrap_ndcg(rows, champion, challenger, config, *, alpha: float = 0.05):
     # Resampled users keep all their rows; _mean_ndcg applies the same
     # informative-slate filter, so CI bounds match ndcg_at_10_delta.
     rows_by_user: Dict[str, list[RankingEvaluationRow]] = {}
@@ -734,8 +816,8 @@ def _cluster_bootstrap_ndcg(rows, champion, challenger, config):
             _mean_ndcg(sampled_rows, challenger) - _mean_ndcg(sampled_rows, champion)
         )
     return {
-        "ndcg_at_10_delta_ci_lower": float(np.quantile(deltas, 0.025)),
-        "ndcg_at_10_delta_ci_upper": float(np.quantile(deltas, 0.975)),
+        "ndcg_at_10_delta_ci_lower": float(np.quantile(deltas, alpha / 2.0)),
+        "ndcg_at_10_delta_ci_upper": float(np.quantile(deltas, 1.0 - alpha / 2.0)),
     }
 
 
