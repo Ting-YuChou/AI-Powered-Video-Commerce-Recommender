@@ -694,6 +694,7 @@ class KafkaManager:
         event_time: Optional[float] = None,
         server_received_at: Optional[float] = None,
         request_id: Optional[str] = None,
+        client_event_time: Optional[float] = None,
     ) -> bool:
         """
         Send a user interaction event to Kafka.
@@ -703,6 +704,8 @@ class KafkaManager:
             product_id: Product identifier
             action: Interaction type (view, click, purchase, etc.)
             context: Additional context data
+            event_time: Server-bounded event time used as the PIT anchor
+            client_event_time: Raw client-supplied time, kept for skew analysis
 
         Returns:
             True if sent successfully
@@ -727,6 +730,9 @@ class KafkaManager:
             event_time=resolved_event_time,
             timestamp=resolved_event_time,
             server_received_at=received_at,
+            client_event_time=(
+                None if client_event_time is None else float(client_event_time)
+            ),
         )
         _add_interaction_history_lineage(
             event,
@@ -756,6 +762,7 @@ class KafkaManager:
         event_time: Optional[float] = None,
         server_received_at: Optional[float] = None,
         request_id: Optional[str] = None,
+        client_event_time: Optional[float] = None,
     ) -> bool:
         """Enqueue a user interaction event without waiting for broker ack."""
         resolved_event_time = (
@@ -778,6 +785,9 @@ class KafkaManager:
             event_time=resolved_event_time,
             timestamp=resolved_event_time,
             server_received_at=received_at,
+            client_event_time=(
+                None if client_event_time is None else float(client_event_time)
+            ),
         )
         _add_interaction_history_lineage(
             event,
@@ -958,7 +968,15 @@ class KafkaManager:
         viewed_at: float,
         context: Optional[Dict[str, Any]] = None,
         request_id: Optional[str] = None,
+        client_viewed_at: Optional[float] = None,
+        served_at: Optional[float] = None,
+        server_received_at: Optional[float] = None,
     ) -> bool:
+        """Publish a viewport-confirmed slate item.
+
+        ``viewed_at`` is the server-bounded view time and becomes the PIT
+        ``event_time``; ``client_viewed_at`` keeps the raw client clock value.
+        """
         published_at = time.time()
         view_payload = {
             "impression_id": impression_id,
@@ -979,6 +997,13 @@ class KafkaManager:
             context=dict(context or {}),
             viewed_at=viewed_at,
             timestamp=viewed_at,
+            client_viewed_at=(
+                float(viewed_at) if client_viewed_at is None else float(client_viewed_at)
+            ),
+            served_at=None if served_at is None else float(served_at),
+            server_received_at=(
+                None if server_received_at is None else float(server_received_at)
+            ),
         )
         event.update(
             {
