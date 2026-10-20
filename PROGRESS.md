@@ -1,5 +1,48 @@
 # Progress
 
+## 2026-10-20 — Stage A WS-C: retrieval PIT contract and eval performance (review items 42, 43)
+
+- Flink `RetrievalPointInTimeJoinJob`:
+  - `seen_product_ids_json` holds the distinct products of the user's N most
+    recent interactions before `as_of_ts` that were available by then. This
+    mirrors serving's `exclude_items`. N is `--seen-history-limit` (default
+    200).
+  - `ranker_score` comes from `$.raw_ranking_score` on `ranker_rejected`
+    rows.
+  - Organic positives use the reader's maturity rule.
+  - The pinned catalog only needs to be available by the cutoff.
+  - The test now executes the SQL in a batch TableEnvironment (planner and
+    runtime are test-scoped deps).
+- Serving: rerank-pool candidates that missed the slate log
+  `raw_ranking_score` and `ranker_scored` in `rejected_candidate_items[].scores`.
+  Scores are reused, with no extra call.
+- Contract:
+  - A pinned catalog generation is a static item snapshot. The per-row
+    `catalog.available_at <= as_of_ts` check is gone, because it rejected every
+    row older than the catalog. Training instead requires the snapshot to
+    predate the holdout start (see the runbook).
+  - The manifest records `ranker_score_coverage` and the reader verifies it.
+  - `teacher_soft` is refused below
+    `RETRIEVAL_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE` (0.9). Unscored rows
+    fall back to weak negatives.
+- Eval:
+  - Query-independent sets are built once, and cold items are resolved per
+    query's relevant items.
+  - Exact scoring uses chunked matrix products with a partition top-k and
+    product-ID tie-break.
+  - Eligible sets are cached, the bootstrap uses index resampling of
+    per-query recall, popularity is cut to top-(K+|seen|), and persisted
+    metrics drop `ranked_product_ids`.
+  - Recall@40 is reported but not gate-blocking (would change
+    `retrieval_quality_gate_v1` decisions).
+- Benchmark (opt-in, `RETRIEVAL_EVAL_BENCHMARK=1`, M3 Pro): 100k items x 10k
+  queries x d=64 with 2000 bootstrap samples took 35.4 s at 532 MB peak RSS.
+- Gaps:
+  - No label-policy bump, so pre-change exports still read as v1.
+  - Without MMR the ranker returns only k items, so teacher_soft coverage
+    stays low.
+  - The seen join is O(queries x user history).
+
 ## 2026-10-20 — Phase 0 hardening (review items 24, 25, 26, 36, 45, 67, 68, 70, 04)
 
 - Measurement: Two-Tower, content, and CF FAISS indexes use inner product.

@@ -314,6 +314,7 @@ appConfig:
     retrievalLabelPolicyVersion: retrieval_label_v1
     retrievalQualityGatePolicyVersion: retrieval_quality_gate_v1
     retrievalRankerRejectedMode: weak
+    retrievalTeacherSoftMinRankerScoreCoverage: "0.9"
     onlineRetrainingEnabled: false
     ttLogqCorrectionEnabled: false
     userEmbeddingCacheSize: 20000

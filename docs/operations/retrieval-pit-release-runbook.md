@@ -11,19 +11,34 @@ Create a complete catalog snapshot JSON containing `products` and `embeddings`.
 Every product belongs to the generation even when an optional modality is
 missing; use a missing embedding value rather than dropping the product.
 
+The pinned generation is a static item snapshot, not an as-of-query catalog.
+Queries older than the generation are valid training rows. However, the
+generation must be available at or before the holdout start, so evaluation
+never scores holdout queries against later item state. The holdout start is
+the latest mature query minus `RETRIEVAL_HOLDOUT_DAYS`. With a cutoff `C`, a
+168h window, 1h lateness and a 7-day holdout, `available_at` must be at most
+`C - 169h - 7d`, and earlier still when the newest mature query precedes
+`C - 169h`. Otherwise training stops with "catalog generation is newer
+than the holdout start".
+
 ```bash
 python scripts/build_retrieval_catalog_generation.py \
   --input /secure/catalog-snapshot.json \
   --generation-id catalog-20261009 \
-  --effective-at 1791511200 \
-  --available-at 1791514800 \
+  --effective-at 1790298000 \
+  --available-at 1790301600 \
   --embedding-model-revision clip-pinned-revision \
   --output-reference /secure/catalog-20261009-reference.json
 ```
 
 Submit the batch materializer with a unique run ID and attempt. The cutoff must
-be after the 168-hour attribution window and allowed lateness for every viewed
-query that should be finalized.
+be after the 168-hour attribution window and allowed lateness for every
+viewed, ranker-rejected, or organic query that should be finalized. Younger
+anchors are not exported. `seen_product_ids_json` holds the distinct products
+from the user's most recent `--seen-history-limit` interactions (default 200;
+`FEATURE_LAKE_RETRIEVAL_SEEN_HISTORY_LIMIT`; 0 disables). Those interactions
+happened strictly before, and were available at, the query time. This
+mirrors serving's `exclude_items`, so evaluation drops those products.
 
 ```bash
 flink run \
@@ -71,6 +86,17 @@ must reuse the same PIT manifest, catalog generation, seed, and training budget:
 - rejected disabled: `RETRIEVAL_RANKER_REJECTED_MODE=disabled`
 - rejected weak: `RETRIEVAL_RANKER_REJECTED_MODE=weak`
 - teacher soft target: `RETRIEVAL_RANKER_REJECTED_MODE=teacher_soft`
+
+`teacher_soft` needs real ranker scores. Serving logs `raw_ranking_score` only
+for rejected candidates that the ranker returned in its rerank pool (MMR on).
+The manifest records `ranker_score_coverage`, and training refuses
+`teacher_soft` below `RETRIEVAL_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE`
+(default 0.9). Rejected rows without a score stay plain weak negatives.
+
+Evaluation reports Recall@40/50/100/200. Recall@40 matches serving's
+`max_live_cf_candidates`. It is informational: `retrieval_quality_gate_v1`
+blocks only on Recall@100 (point and CI), Recall@50/200 regressions, MRR,
+encoding coverage, and long-tail exposure.
 
 Use a distinct model version per treatment. The release manifest records the
 negative policy, mining catalog generation, and mining cutoff. Do not compare
