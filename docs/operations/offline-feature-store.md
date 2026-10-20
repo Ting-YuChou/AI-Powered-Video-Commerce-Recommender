@@ -138,8 +138,8 @@ docker run --rm --memory=2g --memory-swap=2g \
 
 The command fails when either run reaches 2 GiB peak RSS, 500k rows increase
 peak RSS by more than 25% relative to 100k, or an incomplete staging directory
-remains. The same job is available through the manual `pit-memory-benchmark`
-GitHub Actions check. Record host/container resources and the JSON output
+remains. The same job can be run by hand as `pit-memory-benchmark` in the
+`Benchmarks` GitHub Actions workflow. Record host/container resources and the JSON output
 before treating it as release evidence.
 
 ## Typed PIT shadow training

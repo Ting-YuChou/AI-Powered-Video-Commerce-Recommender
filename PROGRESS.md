@@ -1,5 +1,31 @@
 # Progress
 
+## 2026-10-20 — CI: drop duplicate jobs, run once per commit, require checks
+
+- Removed jobs that only repeated other jobs: host-Python `backend-tests`
+  (`docker-backend-tests` runs the same suite plus the 8 tests that need real
+  Redis/Postgres/Kafka: 851 vs 843 passed on PR #45),
+  `artifact-rolling-activation-drill` and `iceberg-maintenance-drill` (their
+  pytest files and `IcebergMaintenanceJobTest` already run in
+  `docker-backend-tests` and `flink-tests`), and the duplicate Compose check
+  in `docker-build`.
+- Removed the manual `docker-integration` job: it cannot pass on a fresh stack
+  (review item 59). Re-add it once that is fixed.
+- `push` now triggers only on `main`; PR branches ran every job twice (push +
+  pull_request). Superseded PR runs are cancelled.
+- `pit-memory-benchmark` moved to a manual `Benchmarks` workflow so it no
+  longer shows as a skipped PR check.
+- Branch protection on `main` now requires `frontend`, `flink-tests`,
+  `deployment-validation`, `docker-build`, `docker-backend-tests`,
+  `flink-closed-loop` and `flink-recovery-drill` (previously only the drill).
+- Key files: `.github/workflows/ci.yml`, `.github/workflows/benchmarks.yml`,
+  `docs/operations/deploy-rollback-runbook.md`,
+  `docs/operations/offline-feature-store.md`.
+- Verification: both workflows parse as YAML; this PR's own CI run.
+- Gaps: `tests/test_helm_workload_images.py::test_ci_builds_content_worker_image`
+  reads `ci.yml`, which is excluded from the Docker test image, so it now only
+  runs locally.
+
 ## 2026-10-20 — Stage A WS-B: trustworthy release gate and champion (review 38, 46, 10, 41, 37)
 
 - Gate `ranking_quality_gate_v4`:
@@ -107,8 +133,9 @@
     `/opt/paddleocr` is present in the content-worker image.
   - Frontend: vitest 16 passed; lint and build passed.
 - Gaps:
-  - The manual `docker-integration` job still cannot pass on a fresh
-    stack. It does not start the ranking coordinator, it needs a sample
+  - The Compose `integration-tests` smoke (formerly the manual
+    `docker-integration` CI job, removed 2026-10-20) still cannot pass on a
+    fresh stack. It does not start the ranking coordinator, it needs a sample
     vector bootstrap, and gateway readiness
     cascades from an untrained (degraded) ranker (review item 59).
   - Concurrent `create_all` across many runner replicas races on a fresh
@@ -211,8 +238,9 @@
   in both the control plane and Flink job, bounded orphan cleanup with prefix
   mismatch failure, and post-run verification. The weekly Helm CronJob remains
   dry-run by default.
-- Added the `artifact-rolling-activation-drill` and
-  `iceberg-maintenance-drill` CI contracts, Java 17 for Iceberg 1.11, migration
+- Added the artifact-rollout and Iceberg-maintenance test contracts (their
+  separate CI jobs were folded into the full suites on 2026-10-20), Java 17
+  for Iceberg 1.11, migration
   `011_artifact_rollout_and_iceberg_maintenance.sql`, and model activation and
   Iceberg operation runbooks.
 - Key files: `video_commerce/ml/artifact_generation.py`,
