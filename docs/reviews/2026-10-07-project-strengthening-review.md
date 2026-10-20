@@ -54,9 +54,8 @@
   - 四個 image 都能 build；content-worker 內含 `/opt/paddleocr`。
   - Flink closed-loop smoke。
   - Flink recovery drill：新增的 compose down/up 情境中，job 從 checkpoint 還原，generation 由 4 接續到 5，並維持 RUNNING。
-- 驗證過程中另外修了兩個既有問題：
-  - zookeeper 沒有持久化，每次 down/up 之後 Kafka 都會出現 cluster ID 不一致。
-  - ranking-service 缺少對 coordinator 的依賴。
+- 驗證過程中另外修了一個既有問題：zookeeper 沒有持久化，每次 down/up 之後 Kafka 都會出現 cluster ID 不一致。
+- ranking-service 不依賴 coordinator 是刻意的設計：Triton profile 需要繞過 coordinator，有 contract test 鎖定。所以只從 ranking-service 帶起的 stack，要另外明確啟動 coordinator。
 
 **尚未達成的完成條件。**
 - 重新產生 retrieval／NDCG baseline。
@@ -64,7 +63,7 @@
 - UI Live 上傳的 e2e。
 - pit-production 跑完一輪訓練。
 
-手動的 `docker-integration` job 在全新 stack 上仍然無法通過，原因有三：需要先跑 sample vector bootstrap；ranker 未訓練時處於 degraded，gateway 的 readiness 會連帶 not_ready（項目 59）；多個 runner replica 同時 `create_all` 會 race。這三點都不是 Phase 0 的修改造成的。
+手動的 `docker-integration` job 在全新 stack 上仍然無法通過，原因有四：沒有啟動 ranking coordinator；需要先跑 sample vector bootstrap；ranker 未訓練時處於 degraded，gateway 的 readiness 會連帶 not_ready（項目 59）；多個 runner replica 同時 `create_all` 會 race。這四點都不是 Phase 0 的修改造成的。
 
 `ranking_quality_gate_v2` 的 evidence 目前仍被視為有效的 Phase C 晉升依據，所以既有 release 不受影響；是否強制改以 v3 重新評估，需要另外決定。
 

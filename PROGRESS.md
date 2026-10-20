@@ -33,11 +33,13 @@
   `video_commerce/services/{gateway,interaction_ingest,model_trainer}/`, `video_commerce/common/{models,service_common}.py`,
   `charts/video-commerce/`, `Code.Frontend/src/api.js`, `monitoring/prometheus-rules.yml`,
   `docs/operations/{flink-realtime-recovery,deploy-rollback-runbook,object-storage-and-auth}.md`, `AGENTS.md`.
-- Compose fixes found during Docker validation, both predating this work:
-  - ZooKeeper now persists `zookeeper_data`/`zookeeper_log`. Before, any
-    compose down/up made Kafka fail with `InconsistentClusterIdException`.
-  - ranking-service depends on `ranking-coordinator` again (dropped in
-    `46f69c8`).
+- Compose fix found during Docker validation (predates this work):
+  ZooKeeper now persists `zookeeper_data`/`zookeeper_log`. Before, any
+  compose down/up made Kafka fail with `InconsistentClusterIdException`.
+  ranking-service intentionally does not depend on `ranking-coordinator`, so
+  the Triton profile can bypass it (`tests/test_ranking_deployment_contract.py`).
+  Stacks started only through ranking-service must start the coordinator
+  explicitly.
 - Verification:
   - Backend suite: Docker `backend-tests` 838 passed, 6 skipped. The pinned
     py3.10 venv also passed (832 passed, 7 skipped).
@@ -53,7 +55,8 @@
   - Frontend: vitest 16 passed; lint and build passed.
 - Gaps:
   - The manual `docker-integration` job still cannot pass on a fresh
-    stack. It needs a sample vector bootstrap, and gateway readiness
+    stack. It does not start the ranking coordinator, it needs a sample
+    vector bootstrap, and gateway readiness
     cascades from an untrained (degraded) ranker (review item 59).
   - Concurrent `create_all` across many runner replicas races on a fresh
     Postgres.

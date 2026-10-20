@@ -137,7 +137,10 @@ for _ in $(seq 1 180); do
   sleep 2
 done
 scripts/flink_realtime_ops.sh verify
-docker compose logs --no-color flink-interaction-features | grep -q "restoring video-commerce-interaction-features from latest retained checkpoint"
+# Capture first: grep -q exits early and SIGPIPEs `docker compose logs` under pipefail.
+docker compose logs --no-color flink-interaction-features >"$ARTIFACT_DIR/submitter-after-restart.log" 2>&1
+grep -q "restoring video-commerce-interaction-features from latest retained checkpoint" \
+  "$ARTIFACT_DIR/submitter-after-restart.log"
 
 produce recovery-after-restart click "$(python3 -c 'import time; print(time.time())')"
 for _ in $(seq 1 60); do

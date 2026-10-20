@@ -566,9 +566,6 @@ services:
     expose:
       - "8003"
     depends_on:
-      # readyz requires the coordinator, so it must start with ranking-service.
-      ranking-coordinator:
-        condition: service_healthy
       ranking-triton:
         condition: service_healthy
         required: false
