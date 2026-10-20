@@ -1,6 +1,8 @@
 from dataclasses import replace
 
+import faiss
 import numpy as np
+import pytest
 
 from video_commerce.ml.retrieval_evaluation import (
     RETRIEVAL_QUALITY_GATE_VERSION,
@@ -147,6 +149,7 @@ def test_exact_audit_reports_ann_top_k_overlap():
 def test_ann_scorer_uses_complete_index_membership_and_filters_invalid_ids():
     class Index:
         ntotal = 4
+        metric_type = faiss.METRIC_INNER_PRODUCT
 
         def search(self, vectors, k):
             assert vectors.shape == (1, 2)
@@ -165,3 +168,92 @@ def test_ann_scorer_uses_complete_index_membership_and_filters_invalid_ids():
     )
 
     assert list(scores["q1"]) == ["p1", "p3", "p2"]
+
+
+def _hnsw_index(embeddings, metric):
+    index = faiss.IndexHNSWFlat(embeddings.shape[1], 32, metric)
+    index.hnsw.efConstruction = 200
+    index.hnsw.efSearch = 50
+    index.add(embeddings)
+    return index
+
+
+def test_real_hnsw_l2_and_inner_product_indexes_score_higher_is_better():
+    rng = np.random.default_rng(11)
+    dimension, item_count = 16, 300
+    embeddings = rng.normal(size=(item_count, dimension)).astype(np.float32)
+    embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True)
+    product_ids = tuple(f"p{index:03d}" for index in range(item_count))
+    index_map = dict(enumerate(product_ids))
+    user_vectors = {}
+    queries = []
+    for query_index in range(40):
+        vector = rng.normal(size=dimension).astype(np.float32)
+        vector /= np.linalg.norm(vector)
+        user_id = f"u{query_index}"
+        user_vectors[user_id] = vector
+        nearest = np.argsort(-(embeddings @ vector))[:3]
+        queries.append(
+            RetrievalEvaluationQuery(
+                query_id=f"q{query_index}",
+                user_id=user_id,
+                relevant_product_ids=frozenset(product_ids[i] for i in nearest),
+                eligible_product_ids=product_ids,
+                seen_product_ids=frozenset(),
+            )
+        )
+
+    def encode_user(query):
+        return user_vectors[query.user_id]
+
+    exact = score_full_catalog_embeddings(
+        queries, dict(zip(product_ids, embeddings)), encode_user=encode_user
+    )
+    # Legacy (pre two_tower_index_v2) champion built with the default L2 metric.
+    champion = score_ann_index(
+        queries,
+        _hnsw_index(embeddings, faiss.METRIC_L2),
+        index_map,
+        encode_user=encode_user,
+    )
+    challenger = score_ann_index(
+        queries,
+        _hnsw_index(embeddings, faiss.METRIC_INNER_PRODUCT),
+        index_map,
+        encode_user=encode_user,
+    )
+
+    for ann in (champion, challenger):
+        audit = exact_audit_ann_recall(queries, ann, exact, cutoffs=(50,))
+        assert audit["ann_recall_at_50"] >= 0.95
+        assert evaluate_full_catalog(queries, ann, cutoffs=(50,))["recall_at_50"] == (
+            pytest.approx(1.0)
+        )
+    result = evaluate_retrieval_gate(
+        queries,
+        champion,
+        challenger,
+        replace(
+            _gate_config(),
+            min_queries=40,
+            min_users=40,
+            min_relevant_labels=40,
+            min_slice_queries=10_000,
+        ),
+    )
+    assert result.overall["recall_at_100_delta"] == pytest.approx(0.0, abs=0.01)
+    assert result.overall["mrr_delta"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_ann_scorer_rejects_unknown_index_metric():
+    class Index:
+        ntotal = 1
+        metric_type = 99
+
+    with pytest.raises(ValueError, match="metric"):
+        score_ann_index(
+            [_query("q1", "u1", {"p1"})],
+            Index(),
+            {0: "p1"},
+            encode_user=lambda current: np.asarray([1.0, 0.0]),
+        )

@@ -16,6 +16,7 @@ from video_commerce.common.config import Config
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.ml.model_artifacts import ModelArtifactManager
+from video_commerce.ml.model_release_quality import QUALITY_GATE_POLICY_VERSION
 from video_commerce.ml.pit_training_dataset import PitTrainingDatasetReader
 from video_commerce.ml.ranking import RankingModel
 from video_commerce.ml.ranking_onnx import export_ranking_onnx
@@ -157,7 +158,7 @@ async def run(args):
             "training_pit_materialization_run_id": source.materialization_run_id,
             "training_seed": 42,
             "training_code_revision": os.getenv("GIT_COMMIT_SHA", "unknown"),
-            "quality_gate_policy_version": "ranking_quality_gate_v2",
+            "quality_gate_policy_version": QUALITY_GATE_POLICY_VERSION,
             "holdout_window": {
                 "start": source.max_as_of_ts - 7 * 86400,
                 "end": source.max_as_of_ts,

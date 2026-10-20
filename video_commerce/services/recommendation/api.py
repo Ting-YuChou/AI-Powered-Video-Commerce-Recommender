@@ -1226,7 +1226,7 @@ async def startup_event():
         )
         if not active_rrf_release_valid(active):
             raise RuntimeError(
-                "production RRF requires a promoted ranking_quality_gate_v2 release with matching fusion policy"
+                "production RRF requires a promoted Phase C ranking quality gate (v2+) release with matching fusion policy"
             )
 
     object_storage = ObjectStorage(runtime.config.object_storage_config)

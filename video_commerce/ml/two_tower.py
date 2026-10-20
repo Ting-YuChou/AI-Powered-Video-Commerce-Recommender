@@ -1673,7 +1673,11 @@ class TwoTowerTrainer:
             for i, idx in enumerate(batch_idxs):
                 all_embeddings[idx - 1] = embs[i]
 
-        index = faiss.IndexHNSWFlat(self.output_dim, 32)
+        # Item embeddings are L2-normalized, so inner product is cosine
+        # similarity and FAISS returns higher-is-better scores.
+        index = faiss.IndexHNSWFlat(
+            self.output_dim, 32, faiss.METRIC_INNER_PRODUCT
+        )
         index.hnsw.efConstruction = 200
         index.hnsw.efSearch = 50
         index.add(all_embeddings)

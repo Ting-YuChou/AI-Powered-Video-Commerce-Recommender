@@ -4,12 +4,18 @@ from dataclasses import replace
 
 import pytest
 
+import numpy as np
+
 from video_commerce.ml.model_release_quality import (
     GateDecision,
+    QUALITY_GATE_POLICY_VERSION,
     RankingEvaluationRow,
     RankingEvaluationSpool,
     RankingPrediction,
     RankingQualityGateConfig,
+    _cluster_bootstrap_ndcg,
+    _informative_impression_count,
+    _mean_ndcg,
     evaluate_quality_gate,
     split_fixed_holdout,
     split_training_examples_fixed_holdout,
@@ -173,7 +179,9 @@ def test_quality_gate_passes_non_regressing_challenger_deterministically():
     assert first.decision is GateDecision.PASSED
     assert first.overall["ndcg_at_10_delta"] == pytest.approx(0.0)
     assert first.bootstrap == second.bootstrap
-    assert first.policy_version == "ranking_quality_gate_v2"
+    assert first.policy_version == "ranking_quality_gate_v3"
+    assert first.policy_version == QUALITY_GATE_POLICY_VERSION
+    assert first.overall["ndcg_informative_impressions"] == 3
 
 
 def test_quality_gate_rejects_serving_order_regression():
@@ -253,3 +261,75 @@ def test_quality_gate_ties_use_product_id_independently_of_row_order():
     predictions = {row.observation_id: RankingPrediction(0.5, 0.5, 0.5, 1.0) for row in rows}
     assert _mean_ndcg(rows, predictions) == pytest.approx(1.0)
     assert _mean_ndcg(list(reversed(rows)), predictions) == pytest.approx(1.0)
+
+
+def _score(serving_score: float) -> RankingPrediction:
+    return RankingPrediction(
+        serving_score=serving_score, ctr=0.5, ctcvr=0.1, predicted_value=1.0
+    )
+
+
+def test_ndcg_excludes_all_view_slates():
+    rows = [
+        _row(impression="engaged", user="u1", product="a", timestamp=1.0, relevance=1.0),
+        _row(
+            impression="engaged",
+            user="u1",
+            product="b",
+            timestamp=1.0,
+            relevance=2.0,
+            clicked=True,
+        ),
+    ]
+    for index in range(9):
+        rows.extend(
+            _row(
+                impression=f"views{index}",
+                user="u2",
+                product=product,
+                timestamp=1.0,
+                relevance=1.0,
+            )
+            for product in ("a", "b", "c")
+        )
+    # The view-only row "a" outranks the clicked row "b" in the engaged slate.
+    misranked = {
+        row.observation_id: _score(1.0 if row.product_id == "a" else 0.0)
+        for row in rows
+    }
+
+    expected = 1.0 / np.log2(3.0)
+    assert _informative_impression_count(rows) == 1
+    # All-view slates would otherwise score a perfect 1.0 and dilute the miss.
+    assert _mean_ndcg(rows, misranked) == pytest.approx(expected)
+
+
+def test_ndcg_delta_is_clearly_negative_for_random_order_challenger():
+    rng = np.random.default_rng(7)
+    rows: list[RankingEvaluationRow] = []
+    for index in range(200):
+        clicked_position = int(rng.integers(5)) if index % 5 == 0 else None
+        for position in range(5):
+            clicked = position == clicked_position
+            rows.append(
+                _row(
+                    impression=f"i{index}",
+                    user=f"u{index % 40}",
+                    product=f"p{position}",
+                    timestamp=1.0,
+                    relevance=2.0 if clicked else 1.0,
+                    clicked=clicked,
+                )
+            )
+    champion = {
+        row.observation_id: _score(1.0 if row.clicked else 0.0) for row in rows
+    }
+    challenger = {row.observation_id: _score(float(rng.random())) for row in rows}
+
+    delta = _mean_ndcg(rows, challenger) - _mean_ndcg(rows, champion)
+    bootstrap = _cluster_bootstrap_ndcg(rows, champion, challenger, _small_config())
+
+    assert _informative_impression_count(rows) == 40
+    assert _mean_ndcg(rows, champion) == pytest.approx(1.0)
+    assert delta < -0.25
+    assert bootstrap["ndcg_at_10_delta_ci_upper"] < -0.15

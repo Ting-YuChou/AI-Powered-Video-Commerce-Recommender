@@ -13,6 +13,11 @@ import numpy as np
 
 RETRIEVAL_QUALITY_GATE_VERSION = "retrieval_quality_gate_v1"
 
+# faiss.METRIC_INNER_PRODUCT / faiss.METRIC_L2; mirrored here so offline
+# evaluation does not need to import faiss just to read ``index.metric_type``.
+FAISS_METRIC_INNER_PRODUCT = 0
+FAISS_METRIC_L2 = 1
+
 
 class RetrievalGateDecision(str, Enum):
     PASSED = "passed"
@@ -119,10 +124,22 @@ def score_ann_index(
     encode_user,
     max_results: int = 200,
 ) -> dict[str, dict[str, float]]:
-    """Search an ANN index containing the complete pinned eligible catalog."""
+    """Search an ANN index containing the complete pinned eligible catalog.
+
+    Returned scores are always higher-is-better: inner-product indexes keep
+    the raw similarity and L2 indexes (pre-``two_tower_index_v2`` champions)
+    report the negated distance.
+    """
     total = int(getattr(index, "ntotal", 0))
     if total <= 0 or len(index_map) != total:
         raise ValueError("retrieval ANN index does not cover its catalog mapping")
+    metric_type = getattr(index, "metric_type", None)
+    if metric_type == FAISS_METRIC_INNER_PRODUCT:
+        score_sign = 1.0
+    elif metric_type == FAISS_METRIC_L2:
+        score_sign = -1.0
+    else:
+        raise ValueError(f"retrieval ANN index metric is unsupported: {metric_type!r}")
     scores: dict[str, dict[str, float]] = {}
     for query in queries:
         vector = np.asarray(encode_user(query), dtype=np.float32).reshape(1, -1)
@@ -135,7 +152,7 @@ def score_ann_index(
             if faiss_index < 0:
                 continue
             product_id = index_map.get(faiss_index)
-            score = float(raw_score)
+            score = score_sign * float(raw_score)
             if product_id is None or not math.isfinite(score):
                 raise ValueError("retrieval ANN result is incompatible or non-finite")
             query_scores[str(product_id)] = score
