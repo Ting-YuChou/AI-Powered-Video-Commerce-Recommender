@@ -1298,20 +1298,25 @@ class ObservabilityManager:
     def update_typed_pit_training_metrics(
         self,
         *,
-        assembler_parity_ratio: float,
-        label_reconciliation_ratio: float,
-        current_state_calls: int,
-        invalid_rows: int,
         value_mask_coverage: float,
+        assembler_parity_ratio: Optional[float] = None,
+        label_reconciliation_ratio: Optional[float] = None,
+        current_state_calls: Optional[int] = None,
+        invalid_rows: Optional[int] = None,
     ) -> None:
-        self.pit_assembler_vector_parity_ratio.set(
-            max(0.0, min(1.0, float(assembler_parity_ratio)))
-        )
-        self.pit_label_reconciliation_ratio.set(
-            max(0.0, min(1.0, float(label_reconciliation_ratio)))
-        )
-        self.pit_current_state_calls.set(max(0, int(current_state_calls)))
-        self.pit_invalid_feature_or_label_rows.set(max(0, int(invalid_rows)))
+        """Set only measured values; an unmeasured gauge stays absent, not green."""
+        if assembler_parity_ratio is not None:
+            self.pit_assembler_vector_parity_ratio.set(
+                max(0.0, min(1.0, float(assembler_parity_ratio)))
+            )
+        if label_reconciliation_ratio is not None:
+            self.pit_label_reconciliation_ratio.set(
+                max(0.0, min(1.0, float(label_reconciliation_ratio)))
+            )
+        if current_state_calls is not None:
+            self.pit_current_state_calls.set(max(0, int(current_state_calls)))
+        if invalid_rows is not None:
+            self.pit_invalid_feature_or_label_rows.set(max(0, int(invalid_rows)))
         self.pit_value_mask_coverage_ratio.set(
             max(0.0, min(1.0, float(value_mask_coverage)))
         )

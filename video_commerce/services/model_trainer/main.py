@@ -15,6 +15,7 @@ import socket
 import threading
 import torch
 import uuid
+from typing import Optional
 
 from video_commerce.common.config import Config, RankingConfig
 from video_commerce.data_plane.feature_store import FeatureStore
@@ -23,6 +24,7 @@ from video_commerce.ml.model_release_quality import (
     HoldoutWindow,
     RankingEvaluationSpool,
     RankingQualityGateConfig,
+    default_gate_config,
     evaluate_quality_gate,
     evaluation_rows_from_examples,
     split_training_examples_fixed_holdout,
@@ -195,6 +197,78 @@ class ModelTrainerService:
             for example in examples
         ]
 
+    def _expected_active_ranking_schema(self) -> Optional[str]:
+        if (
+            self.config.ranking_config.feature_contract_version
+            == "ranking_ltr_v3_categorical_sources"
+        ):
+            return None
+        return self.ranking_model.feature_schema_version
+
+    def _label_purge_seconds(self) -> float:
+        """Labels of rows this close to the holdout can come from holdout events."""
+        lake = getattr(self.config, "feature_lake_config", None)
+        window = float(getattr(lake, "attribution_window_hours", 0) or 0)
+        lateness = float(getattr(lake, "allowed_lateness_hours", 0) or 0)
+        return (window + lateness) * 3600.0
+
+    def _challenger_checkpoint_path(self) -> str:
+        """Where this trainer writes challengers; never read back as a champion."""
+        base = Path(self.config.model_config.ranking_model_path)
+        return str(base.with_name(f"{base.stem}.challenger{base.suffix or '.pt'}"))
+
+    async def _refresh_active_ranking_checkpoint(self):
+        """Resolve the release serving right now; it can change after init."""
+        manager = getattr(self, "artifact_manager", None)
+        if manager is None or not hasattr(manager, "sync_selected_ranking_checkpoint"):
+            return getattr(self, "loaded_ranking_checkpoint", None)
+        try:
+            record = await manager.sync_selected_ranking_checkpoint(
+                gate_mode=self.config.model_release_config.gate_mode,
+                environment=self.config.model_release_config.environment,
+                expected_feature_schema_version=self._expected_active_ranking_schema(),
+            )
+        except Exception:
+            logger.warning("active_ranking_release_refresh_failed", exc_info=True)
+            return None
+        if record is None or record.payload.get("active_generation") is None:
+            return None
+        self.loaded_ranking_checkpoint = record
+        return record
+
+    async def _load_champion_model(self, active_checkpoint) -> "RankingModel":
+        """Load the active release's own checkpoint with its own feature contract."""
+        payload = dict(active_checkpoint.payload or {})
+        checkpoint_path = str(active_checkpoint.checkpoint_path or "")
+        if not checkpoint_path or not Path(checkpoint_path).exists():
+            raise RuntimeError("active ranking checkpoint is not available locally")
+        definition = payload.get("feature_definition_version") or "ranking_ltr_v1"
+        champion_config = self.config.ranking_config.copy(deep=True)
+        champion_config.feature_contract_version = definition
+        champion_config.probability_calibration = (
+            "temperature_v1" if payload.get("probability_calibration") else "none"
+        )
+        champion_config.din_enabled = definition == "ranking_ltr_v2_din"
+        champion_config.trimodal_enabled = (
+            payload.get("feature_schema_version") == "ranking_v4_01_temporal_trimodal"
+        )
+        if champion_config.din_enabled:
+            din_sidecar = dict(
+                dict(payload.get("artifact_manifest") or {}).get(
+                    "din_embedding_sidecar"
+                )
+                or {}
+            )
+            if payload.get("artifact_generation_root") and din_sidecar.get("path"):
+                champion_config.din_embedding_sidecar_path = str(din_sidecar["path"])
+            else:
+                champion_config.din_embedding_sidecar_path = (
+                    self.artifact_manager.ranking_din_sidecar_local_path
+                )
+        champion = RankingModel(champion_config, observability=self.observability)
+        await champion.load_model(checkpoint_path)
+        return champion
+
     @staticmethod
     def _requires_pinned_candidate_sidecar(
         *,
@@ -359,12 +433,7 @@ class ModelTrainerService:
                 await self.artifact_manager.sync_selected_ranking_checkpoint(
                     gate_mode=self.config.model_release_config.gate_mode,
                     environment=self.config.model_release_config.environment,
-                    expected_feature_schema_version=(
-                        None
-                        if self.config.ranking_config.feature_contract_version
-                        == "ranking_ltr_v3_categorical_sources"
-                        else self.ranking_model.feature_schema_version
-                    ),
+                    expected_feature_schema_version=self._expected_active_ranking_schema(),
                 )
             )
         loaded_existing_checkpoint = False
@@ -720,6 +789,7 @@ class ModelTrainerService:
                     pit_dataset.assign_splits(
                         holdout_days=holdout_days,
                         attribution_cutoff=float(pit_dataset.attribution_cutoff),
+                        purge_seconds=self._label_purge_seconds(),
                         validation_fraction=float(
                             getattr(
                                 self.config.ranking_config, "validation_fraction", 0.0
@@ -750,6 +820,7 @@ class ModelTrainerService:
                         pit_dataset.examples,
                         holdout_days=release_config.holdout_days,
                         attribution_cutoff=pit_dataset.attribution_cutoff,
+                        purge_seconds=self._label_purge_seconds(),
                     )
                 else:
                     training_examples = pit_dataset.examples
@@ -773,29 +844,43 @@ class ModelTrainerService:
                 training_examples = await self._attach_trimodal_candidate_embeddings(
                     self.ranking_model, training_examples
                 )
-            active_checkpoint = getattr(self, "loaded_ranking_checkpoint", None)
-            if (
-                use_pit_dataset
-                and (release_holdout_examples or pit_streaming)
-                and active_checkpoint is not None
-                and active_checkpoint.payload.get("active_generation") is not None
-            ):
-                champion_config = self.config.ranking_config.copy(deep=True)
-                checkpoint_definition = active_checkpoint.payload.get(
-                    "feature_definition_version"
-                )
-                champion_config.feature_contract_version = (
-                    checkpoint_definition or "ranking_ltr_v1"
-                )
-                champion_config.probability_calibration = (
-                    "temperature_v1"
-                    if active_checkpoint.payload.get("probability_calibration")
-                    else "none"
-                )
-                champion_model = RankingModel(champion_config)
-                await champion_model.load_model(
-                    self.config.model_config.ranking_model_path
-                )
+            active_checkpoint = None
+            if use_pit_dataset and (release_holdout_examples or pit_streaming):
+                # The champion is whatever serves now, loaded from its own
+                # verified checkpoint, never this trainer's previous output.
+                active_checkpoint = await self._refresh_active_ranking_checkpoint()
+                if active_checkpoint is not None:
+                    try:
+                        champion_model = await self._load_champion_model(
+                            active_checkpoint
+                        )
+                    except Exception:
+                        logger.warning(
+                            "ranking_champion_load_failed_gate_skipped",
+                            exc_info=True,
+                            extra={"model_version": active_checkpoint.model_version},
+                        )
+                        champion_model = None
+                    if (
+                        champion_model is not None
+                        and self.config.ranking_config.feature_contract_version
+                        != "ranking_ltr_v3_categorical_sources"
+                        and champion_model.feature_schema_version
+                        == self.ranking_model.feature_schema_version
+                    ):
+                        # Warm-start from the champion so repeated retrains do
+                        # not drift from rejected challengers.
+                        try:
+                            await self.ranking_model.load_model(
+                                str(active_checkpoint.checkpoint_path)
+                            )
+                        except Exception:
+                            logger.warning(
+                                "ranking_champion_warm_start_failed", exc_info=True
+                            )
+            # Training saves to loaded_model_path; keep that off the champion
+            # file (an immutable generation file or the synced active copy).
+            self.ranking_model.loaded_model_path = self._challenger_checkpoint_path()
             training_kwargs = {"training_sample_source": training_sample_source}
             if pit_training_cancel_event is not None:
                 training_kwargs["cancellation_event"] = pit_training_cancel_event
@@ -849,18 +934,13 @@ class ModelTrainerService:
                 self.ranking_model.model_version = (
                     f"pit-{pit_dataset.materialization_run_id}"
                 )
-                await self.ranking_model.save_model(
-                    self.ranking_model.loaded_model_path
-                    or self.config.model_config.ranking_model_path
-                )
+                await self.ranking_model.save_model(self._challenger_checkpoint_path())
             if use_pit_dataset and hasattr(
                 self.observability, "update_typed_pit_training_metrics"
             ):
+                # Only report what this trainer measures; parity, leakage and
+                # quarantine come from the PIT manifest, not constants.
                 self.observability.update_typed_pit_training_metrics(
-                    assembler_parity_ratio=1.0,
-                    label_reconciliation_ratio=1.0,
-                    current_state_calls=0,
-                    invalid_rows=0,
                     value_mask_coverage=(
                         pit_dataset.value_mask_coverage("training")
                         if pit_streaming
@@ -868,10 +948,7 @@ class ModelTrainerService:
                     ),
                 )
             if self.ranking_model.is_trained and self.artifact_manager:
-                ranking_checkpoint_path = (
-                    self.ranking_model.loaded_model_path
-                    or self.config.model_config.ranking_model_path
-                )
+                ranking_checkpoint_path = self._challenger_checkpoint_path()
                 onnx_path = None
                 onnx_export = None
                 if getattr(self.config.ranking_config, "onnx_export_enabled", False):
@@ -1116,14 +1193,15 @@ class ModelTrainerService:
                         and (release_holdout_examples or pit_streaming)
                         and record.payload.get("model_release_id")
                     ):
-                        quality_config = RankingQualityGateConfig(
+                        quality_config = replace(
+                            default_gate_config("retrain"),
                             **{
                                 field.name: getattr(
                                     self.config.model_release_config, field.name
                                 )
                                 for field in fields(RankingQualityGateConfig)
                                 if hasattr(self.config.model_release_config, field.name)
-                            }
+                            },
                         )
                         if pit_streaming:
                             (

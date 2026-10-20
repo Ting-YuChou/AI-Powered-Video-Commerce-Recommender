@@ -175,12 +175,14 @@ class RankingTrainingSource:
         attribution_cutoff: float,
         validation_fraction: float,
         calibration_fraction: float = 0.0,
+        purge_seconds: float = 0.0,
     ) -> None:
         self.source.assign_ranking_splits(
             holdout_days=holdout_days,
             attribution_cutoff=attribution_cutoff,
             validation_fraction=validation_fraction,
             calibration_fraction=calibration_fraction,
+            purge_seconds=purge_seconds,
         )
 
     def row_count_for_split(self, split: str) -> int:

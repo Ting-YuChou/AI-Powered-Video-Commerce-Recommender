@@ -268,6 +268,7 @@ class VerifiedPitSource:
         attribution_cutoff: float,
         validation_fraction: float,
         calibration_fraction: float = 0.0,
+        purge_seconds: float = 0.0,
     ) -> None:
         validation_fraction = float(validation_fraction)
         calibration_fraction = float(calibration_fraction)
@@ -291,6 +292,15 @@ class VerifiedPitSource:
                 "UPDATE groups SET split='holdout' WHERE max_as_of_ts >= ?",
                 (holdout_start,),
             )
+            # Groups labelled inside the holdout's attribution reach are
+            # excluded from every fitting split (split='purged').
+            purge = max(0.0, float(purge_seconds))
+            if purge > 0.0:
+                connection.execute(
+                    "UPDATE groups SET split='purged' "
+                    "WHERE split='training' AND max_as_of_ts >= ?",
+                    (holdout_start - purge,),
+                )
             pre_holdout = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM groups WHERE split='training'"

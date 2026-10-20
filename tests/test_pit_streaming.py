@@ -137,6 +137,36 @@ def test_ranking_split_reserves_calibration_after_validation_and_before_holdout(
     assert source.group_ids("holdout") == ("holdout",)
 
 
+def test_ranking_split_purges_groups_labelled_inside_holdout_reach(tmp_path):
+    builder = PitSpoolBuilder(
+        tmp_path,
+        generation_id="manifest-purge",
+        kind="ranking",
+        max_group_rows=10,
+        max_bytes=10_000_000,
+    )
+    day = 86400.0
+    builder.add_rows(
+        [
+            _row("old", "a", 1.0),
+            _row("near-holdout", "b", 10 * day),
+            _row("holdout", "c", 20 * day),
+        ]
+    )
+    source = builder.finalize(expected_rows=3)
+
+    source.assign_ranking_splits(
+        holdout_days=7,
+        attribution_cutoff=30 * day,
+        validation_fraction=0.0,
+        purge_seconds=7 * day,
+    )
+
+    assert source.group_ids("training") == ("old",)
+    assert source.group_ids("purged") == ("near-holdout",)
+    assert source.group_ids("holdout") == ("holdout",)
+
+
 def test_spool_value_stats_match_numpy_linear_quantile(tmp_path):
     builder = PitSpoolBuilder(
         tmp_path,
