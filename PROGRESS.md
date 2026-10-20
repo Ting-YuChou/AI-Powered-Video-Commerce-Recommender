@@ -1,5 +1,100 @@
 # Progress
 
+## 2026-10-20 — Phase 0 hardening (review items 24, 25, 26, 36, 45, 67, 68, 70, 04)
+
+- Measurement: Two-Tower, content, and CF FAISS indexes use inner product.
+  `score_ann_index` normalizes scores by `metric_type`, and the Two-Tower meta
+  is `two_tower_index_v2` with a `metric` field; content generations without a
+  metric are rejected and rebuilt. The ranking gate NDCG excludes view-only
+  gain, skips non-informative slates, and reports
+  `ndcg_informative_impressions`; policy `ranking_quality_gate_v3`. v2 is still
+  accepted as Phase C evidence. Training labels and the `ranking.py` sklearn
+  NDCG are unchanged.
+- Flink: the submitter script (`flink-jobs/interaction-features/bin/`) restores
+  from an explicit savepoint, then the newest retained `file://` checkpoint, then
+  empty state. `UserFeatureRedisSink` refuses an empty-state start under an epoch
+  owned by another job (`flink:feature_state_owner`). Redis conflicts are counted
+  and skipped instead of thrown. Restarts are bounded to 10 failures per 10 min.
+  New `FlinkRedisSnapshotStaleWrites` alert. `flink_realtime_ops.sh verify`
+  requires RUNNING, and the recovery drill adds a compose down/up case.
+- Inputs: the Flink parsers send fields wider than their DB column to the DLQ,
+  and the views sink uses `ON CONFLICT DO NOTHING`. API IDs are capped at 255,
+  duplicate view event IDs are rejected, and `X-Request-ID` must be 1-64 safe
+  characters. The ingest `payload_hash` ignores a server-filled `event_time`.
+- Defaults: the Compose and Helm PIT presets set trimodal shadow off, and shadow
+  skips when no PIT URI is set. Axios no longer forces JSON on FormData uploads.
+  Helm adds `images.contentWorker`, workload `imageRef`, and an explicit
+  `MODEL_OCR_BACKEND`; CI builds the content-worker target. Caddy binds
+  `EDGE_BIND_ADDRESS` (default `127.0.0.1`). The gateway returns
+  `503 AUTH_NOT_CONFIGURED` when the auth mode has no credential, and the local
+  default is `SECURITY_AUTH_MODE=disabled`.
+- Key files: `video_commerce/ml/{two_tower,retrieval_evaluation,retrieval_release_training,vector_search,model_release_quality}.py`,
+  `flink-jobs/interaction-features/` (job, test, Dockerfile, bin), `docker-compose.yml`,
+  `video_commerce/services/{gateway,interaction_ingest,model_trainer}/`, `video_commerce/common/{models,service_common}.py`,
+  `charts/video-commerce/`, `Code.Frontend/src/api.js`, `monitoring/prometheus-rules.yml`,
+  `docs/operations/{flink-realtime-recovery,deploy-rollback-runbook,object-storage-and-auth}.md`, `AGENTS.md`.
+- Compose fixes found during Docker validation, both predating this work:
+  - ZooKeeper now persists `zookeeper_data`/`zookeeper_log`. Before, any
+    compose down/up made Kafka fail with `InconsistentClusterIdException`.
+  - ranking-service depends on `ranking-coordinator` again (dropped in
+    `46f69c8`).
+- Verification:
+  - Backend suite: Docker `backend-tests` 838 passed, 6 skipped. The pinned
+    py3.10 venv also passed (832 passed, 7 skipped).
+  - Flink: `mvn test` in Docker passed 42 tests; promtool rule tests passed.
+  - `scripts/run_flink_recovery_drill.sh` passed, including the new
+    compose down/up case: the job restored from the latest checkpoint,
+    generation went 4 to 5, and it stayed RUNNING.
+  - `scripts/run_flink_closed_loop_smoke.sh` passed.
+  - Helm lint/template and kubeconform: 75 valid resources (default and
+    pit-production).
+  - The content-worker, backend, edge and Flink images built;
+    `/opt/paddleocr` is present in the content-worker image.
+  - Frontend: vitest 16 passed; lint and build passed.
+- Gaps:
+  - The manual `docker-integration` job still cannot pass on a fresh
+    stack. It needs a sample vector bootstrap, and gateway readiness
+    cascades from an untrained (degraded) ranker (review item 59).
+  - Concurrent `create_all` across many runner replicas races on a fresh
+    Postgres.
+  - Retrieval and NDCG baselines have not been regenerated, and v2 gate
+    evidence is still accepted.
+  - The bundled UI sends no API key (item 22).
+  - The first upgrade to this version must use the savepoint path.
+  - Old checkpoint dirs are not pruned.
+
+## 2026-10-20 — Project strengthening review refresh (first version 2026-10-07)
+
+- Re-scanned the whole project at `f95f378` (= `origin/main` `1e860c2`) across
+  online data, offline/PIT data, ranking models, retrieval/multimodal, serving
+  runtime, and infra/CI/frontend. Rewrote the review: all 23 original findings
+  now carry current status (17 partial, 6 open, none fully closed) and 54 new
+  findings (24–77: 2 P0, 29 P1, 17 P2, 6 P3) with a revised staged roadmap.
+  Runtime, models, and deployment settings are unchanged.
+- P0s: the Two-Tower release gate ranks raw FAISS L2 distances as similarity
+  (legacy content index has the same L2/IP mix-up); resubmitting the Flink job
+  without restore (`startup.sh restart`, no JobManager HA) makes every Redis
+  commit `stale` and then crash-loops on `conflict`.
+- Corrections to earlier entries: retrieval artifact hot reload never runs in
+  the default remote-ranking topology (sync task requires a local ranker), and
+  PIT parity/leakage gauges are hard-coded, so their alerts cannot fire. Other
+  notable gaps: champion loaded from the trainer's own last challenger, NDCG
+  diluted by all-view slates, default trimodal shadow breaks the PIT preset,
+  Helm content-worker lacks PaddleOCR, frontend Live upload sends JSON, and
+  Compose defaults to an open unauthenticated API.
+- Key files: `docs/reviews/2026-10-07-project-strengthening-review.md`, `PROGRESS.md`.
+- Verification: `docker compose config -q` passed; host pytest (Python 3.12.4,
+  excluding integration) `394 passed, 2 skipped, 7 failed` — all failures are
+  missing host `onnx`/`faiss`, and 34 modules were uncollectable without
+  `sqlalchemy`; frontend vitest 14 passed under Node 26.7.0 and lint passed.
+  P0s and key P1s were confirmed by reading source; small scratchpad probes
+  reproduced DIN batch variance, NDCG dilution, slice-gate blocking, ListNet
+  value gradients, axios FormData-to-JSON, and the event_time hash mismatch.
+- Gaps: Docker daemon unavailable, so no Kafka/Flink/Compose smoke, image
+  build, training, ONNX parity, or load test; no helm/promtool/kubeconform on
+  host; CVEs matched by version only. Findings remain open; this task updated
+  the review, not the proposed fixes.
+
 ## 2026-10-14 — Phase C ranking contracts and experiment gates (acceptance pending)
 
 - Added training-only categorical vocabularies/embeddings and clipped dense
@@ -266,26 +361,6 @@
   cluster-ID mismatch (`rGFua...` versus `dM0r...`). Containers were removed and
   volumes preserved. Hot/unique load baselines therefore remain unrun; no latency
   or production-readiness claim is made from the offline checks.
-
-## 2026-10-07 — Source-grounded project strengthening review
-
-- Reviewed split-service data capture, Kafka/Flink features, retrieval/ranking,
-  PIT training, artifacts, frontend, CI, and deployment defaults at `5695367`.
-  Added a prioritized report with 23 findings, source locations, model ablations,
-  acceptance criteria, and a staged implementation roadmap; runtime is unchanged.
-- Confirmed Compose default/PIT profile gaps, content-worker exceptions returning
-  handled to the Kafka retry wrapper, HTTP retry event-ID instability, synthetic
-  catalog bootstrap, serving/evaluation score mismatch, and scaling opportunities.
-- Key files: `docs/reviews/2026-10-07-project-strengthening-review.md`, `PROGRESS.md`.
-- Verification: Compose config and filtered profile rendering; 15 PIT/contract
-  tests plus 46 synchronous ranking/DIN tests passed (16 async deselected); two
-  isolated source-method probes; frontend lint/build passed. Frontend tests first
-  failed under Node 26 Web Storage, then 14 passed with
-  `NODE_OPTIONS=--no-experimental-webstorage`; no source fix was applied.
-- Gaps: Docker daemon unavailable; broader host tests need pytest-asyncio,
-  cv2/faiss/redis. No live Kafka/Flink, full backend/integration suite, model-quality
-  training, Helm validation, or new capacity benchmark. Findings remain open;
-  this task produced the review, not the proposed implementation.
 
 ## 2026-08-12 — Opt-in ONNX Runtime and Triton ranking backend
 
