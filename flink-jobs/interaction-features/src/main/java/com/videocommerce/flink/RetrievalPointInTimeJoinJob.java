@@ -31,7 +31,8 @@ public final class RetrievalPointInTimeJoinJob {
                 config.allowedLatenessHours,
                 config.materializationCutoff,
                 config.runId,
-                config.catalogGenerationId))
+                config.catalogGenerationId,
+                config.seenHistoryLimit))
         .await();
     tables.executeSql(
         buildExportTableSql(config.exportUri, config.runId, config.exportAttempt));
@@ -68,32 +69,86 @@ public final class RetrievalPointInTimeJoinJob {
       int allowedLatenessHours,
       double materializationCutoff,
       String runId,
-      String catalogGenerationId) {
+      String catalogGenerationId,
+      int seenHistoryLimit) {
+    return "INSERT INTO `"
+        + identifier(namespace)
+        + "`.`retrieval_training_pit`\n"
+        + buildSelectSql(
+            namespace,
+            attributionWindowHours,
+            allowedLatenessHours,
+            materializationCutoff,
+            runId,
+            catalogGenerationId,
+            seenHistoryLimit);
+  }
+
+  /**
+   * Builds the PIT query rows.
+   *
+   * <p>Every anchor (viewed impression, ranker-rejected candidate, organic positive) must be
+   * mature: {@code as_of_ts + attribution window + allowed lateness <= cutoff}, the same rule the
+   * Python reader enforces per row. The pinned catalog generation is a static item snapshot: it
+   * must be available by the materialization cutoff, not before each query (see
+   * {@code retrieval_pit_dataset.py}). {@code seen_product_ids_json} mirrors serving's {@code
+   * exclude_items}: the distinct products of the user's {@code seenHistoryLimit} most recent
+   * interactions (any action) that happened strictly before, and were available at, {@code
+   * as_of_ts}.
+   */
+  static String buildSelectSql(
+      String namespace,
+      int attributionWindowHours,
+      int allowedLatenessHours,
+      double materializationCutoff,
+      String runId,
+      String catalogGenerationId,
+      int seenHistoryLimit) {
     if (attributionWindowHours <= 0 || allowedLatenessHours < 0) {
       throw new IllegalArgumentException("retrieval PIT windows are invalid");
     }
+    if (seenHistoryLimit < 0) {
+      throw new IllegalArgumentException("retrieval seen history limit must be non-negative");
+    }
+    String seenCtes =
+        seenHistoryLimit == 0
+            ? ""
+            : "seen_events AS (\n"
+                + " SELECT v.observation_id,i.product_id,ROW_NUMBER() OVER (PARTITION BY v.observation_id "
+                + "ORDER BY i.event_time_epoch DESC,i.available_at_epoch DESC,i.event_id DESC) seen_rank\n"
+                + " FROM viewed v JOIN `%1$s`.`interaction_history` i ON i.user_id=v.user_id"
+                + " AND i.product_id IS NOT NULL AND i.product_id<>''"
+                + " AND i.event_time_epoch < v.as_of_ts AND i.available_at_epoch <= v.as_of_ts\n),\n"
+                + "seen_products AS (\n"
+                + " SELECT observation_id,JSON_ARRAYAGG(product_id) seen_product_ids_json FROM ("
+                + "SELECT observation_id,product_id FROM seen_events WHERE seen_rank <= %7$d"
+                + " GROUP BY observation_id,product_id) GROUP BY observation_id\n),\n";
+    String seenSelect =
+        seenHistoryLimit == 0 ? "'[]'" : "COALESCE(s.seen_product_ids_json,'[]')";
+    String seenJoin =
+        seenHistoryLimit == 0 ? "" : " LEFT JOIN seen_products s ON s.observation_id=v.observation_id";
+    String mature = "event_time_epoch + %2$d * 3600 + %3$d * 3600 <= %4$f AND available_at_epoch <= %4$f";
     return String.format(
-        "INSERT INTO `%1$s`.`retrieval_training_pit`\n"
-            + "WITH viewed AS (\n"
+        "WITH viewed AS (\n"
             + " SELECT observation_id,COALESCE(JSON_VALUE(canonical_payload_json,'$.impression_id'),observation_id) query_id,"
             + "user_id,product_id,event_time_epoch as_of_ts,event_date,'viewed_impression' label_source,"
             + "CAST(NULL AS STRING) fixed_label_type,CAST(NULL AS DOUBLE) fixed_label_event_time,"
-            + "CAST(NULL AS DOUBLE) fixed_label_available_at\n"
+            + "CAST(NULL AS DOUBLE) fixed_label_available_at,CAST(NULL AS DOUBLE) ranker_score\n"
             + " FROM `%1$s`.`recommendation_view_history`\n"
-            + " WHERE event_time_epoch + %2$d * 3600 + %3$d * 3600 <= %4$f"
-            + " AND available_at_epoch <= %4$f\n"
+            + " WHERE " + mature + "\n"
             + " UNION ALL SELECT observation_id,"
             + "COALESCE(JSON_VALUE(canonical_payload_json,'$.impression_id'),observation_id),"
             + "user_id,product_id,event_time_epoch,event_date,'ranker_rejected','ranker_rejected',"
-            + "event_time_epoch,available_at_epoch FROM `%1$s`.`ranking_observations`"
+            + "event_time_epoch,available_at_epoch,"
+            + "JSON_VALUE(candidate_features_json,'$.raw_ranking_score' RETURNING DOUBLE NULL ON EMPTY NULL ON ERROR)"
+            + " FROM `%1$s`.`ranking_observations`"
             + " WHERE event_type='ranking_rejected_observation'"
-            + " AND event_time_epoch + %2$d * 3600 + %3$d * 3600 <= %4$f"
-            + " AND available_at_epoch <= %4$f\n"
+            + " AND " + mature + "\n"
             + " UNION ALL SELECT event_id,event_id,user_id,product_id,event_time_epoch,event_date,"
-            + "'organic_positive',action,event_time_epoch,available_at_epoch"
+            + "'organic_positive',action,event_time_epoch,available_at_epoch,CAST(NULL AS DOUBLE)"
             + " FROM `%1$s`.`interaction_history` WHERE action IN ('click','add_to_cart','purchase')"
             + " AND JSON_VALUE(context_json,'$.impression_id') IS NULL"
-            + " AND event_time_epoch <= %4$f AND available_at_epoch <= %4$f\n),\n"
+            + " AND " + mature + "\n),\n"
             + "user_candidates AS (\n"
             + " SELECT v.observation_id,h.canonical_payload_json user_features_json,"
             + "h.event_time_epoch feature_event_time,h.available_at_epoch feature_available_at,"
@@ -105,7 +160,7 @@ public final class RetrievalPointInTimeJoinJob {
             + "ROW_NUMBER() OVER (PARTITION BY v.observation_id ORDER BY h.event_time_epoch DESC,h.available_at_epoch DESC,h.event_id DESC) catalog_rank\n"
             + " FROM viewed v JOIN `%1$s`.`item_feature_history` h ON h.entity_id=v.product_id"
             + " AND h.source_version='%6$s'"
-            + " AND h.event_time_epoch <= v.as_of_ts AND h.available_at_epoch <= v.as_of_ts\n),\n"
+            + " AND h.event_time_epoch <= %4$f AND h.available_at_epoch <= %4$f\n),\n"
             + "feedback_candidates AS (\n"
             + " SELECT v.observation_id,i.action,i.event_time_epoch label_event_time,"
             + "i.available_at_epoch label_available_at,ROW_NUMBER() OVER (PARTITION BY v.observation_id "
@@ -116,16 +171,20 @@ public final class RetrievalPointInTimeJoinJob {
             + " AND i.action IN ('click','add_to_cart','purchase')"
             + " AND i.event_time_epoch >= v.as_of_ts AND i.event_time_epoch <= v.as_of_ts + %2$d * 3600"
             + " AND i.available_at_epoch <= %4$f\n),\n"
+            + seenCtes
             + "deduplicated AS (SELECT * FROM `%1$s`.`retrieval_training_pit` WHERE materialization_run_id='%5$s')\n"
             + "SELECT '%5$s',v.query_id,v.user_id,v.product_id,v.label_source,"
             + "COALESCE(v.fixed_label_type,f.action,'viewed_no_positive'),"
             + "CASE COALESCE(v.fixed_label_type,f.action,'viewed_no_positive') WHEN 'purchase' THEN 5.0 WHEN 'add_to_cart' THEN 3.0 WHEN 'click' THEN 2.0 WHEN 'ranker_rejected' THEN 0.15 ELSE 0.25 END,"
             + "v.as_of_ts,COALESCE(v.fixed_label_event_time,f.label_event_time,v.as_of_ts + %2$d * 3600),"
             + "COALESCE(v.fixed_label_available_at,f.label_available_at,%4$f),u.feature_event_time,u.feature_available_at,"
-            + "c.catalog_generation_id,u.user_features_json,'[]',CAST(NULL AS DOUBLE),CURRENT_TIMESTAMP,v.event_date\n"
+            + "c.catalog_generation_id,u.user_features_json,"
+            + seenSelect
+            + ",v.ranker_score,CURRENT_TIMESTAMP,v.event_date\n"
             + "FROM viewed v JOIN user_candidates u ON u.observation_id=v.observation_id AND u.feature_rank=1"
             + " JOIN catalog_candidates c ON c.observation_id=v.observation_id AND c.catalog_rank=1"
             + " LEFT JOIN feedback_candidates f ON f.observation_id=v.observation_id AND f.feedback_rank=1"
+            + seenJoin
             + " LEFT JOIN deduplicated d ON d.query_id=v.query_id AND d.product_id=v.product_id AND d.label_source=v.label_source"
             + " WHERE d.query_id IS NULL",
         identifier(namespace),
@@ -133,7 +192,8 @@ public final class RetrievalPointInTimeJoinJob {
         allowedLatenessHours,
         materializationCutoff,
         literal(runId),
-        literal(catalogGenerationId));
+        literal(catalogGenerationId),
+        seenHistoryLimit);
   }
 
   static String buildExportTableSql(String exportUri, String runId, int attempt) {
@@ -178,7 +238,8 @@ public final class RetrievalPointInTimeJoinJob {
             "--materialization-run-id",
             "--catalog-generation-id",
             "--export-uri",
-            "--export-attempt");
+            "--export-attempt",
+            "--seen-history-limit");
     String catalog;
     String catalogUri;
     String warehouseUri;
@@ -191,6 +252,7 @@ public final class RetrievalPointInTimeJoinJob {
     String catalogGenerationId;
     String exportUri;
     int exportAttempt;
+    int seenHistoryLimit;
 
     static Config resolve(String[] args, Map<String, String> environment) {
       Map<String, String> values = new LinkedHashMap<>();
@@ -213,6 +275,8 @@ public final class RetrievalPointInTimeJoinJob {
       config.catalogGenerationId = value(values, "--catalog-generation-id", environment, "FEATURE_LAKE_RETRIEVAL_CATALOG_GENERATION_ID", null);
       config.exportUri = value(values, "--export-uri", environment, "FEATURE_LAKE_RETRIEVAL_PIT_EXPORT_URI", null);
       config.exportAttempt = Integer.parseInt(value(values, "--export-attempt", environment, "FEATURE_LAKE_EXPORT_ATTEMPT", "1"));
+      // Serving reads up to swing_itemcf_serving_interaction_limit (200) recent interactions.
+      config.seenHistoryLimit = Integer.parseInt(value(values, "--seen-history-limit", environment, "FEATURE_LAKE_RETRIEVAL_SEEN_HISTORY_LIMIT", "200"));
       return config;
     }
 
