@@ -82,6 +82,8 @@ jobs:
         run: docker compose config -q
       - name: Build backend production image
         run: docker build --target production -t video-commerce-backend:ci .
+      - name: Build content-worker image (PaddleOCR runtime)
+        run: docker build --target content-worker -t video-commerce-content-worker:ci .
       - name: Build frontend edge image
         run: docker build -f Code.Frontend/Dockerfile -t video-commerce-edge:ci .
 

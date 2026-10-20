@@ -50,7 +50,8 @@ case "$command" in
   verify)
     job_id="$(one_job)"
     state="$(curl -fsS "${BASE_URL}/jobs/${job_id}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state"))')"
-    [[ "$state" == "RUNNING" || "$state" == "RESTARTING" ]]
+    # RESTARTING is not healthy: a crash-looping job stays RESTARTING.
+    [[ "$state" == "RUNNING" ]]
     echo "${JOB_NAME} ${job_id} ${state}"
     ;;
   savepoint|stop-with-savepoint)

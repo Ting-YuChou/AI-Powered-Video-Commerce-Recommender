@@ -269,7 +269,7 @@ x-common-service: &common-service
     SERVICE_CONTENT_OUTBOX_RETENTION_DAYS: ${SERVICE_CONTENT_OUTBOX_RETENTION_DAYS:-7}
     SERVICE_CONTENT_ORPHAN_GRACE_SECONDS: ${SERVICE_CONTENT_ORPHAN_GRACE_SECONDS:-86400}
     SERVICE_CONTENT_PROCESSING_LEASE_SECONDS: ${SERVICE_CONTENT_PROCESSING_LEASE_SECONDS:-300}
-    SECURITY_AUTH_MODE: ${SECURITY_AUTH_MODE:-api_key}
+    SECURITY_AUTH_MODE: ${SECURITY_AUTH_MODE:-disabled}
     SECURITY_INTERNAL_SERVICE_KEY: ${SECURITY_INTERNAL_SERVICE_KEY:-}
     SECURITY_INTERNAL_SERVICE_KEY_FILE: ${SECURITY_INTERNAL_SERVICE_KEY_FILE:-}
     SECURITY_INTERNAL_SERVICE_HEADER: X-Internal-Service-Key
@@ -356,8 +356,10 @@ services:
       gateway-api:
         condition: service_healthy
     ports:
-      - "80:80"
-      - "443:443"
+      # Loopback by default. Set EDGE_BIND_ADDRESS=0.0.0.0 only after configuring
+      # API_API_KEY (or OIDC) and a non-disabled SECURITY_AUTH_MODE.
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:80:80"
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:443:443"
     volumes:
       - caddy_data:/data
       - caddy_config:/config
@@ -964,6 +966,11 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    # Persist ZooKeeper with kafka_data: a fresh ZooKeeper cluster ID makes the
+    # broker refuse its stored meta.properties after any compose down/up.
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
     networks:
       - video-commerce-network
     healthcheck:
@@ -1128,28 +1135,8 @@ services:
     build:
       context: ./flink-jobs/interaction-features
       dockerfile: Dockerfile
-    command:
-      - sh
-      - -lc
-      - |
-        until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
-        running_count="$$(flink list -m flink-jobmanager:8081 -r 2>/dev/null | grep -c 'video-commerce-interaction-features' || true)"
-        if [ "$${running_count}" -gt 1 ]; then
-          echo "multiple running video-commerce-interaction-features jobs detected" >&2
-          exit 1
-        fi
-        if [ "$${running_count}" -eq 0 ]; then
-          restore_args=""
-          if [ -n "$${FLINK_RESTORE_SAVEPOINT_PATH:-}" ]; then
-            restore_args="-s $${FLINK_RESTORE_SAVEPOINT_PATH}"
-          fi
-          flink run -d \
-            -m flink-jobmanager:8081 \
-            $${restore_args} \
-            -c com.videocommerce.flink.InteractionFeatureJob \
-            /opt/flink/usrlib/interaction-features.jar
-        fi
-        until [ "$$(flink list -m flink-jobmanager:8081 -r 2>/dev/null | grep -c 'video-commerce-interaction-features' || true)" -eq 1 ]; do sleep 2; done
+    # Restores from FLINK_RESTORE_SAVEPOINT_PATH or the newest retained checkpoint.
+    command: ["/opt/flink/vc-bin/submit-interaction-job.sh"]
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -1168,6 +1155,7 @@ services:
       FLINK_REPLAY_HORIZON_DAYS: ${FLINK_REPLAY_HORIZON_DAYS:-7}
       FLINK_FEATURE_STATE_EPOCH: ${FLINK_FEATURE_STATE_EPOCH:-}
       FLINK_RESTORE_SAVEPOINT_PATH: ${FLINK_RESTORE_SAVEPOINT_PATH:-}
+      FLINK_RESTORE_FROM_LATEST_CHECKPOINT: ${FLINK_RESTORE_FROM_LATEST_CHECKPOINT:-true}
       FLINK_KAFKA_TRANSACTION_TIMEOUT_MS: ${FLINK_KAFKA_TRANSACTION_TIMEOUT_MS:-600000}
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -1585,6 +1573,8 @@ services:
 
 volumes:
   caddy_data:
+  zookeeper_data:
+  zookeeper_log:
   caddy_config:
   models_data:
   upload_data:

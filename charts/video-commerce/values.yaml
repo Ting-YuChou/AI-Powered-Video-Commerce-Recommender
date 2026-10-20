@@ -21,6 +21,11 @@ images:
     repository: video-commerce-backend
     tag: ci
     pullPolicy: IfNotPresent
+  # Built from the Dockerfile content-worker target (production + PaddleOCR venv).
+  contentWorker:
+    repository: video-commerce-content-worker
+    tag: ci
+    pullPolicy: IfNotPresent
   pitOrchestrator:
     repository: video-commerce-pit-orchestrator
     tag: ci
@@ -238,6 +243,8 @@ appConfig:
   modelArtifactGenerationMinAgeHours: 24
   modelArtifactActivationPollSeconds: 30
   clipRevision: 57c216476eefef5ab752ec549e440a49ae4ae5f3
+  # paddle requires the contentWorker image; tesseract works with the backend image.
+  ocrBackend: paddle
   contentPipelineVersion: temporal-multimodal-v3
   contentOutboxBatchSize: 50
   contentOutboxLeaseSeconds: 30
@@ -783,6 +790,7 @@ backend:
     contentWorker:
       enabled: true
       name: content-worker
+      imageRef: contentWorker
       replicaCount: 1
       command: ["python", "-m", "video_commerce.services.content_worker.video_processor"]
       env:

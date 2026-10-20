@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Mapping, Any
 
 from video_commerce.ml.model_release_quality import (
-    QUALITY_GATE_POLICY_VERSION,
+    PHASE_C_QUALITY_GATE_POLICY_VERSIONS,
     SUPPORTED_QUALITY_GATE_POLICY_VERSIONS,
 )
 from video_commerce.ml.ranking_score import SCORE_POLICY_VERSION
@@ -62,7 +62,7 @@ def model_release_compatibility(
                 return _failed("invalid_v3_feature_artifacts")
             if (
                 manifest.get("quality_gate_policy_version")
-                != QUALITY_GATE_POLICY_VERSION
+                not in PHASE_C_QUALITY_GATE_POLICY_VERSIONS
             ):
                 return _failed("missing_or_incompatible_quality_gate_policy_version")
         if manifest.get("probability_calibration"):

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import time
 import uuid
 import logging
@@ -26,6 +27,10 @@ from video_commerce.common.observability import (
 from video_commerce.common.telemetry import configure_tracing
 
 logger = logging.getLogger(__name__)
+
+# Client-supplied request IDs flow into logs, traces and Kafka payloads; only adopt
+# short, log-safe values and mint a fresh ID otherwise.
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
 
 class ServiceRuntime:
@@ -277,7 +282,9 @@ def create_service_app(
             if runtime.config
             else "X-Request-ID"
         )
-        request_id = request.headers.get(request_id_header) or str(uuid.uuid4())
+        request_id = request.headers.get(request_id_header)
+        if not request_id or not _REQUEST_ID_PATTERN.fullmatch(request_id):
+            request_id = str(uuid.uuid4())
         request.state.request_id = request_id
         request.state.request_started_at = time.perf_counter()
         runtime.active_requests += 1

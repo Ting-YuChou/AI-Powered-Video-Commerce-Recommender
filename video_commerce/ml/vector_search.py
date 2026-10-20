@@ -31,6 +31,15 @@ from video_commerce.ml.content_clusters import (
 
 logger = logging.getLogger(__name__)
 
+# Product embeddings are L2-normalized, so inner product is cosine similarity
+# and higher scores are better (which ``similarity_threshold`` relies on).
+CONTENT_INDEX_METRIC = "inner_product"
+
+
+class VectorIndexMetricMismatch(ValueError):
+    """A persisted content index predates the inner-product metric and must be rebuilt."""
+
+
 class VectorSearchEngine:
     """
     FAISS-based vector search engine for product similarity matching.
@@ -127,21 +136,34 @@ class VectorSearchEngine:
             index_path, metadata_path = self._resolve_active_artifact_paths(
                 logical_index_path
             )
+            mode = str(getattr(self.config, "bootstrap_mode", "required")).lower()
+            loaded = False
             
             # Try to load existing index
             if not force_rebuild and index_path.exists() and metadata_path.exists():
-                manifest = self._validate_index_manifest(index_path, metadata_path)
-                await self._load_existing_index(index_path, metadata_path)
-                if manifest and int(manifest.get("product_count", -1)) != len(
-                    self.product_index_map
-                ):
-                    raise ValueError("vector index manifest product count mismatch")
-                if self.index.ntotal != len(self.product_index_map):
-                    raise ValueError("vector index row count does not match index map")
-                if set(self.product_index_map) != set(range(self.index.ntotal)):
-                    raise ValueError("vector index map is not contiguous")
-            else:
-                mode = str(getattr(self.config, "bootstrap_mode", "required")).lower()
+                try:
+                    manifest = self._validate_index_manifest(index_path, metadata_path)
+                    await self._load_existing_index(index_path, metadata_path)
+                except VectorIndexMetricMismatch as exc:
+                    # Stale-metric generations are rebuilt through the normal
+                    # bootstrap path below; required mode needs an explicit
+                    # rebuild instead of silently serving an empty catalog.
+                    if mode == "required":
+                        raise
+                    logger.warning(
+                        "Discarding stale vector index generation for rebuild: %s", exc
+                    )
+                else:
+                    if manifest and int(manifest.get("product_count", -1)) != len(
+                        self.product_index_map
+                    ):
+                        raise ValueError("vector index manifest product count mismatch")
+                    if self.index.ntotal != len(self.product_index_map):
+                        raise ValueError("vector index row count does not match index map")
+                    if set(self.product_index_map) != set(range(self.index.ntotal)):
+                        raise ValueError("vector index map is not contiguous")
+                    loaded = True
+            if not loaded:
                 if mode == "sample":
                     raise FileNotFoundError(
                         "Sample vector index is missing; run "
@@ -228,6 +250,11 @@ class VectorSearchEngine:
             raise ValueError("vector index manifest embedding dimension mismatch")
         if str(manifest.get("model_version") or "") != str(self.config.model_version):
             raise ValueError("vector index manifest model version mismatch")
+        if manifest.get("metric") != CONTENT_INDEX_METRIC:
+            raise VectorIndexMetricMismatch(
+                f"vector index manifest metric {manifest.get('metric')!r} != "
+                f"{CONTENT_INDEX_METRIC!r}; rebuild required"
+            )
         expected = {
             index_path: manifest.get("faiss_sha256"),
             metadata_path: manifest.get("metadata_sha256"),
@@ -248,6 +275,10 @@ class VectorSearchEngine:
             # Load FAISS index
             with self.index_lock:
                 self.index = faiss.read_index(str(index_path))
+                if self.index.metric_type != faiss.METRIC_INNER_PRODUCT:
+                    raise VectorIndexMetricMismatch(
+                        "vector index is not inner-product; rebuild required"
+                    )
                 
                 # Configure search parameters
                 if hasattr(self.index, 'hnsw'):
@@ -301,7 +332,11 @@ class VectorSearchEngine:
             # Create HNSW index
             with self.index_lock:
                 if self.config.index_type.upper() == "HNSW":
-                    self.index = faiss.IndexHNSWFlat(self.embedding_dim, self.config.hnsw_m)
+                    self.index = faiss.IndexHNSWFlat(
+                        self.embedding_dim,
+                        self.config.hnsw_m,
+                        faiss.METRIC_INNER_PRODUCT,
+                    )
                     self.index.hnsw.efConstruction = self.config.hnsw_ef_construction
                     self.index.hnsw.efSearch = self.config.hnsw_ef_search
                 else:
@@ -323,7 +358,9 @@ class VectorSearchEngine:
     async def _create_empty_index(self):
         """Create empty index as fallback."""
         with self.index_lock:
-            self.index = faiss.IndexHNSWFlat(self.embedding_dim, 32)
+            self.index = faiss.IndexHNSWFlat(
+                self.embedding_dim, 32, faiss.METRIC_INNER_PRODUCT
+            )
             self.product_index_map = {}
             self.product_embeddings = {}
             self.product_metadata = {}
@@ -471,7 +508,7 @@ class VectorSearchEngine:
                 
                 seen_products.add(product_id)
                 
-                # Apply similarity threshold
+                # Inner-product scores are cosine similarity (higher is better).
                 if score < self.config.similarity_threshold:
                     continue
                 
@@ -777,6 +814,7 @@ class VectorSearchEngine:
                 "index_version": str(self.catalog_version or int(time.time() * 1000)),
                 "embedding_dim": self.embedding_dim,
                 "index_type": self.config.index_type,
+                "metric": CONTENT_INDEX_METRIC,
                 "product_count": len(self.product_index_map),
                 "faiss_sha256": self._sha256_file(staged_index_path),
                 "metadata_sha256": self._sha256_file(staged_metadata_path),
@@ -992,7 +1030,9 @@ class VectorSearchEngine:
 
     def create_cf_index(self, embedding_dim: int = 128) -> faiss.Index:
         """Create a FAISS HNSW index for Two-Tower CF embeddings."""
-        index = faiss.IndexHNSWFlat(embedding_dim, self.config.hnsw_m)
+        index = faiss.IndexHNSWFlat(
+            embedding_dim, self.config.hnsw_m, faiss.METRIC_INNER_PRODUCT
+        )
         index.hnsw.efConstruction = self.config.hnsw_ef_construction
         index.hnsw.efSearch = self.config.hnsw_ef_search
         logger.info(f"Created CF FAISS index (dim={embedding_dim}, M={self.config.hnsw_m})")

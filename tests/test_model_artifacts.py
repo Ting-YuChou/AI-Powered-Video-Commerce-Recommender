@@ -168,7 +168,7 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
         fake_store.registered_releases[-1]["bundle_manifest"][
             "quality_gate_policy_version"
         ]
-        == "ranking_quality_gate_v2"
+        == "ranking_quality_gate_v3"
     )
     assert fake_store.registered_releases[-1]["lifecycle_state"] == "registered"
 

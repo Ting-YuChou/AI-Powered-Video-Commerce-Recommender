@@ -1,4 +1,6 @@
-from fastapi import FastAPI
+import uuid
+
+from fastapi import FastAPI, Request
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -56,6 +58,40 @@ def test_create_service_app_sets_request_id_and_runtime_counters():
     assert "X-Request-ID" in response.headers
     assert app.state.runtime.handled_requests == 1
     assert app.state.runtime.active_requests == 0
+
+
+@pytest.mark.parametrize(
+    ("supplied", "kept"),
+    [
+        ("req-123_abc.def:9", True),
+        ("x" * 64, True),
+        ("x" * 65, False),
+        ("bad id with spaces", False),
+        ("req/../etc", False),
+        ("req;drop", False),
+    ],
+)
+def test_create_service_app_only_adopts_safe_request_ids(supplied, kept):
+    app: FastAPI = create_service_app(
+        title="Test App",
+        description="test",
+        service_name="test-service",
+    )
+
+    @app.get("/echo")
+    async def echo(request: Request):
+        return {"request_id": request.state.request_id}
+
+    with TestClient(app) as client:
+        response = client.get("/echo", headers={"X-Request-ID": supplied})
+
+    request_id = response.json()["request_id"]
+    assert response.headers["X-Request-ID"] == request_id
+    if kept:
+        assert request_id == supplied
+    else:
+        assert request_id != supplied
+        assert str(uuid.UUID(request_id, version=4)) == request_id
 
 
 def test_request_logging_samples_completion_logs_by_status_class():

@@ -5045,7 +5045,14 @@ class SystemStore:
                     hours=max_age_hours
                 ):
                     return None
-                if target_compatibility.policy_version == "ranking_quality_gate_v2":
+                from video_commerce.ml.model_release_quality import (
+                    PHASE_C_QUALITY_GATE_POLICY_VERSIONS,
+                )
+
+                if (
+                    target_compatibility.policy_version
+                    in PHASE_C_QUALITY_GATE_POLICY_VERSIONS
+                ):
                     from video_commerce.ml.phase_c_evidence import (
                         performance_evidence_valid,
                         quality_gate_snapshot_valid,
@@ -5077,7 +5084,7 @@ class SystemStore:
                                 ModelReleaseEvaluation.evaluation_id
                                 == str(prerequisite_id),
                                 ModelReleaseEvaluation.policy_version
-                                == "ranking_quality_gate_v2",
+                                == target_compatibility.policy_version,
                                 ModelReleaseEvaluation.decision == "passed",
                                 ModelReleaseEvaluation.champion_release_id
                                 == evaluation.champion_release_id,

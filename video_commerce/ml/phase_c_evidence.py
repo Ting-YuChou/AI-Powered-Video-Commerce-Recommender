@@ -11,7 +11,7 @@ from typing import Mapping
 def quality_gate_snapshot_valid(
     gate_config: Mapping, *, experiment_kind: str = "combined"
 ) -> bool:
-    """A v2 promotion cannot silently weaken the versioned policy."""
+    """A Phase C (v2+) promotion cannot silently weaken the versioned policy."""
     from dataclasses import asdict
     from video_commerce.ml.model_release_quality import RankingQualityGateConfig
 
@@ -37,11 +37,16 @@ def bundle_digest(manifest: Mapping) -> str:
 
 
 def active_rrf_release_valid(checkpoint) -> bool:
+    from video_commerce.ml.model_release_quality import (
+        PHASE_C_QUALITY_GATE_POLICY_VERSIONS,
+    )
+
     payload = dict((checkpoint or {}).get("payload") or {})
     return (
         bool(payload.get("model_release_id"))
         and int(payload.get("active_generation") or 0) > 0
-        and payload.get("quality_gate_policy_version") == "ranking_quality_gate_v2"
+        and payload.get("quality_gate_policy_version")
+        in PHASE_C_QUALITY_GATE_POLICY_VERSIONS
         and payload.get("candidate_fusion_policy_version") == "candidate_rrf_v1"
         and payload.get("candidate_rrf_k") == 60
         and payload.get("candidate_source_registry_version") == "retrieval_sources_v1"

@@ -175,6 +175,83 @@ async def test_interaction_event_id_is_idempotent_and_detects_collision(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_interaction_retry_without_client_time_is_duplicate_not_collision(monkeypatch):
+    manager = DummyKafkaManager(should_succeed=True)
+    monkeypatch.setattr(interaction_ingest_api, "kafka_manager", manager)
+    monkeypatch.setattr(interaction_ingest_api, "feature_store", FakeFeatureStore())
+    monkeypatch.setattr(interaction_ingest_api, "system_store", None)
+    interaction_ingest_api.app.state.runtime.config = SimpleNamespace(
+        kafka_config=SimpleNamespace(enable=True)
+    )
+
+    async def noop_invalidation(user_id):
+        return None
+
+    monkeypatch.setattr(
+        interaction_ingest_api, "_invalidate_user_serving_cache", noop_invalidation
+    )
+    request = SimpleNamespace(state=SimpleNamespace(request_id="req-retry"))
+    event_id = uuid4()
+
+    def build_payload():
+        # Each retry is parsed independently, so the model stamps a fresh event_time.
+        return UserInteractionRequest(
+            event_id=event_id,
+            user_id="u1",
+            product_id="p1",
+            action=InteractionType.CLICK,
+            context={"page": "home"},
+        )
+
+    first_payload = build_payload()
+    await asyncio.sleep(0.01)
+    retry_payload = build_payload()
+    assert first_payload.event_time != retry_payload.event_time
+
+    first = await interaction_ingest_api.ingest_interaction(request, first_payload)
+    second = await interaction_ingest_api.ingest_interaction(request, retry_payload)
+
+    assert len(manager.calls) == 1
+    assert json.loads(first.body)["duplicate"] is False
+    assert json.loads(second.body)["duplicate"] is True
+
+
+@pytest.mark.asyncio
+async def test_interaction_retry_with_different_client_time_is_collision(monkeypatch):
+    manager = DummyKafkaManager(should_succeed=True)
+    monkeypatch.setattr(interaction_ingest_api, "kafka_manager", manager)
+    monkeypatch.setattr(interaction_ingest_api, "feature_store", FakeFeatureStore())
+    monkeypatch.setattr(interaction_ingest_api, "system_store", None)
+    interaction_ingest_api.app.state.runtime.config = SimpleNamespace(
+        kafka_config=SimpleNamespace(enable=True)
+    )
+
+    async def noop_invalidation(user_id):
+        return None
+
+    monkeypatch.setattr(
+        interaction_ingest_api, "_invalidate_user_serving_cache", noop_invalidation
+    )
+    request = SimpleNamespace(state=SimpleNamespace(request_id="req-retry-time"))
+    event_id = uuid4()
+    now = interaction_ingest_api.time.time()
+
+    def build_payload(event_time):
+        return UserInteractionRequest(
+            event_id=event_id,
+            user_id="u1",
+            product_id="p1",
+            action=InteractionType.CLICK,
+            event_time=event_time,
+        )
+
+    await interaction_ingest_api.ingest_interaction(request, build_payload(now - 5))
+    with pytest.raises(HTTPException) as exc:
+        await interaction_ingest_api.ingest_interaction(request, build_payload(now - 1))
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_postgres_interaction_claim_is_completed_with_lease_owner(monkeypatch):
     manager = DummyKafkaManager(should_succeed=True)
 

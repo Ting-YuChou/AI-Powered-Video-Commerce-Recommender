@@ -589,4 +589,79 @@ class InteractionFeatureJobTest {
     assertEquals(400.0, kafkaEvent.get("event_time"));
     assertEquals(405.0, kafkaEvent.get("available_at"));
   }
+  @Test
+  void parserRejectsOversizedIdsSoTheyGoToDlqInsteadOfFailingJdbc() {
+    String longRequestId = "r".repeat(65);
+    String longProductId = "p".repeat(256);
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            InteractionFeatureJob.parseInteractionEvent(
+                "{\"event_id\":\"e1\",\"user_id\":\"u1\",\"product_id\":\"p1\","
+                    + "\"action\":\"view\",\"request_id\":\""
+                    + longRequestId
+                    + "\"}"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            InteractionFeatureJob.parseInteractionEvent(
+                "{\"event_id\":\"e1\",\"user_id\":\"u1\",\"product_id\":\""
+                    + longProductId
+                    + "\",\"action\":\"view\"}"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            InteractionFeatureJob.parseRecommendationEvent(
+                "{\"event_type\":\"recommendation_viewed\",\"event_id\":\"e1\","
+                    + "\"impression_id\":\"imp-1\",\"product_id\":\""
+                    + longProductId
+                    + "\"}"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            InteractionFeatureJob.parseRecommendationEvent(
+                "{\"user_id\":\"u1\",\"request_id\":\""
+                    + longRequestId
+                    + "\",\"metadata\":{\"impression_id\":\"imp-1\","
+                    + "\"displayed_items\":[{\"product_id\":\"p1\"}]}}"));
+  }
+
+  @Test
+  void parserAcceptsIdsAtColumnWidth() throws Exception {
+    InteractionFeatureJob.InteractionEvent event =
+        InteractionFeatureJob.parseInteractionEvent(
+            "{\"event_id\":\"e1\",\"user_id\":\"u1\",\"product_id\":\""
+                + "p".repeat(255)
+                + "\",\"action\":\"view\",\"request_id\":\""
+                + "r".repeat(64)
+                + "\"}");
+    assertEquals(255, event.productId.length());
+  }
+
+  @Test
+  void epochOwnerRefusesEmptyStateRestartUnderSameEpoch() {
+    // Fresh Redis or bumped epoch: claim.
+    assertEquals(
+        InteractionFeatureJob.EpochOwnerDecision.CLAIM,
+        InteractionFeatureJob.decideEpochOwner(false, 1L, null, null, "job-b"));
+    assertEquals(
+        InteractionFeatureJob.EpochOwnerDecision.CLAIM,
+        InteractionFeatureJob.decideEpochOwner(false, 2L, 1L, "job-a", "job-b"));
+    // Same job failing over before its first checkpoint: continue.
+    assertEquals(
+        InteractionFeatureJob.EpochOwnerDecision.CONTINUE,
+        InteractionFeatureJob.decideEpochOwner(false, 1L, 1L, "job-a", "job-a"));
+    // Resubmitted from a checkpoint/savepoint: generations continue, so claim.
+    assertEquals(
+        InteractionFeatureJob.EpochOwnerDecision.CLAIM,
+        InteractionFeatureJob.decideEpochOwner(true, 1L, 1L, "job-a", "job-b"));
+    // Resubmitted from empty state under the same epoch (compose down/up): refuse.
+    assertEquals(
+        InteractionFeatureJob.EpochOwnerDecision.REFUSE,
+        InteractionFeatureJob.decideEpochOwner(false, 1L, 1L, "job-a", "job-b"));
+    // Older epoch than Redis: every write would be stale, refuse.
+    assertEquals(
+        InteractionFeatureJob.EpochOwnerDecision.REFUSE,
+        InteractionFeatureJob.decideEpochOwner(true, 1L, 2L, "job-a", "job-b"));
+  }
 }

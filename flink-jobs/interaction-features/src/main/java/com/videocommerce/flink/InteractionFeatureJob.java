@@ -31,6 +31,9 @@ import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.metrics.Counter;
+import org.apache.flink.runtime.state.FunctionInitializationContext;
+import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.state.ValueState;
@@ -64,11 +67,15 @@ import org.apache.flink.util.Collector;
 import org.apache.flink.util.OutputTag;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.msgpack.jackson.dataformat.MessagePackFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class InteractionFeatureJob {
   private static final ObjectMapper JSON = new ObjectMapper();
   private static final ObjectMapper MSGPACK = new ObjectMapper(new MessagePackFactory());
   private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
+  private static final Logger LOG = LoggerFactory.getLogger(InteractionFeatureJob.class);
+
   private static final OutputTag<DlqEvent> DLQ_TAG =
       new OutputTag<>("dead-letter-events", TypeInformation.of(DlqEvent.class));
   private static final String USER_INTERACTIONS_SOURCE_TOPIC = "user-interactions";
@@ -172,7 +179,7 @@ public class InteractionFeatureJob {
             .returns(UserFeatureSnapshot.class);
 
     userFeatures
-        .addSink(new UserFeatureRedisSink(config.redisConfig()))
+        .addSink(new UserFeatureRedisSink(config.redisConfig(), config.featureStateEpoch))
         .name("redis-user-feature-snapshots");
 
     userFeatures
@@ -235,6 +242,14 @@ public class InteractionFeatureJob {
     if (!config.checkpointDir.isBlank()) {
       checkpointConfig.setCheckpointStorage(config.checkpointDir);
     }
+    // Bounded restarts: a deterministic failure must end in FAILED (and fire
+    // FlinkInteractionFeatureJobMissing) instead of an endless restart loop.
+    Configuration restart = new Configuration();
+    restart.setString("restart-strategy.type", "failure-rate");
+    restart.setString("restart-strategy.failure-rate.max-failures-per-interval", "10");
+    restart.setString("restart-strategy.failure-rate.failure-rate-interval", "10 min");
+    restart.setString("restart-strategy.failure-rate.delay", "10 s");
+    env.configure(restart);
   }
 
   private static WindowStreams buildWindow(
@@ -388,7 +403,10 @@ public class InteractionFeatureJob {
         "INSERT INTO recommendation_impression_views "
             + "(event_id, impression_id, product_id, position, context, viewed_at) "
             + "VALUES (?, ?, ?, ?, CAST(? AS json), ?) "
-            + "ON CONFLICT (impression_id, product_id) DO NOTHING";
+            // No conflict target: the table has both an event_id PK and a unique
+            // (impression_id, product_id) index; either duplicate must be a no-op,
+            // not a sink failure that replays forever.
+            + "ON CONFLICT DO NOTHING";
     return JdbcSink.sink(
         sql,
         (statement, item) -> {
@@ -482,6 +500,19 @@ public class InteractionFeatureJob {
     }
   }
 
+  // Postgres column widths (migrations/postgres, system_store.py). Oversized values
+  // must fail at parse time so they go to the DLQ instead of failing a JDBC batch,
+  // which would restart the job and replay the same record forever.
+  static final int ID_COLUMN_LENGTH = 64;
+  static final int ENTITY_COLUMN_LENGTH = 255;
+
+  static void requireMaxLength(String field, String value, int maxLength) {
+    if (value != null && value.length() > maxLength) {
+      throw new IllegalArgumentException(
+          field + " exceeds " + maxLength + " characters (" + value.length() + ")");
+    }
+  }
+
   static InteractionEvent parseInteractionEvent(String raw) throws Exception {
     Map<String, Object> payload = JSON.readValue(raw, MAP_TYPE);
     String eventId = stringValue(payload.get("event_id"));
@@ -491,6 +522,10 @@ public class InteractionFeatureJob {
     if (eventId.isBlank() || userId.isBlank() || productId.isBlank() || action.isBlank()) {
       throw new IllegalArgumentException("interaction event missing event_id/user_id/product_id/action");
     }
+    requireMaxLength("event_id", eventId, ID_COLUMN_LENGTH);
+    requireMaxLength("user_id", userId, ENTITY_COLUMN_LENGTH);
+    requireMaxLength("product_id", productId, ENTITY_COLUMN_LENGTH);
+    requireMaxLength("action", action, ID_COLUMN_LENGTH);
 
     Object contextObject = payload.get("context");
     Map<String, Object> eventContext =
@@ -515,6 +550,7 @@ public class InteractionFeatureJob {
     event.eventId = eventId;
     event.schemaVersion = intValue(payload.get("schema_version"), 1);
     event.requestId = nullableString(payload.get("request_id"));
+    requireMaxLength("request_id", event.requestId, ID_COLUMN_LENGTH);
     event.userId = userId;
     event.productId = productId;
     event.action = action;
@@ -545,6 +581,9 @@ public class InteractionFeatureJob {
         throw new IllegalArgumentException(
             "recommendation view missing event_id/impression_id/product_id");
       }
+      requireMaxLength("event_id", eventId, ID_COLUMN_LENGTH);
+      requireMaxLength("impression_id", impressionId, ID_COLUMN_LENGTH);
+      requireMaxLength("product_id", productId, ENTITY_COLUMN_LENGTH);
       RecommendationImpressionEvent event = new RecommendationImpressionEvent();
       event.viewed = true;
       event.impressionId = impressionId;
@@ -599,6 +638,13 @@ public class InteractionFeatureJob {
     event.context = context;
     event.eventTimeMillis = eventTimeMillis;
     event.itemRows = new ArrayList<>();
+    requireMaxLength("impression_id", event.impressionId, ID_COLUMN_LENGTH);
+    requireMaxLength("request_id", event.requestId, ID_COLUMN_LENGTH);
+    requireMaxLength("user_id", event.userId, ENTITY_COLUMN_LENGTH);
+    requireMaxLength("session_id", event.sessionId, ENTITY_COLUMN_LENGTH);
+    requireMaxLength("content_id", event.contentId, ENTITY_COLUMN_LENGTH);
+    requireMaxLength("model_version", event.modelVersion, ENTITY_COLUMN_LENGTH);
+    requireMaxLength("ranking_model_version", event.rankingModelVersion, ENTITY_COLUMN_LENGTH);
 
     for (Object rawItem : displayedItems) {
       if (!(rawItem instanceof Map)) {
@@ -611,6 +657,8 @@ public class InteractionFeatureJob {
       }
       Object rawSource = firstNonNull(item.get("source"), item.get("candidate_source"));
       String source = nullableString(rawSource);
+      requireMaxLength("product_id", productId, ENTITY_COLUMN_LENGTH);
+      requireMaxLength("source", source, ENTITY_COLUMN_LENGTH);
 
       RecommendationImpressionItemRow itemRow = new RecommendationImpressionItemRow();
       itemRow.impressionId = impressionId;
@@ -830,7 +878,37 @@ public class InteractionFeatureJob {
     }
   }
 
-  static final class UserFeatureRedisSink extends BaseRedisSink<UserFeatureSnapshot> {
+  enum EpochOwnerDecision {
+    CLAIM,
+    CONTINUE,
+    REFUSE
+  }
+
+  /**
+   * Decides whether this job may write user snapshots under {@code epoch}.
+   *
+   * <p>Generations live only in job state, so a job that starts from empty state under an epoch
+   * another job already wrote would have every write judged stale, then hit digest conflicts
+   * once its generations catch up. Such a start is refused; it must restore from a
+   * checkpoint/savepoint or bump FLINK_FEATURE_STATE_EPOCH.
+   */
+  static EpochOwnerDecision decideEpochOwner(
+      boolean restored, long epoch, Long ownerEpoch, String ownerJobId, String jobId) {
+    if (ownerEpoch == null || ownerEpoch < epoch) {
+      return EpochOwnerDecision.CLAIM;
+    }
+    if (ownerEpoch > epoch) {
+      return EpochOwnerDecision.REFUSE;
+    }
+    if (jobId.equals(ownerJobId)) {
+      return EpochOwnerDecision.CONTINUE;
+    }
+    return restored ? EpochOwnerDecision.CLAIM : EpochOwnerDecision.REFUSE;
+  }
+
+  static final class UserFeatureRedisSink extends BaseRedisSink<UserFeatureSnapshot>
+      implements CheckpointedFunction {
+    static final String EPOCH_OWNER_KEY = "flink:feature_state_owner";
     private static final String ATOMIC_COMMIT_LUA =
         "local epoch=tonumber(ARGV[1]); local generation=tonumber(ARGV[2]); "
             + "if not epoch or not generation then return 'invalid' end; "
@@ -847,8 +925,55 @@ public class InteractionFeatureJob {
             + "redis.call('HSET',KEYS[5],'epoch',ARGV[1],'generation',ARGV[2],'digest',ARGV[3]); redis.call('EXPIRE',KEYS[5],ARGV[8]); "
             + "if duplicate then return 'duplicate' else return 'applied' end";
 
-    UserFeatureRedisSink(RedisSinkConfig config) {
+    private final long stateEpoch;
+    private transient boolean restored;
+
+    UserFeatureRedisSink(RedisSinkConfig config, long stateEpoch) {
       super(config);
+      this.stateEpoch = stateEpoch;
+    }
+
+    @Override
+    public void initializeState(FunctionInitializationContext context) {
+      restored = context.isRestored();
+    }
+
+    @Override
+    public void snapshotState(FunctionSnapshotContext context) {}
+
+    @Override
+    public void open(Configuration parameters) {
+      super.open(parameters);
+      String jobId = getRuntimeContext().getJobInfo().getJobId().toHexString();
+      byte[] ownerKey = bytes(config.key(EPOCH_OWNER_KEY));
+      byte[] rawEpoch = commands.hget(ownerKey, bytes("epoch"));
+      byte[] rawJobId = commands.hget(ownerKey, bytes("job_id"));
+      Long ownerEpoch =
+          rawEpoch == null ? null : Long.parseLong(new String(rawEpoch, StandardCharsets.UTF_8));
+      String ownerJobId = rawJobId == null ? null : new String(rawJobId, StandardCharsets.UTF_8);
+      EpochOwnerDecision decision =
+          decideEpochOwner(restored, stateEpoch, ownerEpoch, ownerJobId, jobId);
+      if (decision == EpochOwnerDecision.REFUSE) {
+        throw new IllegalStateException(
+            "Refusing to write user features: Redis epoch owner is epoch="
+                + ownerEpoch
+                + " job="
+                + ownerJobId
+                + ", this job "
+                + jobId
+                + " runs epoch="
+                + stateEpoch
+                + " without restored state. Restore from the latest checkpoint/savepoint, "
+                + "or bump FLINK_FEATURE_STATE_EPOCH to intentionally discard state "
+                + "(docs/operations/flink-realtime-recovery.md).");
+      }
+      if (decision == EpochOwnerDecision.CLAIM) {
+        Map<byte[], byte[]> owner = new HashMap<>();
+        owner.put(bytes("epoch"), bytes(Long.toString(stateEpoch)));
+        owner.put(bytes("job_id"), bytes(jobId));
+        owner.put(bytes("claimed_at"), bytes(Long.toString(Instant.now().getEpochSecond())));
+        commands.hset(ownerKey, owner);
+      }
     }
 
     @Override
@@ -894,8 +1019,17 @@ public class InteractionFeatureJob {
       }
       String status = result == null ? "" : new String(result, StandardCharsets.UTF_8);
       recordStatus(status);
-      if ("conflict".equals(status) || "invalid".equals(status)) {
+      if ("invalid".equals(status)) {
         throw new IllegalStateException("Redis user snapshot commit failed: " + status);
+      }
+      if ("conflict".equals(status)) {
+        // Counted by recordStatus (FlinkRedisSnapshotConflict alert). Skipping keeps the
+        // existing Redis snapshot; throwing would replay the same record forever.
+        LOG.error(
+            "Redis user snapshot conflict skipped user={} epoch={} generation={}",
+            snapshot.userId,
+            snapshot.stateEpoch,
+            snapshot.generation);
       }
     }
   }
@@ -959,7 +1093,11 @@ public class InteractionFeatureJob {
       String status = result == null ? "" : new String(result, StandardCharsets.UTF_8);
       recordStatus(status);
       if ("conflict".equals(status)) {
-        throw new IllegalStateException("Redis window snapshot split-brain conflict");
+        LOG.error(
+            "Redis window snapshot conflict skipped key={} window_end={} revision={}",
+            key,
+            snapshot.windowEnd,
+            snapshot.totalEvents);
       }
     }
   }

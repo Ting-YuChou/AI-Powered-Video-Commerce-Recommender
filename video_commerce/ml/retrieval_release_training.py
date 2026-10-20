@@ -271,6 +271,8 @@ def write_two_tower_bundle(
     embedding_sidecar_path = target / f"{model_version}.cf_embeddings.npz"
     trainer.save_checkpoint(str(checkpoint_path))
     index, raw_index_map = trainer.build_item_index()
+    if index.metric_type != faiss.METRIC_INNER_PRODUCT:
+        raise ValueError("Two-Tower item index must use inner-product similarity")
     faiss.write_index(index, str(index_path))
     product_index_map = {
         int(faiss_index): trainer.reverse_item_mapping[item_index]
@@ -279,11 +281,12 @@ def write_two_tower_bundle(
     metadata_path.write_text(
         json.dumps(
             {
-                "schema_version": "two_tower_index_v1",
+                "schema_version": "two_tower_index_v2",
                 "model_version": str(model_version),
                 "index_map": product_index_map,
                 "embedding_dimension": trainer.output_dim,
                 "index_type": type(index).__name__,
+                "metric": "inner_product",
                 "product_count": len(product_index_map),
             },
             sort_keys=True,

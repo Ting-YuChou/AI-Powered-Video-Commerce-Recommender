@@ -297,6 +297,21 @@ groups:
           summary: Flink Redis snapshot version conflict detected
           description: Stop cutover and inspect state epoch, generation, digest, and concurrent official writers.
 
+      - alert: FlinkRedisSnapshotStaleWrites
+        expr: |
+          sum(increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_stale[15m]))
+            /
+          clamp_min(sum(increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_applied[15m]))
+            + sum(increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_stale[15m])), 1)
+            > 0.5
+          and sum(increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_stale[15m])) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Most Flink Redis snapshot writes are rejected as stale
+          description: The job is likely running from empty state under an epoch that already wrote Redis; restore from the latest checkpoint or bump FLINK_FEATURE_STATE_EPOCH.
+
       - alert: FlinkRedisSnapshotWriteFailure
         expr: increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_failure[10m]) > 3
         for: 5m

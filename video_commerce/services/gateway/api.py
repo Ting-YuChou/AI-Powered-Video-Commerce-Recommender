@@ -127,14 +127,26 @@ async def auth_and_rate_limit(request: Request, call_next):
                     headers={request_id_header: request_id},
                 )
 
-        if auth_mode == "api_key" and not api_key_enabled:
-            authenticated = True
-        elif (
-            auth_mode == "api_key_or_bearer"
-            and not api_key_enabled
-            and not bearer_enabled
+        # Fail closed when the selected mode has no credential configured.
+        # Open access must be requested explicitly with SECURITY_AUTH_MODE=disabled.
+        if not authenticated and (
+            (auth_mode == "api_key" and not api_key_enabled)
+            or (
+                auth_mode == "api_key_or_bearer"
+                and not api_key_enabled
+                and not bearer_enabled
+            )
         ):
-            authenticated = True
+            return build_error_response(
+                status_code=503,
+                code="AUTH_NOT_CONFIGURED",
+                message=(
+                    "Authentication is not configured; set API_API_KEY or "
+                    "SECURITY_AUTH_MODE=disabled for local development"
+                ),
+                request_id=request_id,
+                headers={request_id_header: request_id},
+            )
 
         if not authenticated and auth_mode in {
             "api_key",
@@ -196,6 +208,15 @@ async def startup_event():
     ):
         raise ValueError(
             "SECURITY_AUTH_MODE=bearer requires OIDC/JWT validation to be enabled"
+        )
+    auth_mode = runtime.config.security_config.auth_mode
+    if auth_mode in {"api_key", "api_key_or_bearer"} and not (
+        runtime.config.api_config.api_key or bearer_token_validator is not None
+    ):
+        logger.error(
+            "SECURITY_AUTH_MODE=%s but no API key or OIDC validator is configured; "
+            "protected routes will return 503 AUTH_NOT_CONFIGURED",
+            auth_mode,
         )
 
     if runtime.config.kafka_config.enable:

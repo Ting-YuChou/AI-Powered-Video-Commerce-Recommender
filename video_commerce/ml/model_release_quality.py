@@ -20,12 +20,21 @@ from video_commerce.ml.probability_calibration import (
     expected_calibration_error,
     reliability_table,
 )
+from video_commerce.ml.ranking_training import VIEW_RELEVANCE
 
 
 QUALITY_GATE_POLICY_V1 = "ranking_quality_gate_v1"
-QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v2"
+QUALITY_GATE_POLICY_V2 = "ranking_quality_gate_v2"
+# v3: NDCG gains exclude view-only relevance and skip slates with no
+# engagement, so all-view impressions no longer dilute the delta.
+QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v3"
 SUPPORTED_QUALITY_GATE_POLICY_VERSIONS = frozenset(
-    {QUALITY_GATE_POLICY_V1, QUALITY_GATE_POLICY_VERSION}
+    {QUALITY_GATE_POLICY_V1, QUALITY_GATE_POLICY_V2, QUALITY_GATE_POLICY_VERSION}
+)
+# Policies that carry Phase C promotion evidence (prerequisites, ONNX parity,
+# RRF fusion policy).
+PHASE_C_QUALITY_GATE_POLICY_VERSIONS = frozenset(
+    {QUALITY_GATE_POLICY_V2, QUALITY_GATE_POLICY_VERSION}
 )
 
 
@@ -579,6 +588,7 @@ def _comparison_metrics(
         "ndcg_at_10_champion": champion_metrics["ndcg_at_10"],
         "ndcg_at_10_challenger": challenger_metrics["ndcg_at_10"],
         "ndcg_at_10_delta": delta("ndcg_at_10"),
+        "ndcg_informative_impressions": _informative_impression_count(rows),
         "ctr_pr_auc_delta": delta("ctr_pr_auc"),
         "ctcvr_pr_auc_delta": delta("ctcvr_pr_auc"),
         "ctr_log_loss_relative_regression": relative_regression(
@@ -650,14 +660,31 @@ def _model_metrics(rows, predictions, *, ece_bins: int = 15):
     }
 
 
-def _mean_ndcg(rows, predictions) -> float:
+def _ndcg_gain(row: RankingEvaluationRow) -> float:
+    """Graded gain above a plain view; view-only rows carry no ranking signal."""
+    return max(float(row.relevance) - VIEW_RELEVANCE, 0.0)
+
+
+def _informative_impressions(rows) -> list[list[RankingEvaluationRow]]:
+    """Slates NDCG can score: 2+ rows with at least one engagement above view."""
     grouped: Dict[str, list[RankingEvaluationRow]] = {}
     for row in rows:
         grouped.setdefault(row.impression_id, []).append(row)
+    return [
+        impression_rows
+        for impression_rows in grouped.values()
+        if len(impression_rows) >= 2
+        and any(_ndcg_gain(row) > 0.0 for row in impression_rows)
+    ]
+
+
+def _informative_impression_count(rows) -> int:
+    return len(_informative_impressions(rows))
+
+
+def _mean_ndcg(rows, predictions) -> float:
     values = []
-    for impression_rows in grouped.values():
-        if len(impression_rows) < 2:
-            continue
+    for impression_rows in _informative_impressions(rows):
         ranked = sorted(
             impression_rows,
             key=lambda row: (
@@ -671,16 +698,17 @@ def _mean_ndcg(rows, predictions) -> float:
 
         def dcg(selected):
             return sum(
-                float(row.relevance) / math.log2(position + 2)
+                _ndcg_gain(row) / math.log2(position + 2)
                 for position, row in enumerate(selected)
             )
 
-        ideal_gain = dcg(ideal)
-        values.append(dcg(ranked) / ideal_gain if ideal_gain > 0.0 else 0.0)
+        values.append(dcg(ranked) / dcg(ideal))
     return float(np.mean(values)) if values else 0.0
 
 
 def _cluster_bootstrap_ndcg(rows, champion, challenger, config):
+    # Resampled users keep all their rows; _mean_ndcg applies the same
+    # informative-slate filter, so CI bounds match ndcg_at_10_delta.
     rows_by_user: Dict[str, list[RankingEvaluationRow]] = {}
     for row in rows:
         rows_by_user.setdefault(row.user_id, []).append(row)

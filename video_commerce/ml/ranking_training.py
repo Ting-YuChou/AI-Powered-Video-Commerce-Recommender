@@ -15,6 +15,8 @@ from video_commerce.ml.ranking_features import FeatureBundle
 
 RANKING_LABEL_DEFINITION_VERSION = "ranking_labels_v1"
 GROSS_REVENUE_LABEL_DEFINITION_VERSION = "ranking_labels_v2_gross_revenue"
+# Graded relevance of an impression that was only viewed (no engagement).
+VIEW_RELEVANCE = 1.0
 _ATTRIBUTION_ACTIONS = {"view", "click", "add_to_cart", "purchase"}
 
 
@@ -158,7 +160,7 @@ class RankingLabelBuilder:
                 has_value = False
         value = float(facts.attributed_value) if has_value else 0.0
         relevance = {
-            "view": 1.0,
+            "view": VIEW_RELEVANCE,
             "click": 2.0,
             "add_to_cart": 3.0,
             "purchase": 4.0 + math.log1p(value),

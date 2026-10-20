@@ -146,6 +146,7 @@ data:
   MODEL_MAX_OCR_TEMPORAL_TOKENS: {{ .Values.appConfig.multilingualText.maxOcrTemporalTokens | quote }}
   MODEL_MAX_ASR_TEMPORAL_TOKENS: {{ .Values.appConfig.multilingualText.maxAsrTemporalTokens | quote }}
   MODEL_CLIP_REVISION: {{ .Values.appConfig.clipRevision | quote }}
+  MODEL_OCR_BACKEND: {{ .Values.appConfig.ocrBackend | quote }}
   RETRIEVAL_VISUAL_ATTENTION_SHADOW: {{ .Values.appConfig.visualRetrieval.shadow | quote }}
   RETRIEVAL_VISUAL_ATTENTION_ENABLED: {{ .Values.appConfig.visualRetrieval.enabled | quote }}
   RETRIEVAL_VISUAL_CANARY_PERCENT: {{ .Values.appConfig.visualRetrieval.canaryPercent | quote }}

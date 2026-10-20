@@ -36,9 +36,15 @@ post-cleanup verification.
 ## Rollback
 1. Identify the last known-good image tags or Git revision.
 2. Rebuild or retag the last known-good revision.
-3. Re-apply:
+3. Take a savepoint of the realtime feature job before replacing images:
+   - `scripts/flink_realtime_ops.sh stop-with-savepoint` (record the path)
+4. Re-apply:
    - `docker compose --profile flink up -d --build`
-4. Re-run readiness and smoke checks before reopening traffic.
+   - The submitter restores the newest retained checkpoint automatically. If
+     the rolled-back jar needs the recorded savepoint instead, run
+     `scripts/flink_realtime_ops.sh restore <savepoint-path>`. See
+     `docs/operations/flink-realtime-recovery.md`.
+5. Re-run readiness and smoke checks before reopening traffic.
 
 The content migration is additive and should remain in place during rollback.
 The model release migration is also additive and remains in place. Use the

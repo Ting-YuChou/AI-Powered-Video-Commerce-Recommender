@@ -3841,3 +3841,25 @@ async def test_ranking_load_model_keeps_existing_model_when_checkpoint_load_fail
 
     assert ranking.model is existing_model
     assert ranking.optimizer is existing_optimizer
+
+
+@pytest.mark.asyncio
+async def test_pit_shadow_training_skips_without_dataset_uri():
+    class Reader:
+        async def read(self, _uri):
+            raise AssertionError("reader must not be called without a dataset URI")
+
+    service = object.__new__(ModelTrainerService)
+    service.config = SimpleNamespace(
+        feature_lake_config=SimpleNamespace(ranking_pit_dataset_uri=None),
+        ranking_config=SimpleNamespace(training_min_samples=1),
+    )
+    service.pit_dataset_reader = Reader()
+    service.artifact_manager = FakeTrainerArtifactManager()
+    service.observability = FakeTrainerObservability()
+
+    await service._train_pit_shadow_model(trigger="scheduled")
+
+    assert service.observability.runs == [
+        ("scheduled_pit_shadow", "skipped_no_dataset_uri", 0.0)
+    ]
