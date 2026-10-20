@@ -277,7 +277,9 @@ def test_pinned_catalog_does_not_reject_queries_older_than_its_generation(tmp_pa
 
 
 def test_catalog_newer_than_every_query_is_still_future_data(tmp_path):
-    latest = _write_retrieval_dataset(tmp_path, catalog_overrides={"available_at": 121.0})
+    latest = _write_retrieval_dataset(
+        tmp_path, catalog_overrides={"available_at": 121.0}
+    )
 
     with pytest.raises(RetrievalPitDatasetError, match="catalog is future data"):
         asyncio.run(RetrievalPitDatasetReader(LocalObjectStorage()).read(str(latest)))

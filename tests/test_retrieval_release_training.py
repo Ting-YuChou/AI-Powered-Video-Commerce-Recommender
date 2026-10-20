@@ -262,3 +262,46 @@ def test_pit_training_registers_evaluates_and_stages_only_after_gate_pass(tmp_pa
     assert manager.payload["retrieval_pit_manifest_sha256"] == "a" * 64
     assert store.evaluation["decision"] == "passed"
     assert store.staged["release_id"] == "release-1"
+    for name in ("popularity", "champion", "challenger"):
+        assert "ranked_product_ids" not in store.evaluation["metrics"][name]
+        assert "recall_at_40" in store.evaluation["metrics"][name]
+    assert "recall_at_40_delta" in store.evaluation["metrics"]["gate"]
+    assert "ranked_product_ids" not in outcome.challenger_metrics
+
+
+def test_popularity_baseline_keeps_only_top_k_plus_seen():
+    from video_commerce.ml.retrieval_release_training import _popularity_scores
+
+    products = tuple(f"p{index}" for index in range(6))
+    queries = tuple(
+        RetrievalEvaluationQuery(
+            query_id=query_id,
+            user_id="u1",
+            relevant_product_ids=frozenset({"p5"}),
+            eligible_product_ids=products,
+            seen_product_ids=frozenset(seen),
+        )
+        for query_id, seen in (("q1", ()), ("q2", ("p3", "outside")))
+    )
+    inputs = RetrievalTrainingInputs(
+        interactions=tuple(
+            {"user_id": "u1", "product_id": product_id, "action": "click"}
+            for product_id in ("p3", "p3", "p1", "p4")
+        ),
+        external_negatives=(),
+        product_metadata={product_id: {} for product_id in products},
+        product_clip_embeddings={},
+        user_features_map={},
+        training_rows=(),
+        holdout_rows=(),
+        holdout_queries=queries,
+        holdout_window=RetrievalHoldoutWindow(10.0, 20.0),
+        training_as_of_ts=9.0,
+    )
+
+    scores = _popularity_scores(inputs, max_results=3)
+
+    # (-count, product_id): p3=2, then p1/p4 tie on 1 by id, then zeros by id.
+    assert list(scores["q1"].items()) == [("p3", 2.0), ("p1", 1.0), ("p4", 1.0)]
+    # One eligible seen item ("outside" is not eligible) widens the cut by one.
+    assert list(scores["q2"]) == ["p3", "p1", "p4", "p0"]

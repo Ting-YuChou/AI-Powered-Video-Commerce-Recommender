@@ -257,3 +257,266 @@ def test_ann_scorer_rejects_unknown_index_metric():
             {0: "p1"},
             encode_user=lambda current: np.asarray([1.0, 0.0]),
         )
+
+
+def _reference_top_k(queries, item_embeddings, user_vectors, max_results):
+    """Brute-force reference: score all eligible unseen items, sort, cut."""
+    scores = {}
+    for query in queries:
+        user = np.asarray(user_vectors[query.query_id], dtype=np.float64)
+        ranked = sorted(
+            (
+                (float(np.dot(user, item_embeddings[product_id])), product_id)
+                for product_id in query.eligible_product_ids
+                if product_id in item_embeddings
+                and product_id not in query.seen_product_ids
+            ),
+            key=lambda item: (-item[0], item[1]),
+        )[:max_results]
+        scores[query.query_id] = {product_id: score for score, product_id in ranked}
+    return scores
+
+
+def _random_queries(rng, *, products, count, eligible):
+    queries = []
+    for index in range(count):
+        relevant = set(rng.choice(products, size=rng.integers(1, 4), replace=False))
+        seen = set(rng.choice(products, size=rng.integers(0, 6), replace=False))
+        queries.append(
+            RetrievalEvaluationQuery(
+                query_id=f"q{index:03d}",
+                user_id=f"u{index % 17}",
+                relevant_product_ids=frozenset(relevant),
+                eligible_product_ids=eligible,
+                seen_product_ids=frozenset(seen),
+                long_tail_product_ids=frozenset(products[::3]),
+            )
+        )
+    return queries
+
+
+def test_chunked_exact_scorer_matches_brute_force_with_ties_and_seen(monkeypatch):
+    import video_commerce.ml.retrieval_evaluation as evaluation
+
+    # Tiny blocks force several matrix chunks; integer embeddings force ties.
+    monkeypatch.setattr(evaluation, "_SCORING_BLOCK_ELEMENTS", 50)
+    rng = np.random.default_rng(7)
+    products = [f"p{index:03d}" for index in range(40)]
+    item_embeddings = {
+        product_id: rng.integers(-2, 3, size=3).astype(np.float64)
+        for product_id in products
+        if product_id != "p005"  # unencoded items are skipped, not scored
+    }
+    queries = _random_queries(
+        rng, products=products, count=30, eligible=tuple(products)
+    )
+    user_vectors = {
+        query.query_id: rng.integers(-2, 3, size=3).astype(np.float64)
+        for query in queries
+    }
+
+    for max_results in (1, 7, 200):
+        scores = score_full_catalog_embeddings(
+            queries,
+            item_embeddings,
+            encode_user=lambda query: user_vectors[query.query_id],
+            max_results=max_results,
+        )
+        expected = _reference_top_k(queries, item_embeddings, user_vectors, max_results)
+        assert {key: list(value.items()) for key, value in scores.items()} == {
+            key: list(value.items()) for key, value in expected.items()
+        }
+
+
+def test_exact_scorer_rejects_non_finite_and_mismatched_embeddings():
+    query = _query("q1", "u1", {"p1"})
+    items = {product_id: np.asarray([1.0, 0.0]) for product_id in ("p1", "p2")}
+
+    with pytest.raises(ValueError, match="not finite"):
+        score_full_catalog_embeddings(
+            [query], items, encode_user=lambda _query: np.asarray([np.nan, 0.0])
+        )
+    with pytest.raises(ValueError, match="dimensions differ"):
+        score_full_catalog_embeddings(
+            [query], items, encode_user=lambda _query: np.asarray([1.0, 0.0, 0.0])
+        )
+
+
+def _reference_evaluate(queries, scores, cutoffs):
+    """The pre-optimization evaluate_full_catalog, kept as an oracle."""
+    recalls = {cutoff: [] for cutoff in cutoffs}
+    reciprocal_ranks = []
+    all_eligible, encoded, exposed = set(), set(), set()
+    tail_slots = total_slots = 0
+    for query in queries:
+        eligible = set(query.eligible_product_ids) - set(query.seen_product_ids)
+        relevant = set(query.relevant_product_ids) & eligible
+        if not relevant:
+            continue
+        all_eligible.update(eligible)
+        query_scores = scores.get(query.query_id, {})
+        encoded.update(product for product in eligible if product in query_scores)
+        ranked = [
+            product_id
+            for product_id, _ in sorted(
+                (
+                    (product_id, float(query_scores[product_id]))
+                    for product_id in eligible
+                    if product_id in query_scores
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ]
+        window = ranked[: max(cutoffs)]
+        exposed.update(window)
+        tail_slots += sum(product in query.long_tail_product_ids for product in window)
+        total_slots += len(window)
+        first = next(
+            (rank for rank, product in enumerate(ranked, 1) if product in relevant),
+            None,
+        )
+        reciprocal_ranks.append(0.0 if first is None else 1.0 / first)
+        for cutoff in cutoffs:
+            recalls[cutoff].append(len(set(ranked[:cutoff]) & relevant) / len(relevant))
+    result = {
+        "queries": len(reciprocal_ranks),
+        "mrr": float(np.mean(reciprocal_ranks)),
+        "eligible_item_encoding_coverage": len(encoded) / len(all_eligible),
+        "recommendation_catalog_coverage": len(exposed) / len(all_eligible),
+        "long_tail_exposure_share": tail_slots / total_slots,
+    }
+    for cutoff in cutoffs:
+        result[f"recall_at_{cutoff}"] = float(np.mean(recalls[cutoff]))
+    return result
+
+
+def test_set_cached_evaluation_matches_the_reference_implementation():
+    rng = np.random.default_rng(11)
+    products = [f"p{index:03d}" for index in range(30)]
+    shared = tuple(products)
+    queries = _random_queries(rng, products=products, count=40, eligible=shared)
+    # Mix in a second, distinct eligible tuple (and an equal-but-new tuple).
+    queries += [
+        replace(query, query_id=f"r{index}", eligible_product_ids=tuple(products[:20]))
+        for index, query in enumerate(queries[:10])
+    ]
+    queries += [
+        replace(query, query_id=f"s{index}", eligible_product_ids=tuple(products))
+        for index, query in enumerate(queries[:5])
+    ]
+    scores = {
+        query.query_id: {
+            product_id: float(rng.integers(0, 5))
+            for product_id in rng.choice(products, size=12, replace=False)
+        }
+        for query in queries
+    }
+
+    result = evaluate_full_catalog(queries, scores, cutoffs=(3, 5, 10))
+    expected = _reference_evaluate(queries, scores, (3, 5, 10))
+
+    for key, value in expected.items():
+        assert result[key] == pytest.approx(value, abs=1e-12), key
+    single_tuple = evaluate_full_catalog(queries[:40], scores, cutoffs=(3, 5, 10))
+    assert single_tuple["recommendation_catalog_coverage"] == pytest.approx(
+        _reference_evaluate(queries[:40], scores, (3, 5, 10))[
+            "recommendation_catalog_coverage"
+        ]
+    )
+
+
+def test_vectorized_bootstrap_matches_resampling_full_evaluation():
+    from video_commerce.ml.retrieval_evaluation import _bootstrap_recall_delta
+
+    rng = np.random.default_rng(3)
+    products = [f"p{index:03d}" for index in range(150)]
+    queries = _random_queries(
+        rng, products=products, count=60, eligible=tuple(products)
+    )
+    champion = {
+        query.query_id: {
+            product_id: float(rng.random())
+            for product_id in rng.choice(products, size=110, replace=False)
+        }
+        for query in queries
+    }
+    challenger = {
+        query.query_id: {
+            product_id: float(rng.random())
+            for product_id in rng.choice(products, size=110, replace=False)
+        }
+        for query in queries
+    }
+    config = replace(_gate_config(), bootstrap_samples=40, random_seed=5)
+
+    by_user = {}
+    for query in queries:
+        by_user.setdefault(query.user_id, []).append(query)
+    users = sorted(by_user)
+    generator = np.random.default_rng(config.random_seed)
+    deltas = []
+    for sample in range(config.bootstrap_samples):
+        sampled = generator.choice(users, size=len(users), replace=True)
+        sampled_queries, sampled_champion, sampled_challenger = [], {}, {}
+        for cluster, user_id in enumerate(sampled):
+            for query in by_user[str(user_id)]:
+                query_id = f"{sample}:{cluster}:{query.query_id}"
+                sampled_queries.append(replace(query, query_id=query_id))
+                sampled_champion[query_id] = champion[query.query_id]
+                sampled_challenger[query_id] = challenger[query.query_id]
+        deltas.append(
+            evaluate_full_catalog(sampled_queries, sampled_challenger)["recall_at_100"]
+            - evaluate_full_catalog(sampled_queries, sampled_champion)["recall_at_100"]
+        )
+
+    result = _bootstrap_recall_delta(queries, champion, challenger, config)
+
+    assert result["recall_at_100_delta_ci_lower"] == pytest.approx(
+        float(np.quantile(deltas, 0.025)), abs=1e-12
+    )
+    assert result["recall_at_100_delta_ci_upper"] == pytest.approx(
+        float(np.quantile(deltas, 0.975)), abs=1e-12
+    )
+
+
+def test_recall_at_40_is_reported_but_not_a_gate_blocker():
+    queries = [
+        _query("q1", "u1", {"p1"}, long_tail={"p4"}),
+        _query("q2", "u2", {"p2"}, long_tail={"p4"}),
+    ]
+    scores = {
+        "q1": {"p1": 1.0, "p2": 0.5, "p3": 0.2, "p4": 0.1},
+        "q2": {"p2": 1.0, "p1": 0.9, "p3": 0.2, "p4": 0.1},
+    }
+
+    metrics = evaluate_full_catalog(queries, scores, include_ranked_product_ids=False)
+    gate = evaluate_retrieval_gate(queries, scores, scores, _gate_config())
+
+    assert metrics["recall_at_40"] == 1.0
+    assert "ranked_product_ids" not in metrics
+    assert gate.overall["recall_at_40_delta"] == 0.0
+    assert not any("recall_at_40" in reason for reason in gate.reasons)
+
+
+def test_ann_scorer_over_fetches_by_seen_count_and_drops_seen():
+    class Index:
+        ntotal = 4
+        metric_type = faiss.METRIC_INNER_PRODUCT
+
+        def search(self, vectors, k):
+            assert k == 3  # max_results=2 plus one seen item
+            return (
+                np.asarray([[0.9, 0.8, 0.7]], dtype=np.float32),
+                np.asarray([[0, 1, 2]], dtype=np.int64),
+            )
+
+    query = replace(_query("q1", "u1", {"p1"}), seen_product_ids=frozenset({"p2"}))
+    scores = score_ann_index(
+        [query],
+        Index(),
+        {0: "p1", 1: "p2", 2: "p3", 3: "p4"},
+        encode_user=lambda current: np.asarray([1.0, 0.0]),
+        max_results=2,
+    )
+
+    assert list(scores["q1"]) == ["p1", "p3"]
