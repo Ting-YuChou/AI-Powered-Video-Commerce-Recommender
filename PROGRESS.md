@@ -1,5 +1,55 @@
 # Progress
 
+## 2026-10-20 — Stage A WS-A: PIT labels, feature max-age, quality gates (review items 37, 27, 41, 40)
+
+- Labels (37): the ranking PIT join keeps only displayed observations
+  (`event_type='ranking_observation'`), deduplicates them by `observation_id`,
+  and attributes feedback per impression (`context.impression_id` + product,
+  last-touch like the legacy builder). Organic interactions are not attributed.
+  The feedback/view lower bound is the server-side `available_at`. The label
+  version is now `ranking_labels_v2_impression` in Java and Python, so v1
+  datasets are rejected. `PointInTimeAttributionSqlTest` executes the real
+  Flink SQL on in-memory tables: 3 impressions + 1 purchase give 1 positive.
+- Max age (27): official `uf:` TTL is `FLINK_USER_FEATURES_TTL_SECONDS`
+  (default 7 days, no longer `CACHE_USER_FEATURES_TTL`). The PIT `user_ranked`
+  join only uses snapshots within `--feature-max-age-seconds` /
+  `FEATURE_LAKE_FEATURE_MAX_AGE_SECONDS` (7 days), recorded in the manifest.
+  Item snapshots stay unbounded (serving catalog metadata has no TTL). New
+  counter `video_commerce_user_features_missing_known_user_total`.
+- Quality gates (41): the reader fails closed on parity below
+  `FEATURE_LAKE_PIT_MIN_ONLINE_OFFLINE_PARITY_RATIO` (0.99) or quarantine share
+  above `FEATURE_LAKE_PIT_MAX_QUARANTINE_RATIO` (0.2), in both reader modes.
+  The manifest records `positive_rate` and the publisher rejects a relative
+  shift above 0.5 vs the previous run (both runs >= 1000 rows). The
+  orchestrator sets the real `pit_online_offline_parity_ratio` gauge.
+- Catch-up (40): before submitting a new PIT job, the orchestrator waits (with
+  backoff and lease renewal) until the materializer's committed offsets reach
+  the end offsets sampled at the first check and a checkpoint completed after
+  the cutoff. Otherwise the run is parked as `waiting_for_materializer` and
+  resumed by the next claim. The topic mismatch was real: the materializer and
+  interaction job defaulted to the legacy `feature-updates` topic, which
+  `parseRawEvent` rejects, and the readiness gate measured lag on it. They now
+  default to `feature-history-snapshots` (`KAFKA_FEATURE_HISTORY_SNAPSHOTS_TOPIC`),
+  and the materializer refuses other topics.
+- Key files: `flink-jobs/interaction-features/` (PIT job, interaction job,
+  materializer, tests, pom test deps), `video_commerce/ml/{pit_training_dataset,pit_manifest,feature_lake_readiness,ranking_training}.py`,
+  `video_commerce/services/pit_dataset_orchestrator/main.py`,
+  `video_commerce/data_plane/{system_store,feature_store}.py`,
+  `video_commerce/common/{config,observability}.py`, `docker-compose.yml`,
+  `charts/video-commerce/`, `docs/operations/offline-feature-store.md`.
+- Verification: Docker `backend-tests` 861 passed, 5 skipped (venv: 853 passed,
+  13 skipped). `mvn test` in Docker passed 48 tests, and a mutation run with the
+  old join fails the SQL test. `run_flink_closed_loop_smoke.sh` passed.
+  `docker compose config -q` passed. Helm lint/template and kubeconform passed
+  (36/39 resources).
+- Gaps: the closed-loop smoke does not run the PIT profile, so the new SQL is
+  only proven by the in-memory Flink SQL tests. Users idle more than 7 days are
+  served defaults online but quarantined offline (not trained on defaults).
+  The `waiting_for_materializer` status and the known-user counter have no
+  alert yet (`prometheus-rules.yml` is owned by WS-B). The 30-minute catch-up
+  wait plus the Flink timeout can exceed the 2-hour CronJob deadline; the next
+  run then reattaches the job.
+
 ## 2026-10-20 — Phase 0 hardening (review items 24, 25, 26, 36, 45, 67, 68, 70, 04)
 
 - Measurement: Two-Tower, content, and CF FAISS indexes use inner product.
