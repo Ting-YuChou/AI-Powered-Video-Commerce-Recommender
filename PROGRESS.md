@@ -28,6 +28,58 @@
 - Gaps: views are not lower-bounded when Postgres is disabled (no slate). The
   PIT acceptance check from item 28 (identical rows/labels under ±60s skew,
   zero leakage) still depends on WS-A's `available_at` switch.
+## 2026-10-20 — Stage A WS-B: trustworthy release gate and champion (review 38, 46, 10, 41, 37)
+
+- Gate `ranking_quality_gate_v4`:
+  - Only `cold_user`, `cold_item` and the price bands block; their NDCG CIs are
+    Bonferroni-adjusted across the blocking slices that are tested.
+  - Category and retrieval-source slices are capped to the top 10 plus
+    `other`. They and missing-modality slices are report-only
+    (`"blocking": false`).
+  - New experiment kind `retrain` (`default_gate_config`) needs no candidate
+    recall evidence.
+  - `quality_gate_snapshot_valid` checks the defaults for each experiment kind
+    and accepts v2/v3 snapshots without the new top-N fields.
+- Trainer champion:
+  - Re-resolved from the active release every round
+    (`sync_selected_ranking_checkpoint`) and loaded from that release's own
+    checkpoint with its contract, calibration and DIN/trimodal flags.
+  - Warm-starts from the champion. Challengers always go to
+    `<ranking_model>.challenger.pt`, including the implicit save inside
+    `train_model`.
+  - Load failure skips the gate, and the round is not staged.
+  - A passing retrain is staged.
+- Activation rejects an evaluation whose `champion_release_id` is not the
+  current active release (`champion_not_active`); rollbacks are exempt.
+- Splits purge rows within attribution window + lateness before the holdout,
+  in-memory and streaming (`split='purged'`).
+- The trainer no longer reports hard-coded PIT parity/reconciliation/
+  current-state/invalid-row values. The four alerts fed only by those
+  constants were removed. `PitOnlineOfflineParityLow` waits for WS-A's
+  manifest-driven gauge.
+- Key files:
+  - `video_commerce/ml/{model_release_quality,phase_c_evidence,pit_streaming}.py`
+  - `video_commerce/services/model_trainer/main.py`
+  - `video_commerce/data_plane/system_store.py`
+  - `video_commerce/common/observability.py`
+  - `monitoring/prometheus-rules.yml`
+  - `docs/operations/phase-c-ranking.md`
+  - tests: `test_trainer_champion.py`, `test_model_release_quality.py`,
+    `test_model_release_lifecycle.py`, `test_pit_streaming.py`
+- Verification:
+  - Full backend suite in pinned py3.10 venv: 844 passed, 7 skipped.
+  - `test_model_release_lifecycle.py` against a temporary Postgres 16:
+    12 passed, including the champion-mismatch case.
+  - `promtool test rules` passed.
+- Gaps:
+  - In a small A/A fixture (240 impressions), the overall NDCG
+    non-inferiority CI (`overall_ndcg_ci_lower=-0.005`) still fails about 60%
+    of equal-quality challengers. That is a power issue, and underpowered
+    holdouts should probably be INSUFFICIENT rather than FAILED.
+  - No full `_train_ranking_model` → gate → stage integration test yet; the
+    champion, challenger and purge helpers are unit-tested.
+  - Champion sha is verified by the generation installer; the local
+    non-generation path without object storage is not re-hashed.
 
 ## 2026-10-20 — Phase 0 hardening (review items 24, 25, 26, 36, 45, 67, 68, 70, 04)
 

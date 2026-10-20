@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -179,7 +180,7 @@ def test_quality_gate_passes_non_regressing_challenger_deterministically():
     assert first.decision is GateDecision.PASSED
     assert first.overall["ndcg_at_10_delta"] == pytest.approx(0.0)
     assert first.bootstrap == second.bootstrap
-    assert first.policy_version == "ranking_quality_gate_v3"
+    assert first.policy_version == "ranking_quality_gate_v4"
     assert first.policy_version == QUALITY_GATE_POLICY_VERSION
     assert first.overall["ndcg_informative_impressions"] == 3
 
@@ -333,3 +334,229 @@ def test_ndcg_delta_is_clearly_negative_for_random_order_challenger():
     assert _mean_ndcg(rows, champion) == pytest.approx(1.0)
     assert delta < -0.25
     assert bootstrap["ndcg_at_10_delta_ci_upper"] < -0.15
+
+
+# --- ranking_quality_gate_v4 slice policy -------------------------------------------
+
+
+def _categorised(rows, category):
+    return [replace(row, category=category) for row in rows]
+
+
+def _tiny_category_rows():
+    rows = _categorised(_fixture_rows(), "main")
+    rows.extend(
+        _categorised(
+            [
+                _row(
+                    impression="tiny-impression",
+                    user="u-tiny",
+                    product="tiny:positive",
+                    timestamp=1_700_000_000.0 + 3 * 86400,
+                    relevance=2.0,
+                    clicked=True,
+                ),
+                _row(
+                    impression="tiny-impression",
+                    user="u-tiny",
+                    product="tiny:negative",
+                    timestamp=1_700_000_000.0 + 3 * 86400,
+                    relevance=1.0,
+                ),
+            ],
+            "tiny",
+        )
+    )
+    return rows
+
+
+def test_long_tail_category_is_reported_without_blocking_the_gate():
+    rows = _tiny_category_rows()
+    predictions = {row.observation_id: _prediction(row, correct=True) for row in rows}
+    config = replace(_small_config(), min_slice_impressions=4)
+
+    result = evaluate_quality_gate(rows, predictions, predictions, config)
+
+    assert result.decision is GateDecision.PASSED
+    assert result.policy_version == "ranking_quality_gate_v4"
+    tiny = result.slices["category_tiny"]
+    assert tiny["status"] == GateDecision.INSUFFICIENT_EVIDENCE.value
+    assert tiny["blocking"] is False
+    assert result.slices["price_mid"]["blocking"] is True
+
+
+def test_pre_registered_slice_without_evidence_still_blocks():
+    rows = _tiny_category_rows()
+    predictions = {row.observation_id: _prediction(row, correct=True) for row in rows}
+    config = replace(_small_config(), min_slice_impressions=100)
+
+    result = evaluate_quality_gate(rows, predictions, predictions, config)
+
+    assert result.decision is GateDecision.INSUFFICIENT_EVIDENCE
+    assert "slice_price_mid" in result.reasons
+    assert "slice_category_tiny" not in result.reasons
+
+
+def test_category_slices_are_capped_to_top_n_plus_other():
+    rows = []
+    for index, row in enumerate(_fixture_rows()):
+        rows.append(replace(row, category=f"c{(index // 2) % 8}"))
+    predictions = {row.observation_id: _prediction(row, correct=True) for row in rows}
+    config = replace(_small_config(), slice_top_n_categories=3)
+
+    result = evaluate_quality_gate(rows, predictions, predictions, config)
+
+    category_slices = sorted(name for name in result.slices if name.startswith("category_"))
+    assert len(category_slices) == 4
+    assert "category_other" in category_slices
+
+
+def test_retrain_kind_does_not_require_candidate_recall_evidence():
+    from video_commerce.ml.model_release_quality import default_gate_config
+
+    rows = _fixture_rows()
+    predictions = {row.observation_id: _prediction(row, correct=True) for row in rows}
+    small = _small_config()
+    retrain = replace(
+        default_gate_config("retrain"),
+        **{
+            name: getattr(small, name)
+            for name in (
+                "holdout_days",
+                "bootstrap_samples",
+                "min_impressions",
+                "min_users",
+                "min_clicks",
+                "min_purchases",
+                "min_slice_impressions",
+                "min_slice_users",
+                "min_slice_positives",
+            )
+        },
+    )
+    combined = replace(retrain, experiment_kind="combined", require_candidate_recall=True)
+
+    assert evaluate_quality_gate(rows, predictions, predictions, retrain).decision is (
+        GateDecision.PASSED
+    )
+    assert "candidate_recall_at_500" in evaluate_quality_gate(
+        rows, predictions, predictions, combined
+    ).reasons
+
+
+def test_retrain_snapshot_validates_against_retrain_defaults_only():
+    from dataclasses import asdict
+
+    from video_commerce.ml.model_release_quality import default_gate_config
+    from video_commerce.ml.phase_c_evidence import quality_gate_snapshot_valid
+
+    retrain = asdict(default_gate_config("retrain"))
+
+    assert quality_gate_snapshot_valid(retrain, experiment_kind="retrain")
+    assert not quality_gate_snapshot_valid(retrain, experiment_kind="combined")
+    # v2/v3 snapshots predate the top-N fields and remain valid.
+    legacy = asdict(default_gate_config("combined"))
+    legacy.pop("slice_top_n_categories")
+    legacy.pop("slice_top_n_retrieval_sources")
+    assert quality_gate_snapshot_valid(legacy)
+
+
+def test_equivalent_challenger_rarely_fails_across_many_category_slices():
+    """A/A-style check: equal-quality models with noisy scores, 30 categories.
+
+    Only slice-driven failures are counted: the overall NDCG non-inferiority CI
+    is a power question that depends on holdout size, not on slice policy.
+    """
+    slice_failures = 0
+    category_failures = 0
+    trials = 20
+    for seed in range(trials):
+        rng = np.random.default_rng(seed)
+        rows = []
+        for impression in range(240):
+            user = f"u{impression % 120}"
+            category = f"c{impression % 30}"
+            for slot in range(4):
+                clicked = bool(rng.random() < 0.3)
+                rows.append(
+                    replace(
+                        _row(
+                            impression=f"i{impression}",
+                            user=user,
+                            product=f"i{impression}:p{slot}",
+                            timestamp=1_700_000_000.0 + impression * 600,
+                            relevance=2.0 if clicked else 1.0,
+                            clicked=clicked,
+                            purchased=clicked and rng.random() < 0.3,
+                            value=10.0,
+                        ),
+                        category=category,
+                    )
+                )
+        base = {
+            row.observation_id: float(rng.random()) + (0.3 if row.clicked else 0.0)
+            for row in rows
+        }
+
+        def predictions(noise_seed):
+            noise = np.random.default_rng(noise_seed)
+            out = {}
+            for row in rows:
+                score = base[row.observation_id] + float(noise.normal(0.0, 0.01))
+                probability = min(0.99, max(0.01, score / 1.5))
+                out[row.observation_id] = RankingPrediction(
+                    serving_score=score,
+                    ctr=probability,
+                    ctcvr=probability * 0.3,
+                    predicted_value=10.0,
+                )
+            return out
+
+        config = RankingQualityGateConfig(
+            bootstrap_samples=100,
+            min_impressions=50,
+            min_users=20,
+            min_clicks=10,
+            min_purchases=5,
+            min_slice_impressions=5,
+            min_slice_users=3,
+            min_slice_positives=1,
+            require_candidate_recall=False,
+            experiment_kind="retrain",
+        )
+        result = evaluate_quality_gate(
+            rows, predictions(1000 + seed), predictions(2000 + seed), config
+        )
+        slice_reasons = [reason for reason in result.reasons if reason.startswith("slice_")]
+        slice_failures += bool(slice_reasons)
+        category_failures += any("category_" in reason for reason in result.reasons)
+
+    # 30 per-category point thresholds no longer multiply false failures.
+    assert category_failures == 0
+    assert slice_failures / trials <= 0.05
+
+
+def test_fixed_holdout_purges_rows_within_label_reach_of_the_holdout():
+    rows = _fixture_rows()
+
+    training, holdout, window = split_fixed_holdout(
+        rows,
+        holdout_days=2,
+        attribution_cutoff=rows[-1].as_of_ts + 86400,
+        purge_seconds=2 * 86400,
+    )
+    examples = [SimpleNamespace(bundle=SimpleNamespace(as_of_ts=row.as_of_ts)) for row in rows]
+    example_training, _, _ = split_training_examples_fixed_holdout(
+        examples,
+        holdout_days=2,
+        attribution_cutoff=rows[-1].as_of_ts + 86400,
+        purge_seconds=2 * 86400,
+    )
+
+    assert holdout
+    assert all(row.as_of_ts < window.start_ts - 2 * 86400 for row in training)
+    assert len(example_training) == len(training)
+    unpurged, _, _ = split_fixed_holdout(
+        rows, holdout_days=2, attribution_cutoff=rows[-1].as_of_ts + 86400
+    )
+    assert len(unpurged) > len(training)

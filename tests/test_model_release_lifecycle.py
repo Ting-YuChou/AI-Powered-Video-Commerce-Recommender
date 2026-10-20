@@ -253,6 +253,7 @@ def test_postgres_release_activation_is_cas_guarded_and_audited(tmp_path):
                 f"champion-{suffix}",
                 f"challenger-{suffix}",
                 f"regression-{suffix}",
+                f"stale-champion-{suffix}",
             ):
                 assert await store.record_model_checkpoint(
                     "ranking_model",
@@ -375,6 +376,42 @@ def test_postgres_release_activation_is_cas_guarded_and_audited(tmp_path):
                 == challenger["release_id"]
             )
             assert active_checkpoint["payload"]["active_generation"] == 2
+
+            # A pass recorded against the previous champion does not prove the
+            # release beats what is serving now.
+            stale_champion = await store.get_model_release(
+                "ranking_model", f"stale-champion-{suffix}"
+            )
+            await store.record_model_release_evaluation(
+                release_id=stale_champion["release_id"],
+                champion_release_id=champion["release_id"],
+                dataset_manifest_uri="s3://pit/manifest.json",
+                dataset_manifest_sha256="b" * 64,
+                holdout_start=100.0,
+                holdout_end=200.0,
+                policy_version="ranking_quality_gate_v1",
+                decision="passed",
+                metrics={"ndcg_at_10_delta": 0.01},
+                slice_metrics={},
+                bootstrap={"ndcg_at_10_delta_ci_lower": 0.0},
+                gate_config={"bootstrap_samples": 2000},
+            )
+            assert await store.stage_model_release(
+                release_id=stale_champion["release_id"], actor="evaluator"
+            )
+            assert (
+                await store.activate_model_release(
+                    model_name="ranking_model",
+                    model_version=f"stale-champion-{suffix}",
+                    environment=f"test-{suffix}",
+                    expected_generation=2,
+                    actor="release-manager",
+                    reason="evaluated against a retired champion",
+                    bootstrap=False,
+                    rollback=False,
+                )
+                is None
+            )
         finally:
             await store.close()
 
