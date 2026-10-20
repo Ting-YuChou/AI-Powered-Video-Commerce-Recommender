@@ -38,7 +38,27 @@ def test_retrieval_manifest_pins_shards_catalog_and_item_sidecar(tmp_path):
                     "user_features_json": "{}",
                     "seen_product_ids_json": "[]",
                     "ranker_score": None,
-                }
+                },
+                *[
+                    {
+                        "query_id": "q1",
+                        "user_id": "u1",
+                        "product_id": product_id,
+                        "label_source": "ranker_rejected",
+                        "label_type": "ranker_rejected",
+                        "label_weight": 0.15,
+                        "as_of_ts": 100.0,
+                        "label_event_time": 100.0,
+                        "label_available_at": 100.5,
+                        "feature_event_time": 99.0,
+                        "feature_available_at": 99.5,
+                        "catalog_generation_id": "catalog-1",
+                        "user_features_json": "{}",
+                        "seen_product_ids_json": '["p9"]',
+                        "ranker_score": score,
+                    }
+                    for product_id, score in (("p2", 0.4), ("p3", None))
+                ],
             ]
         ),
         shard,
@@ -81,4 +101,9 @@ def test_retrieval_manifest_pins_shards_catalog_and_item_sidecar(tmp_path):
     assert manifest["schema_version"] == "retrieval_training_pit_v1"
     assert manifest["catalog_generation"]["sha256"] == _sha(catalog)
     assert manifest["item_feature_sidecar"]["sha256"] == _sha(sidecar)
-    assert manifest["row_count"] == 1
+    assert manifest["row_count"] == 3
+    assert manifest["ranker_score_coverage"] == {
+        "ranker_rejected_rows": 2,
+        "ranker_scored_rows": 1,
+        "coverage": 0.5,
+    }

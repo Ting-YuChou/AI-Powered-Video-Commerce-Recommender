@@ -120,6 +120,9 @@ async def _run(args: argparse.Namespace):
                 ranker_rejected_mode=(
                     config.recommendation_config.retrieval_ranker_rejected_mode
                 ),
+                teacher_soft_min_ranker_score_coverage=(
+                    config.recommendation_config.retrieval_teacher_soft_min_ranker_score_coverage
+                ),
             )
         )
         version = str(
@@ -155,6 +158,11 @@ async def _run(args: argparse.Namespace):
             "negative_sampling": {
                 "logq_correction_enabled": config.recommendation_config.tt_logq_correction_enabled,
                 "ranker_rejected_mode": config.recommendation_config.retrieval_ranker_rejected_mode,
+                "ranker_score_coverage": dataset.manifest.ranker_score_coverage,
+                "ranker_rejected_rows": dataset.manifest.ranker_rejected_rows,
+                "teacher_soft_min_ranker_score_coverage": (
+                    config.recommendation_config.retrieval_teacher_soft_min_ranker_score_coverage
+                ),
                 "ann_mining_catalog_generation_id": dataset.manifest.catalog_generation_id,
                 "ann_mining_cutoff": inputs.training_as_of_ts,
             },

@@ -24,7 +24,13 @@ def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_retrieval_dataset(tmp_path, *, row_overrides=None, catalog_overrides=None):
+def _write_retrieval_dataset(
+    tmp_path,
+    *,
+    row_overrides=None,
+    catalog_overrides=None,
+    manifest_overrides=None,
+):
     tmp_path.mkdir(parents=True, exist_ok=True)
     catalog = tmp_path / "catalog.json"
     catalog_payload = {
@@ -125,6 +131,7 @@ def _write_retrieval_dataset(tmp_path, *, row_overrides=None, catalog_overrides=
             }
         ],
     }
+    manifest_payload.update(manifest_overrides or {})
     manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
     latest = tmp_path / "latest.json"
     latest.write_text(
@@ -247,3 +254,84 @@ def test_retrieval_holdout_uses_latest_mature_days_without_leaking_frequency():
     assert [row.query_id for row in training] == ["train"]
     assert [row.query_id for row in holdout] == ["holdout"]
     assert window.end_ts == 900_000.0
+
+
+def test_pinned_catalog_does_not_reject_queries_older_than_its_generation(tmp_path):
+    # The catalog generation (available_at=110) is a static snapshot: a query
+    # at as_of=105 that predates it is valid training data.
+    latest = _write_retrieval_dataset(
+        tmp_path,
+        row_overrides={
+            "as_of_ts": 105.0,
+            "feature_event_time": 104.0,
+            "feature_available_at": 104.5,
+        },
+    )
+
+    dataset = asyncio.run(
+        RetrievalPitDatasetReader(LocalObjectStorage()).read(str(latest))
+    )
+
+    assert dataset.rows[0].as_of_ts == 105.0
+    assert dataset.catalog.available_at == 110.0
+
+
+def test_catalog_newer_than_every_query_is_still_future_data(tmp_path):
+    latest = _write_retrieval_dataset(tmp_path, catalog_overrides={"available_at": 121.0})
+
+    with pytest.raises(RetrievalPitDatasetError, match="catalog is future data"):
+        asyncio.run(RetrievalPitDatasetReader(LocalObjectStorage()).read(str(latest)))
+
+
+def test_reader_records_and_verifies_ranker_score_coverage(tmp_path):
+    rejected = {
+        "label_source": "ranker_rejected",
+        "label_type": "ranker_rejected",
+        "label_weight": 0.15,
+        "label_event_time": 120.0,
+        "ranker_score": 1.25,
+        "seen_product_ids_json": '["p2"]',
+    }
+    latest = _write_retrieval_dataset(
+        tmp_path / "ok",
+        row_overrides=rejected,
+        manifest_overrides={
+            "ranker_score_coverage": {
+                "ranker_rejected_rows": 1,
+                "ranker_scored_rows": 1,
+                "coverage": 1.0,
+            }
+        },
+    )
+    reader = RetrievalPitDatasetReader(LocalObjectStorage())
+
+    dataset = asyncio.run(reader.read(str(latest)))
+    source = asyncio.run(
+        reader.validate_and_stage(
+            str(latest),
+            staging_dir=tmp_path / "staging",
+            batch_rows=1,
+            max_group_rows=16,
+            max_bytes=10_000_000,
+        )
+    )
+
+    assert dataset.manifest.ranker_score_coverage == 1.0
+    assert dataset.rows[0].ranker_score == 1.25
+    assert dataset.rows[0].seen_product_ids == ("p2",)
+    assert source.manifest.ranker_score_coverage == 1.0
+    assert source.lineage["ranker_score_coverage"]["ranker_scored_rows"] == 1
+
+    tampered = _write_retrieval_dataset(
+        tmp_path / "tampered",
+        row_overrides={**rejected, "ranker_score": None},
+        manifest_overrides={
+            "ranker_score_coverage": {
+                "ranker_rejected_rows": 1,
+                "ranker_scored_rows": 1,
+                "coverage": 1.0,
+            }
+        },
+    )
+    with pytest.raises(RetrievalPitDatasetError, match="ranker score coverage"):
+        asyncio.run(reader.read(str(tampered)))

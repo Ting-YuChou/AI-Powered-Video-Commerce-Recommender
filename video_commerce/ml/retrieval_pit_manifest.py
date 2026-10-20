@@ -12,10 +12,12 @@ import pyarrow.parquet as pq
 from video_commerce.ml.pit_manifest import PitManifestPublisher
 from video_commerce.ml.pit_training_dataset import arrow_schema_sha256
 from video_commerce.ml.retrieval_pit_dataset import (
+    RANKER_REJECTED,
     RETRIEVAL_ELIGIBILITY_POLICY_VERSION,
     RETRIEVAL_LABEL_POLICY_VERSION,
     RETRIEVAL_PIT_SCHEMA_VERSION,
     RetrievalPitDatasetError,
+    ranker_score_coverage_manifest,
 )
 
 
@@ -74,6 +76,8 @@ class RetrievalPitManifestPublisher(PitManifestPublisher):
         min_as_of = None
         max_as_of = None
         catalog_ids = set()
+        ranker_rejected_rows = 0
+        ranker_scored_rows = 0
         for uri in sorted(set(str(uri) for uri in shard_uris)):
             path, cleanup = await self.object_storage.materialize_for_processing(
                 uri, suggested_suffix=".parquet"
@@ -107,6 +111,14 @@ class RetrievalPitManifestPublisher(PitManifestPublisher):
                         if max_as_of is None
                         else max(max_as_of, max(as_of_values))
                     )
+                for label_source, label_type, ranker_score in zip(
+                    table.column("label_source").to_pylist(),
+                    table.column("label_type").to_pylist(),
+                    table.column("ranker_score").to_pylist(),
+                ):
+                    if RANKER_REJECTED in (label_source, label_type):
+                        ranker_rejected_rows += 1
+                        ranker_scored_rows += ranker_score is not None
                 catalog_ids.update(
                     str(value)
                     for value in table.column("catalog_generation_id").to_pylist()
@@ -145,6 +157,9 @@ class RetrievalPitManifestPublisher(PitManifestPublisher):
             "eligibility_policy_version": RETRIEVAL_ELIGIBILITY_POLICY_VERSION,
             "catalog_generation": catalog_ref,
             "item_feature_sidecar": sidecar_ref,
+            "ranker_score_coverage": ranker_score_coverage_manifest(
+                ranker_rejected_rows, ranker_scored_rows
+            ),
             "shards": shards,
         }
         manifest_uri = self._join_uri(output_prefix, f"runs/{run_id}/manifest.json")

@@ -21,8 +21,10 @@ from video_commerce.ml.retrieval_evaluation import (
     score_full_catalog_embeddings,
 )
 from video_commerce.ml.retrieval_training import (
+    DEFAULT_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE,
     RetrievalStreamingInputs,
     RetrievalTrainingInputs,
+    require_teacher_soft_coverage,
 )
 
 
@@ -79,15 +81,31 @@ class RetrievalReleaseTrainingRunner:
             torch.manual_seed(seed)
         except ImportError:
             pass
+        rejected_mode = (
+            str(getattr(self.config, "retrieval_ranker_rejected_mode", "weak"))
+            .strip()
+            .lower()
+        )
+        if isinstance(inputs, RetrievalStreamingInputs) and (
+            rejected_mode == "teacher_soft"
+        ):
+            require_teacher_soft_coverage(
+                getattr(inputs.source, "manifest", None),
+                min_coverage=float(
+                    getattr(
+                        self.config,
+                        "retrieval_teacher_soft_min_ranker_score_coverage",
+                        DEFAULT_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE,
+                    )
+                ),
+            )
         trainer = self.trainer_factory()
         try:
             if isinstance(inputs, RetrievalStreamingInputs):
                 prepared = trainer.prepare_streaming_source(
                     inputs.source,
                     batch_rows=int(inputs.batch_rows),
-                    ranker_rejected_mode=str(
-                        getattr(self.config, "retrieval_ranker_rejected_mode", "weak")
-                    ),
+                    ranker_rejected_mode=rejected_mode,
                 )
                 if int(prepared.get("num_samples", 0)) <= 0:
                     raise ValueError(

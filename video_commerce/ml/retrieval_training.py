@@ -10,7 +10,9 @@ import numpy as np
 
 from video_commerce.ml.retrieval_evaluation import RetrievalEvaluationQuery
 from video_commerce.ml.retrieval_pit_dataset import (
+    RetrievalCatalog,
     RetrievalPitDataset,
+    RetrievalPitManifest,
     RetrievalPitRow,
     RetrievalHoldoutWindow,
     split_retrieval_holdout,
@@ -20,6 +22,49 @@ POSITIVE_LABELS = frozenset({"click", "add_to_cart", "purchase"})
 EXPOSURE_NEGATIVE_LABELS = frozenset({"viewed_no_positive", "no_positive"})
 NEGATIVE_SOURCE_IMPRESSION_NO_CLICK = "impression_no_click"
 NEGATIVE_SOURCE_RANKER_REJECTED = "ranker_rejected"
+DEFAULT_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE = 0.9
+COLD_ITEM_AGE_SECONDS = 30 * 86400.0
+COLD_ITEM_MAX_TRAINING_EXPOSURES = 5
+
+
+def require_teacher_soft_coverage(
+    manifest: RetrievalPitManifest | None, *, min_coverage: float
+) -> float:
+    """Refuse teacher_soft unless enough rejected rows carry a real ranker score.
+
+    Rows without a score fall back to plain weak negatives (no teacher target)
+    rather than a fabricated 0.0 logit. Below ``min_coverage`` the experiment
+    would mostly be ``weak`` under another name, so it is rejected outright.
+    """
+    coverage = None if manifest is None else manifest.ranker_score_coverage
+    if coverage is None or coverage < float(min_coverage):
+        raise ValueError(
+            "teacher_soft requires ranker_score coverage >= "
+            f"{float(min_coverage):.3f} over ranker_rejected rows; "
+            f"dataset coverage is {coverage if coverage is None else round(coverage, 4)}"
+        )
+    return coverage
+
+
+def teacher_target_from_ranker_score(score: float | None) -> float | None:
+    if score is None:
+        return None
+    clamped = max(-30.0, min(30.0, float(score)))
+    return 1.0 / (1.0 + math.exp(-clamped))
+
+
+def require_catalog_predates_holdout(
+    catalog: RetrievalCatalog, window: RetrievalHoldoutWindow
+) -> None:
+    """Holdout queries must not be scored against item state from after them."""
+    snapshot_at = max(
+        float(catalog.available_at), float(catalog.item_features_available_at)
+    )
+    if snapshot_at > float(window.start_ts):
+        raise ValueError(
+            "retrieval catalog generation is newer than the holdout start; "
+            "pin a generation available at or before the holdout window"
+        )
 
 
 @dataclass(frozen=True)
@@ -56,6 +101,7 @@ def build_retrieval_streaming_inputs(
     """Build O(items + queries) evaluation state while event rows remain on disk."""
     window = source.assign_holdout(holdout_days=holdout_days)
     catalog = source.catalog
+    require_catalog_predates_holdout(catalog, window)
     metadata = {}
     embeddings = {}
     eligible_ids = tuple(product.product_id for product in catalog.eligible_products)
@@ -82,11 +128,7 @@ def build_retrieval_streaming_inputs(
         for row in rows:
             exposures[row.product_id] = exposures.get(row.product_id, 0) + 1
             training_as_of_ts = max(training_as_of_ts, float(row.as_of_ts))
-    ordered = sorted(
-        eligible_ids, key=lambda product_id: (-exposures.get(product_id, 0), product_id)
-    )
-    head_count = max(1, int(math.ceil(len(ordered) * 0.2))) if ordered else 0
-    long_tail = frozenset(ordered[head_count:])
+    context = _EvaluationContext.build(eligible_ids, metadata, exposures)
     queries = []
     for rows in source.iter_row_batches(
         split="holdout", batch_rows=batch_rows, seed=42, epoch=0
@@ -95,67 +137,9 @@ def build_retrieval_streaming_inputs(
         for row in rows:
             grouped.setdefault(row.query_id, []).append(row)
         for query_id, query_rows in grouped.items():
-            relevant = frozenset(
-                row.product_id
-                for row in query_rows
-                if row.label_type in POSITIVE_LABELS
-            )
-            if not relevant:
-                continue
-            representative = min(
-                query_rows, key=lambda row: (row.as_of_ts, row.product_id)
-            )
-            cold_items = frozenset(
-                product_id
-                for product_id in eligible_ids
-                if representative.as_of_ts
-                - float(metadata[product_id].get("created_at", representative.as_of_ts))
-                <= 30 * 86400.0
-                or exposures.get(product_id, 0) <= 5
-            )
-            missing_by_name = {
-                name: frozenset(
-                    product_id
-                    for product_id in eligible_ids
-                    if not bool(
-                        dict(metadata[product_id].get("modality_presence") or {}).get(
-                            name, False
-                        )
-                    )
-                )
-                for name in sorted(
-                    {
-                        key
-                        for product_id in eligible_ids
-                        for key in dict(
-                            metadata[product_id].get("modality_presence") or {}
-                        )
-                    }
-                )
-            }
-            queries.append(
-                RetrievalEvaluationQuery(
-                    query_id=query_id,
-                    user_id=representative.user_id,
-                    relevant_product_ids=relevant,
-                    eligible_product_ids=eligible_ids,
-                    seen_product_ids=frozenset(representative.seen_product_ids),
-                    cold_user=int(
-                        representative.user_features.get("total_interactions", 0) or 0
-                    )
-                    < 5,
-                    cold_item_product_ids=cold_items,
-                    long_tail_product_ids=long_tail,
-                    missing_modality_product_ids=(
-                        frozenset().union(*missing_by_name.values())
-                        if missing_by_name
-                        else frozenset()
-                    ),
-                    missing_modality_product_ids_by_name=missing_by_name,
-                    as_of_ts=representative.as_of_ts,
-                    user_features=dict(representative.user_features),
-                )
-            )
+            query = context.query(query_id, query_rows)
+            if query is not None:
+                queries.append(query)
     return RetrievalStreamingInputs(
         source=source,
         product_metadata=metadata,
@@ -172,16 +156,24 @@ def build_retrieval_training_inputs(
     *,
     holdout_days: int,
     ranker_rejected_mode: str = "weak",
+    teacher_soft_min_ranker_score_coverage: float = (
+        DEFAULT_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE
+    ),
 ) -> RetrievalTrainingInputs:
     """Build legacy trainer tensors without consulting mutable online state."""
     rejected_mode = str(ranker_rejected_mode or "").strip().lower()
     if rejected_mode not in {"disabled", "weak", "teacher_soft"}:
         raise ValueError("ranker_rejected_mode must be disabled, weak, or teacher_soft")
+    if rejected_mode == "teacher_soft":
+        require_teacher_soft_coverage(
+            dataset.manifest, min_coverage=teacher_soft_min_ranker_score_coverage
+        )
     training_rows, holdout_rows, window = split_retrieval_holdout(
         dataset.rows,
         holdout_days=holdout_days,
         attribution_cutoff=dataset.manifest.attribution_cutoff,
     )
+    require_catalog_predates_holdout(dataset.catalog, window)
     interactions = []
     negatives = []
     latest_user_features: dict[str, tuple[float, Mapping[str, Any]]] = {}
@@ -229,10 +221,12 @@ def build_retrieval_training_inputs(
         ):
             if rejected_mode == "disabled":
                 continue
-            teacher_target = None
-            if rejected_mode == "teacher_soft":
-                score = float(row.ranker_score or 0.0)
-                teacher_target = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, score))))
+            # Unscored rows stay plain weak negatives in teacher_soft mode.
+            teacher_target = (
+                teacher_target_from_ranker_score(row.ranker_score)
+                if rejected_mode == "teacher_soft"
+                else None
+            )
             negatives.append(
                 {
                     "user_id": row.user_id,
@@ -310,80 +304,115 @@ def _evaluation_queries(
         training_exposures[row.product_id] = (
             training_exposures.get(row.product_id, 0) + 1
         )
-    ordered = sorted(
-        eligible_product_ids,
-        key=lambda product_id: (-training_exposures.get(product_id, 0), product_id),
+    context = _EvaluationContext.build(
+        tuple(eligible_product_ids), product_metadata, training_exposures
     )
-    head_count = max(1, int(math.ceil(len(ordered) * 0.2))) if ordered else 0
-    long_tail = frozenset(ordered[head_count:])
     grouped: dict[str, list[RetrievalPitRow]] = {}
     for row in holdout_rows:
         grouped.setdefault(row.query_id, []).append(row)
     queries = []
     for query_id, rows in sorted(grouped.items()):
-        relevant = frozenset(
-            row.product_id for row in rows if row.label_type in POSITIVE_LABELS
+        query = context.query(query_id, rows)
+        if query is not None:
+            queries.append(query)
+    return tuple(queries)
+
+
+@dataclass(frozen=True)
+class _EvaluationContext:
+    """Query-independent evaluation state, computed once per holdout.
+
+    ``long_tail`` and the missing-modality sets are shared by every query.
+    Cold items depend on the query's ``as_of_ts``, but the gate only uses them
+    as ``relevant & cold``. Each query therefore stores just its cold relevant
+    items, an O(|relevant|) lookup, instead of an O(catalog) set per query.
+    """
+
+    eligible_ids: tuple[str, ...]
+    created_at: Mapping[str, float | None]
+    exposures: Mapping[str, int]
+    long_tail: frozenset[str]
+    missing_by_name: Mapping[str, frozenset[str]]
+    missing_modality: frozenset[str]
+
+    @classmethod
+    def build(cls, eligible_ids, metadata, exposures) -> "_EvaluationContext":
+        eligible_ids = tuple(eligible_ids)
+        ordered = sorted(
+            eligible_ids,
+            key=lambda product_id: (-exposures.get(product_id, 0), product_id),
         )
-        if not relevant:
-            continue
-        representative = min(rows, key=lambda row: (row.as_of_ts, row.product_id))
-        cold_items = frozenset(
-            product_id
-            for product_id in eligible_product_ids
-            if (
-                representative.as_of_ts
-                - float(
-                    product_metadata[product_id].get(
-                        "created_at", representative.as_of_ts
-                    )
-                )
-                <= 30 * 86400.0
-                or training_exposures.get(product_id, 0) <= 5
-            )
-        )
+        head_count = max(1, int(math.ceil(len(ordered) * 0.2))) if ordered else 0
+        presence = {
+            product_id: dict(metadata[product_id].get("modality_presence") or {})
+            for product_id in eligible_ids
+        }
         modality_names = sorted(
-            {
-                name
-                for product_id in eligible_product_ids
-                for name in dict(
-                    product_metadata[product_id].get("modality_presence") or {}
-                )
-            }
+            {name for values in presence.values() for name in values}
         )
         missing_by_name = {
             name: frozenset(
                 product_id
-                for product_id in eligible_product_ids
-                if not bool(
-                    dict(
-                        product_metadata[product_id].get("modality_presence") or {}
-                    ).get(name, False)
-                )
+                for product_id in eligible_ids
+                if not bool(presence[product_id].get(name, False))
             )
             for name in modality_names
         }
-        missing_modality = (
-            frozenset().union(*missing_by_name.values())
-            if missing_by_name
-            else frozenset()
-        )
-        queries.append(
-            RetrievalEvaluationQuery(
-                query_id=query_id,
-                user_id=representative.user_id,
-                relevant_product_ids=relevant,
-                eligible_product_ids=tuple(eligible_product_ids),
-                seen_product_ids=frozenset(representative.seen_product_ids),
-                cold_user=int(
-                    representative.user_features.get("total_interactions", 0) or 0
+        return cls(
+            eligible_ids=eligible_ids,
+            created_at={
+                product_id: (
+                    float(metadata[product_id]["created_at"])
+                    if metadata[product_id].get("created_at") is not None
+                    else None
                 )
-                < 5,
-                cold_item_product_ids=cold_items,
-                long_tail_product_ids=long_tail,
-                missing_modality_product_ids=missing_modality,
-                missing_modality_product_ids_by_name=missing_by_name,
-                as_of_ts=representative.as_of_ts,
-                user_features=dict(representative.user_features),
-            )
+                for product_id in eligible_ids
+            },
+            exposures=dict(exposures),
+            long_tail=frozenset(ordered[head_count:]),
+            missing_by_name=missing_by_name,
+            missing_modality=(
+                frozenset().union(*missing_by_name.values())
+                if missing_by_name
+                else frozenset()
+            ),
         )
-    return tuple(queries)
+
+    def is_cold(self, product_id: str, as_of_ts: float) -> bool:
+        if product_id not in self.created_at:
+            return False
+        if self.exposures.get(product_id, 0) <= COLD_ITEM_MAX_TRAINING_EXPOSURES:
+            return True
+        created_at = self.created_at[product_id]
+        # A missing created_at counts as brand new, as before.
+        return created_at is None or as_of_ts - created_at <= COLD_ITEM_AGE_SECONDS
+
+    def query(self, query_id, rows) -> RetrievalEvaluationQuery | None:
+        relevant = frozenset(
+            row.product_id for row in rows if row.label_type in POSITIVE_LABELS
+        )
+        if not relevant:
+            return None
+        representative = min(rows, key=lambda row: (row.as_of_ts, row.product_id))
+        as_of_ts = float(representative.as_of_ts)
+        return RetrievalEvaluationQuery(
+            query_id=query_id,
+            user_id=representative.user_id,
+            relevant_product_ids=relevant,
+            eligible_product_ids=self.eligible_ids,
+            seen_product_ids=frozenset(representative.seen_product_ids),
+            cold_user=int(
+                representative.user_features.get("total_interactions", 0) or 0
+            )
+            < 5,
+            cold_item_product_ids=frozenset(
+                product_id
+                for product_id in relevant
+                if self.is_cold(product_id, as_of_ts)
+            ),
+            long_tail_product_ids=self.long_tail,
+            missing_modality_product_ids=self.missing_modality,
+            missing_modality_product_ids_by_name=self.missing_by_name,
+            as_of_ts=as_of_ts,
+            user_features=dict(representative.user_features),
+        )

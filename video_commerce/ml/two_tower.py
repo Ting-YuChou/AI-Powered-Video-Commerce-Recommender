@@ -1282,13 +1282,14 @@ class TwoTowerTrainer:
                     ):
                         continue
                     teacher_target = None
+                    # Rows without a real ranker score stay plain weak
+                    # negatives; coverage is gated before training starts.
                     if (
                         source_name == NEGATIVE_SOURCE_RANKER_REJECTED
                         and rejected_mode == "teacher_soft"
+                        and row.ranker_score is not None
                     ):
-                        raw_score = max(
-                            -30.0, min(30.0, float(row.ranker_score or 0.0))
-                        )
+                        raw_score = max(-30.0, min(30.0, float(row.ranker_score)))
                         teacher_target = 1.0 / (1.0 + np.exp(-raw_score))
                     store.add_negative(
                         user_idx=user_idx,

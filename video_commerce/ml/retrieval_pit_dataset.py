@@ -1,8 +1,24 @@
-"""Immutable point-in-time dataset contract for collaborative retrieval."""
+"""Immutable point-in-time dataset contract for collaborative retrieval.
+
+Catalog semantics: a dataset pins ONE catalog generation, which is a static
+item snapshot (membership, eligibility, metadata, CLIP embeddings). It is not
+an as-of-query catalog, so the reader does not require it to predate every
+row. Doing so rejected every query older than the pinned generation. The
+reader requires the snapshot to be available by ``max_as_of_ts``. The
+training adapters (``retrieval_training``) additionally require it to be
+available by the holdout start. Holdout queries can then never see item
+state from after they happened, while training rows share the
+serving-like snapshot.
+
+``ranker_score_coverage`` is the share of ``ranker_rejected`` rows that
+carry a real ``ranker_score``. The publisher records it in the manifest and
+the reader verifies it. ``teacher_soft`` training is refused below a
+configured threshold.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -25,6 +41,7 @@ RETRIEVAL_CATALOG_SCHEMA_VERSION = "retrieval_catalog_generation_v1"
 RETRIEVAL_ITEM_FEATURE_SCHEMA_VERSION = "retrieval_item_feature_sidecar_v1"
 RETRIEVAL_LABEL_POLICY_VERSION = "retrieval_label_v1"
 RETRIEVAL_ELIGIBILITY_POLICY_VERSION = "retrieval_eligibility_v1"
+RANKER_REJECTED = "ranker_rejected"
 
 
 class RetrievalPitDatasetError(ValueError):
@@ -90,6 +107,13 @@ class RetrievalPitManifest:
     catalog_sha256: str
     manifest_uri: str
     manifest_sha256: str
+    ranker_rejected_rows: int | None = None
+    ranker_scored_rows: int | None = None
+
+    @property
+    def ranker_score_coverage(self) -> float | None:
+        """Non-null ``ranker_score`` share of ranker-rejected rows."""
+        return _coverage(self.ranker_rejected_rows, self.ranker_scored_rows)
 
 
 @dataclass(frozen=True)
@@ -249,6 +273,7 @@ class RetrievalPitDatasetReader:
         catalog = self._attach_item_features(catalog, sidecar_bytes, sidecar_ref)
 
         rows: list[RetrievalPitRow] = []
+        coverage = _RankerScoreCoverage()
         for shard_ref in raw_manifest["shards"]:
             shard_uri = str(shard_ref.get("uri") or "")
             local_path, cleanup = await self.object_storage.materialize_for_processing(
@@ -262,10 +287,10 @@ class RetrievalPitDatasetReader:
                     )
                 if _sha256(shard_bytes) != str(shard_ref.get("sha256") or ""):
                     raise RetrievalPitDatasetError("retrieval shard checksum mismatch")
-                rows.extend(
-                    self._parse_row(row, raw_manifest, catalog)
-                    for row in pq.read_table(local_path).to_pylist()
-                )
+                for raw in pq.read_table(local_path).to_pylist():
+                    row = self._parse_row(raw, raw_manifest, catalog)
+                    coverage.add(row)
+                    rows.append(row)
             finally:
                 if cleanup:
                     Path(local_path).unlink(missing_ok=True)
@@ -274,22 +299,13 @@ class RetrievalPitDatasetReader:
             raise RetrievalPitDatasetError(
                 "retrieval row count does not match manifest"
             )
-        parsed_manifest = RetrievalPitManifest(
-            materialization_run_id=str(raw_manifest["materialization_run_id"]),
-            dataset_version=str(raw_manifest["dataset_version"]),
-            attribution_cutoff=float(raw_manifest["attribution_cutoff"]),
-            attribution_window_hours=int(raw_manifest["attribution_window_hours"]),
-            allowed_lateness_hours=int(raw_manifest["allowed_lateness_hours"]),
-            min_as_of_ts=float(raw_manifest["min_as_of_ts"]),
-            max_as_of_ts=float(raw_manifest["max_as_of_ts"]),
-            row_count=int(raw_manifest["row_count"]),
-            label_policy_version=str(raw_manifest["label_policy_version"]),
-            eligibility_policy_version=str(raw_manifest["eligibility_policy_version"]),
-            catalog_generation_id=str(catalog_ref["generation_id"]),
-            catalog_uri=str(catalog_ref["uri"]),
-            catalog_sha256=str(catalog_ref["sha256"]),
-            manifest_uri=manifest_uri,
-            manifest_sha256=_sha256(manifest_bytes),
+        coverage.verify(raw_manifest)
+        parsed_manifest = self._parsed_manifest(
+            raw_manifest,
+            catalog_ref,
+            manifest_uri,
+            _sha256(manifest_bytes),
+            coverage=coverage,
         )
         return RetrievalPitDataset(parsed_manifest, catalog, tuple(rows))
 
@@ -330,6 +346,7 @@ class RetrievalPitDatasetReader:
         parsed_manifest = self._parsed_manifest(
             raw_manifest, catalog_ref, manifest_uri, manifest_sha
         )
+        coverage = _RankerScoreCoverage()
         lineage = {
             "manifest_uri": manifest_uri,
             "manifest_sha256": manifest_sha,
@@ -395,6 +412,7 @@ class RetrievalPitDatasetReader:
                         spool_rows = []
                         for raw in iter_arrow_batch_rows(batch):
                             row = self._parse_row(raw, raw_manifest, catalog)
+                            coverage.add(row)
                             if not row.query_id or not row.user_id:
                                 raise RetrievalPitDatasetError(
                                     "retrieval row query and user identity are required"
@@ -415,6 +433,13 @@ class RetrievalPitDatasetReader:
                 finally:
                     if cleanup:
                         Path(local_path).unlink(missing_ok=True)
+            coverage.verify(raw_manifest)
+            parsed_manifest = replace(
+                parsed_manifest,
+                ranker_rejected_rows=coverage.rejected_rows,
+                ranker_scored_rows=coverage.scored_rows,
+            )
+            builder.lineage["ranker_score_coverage"] = coverage.as_manifest()
             verified = builder.finalize(expected_rows=int(raw_manifest["row_count"]))
             return RetrievalTrainingSource(
                 verified,
@@ -427,7 +452,9 @@ class RetrievalPitDatasetReader:
             raise
 
     @staticmethod
-    def _parsed_manifest(raw_manifest, catalog_ref, manifest_uri, manifest_sha):
+    def _parsed_manifest(
+        raw_manifest, catalog_ref, manifest_uri, manifest_sha, *, coverage=None
+    ):
         return RetrievalPitManifest(
             materialization_run_id=str(raw_manifest["materialization_run_id"]),
             dataset_version=str(raw_manifest["dataset_version"]),
@@ -444,6 +471,10 @@ class RetrievalPitDatasetReader:
             catalog_sha256=str(catalog_ref["sha256"]),
             manifest_uri=manifest_uri,
             manifest_sha256=manifest_sha,
+            ranker_rejected_rows=(
+                coverage.rejected_rows if coverage is not None else None
+            ),
+            ranker_scored_rows=coverage.scored_rows if coverage is not None else None,
         )
 
     async def _read_json(self, uri: str, kind: str) -> Mapping[str, Any]:
@@ -538,6 +569,7 @@ class RetrievalPitDatasetReader:
                 "retrieval catalog product count does not match manifest"
             )
         available_at = _finite_float(raw.get("available_at"), "catalog available_at")
+        # Dataset-level, not per-row: see the module docstring.
         if available_at > float(manifest["max_as_of_ts"]):
             raise RetrievalPitDatasetError("retrieval catalog is future data")
         return RetrievalCatalog(
@@ -688,10 +720,6 @@ class RetrievalPitDatasetReader:
         generation_id = str(raw.get("catalog_generation_id") or "")
         if generation_id != catalog.generation_id:
             raise RetrievalPitDatasetError("retrieval catalog generation mismatch")
-        if catalog.available_at > as_of_ts:
-            raise RetrievalPitDatasetError("retrieval catalog is future data")
-        if catalog.item_features_available_at > as_of_ts:
-            raise RetrievalPitDatasetError("retrieval item features are future data")
         product_id = str(raw.get("product_id") or "")
         if product_id not in catalog.products:
             raise RetrievalPitDatasetError(
@@ -749,6 +777,53 @@ def split_retrieval_holdout(
     training = [row for row in rows if float(row.as_of_ts) < start_ts]
     holdout = [row for row in rows if start_ts <= float(row.as_of_ts) <= end_ts]
     return training, holdout, RetrievalHoldoutWindow(start_ts, end_ts)
+
+
+def is_ranker_rejected(row: RetrievalPitRow) -> bool:
+    return RANKER_REJECTED in (row.label_source, row.label_type)
+
+
+class _RankerScoreCoverage:
+    """Count ranker-rejected rows and how many carry a real ranker score."""
+
+    def __init__(self) -> None:
+        self.rejected_rows = 0
+        self.scored_rows = 0
+
+    def add(self, row: RetrievalPitRow) -> None:
+        if is_ranker_rejected(row):
+            self.rejected_rows += 1
+            if row.ranker_score is not None:
+                self.scored_rows += 1
+
+    def as_manifest(self) -> dict[str, Any]:
+        return ranker_score_coverage_manifest(self.rejected_rows, self.scored_rows)
+
+    def verify(self, raw_manifest: Mapping[str, Any]) -> None:
+        declared = raw_manifest.get("ranker_score_coverage")
+        if declared is None:
+            return
+        if not isinstance(declared, Mapping) or (
+            int(declared.get("ranker_rejected_rows", -1)) != self.rejected_rows
+            or int(declared.get("ranker_scored_rows", -1)) != self.scored_rows
+        ):
+            raise RetrievalPitDatasetError(
+                "retrieval ranker score coverage does not match manifest"
+            )
+
+
+def ranker_score_coverage_manifest(rejected_rows: int, scored_rows: int) -> dict:
+    return {
+        "ranker_rejected_rows": int(rejected_rows),
+        "ranker_scored_rows": int(scored_rows),
+        "coverage": _coverage(rejected_rows, scored_rows),
+    }
+
+
+def _coverage(rejected_rows: int | None, scored_rows: int | None) -> float | None:
+    if not rejected_rows or scored_rows is None:
+        return None
+    return float(scored_rows) / float(rejected_rows)
 
 
 def _sha256(value: bytes) -> str:
