@@ -115,10 +115,15 @@ def _kafka_offsets(
 
 
 def _materializer_topics() -> list[str]:
+    # The materializer reads Flink snapshots from feature-history-snapshots. In Python
+    # services KAFKA_FEATURE_UPDATES_TOPIC names the legacy feature-updates topic,
+    # which the materializer never consumes, so it must not be read here.
     topics = [
         os.environ.get("KAFKA_USER_INTERACTIONS_TOPIC", "user-interactions"),
         os.environ.get("KAFKA_RECOMMENDATION_EVENTS_TOPIC", "recommendation-events"),
-        os.environ.get("KAFKA_FEATURE_UPDATES_TOPIC", "feature-updates"),
+        os.environ.get(
+            "KAFKA_FEATURE_HISTORY_SNAPSHOTS_TOPIC", "feature-history-snapshots"
+        ),
         os.environ.get("KAFKA_CATALOG_FEATURE_EVENTS_TOPIC", "catalog-feature-events"),
     ]
     if (
@@ -146,6 +151,61 @@ def _materializer_topics() -> list[str]:
             ]
         )
     return topics
+
+
+class MaterializerCatchUpProbe:
+    """Checks that the history materializer has durably consumed past a PIT cutoff.
+
+    The first check of a run samples the end offsets once (after the cutoff); the run
+    is caught up when committed group offsets reach that sample and the materializer
+    has completed a checkpoint after the cutoff. Comparing against end offsets
+    resampled on every poll would never converge under steady traffic.
+    """
+
+    def __init__(
+        self,
+        *,
+        flink_rest_url: str,
+        bootstrap_servers: str,
+        job_name: str | None = None,
+        group_id: str | None = None,
+        topics: list[str] | None = None,
+        status_reader=None,
+        offsets_reader=None,
+    ) -> None:
+        self.flink_rest_url = (
+            flink_rest_url.rstrip("/")
+            if flink_rest_url.startswith(("http://", "https://"))
+            else f"http://{flink_rest_url.rstrip('/')}"
+        )
+        self.bootstrap_servers = bootstrap_servers
+        self.job_name = job_name or os.environ.get(
+            "FEATURE_HISTORY_MATERIALIZER_JOB_NAME",
+            "video-commerce-feature-history-materializer",
+        )
+        self.group_id = group_id or os.environ.get(
+            "FEATURE_HISTORY_CONSUMER_GROUP", "feature-history-materializer-v1"
+        )
+        self.topics = list(topics) if topics is not None else _materializer_topics()
+        self.status_reader = status_reader or _flink_status
+        self.offsets_reader = offsets_reader or _read_kafka_offsets
+        self._targets: dict[str, dict[str, int]] = {}
+
+    async def reasons(self, *, run_id: str, cutoff_ts: float) -> list[str]:
+        state, checkpoint_at = await asyncio.to_thread(
+            self.status_reader, self.flink_rest_url, self.job_name
+        )
+        committed, ends = await self.offsets_reader(
+            self.bootstrap_servers, self.group_id, self.topics
+        )
+        target = self._targets.setdefault(run_id, dict(ends))
+        return readiness_reasons(
+            job_state=state,
+            completed_checkpoint_at_ms=checkpoint_at,
+            gate_started_at_ms=int(float(cutoff_ts) * 1000),
+            committed_offsets=committed,
+            end_offsets=target,
+        )
 
 
 def wait_until_ready() -> None:

@@ -246,3 +246,68 @@ async def test_next_daily_run_takes_over_expired_prior_run_before_starting_new_o
                 {"old_run_id": old_run_id, "new_run_id": new_run_id},
             )
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_waiting_for_materializer_is_resumed_before_a_newer_cutoff():
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for PIT run-store integration test")
+    suffix = uuid.uuid4().hex[:16]
+    parked_run_id = f"pit-parked-{suffix}"
+    new_run_id = f"pit-after-parked-{suffix}"
+    store = SystemStore(
+        DatabaseConfig(
+            enable=True,
+            url=database_url,
+            auto_create_schema=True,
+            enable_retention_cleanup=False,
+        )
+    )
+    await store.initialize()
+    try:
+        first = await store.claim_pit_materialization_run(
+            run_id=parked_run_id,
+            cutoff_ts=1_600_000_000.0,
+            worker_id="worker-1",
+            lease_seconds=60,
+        )
+        assert first["claimed"] is True
+        await store.mark_pit_materialization_waiting_for_materializer(
+            parked_run_id,
+            worker_id="worker-1",
+            reason="consumer_lag:user-interactions:0:5",
+        )
+
+        resumed = await store.claim_pit_materialization_run(
+            run_id=new_run_id,
+            cutoff_ts=1_600_086_400.0,
+            worker_id="worker-2",
+            lease_seconds=60,
+        )
+
+        assert resumed["claimed"] is True
+        assert resumed["run_id"] == parked_run_id
+        assert resumed["status"] == "running"
+        assert resumed["phase"] == "export"
+        assert resumed["attempts"] == 2
+        assert resumed["last_error"] is None
+
+        blocked = await store.claim_pit_materialization_run(
+            run_id=new_run_id,
+            cutoff_ts=1_600_086_400.0,
+            worker_id="worker-3",
+            lease_seconds=60,
+        )
+        assert blocked["claimed"] is False
+        assert blocked["run_id"] == parked_run_id
+    finally:
+        async with store.session_factory.begin() as session:
+            await session.execute(
+                text(
+                    "DELETE FROM pit_materialization_runs "
+                    "WHERE run_id IN (:parked, :new)"
+                ),
+                {"parked": parked_run_id, "new": new_run_id},
+            )
+        await store.close()

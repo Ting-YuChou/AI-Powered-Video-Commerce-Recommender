@@ -595,6 +595,11 @@ class ObservabilityManager:
             buckets=(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
             registry=self.registry,
         )
+        self.user_features_missing_known_user_total = Counter(
+            "video_commerce_user_features_missing_known_user_total",
+            "Serving reads where a known user had no official uf: feature key",
+            registry=self.registry,
+        )
         self.ranking_candidate_sidecar_miss_total = Counter(
             "video_commerce_ranking_candidate_sidecar_miss_total",
             "Candidate IDs absent from the checkpoint-locked embedding sidecar",
@@ -1158,6 +1163,9 @@ class ObservabilityManager:
         self.ranking_trimodal_gate.labels(modality=str(modality)).observe(
             max(0.0, min(1.0, float(value)))
         )
+
+    def record_known_user_features_missing(self) -> None:
+        self.user_features_missing_known_user_total.inc()
 
     def record_candidate_sidecar_miss(self) -> None:
         self.ranking_candidate_sidecar_miss_total.inc()
