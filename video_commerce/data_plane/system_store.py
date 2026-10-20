@@ -5045,6 +5045,27 @@ class SystemStore:
                     hours=max_age_hours
                 ):
                     return None
+                # A promotion is only meaningful against the release it would
+                # replace: an evaluation made against an older or different
+                # champion does not prove the target beats what is serving.
+                if (
+                    not rollback
+                    and pointer is not None
+                    and str(evaluation.champion_release_id or "")
+                    != str(pointer.release_id)
+                ):
+                    logger.warning(
+                        "model_release_activation_rejected",
+                        extra={
+                            "reason": "champion_not_active",
+                            "release_id": str(target.release_id),
+                            "evaluation_champion_release_id": str(
+                                evaluation.champion_release_id or ""
+                            ),
+                            "active_release_id": str(pointer.release_id),
+                        },
+                    )
+                    return None
                 from video_commerce.ml.model_release_quality import (
                     PHASE_C_QUALITY_GATE_POLICY_VERSIONS,
                 )

@@ -1943,6 +1943,8 @@ async def test_model_trainer_renews_pit_training_lease_while_training():
 
     assert store.pit_training_renewals >= 1
     assert store.completed_pit_training["run_id"] == "run-42"
+    # Challengers never overwrite the file a champion could be loaded from.
+    assert service.ranking_model.loaded_model_path == "/tmp/ranking.challenger.pt"
 
 
 @pytest.mark.asyncio
