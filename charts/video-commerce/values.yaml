@@ -155,6 +155,17 @@ external:
     featureDefinitionVersion: ranking_ltr_v1
     attributionWindowHours: 168
     allowedLatenessHours: 1
+    # User-feature max age for the ranking PIT join; keep equal to the Flink job's
+    # FLINK_USER_FEATURES_TTL_SECONDS (official uf: TTL) so train and serve agree.
+    featureMaxAgeSeconds: 604800
+    # Fail-closed PIT dataset quality gates (reader and manifest publisher).
+    pitMinOnlineOfflineParityRatio: 0.99
+    pitMaxQuarantineRatio: 0.2
+    pitMaxPositiveRateRelativeShift: 0.5
+    pitPositiveRateMinRows: 1000
+    # How long a daily PIT run waits for the history materializer to pass its cutoff.
+    pitMaterializerCatchupTimeoutSeconds: 1800
+    pitMaterializerCatchupPollSeconds: 15
     catalogOutboxBatchSize: 500
     catalogOutboxLeaseSeconds: 60
     catalogOutboxPollSeconds: 1

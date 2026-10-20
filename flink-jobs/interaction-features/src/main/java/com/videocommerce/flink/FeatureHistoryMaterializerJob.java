@@ -46,6 +46,7 @@ import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 /** Independent Kafka to Iceberg append-only history materializer. */
 public final class FeatureHistoryMaterializerJob {
   static final String PRODUCTION_GROUP_ID = "feature-history-materializer-v1";
+  static final String FEATURE_HISTORY_SNAPSHOTS_TOPIC_SUFFIX = "feature-history-snapshots";
   static final List<String> TABLES =
       Arrays.asList(
           "interaction_history",
@@ -224,7 +225,7 @@ public final class FeatureHistoryMaterializerJob {
     } else if (raw.topic.endsWith("recommendation-events")
         || raw.topic.endsWith("recommendation-events-backfill")) {
       rows = parseRecommendation(raw.topic, event);
-    } else if (raw.topic.endsWith("feature-history-snapshots")
+    } else if (raw.topic.endsWith(FEATURE_HISTORY_SNAPSHOTS_TOPIC_SUFFIX)
         || raw.topic.endsWith("feature-updates-backfill")) {
       rows = Collections.singletonList(parseFeature(raw.topic, event));
     } else if (raw.topic.endsWith("catalog-feature-events")
@@ -773,7 +774,7 @@ public final class FeatureHistoryMaterializerJob {
               Arrays.asList(
                   env("KAFKA_USER_INTERACTIONS_TOPIC", "user-interactions"),
                   env("KAFKA_RECOMMENDATION_EVENTS_TOPIC", "recommendation-events"),
-                  env("KAFKA_FEATURE_UPDATES_TOPIC", "feature-updates"),
+                  featureHistorySnapshotsTopic(),
                   env("KAFKA_CATALOG_FEATURE_EVENTS_TOPIC", "catalog-feature-events")));
       if (Boolean.parseBoolean(env("FEATURE_HISTORY_INCLUDE_BACKFILL_TOPICS", "false"))) {
         config.topics.add(env("KAFKA_USER_INTERACTIONS_BACKFILL_TOPIC", "user-interactions-backfill"));
@@ -807,6 +808,29 @@ public final class FeatureHistoryMaterializerJob {
       }
       return config;
     }
+  }
+
+  /**
+   * Flink user/window snapshot topic. Records from any topic that does not end in
+   * "feature-history-snapshots" are rejected by {@link #parseRawEvent}, so a legacy
+   * "feature-updates" subscription would send every snapshot to the DLQ; fail fast instead.
+   */
+  static String featureHistorySnapshotsTopic() {
+    return validateFeatureHistorySnapshotsTopic(
+        env(
+            "KAFKA_FEATURE_HISTORY_SNAPSHOTS_TOPIC",
+            env("KAFKA_FEATURE_UPDATES_TOPIC", FEATURE_HISTORY_SNAPSHOTS_TOPIC_SUFFIX)));
+  }
+
+  static String validateFeatureHistorySnapshotsTopic(String topic) {
+    if (topic == null || !topic.endsWith(FEATURE_HISTORY_SNAPSHOTS_TOPIC_SUFFIX)) {
+      throw new IllegalArgumentException(
+          "feature history snapshot topic must end with '"
+              + FEATURE_HISTORY_SNAPSHOTS_TOPIC_SUFFIX
+              + "': "
+              + topic);
+    }
+    return topic;
   }
 
   private static String env(String name, String defaultValue) {

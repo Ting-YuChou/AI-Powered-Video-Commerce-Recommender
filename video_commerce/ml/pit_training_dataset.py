@@ -49,6 +49,47 @@ class PitTrainingDatasetUnavailable(PitTrainingDatasetError):
     """Raised while a greenfield deployment is waiting for its first pointer."""
 
 
+class PitDatasetQualityError(PitTrainingDatasetError):
+    """Raised when a well-formed PIT manifest fails a data-quality threshold."""
+
+
+def validate_pit_manifest_quality(
+    manifest: Mapping[str, Any],
+    *,
+    min_online_offline_parity_ratio: float,
+    max_quarantine_ratio: float,
+) -> Dict[str, float]:
+    """Fail closed on low online/offline parity or a high quarantine share."""
+    try:
+        parity = float(manifest["online_offline_parity_ratio"])
+        row_count = int(manifest["row_count"])
+        quarantine_count = int(manifest.get("quarantine_row_count", 0))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PitDatasetQualityError(
+            "PIT dataset manifest is missing parity or quarantine counts"
+        ) from exc
+    if not np.isfinite(parity) or not 0.0 <= parity <= 1.0:
+        raise PitDatasetQualityError("PIT dataset parity ratio is invalid")
+    if row_count < 0 or quarantine_count < 0:
+        raise PitDatasetQualityError("PIT dataset row counts are invalid")
+    total = row_count + quarantine_count
+    quarantine_ratio = quarantine_count / total if total else 0.0
+    if parity < float(min_online_offline_parity_ratio):
+        raise PitDatasetQualityError(
+            f"PIT dataset online/offline parity {parity:.6f} is below "
+            f"{float(min_online_offline_parity_ratio):.6f}"
+        )
+    if quarantine_ratio > float(max_quarantine_ratio):
+        raise PitDatasetQualityError(
+            f"PIT dataset quarantine ratio {quarantine_ratio:.6f} exceeds "
+            f"{float(max_quarantine_ratio):.6f}"
+        )
+    return {
+        "online_offline_parity_ratio": parity,
+        "quarantine_ratio": quarantine_ratio,
+    }
+
+
 @dataclass(frozen=True)
 class PitTrainingDataset:
     dataset_version: str
@@ -335,12 +376,33 @@ class PitTrainingDatasetReader:
         expected_label_definition_version: str = RANKING_LABEL_DEFINITION_VERSION,
         require_candidate_sidecar: bool = False,
         observability=None,
+        min_online_offline_parity_ratio: float | None = None,
+        max_quarantine_ratio: float | None = None,
     ):
         self.object_storage = object_storage
         self.expected_feature_definition_version = expected_feature_definition_version
         self.expected_label_definition_version = expected_label_definition_version
         self.require_candidate_sidecar = require_candidate_sidecar
         self.observability = observability
+        if min_online_offline_parity_ratio is None or max_quarantine_ratio is None:
+            from video_commerce.common.config import FeatureLakeConfig
+
+            feature_lake = FeatureLakeConfig()
+            if min_online_offline_parity_ratio is None:
+                min_online_offline_parity_ratio = (
+                    feature_lake.pit_min_online_offline_parity_ratio
+                )
+            if max_quarantine_ratio is None:
+                max_quarantine_ratio = feature_lake.pit_max_quarantine_ratio
+        self.min_online_offline_parity_ratio = float(min_online_offline_parity_ratio)
+        self.max_quarantine_ratio = float(max_quarantine_ratio)
+
+    def _validate_quality(self, manifest: Mapping[str, Any]) -> Dict[str, float]:
+        return validate_pit_manifest_quality(
+            manifest,
+            min_online_offline_parity_ratio=self.min_online_offline_parity_ratio,
+            max_quarantine_ratio=self.max_quarantine_ratio,
+        )
 
     async def read(self, dataset_uri: str) -> PitTrainingDataset:
         try:
@@ -374,7 +436,14 @@ class PitTrainingDatasetReader:
                 "PIT latest pointer is missing manifest_uri or materialization_run_id"
             )
         manifest = await self._read_json_uri(manifest_uri, kind="manifest")
-        contract = self._validate_streaming_manifest(manifest, pointer_run_id)
+        try:
+            contract = self._validate_streaming_manifest(manifest, pointer_run_id)
+        except PitTrainingDatasetError as exc:
+            if self.observability is not None:
+                self.observability.record_pit_manifest_validation_failure(
+                    type(exc).__name__
+                )
+            raise
         manifest_sha = payload_sha256(manifest)
         sidecar_reference = self._validate_candidate_sidecar_reference(
             manifest.get("candidate_embedding_sidecar"),
@@ -549,7 +618,9 @@ class PitTrainingDatasetReader:
             raise PitTrainingDatasetError(
                 "PIT dataset manifest metadata is inconsistent"
             )
+        quality = self._validate_quality(manifest)
         return {
+            **quality,
             "dataset_version": str(manifest.get("dataset_version") or ""),
             "materialization_run_id": run_id,
             "feature_definition_version": feature_version,
@@ -752,6 +823,7 @@ class PitTrainingDatasetReader:
             raise PitTrainingDatasetError(
                 "PIT dataset manifest holdout timestamps are inconsistent"
             )
+        self._validate_quality(manifest)
         shards = manifest.get("shards")
         if not isinstance(shards, list) or not shards:
             raise PitTrainingDatasetError("PIT dataset manifest has no Parquet shards")
