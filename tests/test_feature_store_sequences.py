@@ -621,3 +621,61 @@ async def test_content_feature_snapshot_serves_known_content_from_memory():
     assert result == features
     assert result.audio_features.audio_transcript == "手機 headphones"
     assert fake.get_calls == []
+
+
+class KnownUserMissingSpy:
+    def __init__(self):
+        self.count = 0
+
+    def record_known_user_features_missing(self):
+        self.count += 1
+
+
+@pytest.mark.asyncio
+async def test_known_user_with_expired_uf_key_is_counted():
+    spy = KnownUserMissingSpy()
+    store = FeatureStore(RedisConfig(), CacheConfig(), observability=spy)
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["ust:200:returning-user"] = json.dumps(
+        {"length": 3, "latest_event_id": "e3", "latest_occurred_at": 3.0}
+    )
+    store.mark_user_known("snapshot-user")
+
+    features, _ = await store.get_user_serving_context("returning-user")
+    await store.get_user_serving_context("snapshot-user")
+    await store.get_user_serving_context("cold-user")
+
+    assert features.total_interactions == 0
+    assert spy.count == 2
+
+
+@pytest.mark.asyncio
+async def test_known_user_with_uf_key_is_not_counted():
+    spy = KnownUserMissingSpy()
+    store = FeatureStore(RedisConfig(), CacheConfig(), observability=spy)
+    fake = FakeRedis()
+    store.redis_client = fake
+    fake.data["uf:warm-user"] = pack_cache_payload(
+        "user_features",
+        {"user_id": "warm-user", "total_interactions": 1},
+    )
+    store.mark_user_known("warm-user")
+
+    await store.get_user_serving_context("warm-user")
+
+    assert spy.count == 0
+
+
+def test_known_user_missing_counter_is_exported():
+    from video_commerce.common.observability import ObservabilityManager
+
+    observability = ObservabilityManager()
+    observability.record_known_user_features_missing()
+
+    assert (
+        observability.registry.get_sample_value(
+            "video_commerce_user_features_missing_known_user_total"
+        )
+        == 1.0
+    )

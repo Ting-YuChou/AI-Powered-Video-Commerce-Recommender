@@ -14,10 +14,12 @@ from video_commerce.ml.candidate_embedding_sidecar import (
     write_candidate_embedding_sidecar,
 )
 from video_commerce.ml.pit_training_dataset import (
+    PitDatasetQualityError,
     PitTrainingDatasetError,
     PitTrainingDatasetUnavailable,
     PitTrainingDatasetReader,
     arrow_schema_sha256,
+    validate_pit_manifest_quality,
 )
 from video_commerce.ml.pit_manifest import (
     PitManifestPublisher,
@@ -128,6 +130,9 @@ def _write_dataset(
     context=None,
     behavior_sequences=None,
     candidate_embedding_sidecar=None,
+    parity_ratio=1.0,
+    quarantine_row_count=0,
+    attributed_click=1,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     definition_version = definition_version or (
@@ -146,8 +151,8 @@ def _write_dataset(
         "as_of_ts": 50.0,
         "feature_definition_version": definition_version,
         "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
-        "attributed_action": "click",
-        "attributed_click": 1,
+        "attributed_action": "click" if attributed_click else "view",
+        "attributed_click": attributed_click,
         "attributed_purchase": 0,
         "attributed_value": None,
         "attributed_value_source": None,
@@ -158,7 +163,6 @@ def _write_dataset(
             '{"collaborative_score":0.8,"content_similarity_score":0.7,'
             '"popularity_score":0.6,"combined_score":0.5}'
         ),
-        "online_feature_bundle_hash": "a" * 64,
     }
     if behavior_sequences is not None:
         row["behavior_sequences_json"] = json.dumps(behavior_sequences)
@@ -180,6 +184,8 @@ def _write_dataset(
     if behavior_sequences is not None:
         bundle_payload["behavior_sequences"] = behavior_sequences
     row["feature_bundle_hash"] = payload_sha256(bundle_payload)
+    # Serving computed the same bundle, so the row is online/offline parity-matched.
+    row["online_feature_bundle_hash"] = row["feature_bundle_hash"]
     table = pa.Table.from_pylist([row])
     pq.write_table(table, shard)
     shard_bytes = shard.read_bytes()
@@ -195,7 +201,9 @@ def _write_dataset(
         "schema_hash": arrow_schema_sha256(table.schema),
         "attribution_cutoff": 1_700_000_000.0,
         "row_count": 1,
-        "quarantine_row_count": 0,
+        "quarantine_row_count": quarantine_row_count,
+        "online_offline_parity_ratio": parity_ratio,
+        "positive_rate": float(attributed_click),
         "min_as_of_ts": 50.0,
         "max_as_of_ts": 50.0,
         "shards": [
@@ -768,3 +776,182 @@ async def test_manifest_retry_reads_and_cleans_downloaded_s3_manifest_once(tmp_p
 
     assert payload == {"status": "complete"}
     assert not downloaded.exists()
+
+
+class RecordingObservability:
+    def __init__(self):
+        self.failures = []
+
+    def record_pit_manifest_validation_failure(self, reason):
+        self.failures.append(reason)
+
+    def record_pit_stream_failure(self, stage):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dataset_kwargs", "error"),
+    [
+        ({"parity_ratio": 0.5}, "parity 0.500000 is below 0.990000"),
+        ({"quarantine_row_count": 9}, "quarantine ratio 0.900000 exceeds 0.200000"),
+    ],
+)
+async def test_pit_reader_fails_closed_on_low_parity_or_high_quarantine(
+    tmp_path, dataset_kwargs, error
+):
+    latest, _, _ = _write_dataset(tmp_path / "dataset", **dataset_kwargs)
+    observability = RecordingObservability()
+    reader = PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        observability=observability,
+        min_online_offline_parity_ratio=0.99,
+        max_quarantine_ratio=0.2,
+    )
+
+    with pytest.raises(PitDatasetQualityError, match=error):
+        await reader.read(str(latest))
+    with pytest.raises(PitDatasetQualityError, match=error):
+        await reader.validate_and_stage(
+            str(latest),
+            staging_dir=tmp_path / "staging",
+            batch_rows=1,
+            max_group_rows=16,
+            max_bytes=10_000_000,
+        )
+
+    assert observability.failures == ["PitDatasetQualityError"] * 2
+    assert not list((tmp_path / "staging").glob("ranking-*"))
+
+
+@pytest.mark.asyncio
+async def test_pit_reader_rejects_manifest_without_parity(tmp_path):
+    latest, manifest_path, _ = _write_dataset(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["online_offline_parity_ratio"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PitDatasetQualityError, match="missing parity"):
+        await PitTrainingDatasetReader(
+            LocalObjectStorage(),
+            expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        ).read(str(latest))
+
+
+def test_pit_reader_quality_thresholds_default_to_feature_lake_config(monkeypatch):
+    monkeypatch.setenv("FEATURE_LAKE_PIT_MIN_ONLINE_OFFLINE_PARITY_RATIO", "0.95")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_MAX_QUARANTINE_RATIO", "0.1")
+
+    reader = PitTrainingDatasetReader(
+        LocalObjectStorage(),
+        expected_feature_definition_version=RANKING_LTR_FEATURE_DEFINITION_VERSION,
+    )
+
+    assert reader.min_online_offline_parity_ratio == 0.95
+    assert reader.max_quarantine_ratio == 0.1
+
+
+def test_pit_quality_gate_accepts_boundary_values():
+    quality = validate_pit_manifest_quality(
+        {
+            "online_offline_parity_ratio": 0.99,
+            "row_count": 80,
+            "quarantine_row_count": 20,
+        },
+        min_online_offline_parity_ratio=0.99,
+        max_quarantine_ratio=0.2,
+    )
+
+    assert quality == {"online_offline_parity_ratio": 0.99, "quarantine_ratio": 0.2}
+
+
+def _publish_kwargs(shard, output, run_id, cutoff):
+    return {
+        "shard_uris": [str(shard)],
+        "output_prefix": str(output),
+        "materialization_run_id": run_id,
+        "iceberg_table_id": "video_commerce.ranking_training_pit",
+        "iceberg_snapshot_id": run_id,
+        "feature_definition_version": RANKING_LTR_FEATURE_DEFINITION_VERSION,
+        "label_definition_version": RANKING_LABEL_DEFINITION_VERSION,
+        "attribution_cutoff": cutoff,
+    }
+
+
+@pytest.mark.asyncio
+async def test_manifest_records_parity_positive_rate_and_feature_max_age(tmp_path):
+    _, _, shard = _write_dataset(tmp_path / "source")
+    output = tmp_path / "published"
+    publisher = PitManifestPublisher(LocalObjectStorage())
+
+    await publisher.publish(
+        **_publish_kwargs(shard, output, "run-1", 1_700_000_000.0),
+        feature_max_age_seconds=604800,
+    )
+
+    manifest = json.loads(
+        (output / "runs/run-1/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["online_offline_parity_ratio"] == 1.0
+    assert manifest["positive_rate"] == 1.0
+    assert manifest["feature_max_age_seconds"] == 604800
+    assert publisher.last_manifest == manifest
+
+
+@pytest.mark.asyncio
+async def test_manifest_publisher_rejects_positive_rate_shift_against_previous_run(
+    tmp_path,
+):
+    _, _, clicked = _write_dataset(tmp_path / "clicked", attributed_click=1)
+    _, _, viewed = _write_dataset(tmp_path / "viewed", attributed_click=0)
+    output = tmp_path / "published"
+    publisher = PitManifestPublisher(
+        LocalObjectStorage(),
+        max_positive_rate_relative_shift=0.5,
+        positive_rate_min_rows=1,
+    )
+    await publisher.publish(**_publish_kwargs(clicked, output, "run-1", 1_000.0))
+
+    with pytest.raises(PitTrainingDatasetError, match="positive rate 0.000000 shifted"):
+        await publisher.publish(**_publish_kwargs(viewed, output, "run-2", 2_000.0))
+    assert not (output / "runs/run-2/manifest.json").exists()
+    pointer = json.loads((output / "latest.json").read_text(encoding="utf-8"))
+    assert pointer["materialization_run_id"] == "run-1"
+
+    # The same rate passes, and too few rows skip the comparison entirely.
+    await publisher.publish(**_publish_kwargs(clicked, output, "run-3", 3_000.0))
+    await PitManifestPublisher(
+        LocalObjectStorage(), positive_rate_min_rows=2
+    ).publish(**_publish_kwargs(viewed, output, "run-4", 4_000.0))
+
+
+@pytest.mark.asyncio
+async def test_manifest_publisher_skips_shift_check_without_previous_positive_rate(
+    tmp_path,
+):
+    _, _, viewed = _write_dataset(tmp_path / "viewed", attributed_click=0)
+    output = tmp_path / "published"
+    legacy_manifest = output / "runs/run-legacy/manifest.json"
+    legacy_manifest.parent.mkdir(parents=True)
+    legacy_manifest.write_text(
+        json.dumps({"row_count": 10_000, "materialization_run_id": "run-legacy"}),
+        encoding="utf-8",
+    )
+    (output / "latest.json").write_text(
+        json.dumps(
+            {
+                "manifest_uri": str(legacy_manifest),
+                "materialization_run_id": "run-legacy",
+                "attribution_cutoff": 1_000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    await PitManifestPublisher(
+        LocalObjectStorage(), positive_rate_min_rows=1
+    ).publish(**_publish_kwargs(viewed, output, "run-new", 2_000.0))
+
+    pointer = json.loads((output / "latest.json").read_text(encoding="utf-8"))
+    assert pointer["materialization_run_id"] == "run-new"

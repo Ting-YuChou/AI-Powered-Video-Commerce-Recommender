@@ -2088,6 +2088,45 @@ class FeatureLakeConfig(BaseSettings):
         ge=0,
         description="Additional lateness allowed before PIT observations finalize",
     )
+    feature_max_age_seconds: int = Field(
+        604800,
+        description=(
+            "Oldest user feature snapshot the ranking PIT join may use; shares the "
+            "7-day contract with the Flink uf: TTL (FLINK_USER_FEATURES_TTL_SECONDS)"
+        ),
+    )
+    pit_min_online_offline_parity_ratio: float = Field(
+        0.99,
+        ge=0.0,
+        le=1.0,
+        description="Minimum online/offline bundle parity a PIT manifest needs for training",
+    )
+    pit_max_quarantine_ratio: float = Field(
+        0.2,
+        ge=0.0,
+        le=1.0,
+        description="Maximum quarantined share of a PIT run before training fails closed",
+    )
+    pit_max_positive_rate_relative_shift: float = Field(
+        0.5,
+        ge=0.0,
+        description=(
+            "Maximum relative change of the PIT positive (click) rate versus the "
+            "previous published run before publication is rejected"
+        ),
+    )
+    pit_positive_rate_min_rows: int = Field(
+        1000,
+        description="Both runs need this many rows before the positive-rate shift is checked",
+    )
+    pit_materializer_catchup_timeout_seconds: int = Field(
+        1800,
+        description="How long a PIT run waits for the history materializer to pass the cutoff",
+    )
+    pit_materializer_catchup_poll_seconds: float = Field(
+        15.0,
+        description="First backoff between materializer catch-up checks (doubles up to 5 min)",
+    )
     catalog_outbox_batch_size: int = Field(
         500, description="Catalog outbox rows claimed by one publisher iteration"
     )
@@ -2128,6 +2167,9 @@ class FeatureLakeConfig(BaseSettings):
 
     @validator(
         "attribution_window_hours",
+        "feature_max_age_seconds",
+        "pit_positive_rate_min_rows",
+        "pit_materializer_catchup_timeout_seconds",
         "catalog_outbox_batch_size",
         "catalog_outbox_lease_seconds",
         "catalog_outbox_retention_days",
@@ -2146,6 +2188,12 @@ class FeatureLakeConfig(BaseSettings):
     def validate_positive_feature_lake_ints(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("feature lake integer settings must be positive")
+        return value
+
+    @validator("pit_materializer_catchup_poll_seconds")
+    def validate_pit_materializer_catchup_poll_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("pit_materializer_catchup_poll_seconds must be positive")
         return value
 
     @validator("catalog_outbox_poll_seconds")

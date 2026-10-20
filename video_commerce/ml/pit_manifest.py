@@ -26,8 +26,17 @@ from video_commerce.ml.candidate_embedding_sidecar import (
 
 
 class PitManifestPublisher:
-    def __init__(self, object_storage: Any) -> None:
+    def __init__(
+        self,
+        object_storage: Any,
+        *,
+        max_positive_rate_relative_shift: float | None = 0.5,
+        positive_rate_min_rows: int = 1000,
+    ) -> None:
         self.object_storage = object_storage
+        self.max_positive_rate_relative_shift = max_positive_rate_relative_shift
+        self.positive_rate_min_rows = max(1, int(positive_rate_min_rows))
+        self.last_manifest: Dict[str, Any] | None = None
 
     async def publish(
         self,
@@ -43,6 +52,7 @@ class PitManifestPublisher:
         quarantine_row_count: int = 0,
         expected_iceberg_row_count: int | None = None,
         candidate_embedding_sidecar: Dict[str, Any] | None = None,
+        feature_max_age_seconds: int | None = None,
     ) -> str:
         run_id = str(materialization_run_id or "").strip()
         if not run_id:
@@ -51,6 +61,7 @@ class PitManifestPublisher:
         schema_hash = None
         row_count = 0
         parity_matches = 0
+        positive_rows = 0
         min_as_of = None
         max_as_of = None
         for uri in sorted(set(str(uri) for uri in shard_uris)):
@@ -112,6 +123,11 @@ class PitManifestPublisher:
                         table.column("feature_bundle_hash").to_pylist(),
                     )
                     if online == offline
+                )
+                positive_rows += sum(
+                    1
+                    for clicked in table.column("attributed_click").to_pylist()
+                    if clicked is not None and int(clicked) == 1
                 )
                 versions = set(table.column("feature_definition_version").to_pylist())
                 if versions != {feature_definition_version}:
@@ -225,13 +241,25 @@ class PitManifestPublisher:
             "row_count": row_count,
             "quarantine_row_count": max(0, int(quarantine_row_count)),
             "online_offline_parity_ratio": parity_matches / row_count,
+            "positive_rate": positive_rows / row_count,
             "min_as_of_ts": min_as_of,
             "max_as_of_ts": max_as_of,
             "shards": shards,
         }
+        if feature_max_age_seconds is not None:
+            manifest["feature_max_age_seconds"] = int(feature_max_age_seconds)
         if candidate_embedding_sidecar is not None:
             manifest["candidate_embedding_sidecar"] = dict(candidate_embedding_sidecar)
         existing_manifest = await self._read_json_if_exists(manifest_uri)
+        if existing_manifest is None:
+            await self._check_positive_rate_shift(
+                latest_uri,
+                run_id=run_id,
+                attribution_cutoff=float(attribution_cutoff),
+                positive_rate=manifest["positive_rate"],
+                row_count=row_count,
+            )
+        self.last_manifest = dict(manifest)
         latest_pointer = {
             "manifest_uri": manifest_uri,
             "materialization_run_id": run_id,
@@ -247,6 +275,49 @@ class PitManifestPublisher:
         await self._write_json(manifest_uri, manifest, create_only=True)
         await self._write_latest_pointer(latest_uri, latest_pointer)
         return latest_uri
+
+    async def _check_positive_rate_shift(
+        self,
+        latest_uri: str,
+        *,
+        run_id: str,
+        attribution_cutoff: float,
+        positive_rate: float,
+        row_count: int,
+    ) -> None:
+        """Reject a label rate that moved too far from the previous published run."""
+        if self.max_positive_rate_relative_shift is None:
+            return
+        pointer = await self._read_json_if_exists(latest_uri)
+        if not pointer:
+            return
+        previous_uri = str(pointer.get("manifest_uri") or "").strip()
+        previous_run = str(pointer.get("materialization_run_id") or "").strip()
+        previous_cutoff = float(pointer.get("attribution_cutoff") or 0.0)
+        if (
+            not previous_uri
+            or previous_run == run_id
+            or previous_cutoff >= attribution_cutoff
+        ):
+            return
+        previous = await self._read_json_if_exists(previous_uri)
+        if not previous or previous.get("positive_rate") is None:
+            # Manifests written before positive_rate was recorded have no baseline.
+            return
+        previous_rate = float(previous["positive_rate"])
+        previous_rows = int(previous.get("row_count") or 0)
+        if min(previous_rows, row_count) < self.positive_rate_min_rows:
+            return
+        if previous_rate <= 0.0:
+            relative_shift = math.inf if positive_rate > 0.0 else 0.0
+        else:
+            relative_shift = abs(positive_rate - previous_rate) / previous_rate
+        if relative_shift > float(self.max_positive_rate_relative_shift):
+            raise PitTrainingDatasetError(
+                f"PIT positive rate {positive_rate:.6f} shifted {relative_shift:.3f} "
+                f"relative to run {previous_run} ({previous_rate:.6f}); limit is "
+                f"{float(self.max_positive_rate_relative_shift):.3f}"
+            )
 
     async def _write_latest_pointer(
         self, latest_uri: str, pointer: Dict[str, Any]
@@ -465,7 +536,13 @@ async def _main() -> None:
         raise PitTrainingDatasetError(
             "configured Iceberg snapshot ID does not match the committed PIT table"
         )
-    await PitManifestPublisher(storage).publish(
+    await PitManifestPublisher(
+        storage,
+        max_positive_rate_relative_shift=(
+            feature_lake.pit_max_positive_rate_relative_shift
+        ),
+        positive_rate_min_rows=feature_lake.pit_positive_rate_min_rows,
+    ).publish(
         shard_uris=shards,
         output_prefix=export_prefix,
         materialization_run_id=run_id,
@@ -477,6 +554,7 @@ async def _main() -> None:
         quarantine_row_count=quarantine_row_count,
         expected_iceberg_row_count=iceberg_row_count,
         candidate_embedding_sidecar=(_candidate_sidecar_reference_from_environment()),
+        feature_max_age_seconds=feature_lake.feature_max_age_seconds,
     )
 
 

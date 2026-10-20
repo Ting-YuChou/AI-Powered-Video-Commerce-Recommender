@@ -37,6 +37,7 @@ class FakeRunStore:
         self.completed = None
         self.completed_calls = []
         self.waiting = None
+        self.waiting_for_materializer = None
         self.failed = None
 
     async def claim_pit_materialization_run(self, **claim):
@@ -85,6 +86,9 @@ class FakeRunStore:
 
     async def mark_pit_materialization_waiting(self, run_id, **result):
         self.waiting = (run_id, result)
+
+    async def mark_pit_materialization_waiting_for_materializer(self, run_id, **result):
+        self.waiting_for_materializer = (run_id, result)
 
     async def fail_pit_materialization_run(self, run_id, **result):
         self.failed = (run_id, result)
@@ -247,6 +251,8 @@ def test_flink_runner_builds_explicit_reproducible_job_arguments():
         "s3://features/training/ranking-pit",
         "--export-attempt",
         "2",
+        "--feature-max-age-seconds",
+        "604800",
     ]
     assert deterministic_flink_job_id("pit-20260711", 2) != (
         deterministic_flink_job_id("pit-20260711", 1)
@@ -308,7 +314,12 @@ async def test_flink_runner_submits_fixed_job_id_and_polls_to_completion(tmp_pat
     await client.aclose()
 
     assert submissions[0]["jobId"] == job_id
-    assert submissions[0]["programArgsList"][-2:] == ["--export-attempt", "1"]
+    assert submissions[0]["programArgsList"][-4:] == [
+        "--export-attempt",
+        "1",
+        "--feature-max-age-seconds",
+        "604800",
+    ]
     assert heartbeats == 1
 
 
@@ -538,3 +549,194 @@ async def test_orchestrator_resumes_manifest_phase_without_rerunning_flink():
     assert runner.calls == []
     assert len(publisher.calls) == 1
     assert publisher.calls[0][2] == 1
+
+
+class FakeCatchUpProbe:
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    async def reasons(self, *, run_id, cutoff_ts):
+        self.calls.append((run_id, cutoff_ts))
+        result = self.results.pop(0) if self.results else ["still_lagging"]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _completed_publication(parity=None):
+    return PitPublicationResult(
+        row_count=2,
+        quarantine_count=0,
+        snapshot_id="44",
+        manifest_uri="s3://features/runs/pit-20260711/manifest.json",
+        online_offline_parity_ratio=parity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_waits_for_materializer_before_submitting_flink():
+    store = FakeRunStore()
+    runner = FakeFlinkRunner()
+    publisher = FakePublisher(_completed_publication())
+    probe = FakeCatchUpProbe(
+        [["consumer_lag:user-interactions:0:5"], RuntimeError("kafka down"), []]
+    )
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    orchestrator = PitDatasetOrchestrator(
+        system_store=store,
+        flink_runner=runner,
+        publisher=publisher,
+        worker_id="worker-1",
+        catchup_probe=probe,
+        catchup_timeout_seconds=3600,
+        catchup_poll_seconds=10,
+        sleep=fake_sleep,
+    )
+
+    status = await orchestrator.run_once(
+        datetime(2026, 7, 11, 2, 5, tzinfo=timezone.utc)
+    )
+
+    cutoff = datetime(2026, 7, 11, 2, 0, tzinfo=timezone.utc).timestamp()
+    assert status == "completed"
+    assert probe.calls == [("pit-20260711", cutoff)] * 3
+    assert sleeps == [10, 20]
+    # The lease is renewed while waiting, then once more by the Flink heartbeat.
+    assert store.renewals == 3
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_records_waiting_for_materializer_without_publishing():
+    class ObservabilitySpy:
+        def __init__(self):
+            self.statuses = []
+
+        def record_pit_orchestrator_run(self, status):
+            self.statuses.append(status)
+
+        def set_pit_orchestrator_waiting_for_rows(self, waiting):
+            pass
+
+        def set_pit_orchestrator_run_in_progress(self, running):
+            pass
+
+    observability = ObservabilitySpy()
+    store = FakeRunStore()
+    runner = FakeFlinkRunner()
+    publisher = FakePublisher(_completed_publication())
+    clock = {"now": 0.0}
+
+    async def advancing_sleep(seconds):
+        clock["now"] += seconds
+
+    orchestrator = PitDatasetOrchestrator(
+        system_store=store,
+        flink_runner=runner,
+        publisher=publisher,
+        worker_id="worker-1",
+        observability=observability,
+        catchup_probe=FakeCatchUpProbe([]),
+        catchup_timeout_seconds=0,
+        sleep=advancing_sleep,
+    )
+
+    status = await orchestrator.run_once(
+        datetime(2026, 7, 11, 2, 5, tzinfo=timezone.utc)
+    )
+
+    assert status == "waiting_for_materializer"
+    assert observability.statuses == ["waiting_for_materializer"]
+    assert store.waiting_for_materializer == (
+        "pit-20260711",
+        {"worker_id": "worker-1", "reason": "still_lagging"},
+    )
+    assert runner.calls == []
+    assert publisher.calls == []
+    assert store.completed is None
+    assert store.failed is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_reattaches_running_flink_job_without_catchup_check():
+    job_id = deterministic_flink_job_id("pit-20260711", 1)
+    store = FakeRunStore(
+        phase="flink", attempts=2, export_attempt=1, flink_job_id=job_id
+    )
+    probe = FakeCatchUpProbe([])
+    orchestrator = PitDatasetOrchestrator(
+        system_store=store,
+        flink_runner=FakeFlinkRunner(status="RUNNING"),
+        publisher=FakePublisher(_completed_publication()),
+        worker_id="worker-2",
+        catchup_probe=probe,
+        catchup_timeout_seconds=0,
+    )
+
+    status = await orchestrator.run_once(
+        datetime(2026, 7, 11, 4, 0, tzinfo=timezone.utc)
+    )
+
+    assert status == "completed"
+    assert probe.calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_sets_real_parity_gauge_after_publish():
+    from video_commerce.common.observability import ObservabilityManager
+
+    observability = ObservabilityManager()
+    orchestrator = PitDatasetOrchestrator(
+        system_store=FakeRunStore(),
+        flink_runner=FakeFlinkRunner(),
+        publisher=FakePublisher(_completed_publication(parity=0.875)),
+        worker_id="worker-1",
+        observability=observability,
+    )
+
+    status = await orchestrator.run_once(
+        datetime(2026, 7, 11, 2, 5, tzinfo=timezone.utc)
+    )
+
+    assert status == "completed"
+    assert (
+        observability.registry.get_sample_value("pit_online_offline_parity_ratio")
+        == 0.875
+    )
+
+
+@pytest.mark.asyncio
+async def test_iceberg_publisher_reports_manifest_parity_and_max_age():
+    class ManifestPublisherWithLast(FakeManifestPublisher):
+        async def publish(self, **payload):
+            self.last_manifest = {"online_offline_parity_ratio": 0.5}
+            return await super().publish(**payload)
+
+    manifest_publisher = ManifestPublisherWithLast()
+    publisher = IcebergPitPublisher(
+        storage=FakeObjectStorage(
+            ["s3://features/training/ranking-pit/runs/pit-20260711/shards/part-1"]
+        ),
+        manifest_publisher=manifest_publisher,
+        feature_lake=SimpleNamespace(
+            catalog_uri="http://catalog:8181",
+            warehouse_uri="s3://features/warehouse",
+            namespace="video_commerce",
+            feature_definition_version="ranking_ltr_v1",
+        ),
+        export_prefix="s3://features/training/ranking-pit",
+        run_loader=lambda **_kwargs: ("42", 3, 1),
+        feature_max_age_seconds=604800,
+    )
+
+    result = await publisher.publish(
+        run_id="pit-20260711", cutoff_ts=1_752_215_200.0, attempt=1
+    )
+
+    assert result.online_offline_parity_ratio == 0.5
+    assert manifest_publisher.calls[0]["feature_max_age_seconds"] == 604800
