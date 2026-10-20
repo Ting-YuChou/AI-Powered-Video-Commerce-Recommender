@@ -1359,9 +1359,18 @@ class ModelTrainerService:
         if not self.pit_dataset_reader or not self.artifact_manager:
             raise RuntimeError("PIT shadow training dependencies are unavailable")
         feature_lake = self.config.feature_lake_config
-        dataset = await self.pit_dataset_reader.read(
-            feature_lake.ranking_pit_dataset_uri
-        )
+        dataset_uri = getattr(feature_lake, "ranking_pit_dataset_uri", None)
+        if not dataset_uri:
+            # trimodal_shadow can be on without any PIT dataset configured
+            # (legacy training source); skip instead of failing every round.
+            logger.warning(
+                "Skipping PIT shadow training: FEATURE_LAKE_RANKING_PIT_DATASET_URI is not set"
+            )
+            self.observability.record_training_run(
+                f"{trigger}_pit_shadow", "skipped_no_dataset_uri", 0.0
+            )
+            return
+        dataset = await self.pit_dataset_reader.read(dataset_uri)
         if len(dataset.examples) < self.config.ranking_config.training_min_samples:
             self.observability.record_training_run(
                 f"{trigger}_pit_shadow", "skipped_insufficient_samples", 0.0

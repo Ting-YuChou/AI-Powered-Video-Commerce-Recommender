@@ -269,7 +269,7 @@ x-common-service: &common-service
     SERVICE_CONTENT_OUTBOX_RETENTION_DAYS: ${SERVICE_CONTENT_OUTBOX_RETENTION_DAYS:-7}
     SERVICE_CONTENT_ORPHAN_GRACE_SECONDS: ${SERVICE_CONTENT_ORPHAN_GRACE_SECONDS:-86400}
     SERVICE_CONTENT_PROCESSING_LEASE_SECONDS: ${SERVICE_CONTENT_PROCESSING_LEASE_SECONDS:-300}
-    SECURITY_AUTH_MODE: ${SECURITY_AUTH_MODE:-api_key}
+    SECURITY_AUTH_MODE: ${SECURITY_AUTH_MODE:-disabled}
     SECURITY_INTERNAL_SERVICE_KEY: ${SECURITY_INTERNAL_SERVICE_KEY:-}
     SECURITY_INTERNAL_SERVICE_KEY_FILE: ${SECURITY_INTERNAL_SERVICE_KEY_FILE:-}
     SECURITY_INTERNAL_SERVICE_HEADER: X-Internal-Service-Key
@@ -356,8 +356,10 @@ services:
       gateway-api:
         condition: service_healthy
     ports:
-      - "80:80"
-      - "443:443"
+      # Loopback by default. Set EDGE_BIND_ADDRESS=0.0.0.0 only after configuring
+      # API_API_KEY (or OIDC) and a non-disabled SECURITY_AUTH_MODE.
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:80:80"
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:443:443"
     volumes:
       - caddy_data:/data
       - caddy_config:/config

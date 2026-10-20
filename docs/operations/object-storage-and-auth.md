@@ -26,6 +26,17 @@
 - `SECURITY_AUTH_MODE=api_key` keeps the current `X-API-Key` flow.
 - `SECURITY_AUTH_MODE=bearer` requires `Authorization: Bearer <jwt>` and `SECURITY_OIDC_ENABLED=true`.
 - `SECURITY_AUTH_MODE=api_key_or_bearer` allows progressive migration.
+- `SECURITY_AUTH_MODE=disabled` is the local Compose default (`.env.example`).
+  Production config rejects it.
+- The gateway fails closed. In `api_key` or `api_key_or_bearer` mode with no
+  API key (and no OIDC validator), protected routes return
+  `503 AUTH_NOT_CONFIGURED` instead of allowing anonymous access.
+- Compose binds Caddy to `EDGE_BIND_ADDRESS` (default `127.0.0.1`). Set
+  `EDGE_BIND_ADDRESS=0.0.0.0` only after configuring a key or OIDC and a
+  non-disabled auth mode.
+- Known gap: the bundled UI does not send an API key or bearer token yet. A
+  public edge with auth enabled needs an authenticated frontend or a
+  separate UI access path (review item 22).
 - For local or staging JWT validation, use:
   - `SECURITY_JWT_SHARED_SECRET_FILE=/run/secrets/jwt_shared_secret`
   - `SECURITY_JWT_ALGORITHMS=HS256`

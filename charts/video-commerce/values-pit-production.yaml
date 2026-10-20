@@ -31,6 +31,11 @@ external:
     pitExportUri: s3://video-commerce-features/training/ranking-pit
     pitJobJarPath: /opt/flink/usrlib/interaction-features.jar
 
+# Trimodal shadow requires a pinned candidate sidecar in the PIT manifest.
+appConfig:
+  ranking:
+    trimodalShadow: false
+
 pitOrchestrator:
   enabled: true
   schedule: "0 2 * * *"

@@ -23,6 +23,10 @@ def test_compose_pit_production_preset_is_pit_first():
         "s3://video-commerce-features/training/ranking-pit/latest.json"
     )
     assert preset["FEATURE_LAKE_PIT_ORCHESTRATOR_ENABLED"] == "true"
+    # Trimodal shadow needs a pinned candidate sidecar; the preset ships empty
+    # sidecar fields, so shadow must be off or every PIT read fails closed.
+    if not preset["FEATURE_LAKE_CANDIDATE_SIDECAR_URI"]:
+        assert preset["RANKING_TRIMODAL_SHADOW"] == "false"
 
 
 def test_compose_defines_resumable_pit_orchestrator_service():
@@ -56,6 +60,7 @@ def test_helm_pit_production_preset_and_cronjob_contract():
         (ROOT / "charts/video-commerce/values-pit-production.yaml").read_text()
     )
     lake = values["external"]["featureLake"]
+    assert values["appConfig"]["ranking"]["trimodalShadow"] is False
     cron = values["pitOrchestrator"]
 
     assert lake["enabled"] is True

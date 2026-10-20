@@ -3,7 +3,9 @@ import {
   buildInteractionPayload,
   buildRecommendationPayload,
   buildUploadParams,
+  api,
   interactionActions,
+  videoApi,
 } from './api';
 
 describe('api payload builders', () => {
@@ -72,5 +74,44 @@ describe('api payload builders', () => {
       session_id: 'session-1',
       surface: 'recommendations',
     });
+  });
+});
+
+describe('api transport', () => {
+  const captureRequest = () => {
+    const seen = [];
+    const original = api.defaults.adapter;
+    api.defaults.adapter = async (config) => {
+      seen.push(config);
+      return { data: {}, status: 200, statusText: 'OK', headers: {}, config };
+    };
+    return { seen, restore: () => { api.defaults.adapter = original; } };
+  };
+
+  it('sends video uploads as multipart FormData, not JSON', async () => {
+    const { seen, restore } = captureRequest();
+    try {
+      const file = new File(['video-bytes'], 'clip.mp4', { type: 'video/mp4' });
+      await videoApi.uploadVideo(file, 'user-1', 'high');
+    } finally {
+      restore();
+    }
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].data).toBeInstanceOf(FormData);
+    expect(seen[0].data.get('file')).toBeInstanceOf(File);
+    expect(String(seen[0].headers.get('Content-Type') || '')).not.toContain('application/json');
+  });
+
+  it('still sends object bodies as JSON', async () => {
+    const { seen, restore } = captureRequest();
+    try {
+      await videoApi.getRecommendations('user-1');
+    } finally {
+      restore();
+    }
+
+    expect(String(seen[0].headers.get('Content-Type'))).toContain('application/json');
+    expect(JSON.parse(seen[0].data).user_id).toBe('user-1');
   });
 });

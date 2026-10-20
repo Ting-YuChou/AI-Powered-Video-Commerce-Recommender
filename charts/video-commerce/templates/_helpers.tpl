@@ -86,6 +86,28 @@ Backend image reference.
 {{- end -}}
 
 {{/*
+Per-workload image reference. A workload may set imageRef to a key under
+.Values.images (for example contentWorker, which needs the PaddleOCR runtime
+from the Dockerfile content-worker target); otherwise the backend image is used.
+Call with (dict "root" $ "workload" $workload).
+*/}}
+{{- define "video-commerce.workloadImage" -}}
+{{- $image := .root.Values.images.backend -}}
+{{- with .workload.imageRef -}}
+{{- $image = required (printf "images.%s is not defined" .) (index $.root.Values.images .) -}}
+{{- end -}}
+{{- printf "%s:%s" $image.repository $image.tag -}}
+{{- end -}}
+
+{{- define "video-commerce.workloadImagePullPolicy" -}}
+{{- $image := .root.Values.images.backend -}}
+{{- with .workload.imageRef -}}
+{{- $image = index $.root.Values.images . -}}
+{{- end -}}
+{{- $image.pullPolicy | default "IfNotPresent" -}}
+{{- end -}}
+
+{{/*
 Frontend/Caddy image reference.
 */}}
 {{- define "video-commerce.frontendImage" -}}

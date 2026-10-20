@@ -1,12 +1,11 @@
 import axios from 'axios';
 
-// Create axios instance with base configuration
-const api = axios.create({
+// Create axios instance with base configuration. Do not set a default
+// Content-Type: axios already sends JSON for plain-object bodies, and a JSON
+// default makes axios serialize FormData uploads to JSON instead of multipart.
+export const api = axios.create({
   baseURL: '',
   timeout: 30000,
-  headers: {
-    'Content-Type': 'application/json',
-  },
 });
 
 // Request interceptor

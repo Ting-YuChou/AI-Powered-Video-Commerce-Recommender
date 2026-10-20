@@ -58,8 +58,8 @@ spec:
       {{- end }}
       containers:
         - name: {{ $workload.name }}
-          image: {{ include "video-commerce.backendImage" $ | quote }}
-          imagePullPolicy: {{ $.Values.images.backend.pullPolicy }}
+          image: {{ include "video-commerce.workloadImage" (dict "root" $ "workload" $workload) | quote }}
+          imagePullPolicy: {{ include "video-commerce.workloadImagePullPolicy" (dict "root" $ "workload" $workload) }}
           {{- with $workload.command }}
           command:
             {{- toYaml . | nindent 12 }}
