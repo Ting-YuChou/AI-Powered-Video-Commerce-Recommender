@@ -53,8 +53,12 @@ class HealthStatus(str, Enum):
 class RecommendationRequest(BaseModel):
     """Request model for product recommendations."""
 
-    user_id: str = Field(..., description="Unique user identifier")
-    content_id: Optional[str] = Field(None, description="Video content identifier")
+    user_id: str = Field(
+        ..., min_length=1, max_length=255, description="Unique user identifier"
+    )
+    content_id: Optional[str] = Field(
+        None, min_length=1, max_length=255, description="Video content identifier"
+    )
     context: Dict[str, Any] = Field(
         default_factory=dict, description="Additional context"
     )
@@ -83,8 +87,12 @@ class UserInteractionRequest(BaseModel):
     event_id: Optional[UUID] = Field(
         None, description="Stable client event identifier reused across retries"
     )
-    user_id: str = Field(..., description="Unique user identifier")
-    product_id: str = Field(..., description="Product identifier")
+    user_id: str = Field(
+        ..., min_length=1, max_length=255, description="Unique user identifier"
+    )
+    product_id: str = Field(
+        ..., min_length=1, max_length=255, description="Product identifier"
+    )
     action: InteractionType = Field(..., description="Type of interaction")
     context: Dict[str, Any] = Field(
         default_factory=dict, description="Interaction context"
@@ -142,6 +150,15 @@ class ViewedImpressionRequest(BaseModel):
     viewed_at: float
     items: List[ViewedImpressionItem] = Field(..., min_items=1, max_items=100)
     context: Dict[str, Any] = Field(default_factory=dict)
+
+    @validator("items")
+    def reject_duplicate_item_event_ids(cls, items):
+        seen = set()
+        for item in items:
+            if item.event_id in seen:
+                raise ValueError(f"duplicate item event_id: {item.event_id}")
+            seen.add(item.event_id)
+        return items
 
 
 # Response Models

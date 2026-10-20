@@ -163,15 +163,19 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         raise HTTPException(status_code=503, detail="Interaction ingest requires Kafka to be available")
 
     event_id = str(request.event_id or uuid.uuid4())
+    hashed_fields = {
+        "user_id": request.user_id,
+        "product_id": request.product_id,
+        "action": action,
+        "context": request.context,
+    }
+    # The model fills a missing event_time with time.time(), so only hash it when
+    # the client sent one; otherwise retries of the same event_id look like collisions.
+    if {"event_time", "timestamp"} & request.__fields_set__:
+        hashed_fields["event_time"] = request.event_time
     payload_hash = hashlib.sha256(
         json.dumps(
-            {
-                "user_id": request.user_id,
-                "product_id": request.product_id,
-                "action": action,
-                "context": request.context,
-                "event_time": request.event_time,
-            },
+            hashed_fields,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
