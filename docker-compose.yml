@@ -566,6 +566,9 @@ services:
     expose:
       - "8003"
     depends_on:
+      # readyz requires the coordinator, so it must start with ranking-service.
+      ranking-coordinator:
+        condition: service_healthy
       ranking-triton:
         condition: service_healthy
         required: false
@@ -966,6 +969,11 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    # Persist ZooKeeper with kafka_data: a fresh ZooKeeper cluster ID makes the
+    # broker refuse its stored meta.properties after any compose down/up.
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
     networks:
       - video-commerce-network
     healthcheck:
@@ -1568,6 +1576,8 @@ services:
 
 volumes:
   caddy_data:
+  zookeeper_data:
+  zookeeper_log:
   caddy_config:
   models_data:
   upload_data:
