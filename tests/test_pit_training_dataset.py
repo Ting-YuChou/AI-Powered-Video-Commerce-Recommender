@@ -80,7 +80,7 @@ def test_pit_row_preserves_retrieval_signals_and_masks_conflicting_gross_values(
         attributed_value_currency="USD",
     )
     example = PitTrainingDatasetReader._normalize_training_row(
-        row, "ranking_ltr_v1", "ranking_labels_v1"
+        row, "ranking_ltr_v1", RANKING_LABEL_DEFINITION_VERSION
     )
     assert example.bundle.candidate.retrieval_signals["two_tower"].source_rank == 1
     assert example.bundle.candidate.fusion_policy_version == "candidate_rrf_v1"
@@ -95,7 +95,9 @@ def test_pit_row_preserves_retrieval_signals_and_masks_conflicting_gross_values(
 def test_missing_pit_recency_uses_observation_time_instead_of_current_clock(tmp_path):
     _, _, shard = _write_dataset(tmp_path)
     row = pq.read_table(shard).to_pylist()[0]
-    example = PitTrainingDatasetReader._normalize_training_row(row, "ranking_ltr_v1", "ranking_labels_v1")
+    example = PitTrainingDatasetReader._normalize_training_row(
+        row, "ranking_ltr_v1", RANKING_LABEL_DEFINITION_VERSION
+    )
     assert example.bundle.user_features.last_active == example.bundle.as_of_ts
 
 

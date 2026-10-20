@@ -310,7 +310,7 @@ class InteractionFeatureJobTest {
     assertEquals(false, sql.contains("INSERT OVERWRITE"));
     assertEquals(true, sql.contains("pit_feature_bundle_hash"));
     assertEquals(true, sql.contains("o.feature_bundle_hash"));
-    assertTrue(sql.contains("'ranking_labels_v1'"));
+    assertTrue(sql.contains("'ranking_labels_v2_impression'"));
     assertTrue(sql.contains("attributed_action"));
     assertTrue(sql.contains("attributed_value"));
     assertTrue(sql.contains("attributed_value_source"));
@@ -321,6 +321,23 @@ class InteractionFeatureJobTest {
     assertTrue(sql.contains("recommendation_view_history"));
     assertTrue(sql.contains("v.observation_id IS NOT NULL OR COALESCE(f.attributed_click,0)=1"));
     assertTrue(sql.contains("\nWITH eligible_observations"));
+    // Item 37: only displayed observations, deduplicated, with impression-level feedback.
+    assertTrue(sql.contains("o.event_type='ranking_observation'"));
+    assertFalse(sql.contains("ranking_rejected_observation"));
+    assertTrue(sql.contains(
+        "ROW_NUMBER() OVER (PARTITION BY o.observation_id "
+            + "ORDER BY o.available_at_epoch ASC,o.source_event_id ASC) observation_rank"));
+    assertTrue(sql.contains("WHERE observation_rank=1"));
+    assertTrue(sql.contains(
+        "ON i.user_id=o.user_id AND i.product_id=o.product_id "
+            + "AND JSON_VALUE(i.context_json,'$.impression_id')="
+            + "JSON_VALUE(o.canonical_payload_json,'$.impression_id') "
+            + "AND i.available_at_epoch>=o.event_time_epoch "));
+    assertFalse(sql.contains("i.event_time_epoch>=o.event_time_epoch"));
+    assertTrue(sql.contains("v.available_at_epoch>=o.event_time_epoch"));
+    assertFalse(sql.contains("v.event_time_epoch>=o.event_time_epoch"));
+    // Item 27: user features older than the 7-day max age are not joined.
+    assertTrue(sql.contains("u.event_time_epoch>=o.event_time_epoch-604800"));
     assertEquals(
         true,
         PointInTimeFeatureJoinJob.buildExistingRunSql("video_commerce", "run-1")
@@ -385,6 +402,59 @@ class InteractionFeatureJobTest {
     assertEquals("video_commerce", config.namespace);
     assertEquals("s3://features/training/ranking-pit", config.exportPrefix);
     assertEquals(2, config.exportAttempt);
+    assertEquals(604_800L, config.featureMaxAgeSeconds);
+  }
+
+  @Test
+  void pitFeatureMaxAgeIsConfigurableAndMustBePositive() {
+    Map<String, String> environment = Map.ofEntries(
+        Map.entry("FEATURE_LAKE_CATALOG_URI", "http://catalog:8181"),
+        Map.entry("FEATURE_LAKE_WAREHOUSE_URI", "s3://features/warehouse"),
+        Map.entry("FEATURE_LAKE_S3_ENDPOINT", "http://minio:9000"),
+        Map.entry("FEATURE_LAKE_MATERIALIZATION_CUTOFF", "100"),
+        Map.entry("FEATURE_LAKE_MATERIALIZATION_RUN_ID", "run"),
+        Map.entry("FEATURE_LAKE_PIT_EXPORT_URI", "s3://features/pit"));
+
+    assertEquals(
+        3600L,
+        PointInTimeFeatureJoinJob.JobConfig.resolve(
+                new String[] {"--feature-max-age-seconds", "3600"}, environment)
+            .featureMaxAgeSeconds);
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> PointInTimeFeatureJoinJob.JobConfig.resolve(
+            new String[] {"--feature-max-age-seconds", "0"}, environment));
+    assertTrue(PointInTimeFeatureJoinJob.buildPointInTimeSelectSql(
+            "video_commerce", "ranking_ltr_v1", 168, 1, 1_700_000_000.0, "run-1",
+            List.of("observation_id"), 3600L)
+        .contains("u.event_time_epoch>=o.event_time_epoch-3600"));
+    assertTrue(PointInTimeFeatureJoinJob.buildQuarantineInsertSql(
+            "video_commerce", "ranking_ltr_v1", 168, 1, 1_700_000_000.0, "run-1", 3600L)
+        .contains("u.event_time_epoch>=o.event_time_epoch-3600"));
+  }
+
+  @Test
+  void officialUserFeatureTtlDefaultsToSevenDayMaxAgeContract() {
+    assertEquals(604_800, InteractionFeatureJob.JobConfig.DEFAULT_USER_FEATURES_TTL_SECONDS);
+    assertEquals(
+        PointInTimeFeatureJoinJob.DEFAULT_FEATURE_MAX_AGE_SECONDS,
+        (long) InteractionFeatureJob.JobConfig.DEFAULT_USER_FEATURES_TTL_SECONDS);
+  }
+
+  @Test
+  void featureHistoryMaterializerRejectsLegacyFeatureUpdatesTopic() {
+    assertEquals(
+        "feature-history-snapshots",
+        FeatureHistoryMaterializerJob.validateFeatureHistorySnapshotsTopic(
+            "feature-history-snapshots"));
+    assertEquals(
+        "staging.feature-history-snapshots",
+        FeatureHistoryMaterializerJob.validateFeatureHistorySnapshotsTopic(
+            "staging.feature-history-snapshots"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> FeatureHistoryMaterializerJob.validateFeatureHistorySnapshotsTopic(
+            "feature-updates"));
   }
 
   @Test
@@ -411,7 +481,7 @@ class InteractionFeatureJobTest {
 
     assertTrue(sql.contains(
         "COALESCE(f.attributed_purchase,0),'ranking_ltr_v1',CURRENT_TIMESTAMP,CURRENT_DATE,"
-            + "f.attributed_action,f.attributed_value,f.attributed_value_source,'ranking_labels_v1'"));
+            + "f.attributed_action,f.attributed_value,f.attributed_value_source,'ranking_labels_v2_impression'"));
   }
 
   @Test
@@ -499,6 +569,9 @@ class InteractionFeatureJobTest {
 
     config.dedupStateTtlDays = 8;
     config.validate();
+
+    config.userFeaturesTtlSeconds = 0;
+    assertThrows(IllegalArgumentException.class, config::validate);
   }
 
   @Test

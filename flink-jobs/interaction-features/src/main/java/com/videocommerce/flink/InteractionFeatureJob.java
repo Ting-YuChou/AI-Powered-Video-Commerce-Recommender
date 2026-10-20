@@ -1451,7 +1451,8 @@ public class InteractionFeatureJob {
     public int redisPort;
     public int redisDb;
     public String redisPassword;
-    public int userFeaturesTtlSeconds;
+    static final int DEFAULT_USER_FEATURES_TTL_SECONDS = 604_800;
+    public int userFeaturesTtlSeconds = DEFAULT_USER_FEATURES_TTL_SECONDS;
     public int sequenceTtlSeconds;
     public int windowFeatureTtlSeconds;
     public String postgresJdbcUrl;
@@ -1468,7 +1469,12 @@ public class InteractionFeatureJob {
       config.userInteractionsTopic = env("KAFKA_USER_INTERACTIONS_TOPIC", "user-interactions");
       config.recommendationEventsTopic =
           env("KAFKA_RECOMMENDATION_EVENTS_TOPIC", "recommendation-events");
-      config.featureUpdatesTopic = env("KAFKA_FEATURE_UPDATES_TOPIC", "feature-updates");
+      // Immutable user/window snapshots for the feature-history materializer. The legacy
+      // Python "feature-updates" topic is excluded from history materialization.
+      config.featureUpdatesTopic =
+          env(
+              "KAFKA_FEATURE_HISTORY_SNAPSHOTS_TOPIC",
+              env("KAFKA_FEATURE_UPDATES_TOPIC", "feature-history-snapshots"));
       config.deadLetterTopic = env("KAFKA_DEAD_LETTER_TOPIC", "dead-letter-events");
       config.consumerGroupId = env("FLINK_INTERACTION_FEATURE_CONSUMER_GROUP", "video-commerce-flink-feature-v1");
       config.checkpointDir = env("FLINK_CHECKPOINT_DIR", "file:///flink/checkpoints/runtime");
@@ -1485,7 +1491,10 @@ public class InteractionFeatureJob {
       config.redisPort = envInt("REDIS_PORT", 6379);
       config.redisDb = envInt("REDIS_DB", 0);
       config.redisPassword = env("REDIS_PASSWORD", "");
-      config.userFeaturesTtlSeconds = envInt("CACHE_USER_FEATURES_TTL", 1800);
+      // Official uf: keys share the 7-day feature max-age contract with the PIT join
+      // (FEATURE_LAKE_FEATURE_MAX_AGE_SECONDS); the Python cache TTL no longer applies.
+      config.userFeaturesTtlSeconds =
+          envInt("FLINK_USER_FEATURES_TTL_SECONDS", DEFAULT_USER_FEATURES_TTL_SECONDS);
       config.sequenceTtlSeconds = envInt("FLINK_SEQUENCE_TTL_SECONDS", 2_592_000);
       config.windowFeatureTtlSeconds = envInt("FLINK_WINDOW_FEATURE_TTL_SECONDS", 86_400);
       config.postgresJdbcUrl = env("POSTGRES_JDBC_URL", "jdbc:postgresql://postgres:5432/video_commerce");
@@ -1510,6 +1519,9 @@ public class InteractionFeatureJob {
     }
 
     void validate() {
+      if (userFeaturesTtlSeconds < 1) {
+        throw new IllegalArgumentException("FLINK_USER_FEATURES_TTL_SECONDS must be positive");
+      }
       if (featureStateEpoch < 1) {
         throw new IllegalArgumentException("FLINK_FEATURE_STATE_EPOCH must be at least 1");
       }
