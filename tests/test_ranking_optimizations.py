@@ -50,6 +50,7 @@ from video_commerce.services.recommendation.api import (
     _build_displayed_item_snapshots,
     _build_impression_context_snapshot,
     _build_rejected_candidate_snapshots,
+    _ranker_scores_by_product,
     _build_recommendation_cache_context,
     _catalog_serving_version_context,
     _attach_ranking_history_embeddings,
@@ -973,6 +974,48 @@ def test_rejected_candidate_snapshots_are_capped_and_exclude_returned_top_k():
     assert snapshots[0]["position"] == 2
     assert snapshots[0]["scores"]["combined_score"] == 0.7
     assert snapshots[0]["feature_snapshot"]["price"] == 12.0
+
+
+def test_rejected_candidate_snapshots_reuse_rerank_pool_ranker_scores():
+    candidates = [
+        CandidateProduct(product_id="shown", source="two_tower", combined_score=0.9),
+        CandidateProduct(product_id="pool-miss", source="content", combined_score=0.7),
+        CandidateProduct(product_id="unranked", source="popular", combined_score=0.5),
+    ]
+
+    def recommendation(product_id, raw_score):
+        return ProductRecommendation(
+            product_id=product_id,
+            title=product_id,
+            price=10.0,
+            confidence_score=0.5,
+            ranking_score=0.5,
+            raw_ranking_score=raw_score,
+        )
+
+    # The ranker returned an MMR pool of three; MMR kept only "shown".
+    rerank_pool = [
+        recommendation("shown", 2.5),
+        recommendation("pool-miss", -0.75),
+        recommendation("no-score", None),
+    ]
+    pool_scores = _ranker_scores_by_product(rerank_pool)
+
+    snapshots = _build_rejected_candidate_snapshots(
+        candidates,
+        rerank_pool[:1],
+        product_metadata_map={},
+        max_items=5,
+        ranker_scores_by_product=pool_scores,
+    )
+
+    assert pool_scores == {"shown": 2.5, "pool-miss": -0.75}
+    by_product = {item["product_id"]: item["scores"] for item in snapshots}
+    assert set(by_product) == {"pool-miss", "unranked"}
+    assert by_product["pool-miss"]["raw_ranking_score"] == -0.75
+    assert by_product["pool-miss"]["ranker_scored"] is True
+    assert "raw_ranking_score" not in by_product["unranked"]
+    assert by_product["unranked"]["ranker_scored"] is False
 
 
 @pytest.mark.asyncio

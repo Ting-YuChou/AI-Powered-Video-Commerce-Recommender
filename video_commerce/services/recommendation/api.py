@@ -1036,14 +1036,38 @@ def _build_displayed_item_snapshots(
     return displayed_items
 
 
+def _ranker_scores_by_product(recommendations: List[Any]) -> Dict[str, float]:
+    """Index finite raw ranker scores already returned for the rerank pool."""
+    scores: Dict[str, float] = {}
+    for recommendation in recommendations:
+        product_id = _recommendation_field(recommendation, "product_id")
+        raw_score = _recommendation_field(recommendation, "raw_ranking_score", None)
+        if not product_id or raw_score is None or isinstance(raw_score, bool):
+            continue
+        try:
+            value = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            scores[str(product_id)] = value
+    return scores
+
+
 def _build_rejected_candidate_snapshots(
     candidates: List[CandidateProduct],
     recommendations: List[Any],
     *,
     product_metadata_map: Dict[str, Dict[str, Any]],
     max_items: int,
+    ranker_scores_by_product: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
-    """Build bounded ranker-rejected snapshots for weak retrieval negatives."""
+    """Build bounded ranker-rejected snapshots for weak retrieval negatives.
+
+    ``ranker_scores_by_product`` holds raw scores the ranker already returned
+    for the rerank pool (e.g. MMR candidates that missed the final slate).
+    Those snapshots carry ``raw_ranking_score`` and ``ranker_scored=True``;
+    candidates the ranker did not return are marked ``ranker_scored=False``.
+    """
     if max_items <= 0:
         return []
 
@@ -1064,6 +1088,10 @@ def _build_rejected_candidate_snapshots(
             continue
         metadata = product_metadata_map.get(product_id, {})
         scores = _candidate_score_snapshot(candidate)
+        ranker_score = (ranker_scores_by_product or {}).get(product_id)
+        scores["ranker_scored"] = ranker_score is not None
+        if ranker_score is not None:
+            scores["raw_ranking_score"] = ranker_score
         rejected_items.append(
             {
                 "product_id": product_id,
@@ -2148,6 +2176,13 @@ async def get_recommendations(
         profile["ranking_ms"] = round((time.perf_counter() - stage_started) * 1000, 2)
         profile["ranking_profile"] = ranking_profile
         profile["slate_diversity_pool_size"] = len(ranked_recommendations)
+        # Captured before MMR trims the pool so rejected snapshots can reuse
+        # scores the ranker already produced (no extra ranking call).
+        ranker_pool_scores = (
+            _ranker_scores_by_product(ranked_recommendations)
+            if runtime.config.recommendation_config.impression_logging_enabled
+            else {}
+        )
 
         if slate_diversity_enabled:
             stage_started = time.perf_counter()
@@ -2202,6 +2237,7 @@ async def get_recommendations(
                 max_items=int(
                     runtime.config.recommendation_config.ranker_rejected_logging_max_items
                 ),
+                ranker_scores_by_product=ranker_pool_scores,
             )
 
         stage_started = time.perf_counter()
