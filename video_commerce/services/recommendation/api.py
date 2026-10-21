@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import httpx
 from fastapi import Body, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+import orjson
 import torch
 
 from video_commerce.common.cache_codec import json_dumps, json_loads
@@ -27,7 +29,11 @@ from video_commerce.common.feature_history_contracts import (
     payload_sha256,
 )
 from video_commerce.data_plane.feature_store import FeatureStore
-from video_commerce.data_plane.kafka_client import close_kafka, init_kafka
+from video_commerce.data_plane.kafka_client import (
+    KafkaPublishError,
+    close_kafka,
+    init_kafka,
+)
 from video_commerce.ml.content_artifacts import content_artifact_reference
 from video_commerce.ml.model_artifacts import ModelArtifactManager
 from video_commerce.ml.temporal_multimodal import pack_content_features
@@ -64,7 +70,6 @@ from video_commerce.common.service_common import (
     build_health_response,
     build_liveness_payload,
     build_metrics_response,
-    build_readiness_response,
     component_health,
     configure_service_logging,
     create_service_app,
@@ -93,13 +98,30 @@ ranking_client_pool: Optional[RoundRobinAsyncClientPool] = None
 ranking_coordinator_client_pool: Optional[RankingCoordinatorClientPool] = None
 kafka_manager = None
 system_store: Optional[SystemStore] = None
-ranking_checkpoint_sync_task: Optional[asyncio.Task] = None
+serving_artifact_sync_task: Optional[asyncio.Task] = None
 known_user_snapshot_refresh_task: Optional[asyncio.Task] = None
 content_feature_snapshot_refresh_task: Optional[asyncio.Task] = None
 object_storage: Optional[ObjectStorage] = None
 artifact_manager: Optional[ModelArtifactManager] = None
 best_effort_task_queue = None
 recommendation_outbox_task: Optional[asyncio.Task] = None
+# Active ranking release read from the DB pointer when ranking runs remotely
+# (coordinator/ranking-service). During a rolling activation the pointer can
+# lead what every runner has actually loaded; lineage follows the pointer.
+_remote_ranking_release: Optional[Dict[str, Any]] = None
+_impression_outbox_semaphore: Optional[asyncio.Semaphore] = None
+_recommendation_outbox_wakeup: Optional[asyncio.Event] = None
+_background_tasks: Set[asyncio.Task] = set()
+_RECOMMENDATION_OUTBOX_IDLE_SLEEP_MIN_SECONDS = 0.25
+_RECOMMENDATION_OUTBOX_IDLE_SLEEP_MAX_SECONDS = 2.0
+_RECOMMENDATION_OUTBOX_STATS_INTERVAL_SECONDS = 10.0
+# Dropped first when feature_context exceeds its byte budget: the bulky,
+# reconstructable ranker inputs. Remaining keys are then bounded per value.
+_FEATURE_CONTEXT_TRUNCATION_ORDER = (
+    RANKING_HISTORY_CONTEXT_KEY,
+    DIN_SEQUENCE_CONTEXT_KEY,
+    "_realtime_window_features",
+)
 _recommendation_singleflight: Dict[str, asyncio.Future] = {}
 _recommendation_singleflight_lock = asyncio.Lock()
 _serving_version_context_cache: Optional[Dict[str, Any]] = None
@@ -547,11 +569,9 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
     cluster_metadata_path, cluster_centroids_path = _content_cluster_artifact_paths(
         runtime
     )
-    ranking_artifact_metadata = (
-        getattr(ranking_model, "artifact_metadata", {}) or {} if ranking_model else {}
-    )
+    ranking_release = _serving_ranking_release()
     return {
-        "ranking_model": ranking_model.model_version if ranking_model else None,
+        "ranking_model": ranking_release.get("model_version"),
         "ranking_feature_contract": (
             getattr(
                 getattr(ranking_model, "config", None), "feature_contract_version", None
@@ -572,10 +592,10 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
             "candidate_rrf_k",
             60,
         ),
-        "model_release_id": (ranking_artifact_metadata.get("model_release_id")),
-        "active_generation": (ranking_artifact_metadata.get("active_generation")),
-        "quality_gate_policy_version": (
-            ranking_artifact_metadata.get("quality_gate_policy_version")
+        "model_release_id": ranking_release.get("model_release_id"),
+        "active_generation": ranking_release.get("active_generation"),
+        "quality_gate_policy_version": ranking_release.get(
+            "quality_gate_policy_version"
         ),
         "ranking_checkpoint_mtime": _safe_file_mtime(ranking_path),
         "two_tower_model": (
@@ -642,6 +662,56 @@ def _build_serving_version_context_uncached(runtime) -> Dict[str, Any]:
         "catalog": _catalog_serving_version_context(),
         "ranking_history_embeddings": _ranking_history_serving_context(runtime),
     }
+
+
+def _serving_ranking_release() -> Dict[str, Any]:
+    """Identity of the ranker serving this process: local model or DB pointer."""
+    if ranking_model is not None:
+        metadata = getattr(ranking_model, "artifact_metadata", {}) or {}
+        return {
+            "model_version": ranking_model.model_version,
+            "model_release_id": metadata.get("model_release_id"),
+            "active_generation": metadata.get("active_generation"),
+            "quality_gate_policy_version": metadata.get("quality_gate_policy_version"),
+        }
+    return dict(_remote_ranking_release or {})
+
+
+def _uses_remote_ranking_release() -> bool:
+    return ranking_model is None and bool(
+        ranking_coordinator_client_pool or ranking_client_pool
+    )
+
+
+async def _refresh_remote_ranking_release(runtime) -> bool:
+    """Read the active ranking release pointer; return True when it changed.
+
+    Remote runners activate the same pointer on their own poll, so the pointer
+    can lead the generation a runner has loaded for up to one runner poll
+    interval. On a DB error the last known release is kept.
+    """
+    global _remote_ranking_release
+    if system_store is None or not _uses_remote_ranking_release():
+        return False
+    active = await system_store.get_active_model_checkpoint(
+        ModelArtifactManager.RANKING_MODEL_NAME,
+        environment=runtime.config.model_release_config.environment,
+    )
+    release: Optional[Dict[str, Any]] = None
+    if active:
+        payload = active.get("payload") or {}
+        release = {
+            "model_version": active.get("model_version"),
+            "model_release_id": payload.get("model_release_id")
+            or active.get("release_id"),
+            "active_generation": payload.get("active_generation")
+            if payload.get("active_generation") is not None
+            else active.get("generation"),
+            "quality_gate_policy_version": payload.get("quality_gate_policy_version"),
+        }
+    changed = release != _remote_ranking_release
+    _remote_ranking_release = release
+    return changed
 
 
 def _content_cluster_artifact_paths(runtime) -> Tuple[Optional[str], Optional[str]]:
@@ -1146,17 +1216,23 @@ def _recommendation_product_ids(recommendations: List[Any]) -> List[str]:
 async def startup_event():
     global feature_store, vector_search, recommendation_engine, ranking_model, ranking_batcher, ranking_client_pool, ranking_coordinator_client_pool, kafka_manager
     global system_store
-    global ranking_checkpoint_sync_task, known_user_snapshot_refresh_task
-    global content_feature_snapshot_refresh_task
+    global serving_artifact_sync_task, known_user_snapshot_refresh_task
     global content_feature_snapshot_refresh_task
     global object_storage, artifact_manager
     global best_effort_task_queue, recommendation_outbox_task
     global _serving_version_context_cache, _serving_version_context_paths
+    global _remote_ranking_release, _impression_outbox_semaphore
+    global _recommendation_outbox_wakeup
 
     runtime = app.state.runtime
     _serving_version_context_cache = None
     _serving_version_context_paths = None
+    _remote_ranking_release = None
     runtime.config = Config()
+    _impression_outbox_semaphore = asyncio.Semaphore(
+        int(runtime.config.recommendation_config.impression_outbox_max_inflight)
+    )
+    _recommendation_outbox_wakeup = asyncio.Event()
     configure_service_logging(runtime)
     best_effort_task_queue = _BestEffortTaskQueue(runtime)
     await best_effort_task_queue.start()
@@ -1344,6 +1420,10 @@ async def startup_event():
         )
     else:
         ranking_model = None
+    try:
+        await _refresh_remote_ranking_release(runtime)
+    except Exception as exc:
+        logger.warning("remote_ranking_release_lookup_failed: %s", exc)
     _refresh_serving_version_context(runtime)
     if ranking_model is not None and (
         not ranking_client_pool
@@ -1355,13 +1435,12 @@ async def startup_event():
             observability=runtime.observability,
         )
         await ranking_batcher.start()
-    if (
-        ranking_model is not None
-        and runtime.config.ranking_config.checkpoint_sync_interval_seconds > 0
-    ):
-        ranking_checkpoint_sync_task = asyncio.create_task(
-            _periodic_ranking_checkpoint_sync(runtime),
-            name="ranking-checkpoint-sync",
+    if runtime.config.ranking_config.checkpoint_sync_interval_seconds > 0:
+        # Retrieval artifacts and the remote ranking release must hot-swap in
+        # every topology, not only when a local ranker is loaded.
+        serving_artifact_sync_task = asyncio.create_task(
+            _periodic_serving_artifact_sync(runtime),
+            name="serving-artifact-sync",
         )
 
     if runtime.config.kafka_config.enable:
@@ -1393,7 +1472,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global ranking_checkpoint_sync_task, known_user_snapshot_refresh_task
+    global serving_artifact_sync_task, known_user_snapshot_refresh_task
     global best_effort_task_queue, ranking_coordinator_client_pool
     global recommendation_outbox_task
 
@@ -1405,13 +1484,13 @@ async def shutdown_event():
             pass
         recommendation_outbox_task = None
 
-    if ranking_checkpoint_sync_task:
-        ranking_checkpoint_sync_task.cancel()
+    if serving_artifact_sync_task:
+        serving_artifact_sync_task.cancel()
         try:
-            await ranking_checkpoint_sync_task
+            await serving_artifact_sync_task
         except asyncio.CancelledError:
             pass
-        ranking_checkpoint_sync_task = None
+        serving_artifact_sync_task = None
     if known_user_snapshot_refresh_task:
         known_user_snapshot_refresh_task.cancel()
         try:
@@ -1462,6 +1541,35 @@ async def livez():
     return build_liveness_payload(app.state.runtime)
 
 
+def _recommendation_readiness_response(
+    runtime,
+    critical: Dict[str, Dict[str, Any]],
+    informational: Dict[str, Dict[str, Any]],
+) -> JSONResponse:
+    """Readiness gated only on what this pod needs to serve a slate.
+
+    Remote ranking, Kafka and Postgres degrade the response (fallback ranking,
+    no impression_id) but must not pull every recommendation pod out of the
+    Service at once, so they are reported without failing readiness.
+    """
+    ready = all(check.get("status") == "healthy" for check in critical.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": "ready" if ready else "not_ready",
+            "service": runtime.service_name,
+            "checks": {**critical, **informational},
+            "critical": sorted(critical),
+            "informational": sorted(informational),
+            "request_id_header": (
+                runtime.config.monitoring_config.request_id_header
+                if runtime.config
+                else "X-Request-ID"
+            ),
+        },
+    )
+
+
 @app.get("/readyz")
 async def readyz():
     runtime = app.state.runtime
@@ -1500,12 +1608,14 @@ async def readyz():
         else {"status": "healthy", "response_time_ms": 0.0}
     )
 
-    return build_readiness_response(
+    return _recommendation_readiness_response(
         runtime,
         {
             "redis": feature_store_health,
-            "database": database_health,
             "vector_search": vector_health,
+        },
+        {
+            "database": database_health,
             "ranking_model": ranking_health,
             "ranking_service": ranking_service_health,
             "kafka": kafka_health,
@@ -3072,6 +3182,133 @@ def _default_user_features(user_id: str) -> UserFeatures:
     )
 
 
+def _serialized_size(value: Any) -> int:
+    return len(
+        orjson.dumps(
+            value,
+            default=str,
+            option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS,
+        )
+    )
+
+
+def _bound_feature_context(
+    context: Optional[Mapping[str, Any]], max_bytes: int
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Fit the impression feature_context into ``max_bytes`` serialized bytes.
+
+    Returns the bounded context and the keys that were dropped or reduced. The
+    large reconstructable ranker inputs go first; if that is not enough every
+    remaining value is cut with the impression-context bounds, and as a last
+    resort only the scalar impression context keys survive.
+    """
+    bounded = dict(context or {})
+    if _serialized_size(bounded) <= max_bytes:
+        return bounded, []
+    truncated: List[str] = []
+    for key in _FEATURE_CONTEXT_TRUNCATION_ORDER:
+        if key in bounded:
+            bounded.pop(key)
+            truncated.append(key)
+            if _serialized_size(bounded) <= max_bytes:
+                return bounded, truncated
+    reduced: Dict[str, Any] = {}
+    for key, value in bounded.items():
+        bounded_value = _bounded_impression_context_value(value)
+        if bounded_value is None and value is not None:
+            truncated.append(str(key))
+            continue
+        if bounded_value != value:
+            truncated.append(str(key))
+        reduced[str(key)[:256]] = bounded_value
+    if _serialized_size(reduced) <= max_bytes:
+        return reduced, truncated
+    snapshot = {
+        key: value for key, value in reduced.items() if key in _IMPRESSION_CONTEXT_KEYS
+    }
+    truncated.extend(key for key in reduced if key not in snapshot)
+    return snapshot, truncated
+
+
+def _bounded_impression_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    if "feature_context" not in metadata:
+        return metadata
+    recommendation_config = getattr(
+        getattr(app.state.runtime, "config", None), "recommendation_config", None
+    )
+    max_bytes = int(
+        getattr(recommendation_config, "feature_context_max_bytes", 262144) or 262144
+    )
+    bounded, truncated = _bound_feature_context(metadata.get("feature_context"), max_bytes)
+    if not truncated:
+        return metadata
+    return {
+        **metadata,
+        "feature_context": bounded,
+        "feature_context_truncated": True,
+        "feature_context_truncated_keys": sorted(set(truncated)),
+    }
+
+
+def _impression_outbox_timeout_seconds() -> float:
+    recommendation_config = getattr(
+        getattr(app.state.runtime, "config", None), "recommendation_config", None
+    )
+    timeout_ms = getattr(recommendation_config, "impression_outbox_timeout_ms", 100)
+    return max(0.001, float(timeout_ms or 100) / 1000.0)
+
+
+def _track_background_task(task: asyncio.Task) -> None:
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _retire_unexposed_impression(event_id: str, impression_id: str) -> None:
+    try:
+        retired = await asyncio.wait_for(
+            system_store.mark_recommendation_outbox_not_exposed(event_id),
+            timeout=5.0,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "recommendation_impression_retire_failed",
+            extra={"impression_id": impression_id, "error": str(exc)},
+        )
+        return
+    if retired:
+        app.state.runtime.observability.record_recommendation_outbox_terminal(
+            "not_exposed"
+        )
+
+
+def _retire_if_inserted_late(
+    event_id: str, impression_id: str, task: asyncio.Future
+) -> None:
+    """Done-callback for an outbox write that outlived the serving budget."""
+    if task.cancelled() or task.exception() is not None:
+        return
+    if task.result() != "inserted" or system_store is None:
+        return
+    _track_background_task(
+        asyncio.create_task(
+            _retire_unexposed_impression(event_id, impression_id),
+            name="retire-unexposed-impression",
+        )
+    )
+
+
+async def _enqueue_impression_with_permit(
+    semaphore: Optional[asyncio.Semaphore], event: Dict[str, Any]
+) -> str:
+    try:
+        return await system_store.enqueue_recommendation_event(event)
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
 async def _stage_served_impression_event(
     *,
     user_id: str,
@@ -3080,76 +3317,161 @@ async def _stage_served_impression_event(
     request_id: Optional[str],
     metadata: Dict[str, Any],
 ) -> bool:
-    """Persist a stable served-impression event before exposing its ID."""
+    """Persist a stable served-impression event before exposing its ID.
+
+    The write is bounded by RECOMMENDATION_IMPRESSION_OUTBOX_TIMEOUT_MS. On
+    expiry the slate is still returned, just without an impression_id
+    (outcome ``timeout``). The insert itself is shielded rather than cancelled
+    so asyncpg never returns a connection mid-transaction; if it commits late
+    the row is retired as terminal ``not_exposed`` and never published.
+    """
     if kafka_manager is None or system_store is None:
         return False
     impression_id = str(metadata.get("impression_id") or "").strip()
     if not impression_id:
         return False
+    observability = app.state.runtime.observability
+    semaphore = _impression_outbox_semaphore
+    if semaphore is not None:
+        if semaphore.locked():
+            # The DB is already slow for this process; do not queue on the pool.
+            observability.record_recommendation_impression("served", "unavailable")
+            return False
+        await semaphore.acquire()
     event_id = uuid.uuid5(
         uuid.NAMESPACE_URL, f"video-commerce:recommendation-served:{impression_id}"
     ).hex
-    event = kafka_manager.build_recommendation_event(
-        user_id=user_id,
-        recommendations=recommendations,
-        response_time_ms=response_time_ms,
-        metadata=metadata,
-        request_id=request_id,
-        event_id=event_id,
-    )
     try:
-        outcome = await system_store.enqueue_recommendation_event(event)
-        app.state.runtime.observability.record_recommendation_impression(
-            "served", outcome
+        event = kafka_manager.build_recommendation_event(
+            user_id=user_id,
+            recommendations=recommendations,
+            response_time_ms=response_time_ms,
+            metadata=_bounded_impression_metadata(metadata),
+            request_id=request_id,
+            event_id=event_id,
         )
-        return outcome in {"inserted", "duplicate"}
+    except BaseException:
+        if semaphore is not None:
+            semaphore.release()
+        raise
+    write = asyncio.ensure_future(_enqueue_impression_with_permit(semaphore, event))
+    try:
+        outcome = await asyncio.wait_for(
+            asyncio.shield(write), timeout=_impression_outbox_timeout_seconds()
+        )
+    except asyncio.TimeoutError:
+        write.add_done_callback(
+            lambda task: _retire_if_inserted_late(event_id, impression_id, task)
+        )
+        observability.record_recommendation_impression("served", "timeout")
+        logger.warning(
+            "recommendation_impression_outbox_timeout",
+            extra={"impression_id": impression_id},
+        )
+        return False
+    except asyncio.CancelledError:
+        write.add_done_callback(
+            lambda task: _retire_if_inserted_late(event_id, impression_id, task)
+        )
+        raise
     except Exception as exc:
-        app.state.runtime.observability.record_recommendation_impression(
-            "served", "unavailable"
-        )
+        observability.record_recommendation_impression("served", "unavailable")
         logger.warning(
             "recommendation_impression_outbox_failed",
             extra={"impression_id": impression_id, "error": str(exc)},
         )
         return False
+    observability.record_recommendation_impression("served", outcome)
+    if outcome == "inserted" and _recommendation_outbox_wakeup is not None:
+        _recommendation_outbox_wakeup.set()
+    return outcome in {"inserted", "duplicate"}
+
+
+async def _wait_for_recommendation_outbox_work(timeout_seconds: float) -> None:
+    wakeup = _recommendation_outbox_wakeup
+    if wakeup is None:
+        await asyncio.sleep(timeout_seconds)
+        return
+    try:
+        await asyncio.wait_for(wakeup.wait(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        pass
+    wakeup.clear()
 
 
 async def _run_recommendation_outbox_dispatcher() -> None:
     worker_id = f"recommendation-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    observability = app.state.runtime.observability
+    max_attempts = int(
+        getattr(
+            getattr(app.state.runtime.config, "recommendation_config", None),
+            "outbox_max_attempts",
+            20,
+        )
+    )
+    idle_sleep = _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MIN_SECONDS
+    last_stats_at: Optional[float] = None
     while True:
         try:
             if system_store is None or kafka_manager is None:
                 await asyncio.sleep(1.0)
                 continue
+            now = time.monotonic()
+            if (
+                last_stats_at is None
+                or now - last_stats_at >= _RECOMMENDATION_OUTBOX_STATS_INTERVAL_SECONDS
+            ):
+                last_stats_at = now
+                outbox_stats = await system_store.get_recommendation_outbox_stats()
+                observability.update_recommendation_outbox(**outbox_stats)
             events = await system_store.claim_recommendation_outbox(
                 worker_id=worker_id, batch_size=50, lease_seconds=30
             )
-            outbox_stats = await system_store.get_recommendation_outbox_stats()
-            app.state.runtime.observability.update_recommendation_outbox(**outbox_stats)
             if not events:
-                await asyncio.sleep(0.25)
+                # Local inserts wake the dispatcher at once; otherwise back off
+                # so idle replicas do not poll Postgres four times a second.
+                await _wait_for_recommendation_outbox_work(idle_sleep)
+                idle_sleep = min(
+                    idle_sleep * 2, _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MAX_SECONDS
+                )
                 continue
+            idle_sleep = _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MIN_SECONDS
             for event in events:
                 event_id = str(event.get("event_id") or "")
                 try:
-                    published = (
-                        await kafka_manager.publish_recommendation_event_payload(event)
-                    )
-                    if not published:
-                        raise RuntimeError("Kafka publish returned false")
+                    await kafka_manager.publish_recommendation_outbox_event(event)
                     await system_store.mark_recommendation_outbox_published(
                         event_id, worker_id=worker_id
                     )
-                    app.state.runtime.observability.record_recommendation_impression(
+                    observability.record_recommendation_impression(
                         "served", "published"
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
-                    await system_store.mark_recommendation_outbox_failed(
-                        event_id, str(exc), worker_id=worker_id
+                    classified = isinstance(exc, KafkaPublishError)
+                    terminal = await system_store.mark_recommendation_outbox_failed(
+                        event_id,
+                        str(exc),
+                        worker_id=worker_id,
+                        retryable=exc.retryable if classified else True,
+                        terminal_reason=exc.reason if classified else None,
+                        max_attempts=max_attempts,
                     )
-                    app.state.runtime.observability.record_recommendation_impression(
-                        "served", "publish_retry"
-                    )
+                    if terminal:
+                        observability.record_recommendation_outbox_terminal(terminal)
+                        logger.warning(
+                            "recommendation_outbox_event_terminal",
+                            extra={
+                                "event_id": event_id,
+                                "reason": terminal,
+                                "error": str(exc)[:500],
+                            },
+                        )
+                    else:
+                        observability.record_recommendation_impression(
+                            "served", "publish_retry"
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3223,80 +3545,109 @@ def _configure_torch_runtime(runtime) -> None:
     )
 
 
-async def _periodic_ranking_checkpoint_sync(runtime) -> None:
+def _ranking_artifact_identity(metadata: Optional[Mapping[str, Any]]) -> Tuple:
+    metadata = metadata or {}
+    return (
+        metadata.get("model_release_id"),
+        metadata.get("active_generation"),
+        metadata.get("bundle_digest"),
+    )
+
+
+async def _sync_local_ranking_checkpoint(runtime, last_identity: Tuple) -> Tuple:
+    """Hot-swap the in-process ranker to the selected release; return its identity."""
     global ranking_model
+    environment = runtime.config.model_release_config.environment
+    latest_ranking = await artifact_manager.sync_selected_ranking_checkpoint(
+        gate_mode=runtime.config.model_release_config.gate_mode,
+        environment=environment,
+        expected_feature_schema_version=ranking_model.feature_schema_version,
+    )
+    if latest_ranking is None:
+        return last_identity
+    selected_identity = _ranking_artifact_identity(latest_ranking.payload)
+    if selected_identity != last_identity:
+        replacement = await artifact_manager.prepare_ranking_replacement(
+            ranking_model,
+            latest_ranking,
+            environment=environment,
+        )
+        if ranking_batcher is not None:
+            ranking_batcher.replace_ranking_model(replacement)
+        ranking_model = replacement
+        await artifact_manager.record_generation_activation(
+            latest_ranking,
+            environment=environment,
+            state="ready",
+        )
+        await artifact_manager.cleanup_local_generations(
+            latest_ranking,
+            environment=environment,
+            inflight_identities=(
+                ranking_batcher.inflight_generation_identities()
+                if ranking_batcher is not None
+                else set()
+            ),
+        )
+        return selected_identity
+    await artifact_manager.record_generation_activation(
+        latest_ranking,
+        environment=environment,
+        state="ready",
+    )
+    return selected_identity
+
+
+async def _periodic_serving_artifact_sync(runtime) -> None:
+    """Poll release pointers and hot-swap serving artifacts every interval.
+
+    Each step is isolated so a failing ranking lookup cannot stall retrieval
+    artifact swaps (or the reverse). The serving version context, and with it
+    the recommendation cache key and impression lineage, is rebuilt every
+    cycle, so a promotion is visible within one interval.
+    """
     interval_seconds = max(
         1, int(runtime.config.ranking_config.checkpoint_sync_interval_seconds)
     )
-    last_ranking_identity = (
-        ranking_model.artifact_metadata.get("model_release_id")
-        if ranking_model
-        else None,
-        ranking_model.artifact_metadata.get("active_generation")
-        if ranking_model
-        else None,
-        ranking_model.artifact_metadata.get("bundle_digest") if ranking_model else None,
+    last_ranking_identity = _ranking_artifact_identity(
+        getattr(ranking_model, "artifact_metadata", None) if ranking_model else None
     )
     while True:
         try:
             await asyncio.sleep(interval_seconds)
-            if ranking_model and artifact_manager:
-                latest_ranking = await artifact_manager.sync_selected_ranking_checkpoint(
-                    gate_mode=runtime.config.model_release_config.gate_mode,
-                    environment=runtime.config.model_release_config.environment,
-                    expected_feature_schema_version=ranking_model.feature_schema_version,
+        except asyncio.CancelledError:
+            break
+        failed = False
+        try:
+            if ranking_model is not None and artifact_manager is not None:
+                last_ranking_identity = await _sync_local_ranking_checkpoint(
+                    runtime, last_ranking_identity
                 )
-                selected_identity = (
-                    latest_ranking.payload.get("model_release_id")
-                    if latest_ranking
-                    else None,
-                    latest_ranking.payload.get("active_generation")
-                    if latest_ranking
-                    else None,
-                    latest_ranking.payload.get("bundle_digest")
-                    if latest_ranking
-                    else None,
-                )
-                if latest_ranking and selected_identity != last_ranking_identity:
-                    replacement = await artifact_manager.prepare_ranking_replacement(
-                        ranking_model,
-                        latest_ranking,
-                        environment=runtime.config.model_release_config.environment,
-                    )
-                    if ranking_batcher is not None:
-                        ranking_batcher.replace_ranking_model(replacement)
-                    ranking_model = replacement
-                    await artifact_manager.record_generation_activation(
-                        latest_ranking,
-                        environment=runtime.config.model_release_config.environment,
-                        state="ready",
-                    )
-                    await artifact_manager.cleanup_local_generations(
-                        latest_ranking,
-                        environment=runtime.config.model_release_config.environment,
-                        inflight_identities=(
-                            ranking_batcher.inflight_generation_identities()
-                            if ranking_batcher is not None
-                            else set()
-                        ),
-                    )
-                    last_ranking_identity = selected_identity
-                if latest_ranking and selected_identity == last_ranking_identity:
-                    await artifact_manager.record_generation_activation(
-                        latest_ranking,
-                        environment=runtime.config.model_release_config.environment,
-                        state="ready",
-                    )
-            if recommendation_engine:
-                if await recommendation_engine.sync_serving_artifacts_if_updated():
-                    _refresh_serving_version_context(runtime)
-            if ranking_model:
-                _refresh_serving_version_context(runtime)
+            else:
+                await _refresh_remote_ranking_release(runtime)
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.error(f"Ranking checkpoint sync failed: {exc}")
-            await asyncio.sleep(min(interval_seconds, 60))
+            failed = True
+            logger.error(f"Ranking release sync failed: {exc}")
+        try:
+            if recommendation_engine:
+                await recommendation_engine.sync_serving_artifacts_if_updated()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            failed = True
+            logger.error(f"Serving artifact sync failed: {exc}")
+        try:
+            _refresh_serving_version_context(runtime)
+        except Exception as exc:
+            failed = True
+            logger.error(f"Serving version context refresh failed: {exc}")
+        if failed:
+            try:
+                await asyncio.sleep(min(interval_seconds, 60))
+            except asyncio.CancelledError:
+                break
 
 
 async def _periodic_known_user_snapshot_refresh(runtime) -> None:

@@ -29,7 +29,9 @@ and S3-compatible object storage must be provided outside the chart.
 
 Create or provision these before installing the chart:
 
-- Postgres database and async SQLAlchemy URL.
+- Postgres database and async SQLAlchemy URL. Its `max_connections` (or a
+  PgBouncer `max_db_connections`) must cover `postgres.maxConnectionsBudget`;
+  see `postgres-connection-budget.md` for the per-workload table.
 - Redis for state and optionally a separate Redis for recommendation cache.
 - Kafka brokers reachable from the cluster.
 - S3-compatible object storage bucket.

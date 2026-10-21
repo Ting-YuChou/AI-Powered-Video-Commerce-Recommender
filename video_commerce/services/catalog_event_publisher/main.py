@@ -10,7 +10,11 @@ import time
 from typing import Any
 
 from video_commerce.common.config import Config
-from video_commerce.data_plane.kafka_client import close_kafka, init_kafka
+from video_commerce.data_plane.kafka_client import (
+    KafkaPublishError,
+    close_kafka,
+    init_kafka,
+)
 from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.common.observability import (
     ObservabilityManager,
@@ -28,11 +32,15 @@ class CatalogEventPublisher:
         kafka_manager: Any,
         config: Any,
         worker_id: str,
+        max_attempts: int | None = None,
+        observability: Any = None,
     ) -> None:
         self.system_store = system_store
         self.kafka_manager = kafka_manager
         self.config = config
         self.worker_id = worker_id
+        self.max_attempts = max_attempts
+        self.observability = observability
 
     async def publish_once(self) -> int:
         rows = await self.system_store.claim_catalog_outbox(
@@ -52,11 +60,19 @@ class CatalogEventPublisher:
                 )
                 published += 1
             except Exception as exc:
-                await self.system_store.mark_catalog_outbox_failed(
+                # KafkaMessageTooLargeError is not retryable; anything else
+                # backs off until max_attempts retires the row.
+                classified = isinstance(exc, KafkaPublishError)
+                terminal = await self.system_store.mark_catalog_outbox_failed(
                     event_id,
                     str(exc),
                     worker_id=self.worker_id,
+                    retryable=exc.retryable if classified else True,
+                    terminal_reason=exc.reason if classified else None,
+                    max_attempts=self.max_attempts,
                 )
+                if terminal and self.observability is not None:
+                    self.observability.record_catalog_outbox_terminal(terminal)
         return published
 
 
@@ -77,6 +93,8 @@ async def main() -> None:
         kafka_manager=kafka,
         config=config.feature_lake_config,
         worker_id=worker_id,
+        max_attempts=config.recommendation_config.outbox_max_attempts,
+        observability=observability,
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

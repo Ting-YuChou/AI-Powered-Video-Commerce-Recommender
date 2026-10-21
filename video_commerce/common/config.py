@@ -618,6 +618,38 @@ class RecommendationConfig(BaseSettings):
         100,
         description="Maximum displayed top-k items to include in one impression event",
     )
+    impression_outbox_timeout_ms: int = Field(
+        100,
+        ge=1,
+        description=(
+            "Hot-path budget for durably staging one served impression; on expiry "
+            "the response omits impression_id and the outcome is recorded as timeout"
+        ),
+    )
+    impression_outbox_max_inflight: int = Field(
+        32,
+        ge=1,
+        description=(
+            "Per-process cap on concurrent served-impression outbox writes; when "
+            "full the impression is skipped instead of queueing on the DB pool"
+        ),
+    )
+    feature_context_max_bytes: int = Field(
+        262144,
+        ge=1024,
+        description=(
+            "Serialized size cap for the impression feature_context; history "
+            "embeddings and DIN sequences are dropped first when exceeded"
+        ),
+    )
+    outbox_max_attempts: int = Field(
+        20,
+        ge=1,
+        description=(
+            "Publish attempts before a recommendation or catalog outbox row is "
+            "marked terminal instead of retried"
+        ),
+    )
 
     # Ranking weights
     cf_weight: float = Field(0.4, description="Collaborative filtering weight")
@@ -1890,6 +1922,14 @@ class KafkaConfig(BaseSettings):
     producer_compression_type: str = Field(
         "gzip", description="Producer compression type"
     )
+    producer_max_request_size: int = Field(
+        1048576,
+        ge=1024,
+        description=(
+            "Producer max_request_size in bytes; must not exceed the broker or "
+            "topic max.message.bytes"
+        ),
+    )
 
     # Consumer settings
     consumer_group_id: str = Field(
@@ -2660,6 +2700,62 @@ class DatabaseConfig(BaseSettings):
         description="How often to run interaction_events retention cleanup",
     )
     echo_sql: bool = Field(False, description="Enable SQLAlchemy SQL logging")
+    pool_timeout_seconds: float = Field(
+        2.0,
+        gt=0,
+        description=(
+            "Seconds to wait for a pooled connection before failing; offline "
+            "services (trainer, PIT orchestrator, iceberg maintenance) override it"
+        ),
+    )
+    pool_recycle_seconds: int = Field(
+        1800,
+        ge=-1,
+        description="Recycle pooled connections older than this; -1 disables",
+    )
+    connect_timeout_seconds: float = Field(
+        5.0,
+        gt=0,
+        description="asyncpg connection establishment timeout",
+    )
+    idle_in_transaction_session_timeout_ms: int = Field(
+        60000,
+        ge=0,
+        description=(
+            "Server-side idle_in_transaction_session_timeout for every session; "
+            "0 leaves the server default"
+        ),
+    )
+    hot_path_statement_timeout_ms: int = Field(
+        1000,
+        ge=0,
+        description=(
+            "SET LOCAL statement_timeout for latency-sensitive methods (outbox "
+            "enqueue, ingest ledger, slate lookup, health); 0 disables"
+        ),
+    )
+    schema_lock_timeout_ms: int = Field(
+        5000,
+        ge=0,
+        description=(
+            "SET LOCAL lock_timeout for startup DDL after the schema advisory "
+            "lock is held; 0 disables"
+        ),
+    )
+    statement_cache_size: Optional[int] = Field(
+        None,
+        ge=0,
+        description=(
+            "asyncpg prepared statement cache size; set 0 behind PgBouncer "
+            "transaction pooling"
+        ),
+    )
+
+    @validator("statement_cache_size", pre=True)
+    def blank_statement_cache_size_is_unset(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @validator(
         "training_sequence_lookback_days",
