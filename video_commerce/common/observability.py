@@ -297,7 +297,7 @@ class ObservabilityManager:
             "video_commerce_kafka_producer_connected",
             "Kafka producer connection status",
             registry=self.registry,
-            multiprocess_mode="livemax",
+            multiprocess_mode="mostrecent",
         )
         self.kafka_messages_produced_total = Counter(
             "video_commerce_kafka_messages_produced_total",
@@ -724,7 +724,7 @@ class ObservabilityManager:
             "video_commerce_ranking_triton_model_ready",
             "Whether the exact required Triton model version is ready",
             registry=self.registry,
-            multiprocess_mode="livemin",
+            multiprocess_mode="mostrecent",
         )
         self.upstream_requests_total = Counter(
             "video_commerce_upstream_requests_total",
@@ -738,6 +738,26 @@ class ObservabilityManager:
             ["target"],
             registry=self.registry,
             multiprocess_mode="livesum",
+        )
+        self.rate_limiter_errors_total = Counter(
+            "video_commerce_rate_limiter_errors_total",
+            "Rate-limit decisions that failed open because Redis was slow or unavailable",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.dependency_status = Gauge(
+            "video_commerce_dependency_status",
+            "Last readiness probe result per dependency: 1 healthy, 0.5 degraded, 0 unhealthy",
+            ["service", "dependency"],
+            registry=self.registry,
+            multiprocess_mode="mostrecent",
+        )
+        self.feature_pipeline_mode = Gauge(
+            "video_commerce_feature_pipeline_mode",
+            "Configured interaction feature pipeline mode (1 for the active mode)",
+            ["mode"],
+            registry=self.registry,
+            multiprocess_mode="max",
         )
         self.best_effort_tasks_total = Counter(
             "video_commerce_best_effort_tasks_total",
@@ -1163,6 +1183,69 @@ class ObservabilityManager:
             multiprocess_mode="mostrecent",
         )
         self._process = psutil.Process()
+        self._precreate_alerted_series()
+
+    # Label values that alert rules select with increase()/rate(). A labelled
+    # counter series only appears with its first event, and increase() needs a
+    # prior sample, so that first event would never alert. tests/
+    # test_alert_metric_contract.py keeps this table in step with the rules.
+    # Attributes still missing here belong to open Stage B PRs (WS-2/3/4) and
+    # are skipped until they merge; the contract test lists them explicitly.
+    ALERTED_LABEL_VALUES: Dict[str, tuple] = {
+        "rate_limiter_errors_total": tuple(
+            {"reason": reason} for reason in ("timeout", "error", "cooldown")
+        ),
+        "content_task_publish_retries_total": ({"reason": "missing_object"},),
+        "content_processing_events_total": ({"outcome": "lease_lost"},),
+        "ranking_coordinator_client_errors_total": ({"reason": "timeout"},),
+        "recommendation_impression_events_total": tuple(
+            {"stage": "served", "status": status}
+            for status in ("inserted", "duplicate", "unavailable", "timeout")
+        ),
+        "recommendation_outbox_terminal_total": tuple(
+            {"reason": reason}
+            for reason in (
+                "message_too_large",
+                "publish_failed",
+                "non_retryable",
+                "max_attempts",
+                "not_exposed",
+            )
+        ),
+        "catalog_outbox_terminal_total": tuple(
+            {"reason": reason}
+            for reason in (
+                "message_too_large",
+                "publish_failed",
+                "non_retryable",
+                "max_attempts",
+            )
+        ),
+        "content_processing_redrives_total": ({"outcome": "exhausted"},),
+        "ranking_runtime_auth_total": tuple(
+            {"role": role, "result": result}
+            for role in ("coordinator", "runner")
+            for result in (
+                "unauthenticated",
+                "rejected",
+                "invalid_mac",
+                "expired",
+                "replayed",
+                "malformed",
+                "unsupported_version",
+                "wrong_role",
+                "unconfigured",
+            )
+        ),
+    }
+
+    def _precreate_alerted_series(self) -> None:
+        for attribute, label_sets in self.ALERTED_LABEL_VALUES.items():
+            metric = getattr(self, attribute, None)
+            if metric is None:
+                continue
+            for labels in label_sets:
+                metric.labels(**labels)
 
     def observe_model_artifact_activation(
         self, *, model_name: str, status: str, duration_seconds: float
@@ -1210,9 +1293,10 @@ class ObservabilityManager:
             duration
         )
         if self.multiprocess_dir:
-            # Prometheus keeps one keep-alive connection, so a single worker
-            # tends to serve every scrape; let each worker refresh its own
-            # process gauges from the request path instead.
+            # Each scrape lands on an arbitrary worker (uvicorn's 5s keep-alive
+            # is shorter than the scrape interval), so a gauge refreshed only at
+            # scrape time is stale in the others. Refresh this worker's own
+            # CPU/RSS from the request path to keep the livesum current.
             now = time.monotonic()
             if now - self._process_metrics_refreshed_at >= (
                 self._PROCESS_METRICS_REFRESH_SECONDS
@@ -1697,6 +1781,22 @@ class ObservabilityManager:
 
     def set_ranking_triton_model_ready(self, ready: bool) -> None:
         self.ranking_triton_model_ready.set(1 if ready else 0)
+
+    def record_rate_limiter_error(self, reason: str) -> None:
+        self.rate_limiter_errors_total.labels(reason=reason).inc()
+
+    _DEPENDENCY_STATUS_VALUES = {"healthy": 1.0, "degraded": 0.5}
+
+    def set_dependency_status(self, service: str, dependency: str, status: str) -> None:
+        self.dependency_status.labels(service=service, dependency=dependency).set(
+            self._DEPENDENCY_STATUS_VALUES.get(str(status), 0.0)
+        )
+
+    def set_feature_pipeline_mode(self, mode: str) -> None:
+        for candidate in ("python", "flink_shadow", "flink"):
+            self.feature_pipeline_mode.labels(mode=candidate).set(
+                1.0 if candidate == mode else 0.0
+            )
 
     def inc_upstream_inflight(self, target: str) -> None:
         self.upstream_inflight.labels(target=target).inc()

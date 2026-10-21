@@ -21,7 +21,7 @@ from video_commerce.common.event_time import (
     validate_public_event_time,
 )
 from video_commerce.data_plane.feature_store import FeatureStore
-from video_commerce.data_plane.kafka_client import close_kafka, init_kafka
+from video_commerce.data_plane.kafka_client import KafkaProducerSupervisor
 from video_commerce.common.models import UserInteractionRequest, ViewedImpressionRequest
 from video_commerce.data_plane.system_store import SystemStore
 from video_commerce.common.service_common import (
@@ -32,7 +32,7 @@ from video_commerce.common.service_common import (
     component_health,
     configure_service_logging,
     create_service_app,
-    require_internal_service_auth,
+    internal_service_auth_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,18 +48,21 @@ app = create_service_app(
 
 feature_store: Optional[FeatureStore] = None
 kafka_manager = None
+kafka_supervisor: Optional[KafkaProducerSupervisor] = None
 system_store: Optional[SystemStore] = None
 
 
 @app.middleware("http")
 async def internal_auth(request: Request, call_next):
-    require_internal_service_auth(request, app.state.runtime)
+    denied = internal_service_auth_response(request, app.state.runtime)
+    if denied is not None:
+        return denied
     return await call_next(request)
 
 
 @app.on_event("startup")
 async def startup_event():
-    global feature_store, kafka_manager, system_store
+    global feature_store, kafka_manager, kafka_supervisor, system_store
 
     runtime = app.state.runtime
     runtime.config = Config()
@@ -75,14 +78,18 @@ async def startup_event():
         await system_store.initialize()
 
     if runtime.config.kafka_config.enable:
-        try:
-            kafka_manager = await init_kafka(
-                runtime.config.kafka_config,
-                observability=runtime.observability,
-            )
-        except Exception as exc:
-            logger.warning(f"Interaction ingest Kafka init failed: {exc}")
-            kafka_manager = None
+        kafka_supervisor = KafkaProducerSupervisor(
+            runtime.config.kafka_config,
+            service_name="interaction-ingest-service",
+            observability=runtime.observability,
+            on_connected=_set_kafka_manager,
+        )
+        kafka_manager = await kafka_supervisor.start()
+
+
+def _set_kafka_manager(manager) -> None:
+    global kafka_manager
+    kafka_manager = manager
 
 
 @app.on_event("shutdown")
@@ -91,8 +98,8 @@ async def shutdown_event():
         await feature_store.close()
     if system_store:
         await system_store.close()
-    if kafka_manager:
-        await close_kafka()
+    if kafka_supervisor:
+        await kafka_supervisor.stop()
 
 
 @app.get("/")
@@ -125,7 +132,7 @@ async def readyz():
             "error": None if producer_health.get("connected") else "Kafka producer unavailable",
         }
     elif runtime.config.kafka_config.enable:
-        kafka_health = {"status": "unhealthy", "error": "Kafka producer unavailable"}
+        kafka_health = {"status": "unhealthy", "error": "Kafka producer reconnecting"}
 
     database_health = {"status": "healthy", "response_time_ms": 0.0}
     if runtime.config.database_config.enable:
@@ -142,14 +149,19 @@ async def readyz():
                 "error": database_status.error,
             }
 
-    return build_readiness_response(
-        runtime,
-        {
-            "redis": feature_store_health,
-            "kafka": kafka_health,
-            "database": database_health,
-        },
-    )
+    # Ingest acknowledges only after Kafka accepts the event and dedups through
+    # the Postgres ledger, so those two decide readiness. Redis only backs
+    # best-effort cache invalidation.
+    checks = {
+        "redis": feature_store_health,
+        "kafka": kafka_health,
+        "database": database_health,
+    }
+    for name, check in checks.items():
+        runtime.observability.set_dependency_status(
+            "interaction-ingest-service", name, str(check.get("status", "unhealthy"))
+        )
+    return build_readiness_response(runtime, checks, critical=("kafka", "database"))
 
 
 @app.post("/api/interactions")

@@ -92,9 +92,19 @@ def test_prometheus_rule_template_is_optional_and_reads_the_chart_copy():
 
 
 def test_new_and_changed_alerts_have_promtool_cases():
-    cases = (ROOT / "tests/monitoring/prometheus-rules.test.yml").read_text(
-        encoding="utf-8"
+    suite = yaml.safe_load(
+        (ROOT / "tests/monitoring/prometheus-rules.test.yml").read_text(
+            encoding="utf-8"
+        )
     )
+    # Only cases that expect the alert to fire count as coverage.
+    cases = {
+        case["alertname"]
+        for test in suite["tests"]
+        for case in test.get("alert_rule_test", [])
+        if case.get("exp_alerts")
+    }
+    defined = {alert["alert"] for alert in _alerts()}
     for name in (
         "WorkerHeartbeatMissing",
         "WorkerMetricsTargetDown",
@@ -111,4 +121,5 @@ def test_new_and_changed_alerts_have_promtool_cases():
         "PitRunWaitingForMaterializer",
         "KnownUserFeaturesMissing",
     ):
-        assert f"alertname: {name}" in cases, name
+        assert name in defined, name
+        assert name in cases, name

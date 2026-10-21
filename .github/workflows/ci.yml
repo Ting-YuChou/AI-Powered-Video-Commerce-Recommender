@@ -72,6 +72,13 @@ jobs:
           -schema-location default
           -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
           /work/video-commerce-monitoring.yaml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Check rendered ServiceMonitor relabels and PrometheusRule parity
+        run: |
+          python -m pip install --quiet pyyaml
+          python scripts/check_rendered_monitoring.py /tmp/video-commerce-monitoring.yaml
       - name: Test Prometheus rules
         run: docker run --rm --entrypoint /bin/promtool -v "$PWD:/work" -w /work prom/prometheus:v2.54.1 test rules tests/monitoring/prometheus-rules.test.yml
       - name: Check Alertmanager config
@@ -128,6 +135,25 @@ jobs:
         with:
           name: flink-closed-loop-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/flink-closed-loop-artifacts
+          if-no-files-found: warn
+
+  http-smoke:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: vc-http-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      HTTP_SMOKE_ARTIFACT_DIR: /tmp/http-smoke-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run fresh-stack HTTP smoke and ranking outage check
+        run: scripts/run_http_smoke.sh
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/http-smoke-artifacts
           if-no-files-found: warn
 
   flink-recovery-drill:

@@ -10,6 +10,7 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
 from prometheus_client import Gauge
 from prometheus_client.parser import text_string_to_metric_families
 
@@ -47,6 +48,18 @@ def test_every_gauge_in_the_codebase_declares_multiprocess_mode():
     assert offenders == []
 
 
+def _gauge_names_declared_in(path: Path):
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", "")) == "Gauge"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+
+
 def test_registered_gauges_use_an_aggregating_mode():
     manager = ObservabilityManager()
     gauges = [
@@ -55,7 +68,10 @@ def test_registered_gauges_use_an_aggregating_mode():
         if isinstance(collector, Gauge)
     ]
 
-    assert len(gauges) >= 69
+    # Every Gauge declared in observability.py is registered and checked here.
+    assert {gauge._name for gauge in gauges} == _gauge_names_declared_in(
+        ROOT / "video_commerce/common/observability.py"
+    )
     assert {
         gauge._name: gauge._multiprocess_mode
         for gauge in gauges
@@ -134,7 +150,7 @@ def test_two_worker_processes_aggregate_into_one_scrape(tmp_path):
     assert samples[requests_key] == 8.0
     # livesum: worker A's in-flight gauge was dropped by mark_process_dead.
     assert samples[("video_commerce_http_requests_in_progress", ())] == 1.0
-    # livemax: any live worker with a connected producer reports connected.
+    # mostrecent: the latest worker observation of the producer wins.
     assert samples[("video_commerce_kafka_producer_connected", ())] == 1.0
     # mostrecent: the latest observation of shared Redis state wins.
     assert (
@@ -226,3 +242,32 @@ def test_service_apps_drop_live_gauges_on_shutdown():
     app = create_service_app("Test", "test", "test-service")
 
     assert app.state.runtime.observability.mark_process_dead in app.router.on_shutdown
+
+
+@pytest.mark.asyncio
+async def test_ranking_proxy_serves_its_own_metrics_on_a_separate_path():
+    from video_commerce.services.ranking_service.proxy_asgi import RankingProxyApp
+
+    app = RankingProxyApp()
+    app.runtime.observability.record_ranking_coordinator_client_error("timeout")
+    messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": b""}
+
+    async def send(message):
+        messages.append(message)
+
+    # No coordinator client is configured: /metrics/proxy must not need one.
+    await app._handle_http(
+        {"type": "http", "method": "GET", "path": "/metrics/proxy", "headers": []},
+        receive,
+        send,
+    )
+
+    assert messages[0]["status"] == 200
+    body = b"".join(m.get("body", b"") for m in messages[1:]).decode("utf-8")
+    assert (
+        'video_commerce_ranking_coordinator_client_errors_total{reason="timeout"} 1.0'
+        in body
+    )

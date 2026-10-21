@@ -4,6 +4,9 @@ Shared helpers for multi-service API entrypoints.
 
 from __future__ import annotations
 
+import asyncio
+import hmac
+import ipaddress
 import os
 import random
 import re
@@ -11,12 +14,14 @@ import time
 import uuid
 import logging
 from http import HTTPStatus
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from video_commerce.common.models import ComponentHealth, HealthResponse, HealthStatus
 from video_commerce.common.observability import (
@@ -49,7 +54,12 @@ class ServiceRuntime:
 
 
 class RedisRateLimiter:
-    """Redis-backed fixed-window rate limiter."""
+    """Redis-backed fixed-window rate limiter.
+
+    Fails open: a slow or unavailable Redis must not turn every request into a
+    500 or a 30-second wait. Errors are reported through ``on_error`` and Redis
+    is skipped for ``error_cooldown_seconds`` after a failure.
+    """
 
     def __init__(
         self,
@@ -57,21 +67,131 @@ class RedisRateLimiter:
         limit: int,
         window_seconds: int = 60,
         prefix: str = "rate_limit:",
+        *,
+        timeout_seconds: float = 0.05,
+        error_cooldown_seconds: float = 1.0,
+        on_error: Optional[Callable[[str], None]] = None,
     ):
         self.redis_client = redis_client
         self.limit = limit
         self.window_seconds = window_seconds
         self.prefix = prefix
+        self.timeout_seconds = timeout_seconds
+        self.error_cooldown_seconds = error_cooldown_seconds
+        self.on_error = on_error
+        self._skip_until = 0.0
+
+    def _window_key(self, key: str) -> str:
+        window = int(time.time()) // self.window_seconds
+        return f"{self.prefix}{window}:{key}"
+
+    def _record_error(self, reason: str) -> None:
+        self._skip_until = time.monotonic() + self.error_cooldown_seconds
+        if self.on_error is not None:
+            try:
+                self.on_error(reason)
+            except Exception:
+                logger.debug("rate_limiter_error_callback_failed", exc_info=True)
+
+    async def _guarded(self, operation):
+        if time.monotonic() < self._skip_until:
+            if self.on_error is not None:
+                self.on_error("cooldown")
+            return None
+        try:
+            return await asyncio.wait_for(operation(), timeout=self.timeout_seconds)
+        except asyncio.TimeoutError:
+            self._record_error("timeout")
+        except Exception as exc:
+            logger.warning("rate_limiter_redis_error: %s", type(exc).__name__)
+            self._record_error("error")
+        return None
 
     async def allow(self, key: str) -> bool:
-        now = int(time.time())
-        window = now // self.window_seconds
-        redis_key = f"{self.prefix}{window}:{key}"
-        pipe = self.redis_client.pipeline(transaction=False)
-        pipe.incr(redis_key)
-        pipe.expire(redis_key, self.window_seconds)
-        current_count, _ = await pipe.execute()
-        return int(current_count) <= self.limit
+        redis_key = self._window_key(key)
+
+        async def increment():
+            pipe = self.redis_client.pipeline(transaction=False)
+            pipe.incr(redis_key)
+            pipe.expire(redis_key, self.window_seconds)
+            current_count, _ = await pipe.execute()
+            return int(current_count)
+
+        current_count = await self._guarded(increment)
+        if current_count is None:
+            return True
+        return current_count <= self.limit
+
+    async def is_blocked(self, key: str) -> bool:
+        """Whether ``key`` is already over the limit, without counting a hit."""
+        redis_key = self._window_key(key)
+
+        async def read():
+            value = await self.redis_client.get(redis_key)
+            return int(value or 0)
+
+        current_count = await self._guarded(read)
+        if current_count is None:
+            return False
+        return current_count > self.limit
+
+
+def parse_trusted_proxy_networks(value: str | Iterable[str] | None):
+    """Parse a comma-separated CIDR list into ip_network objects."""
+    if value is None:
+        return ()
+    items = value.split(",") if isinstance(value, str) else list(value)
+    networks = []
+    for item in items:
+        item = str(item).strip()
+        if not item:
+            continue
+        networks.append(ipaddress.ip_network(item, strict=False))
+    return tuple(networks)
+
+
+def _address_in_networks(address: str, networks) -> bool:
+    try:
+        parsed = ipaddress.ip_address(address.strip())
+    except ValueError:
+        return False
+    return any(parsed in network for network in networks)
+
+
+def resolve_client_ip(request: Request, trusted_networks) -> str:
+    """Client IP, honouring X-Forwarded-For only from trusted proxies.
+
+    The forwarded chain is walked from the right and the first address that
+    is not itself a trusted proxy wins, so a client cannot spoof its bucket by
+    prepending addresses.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if not trusted_networks or not _address_in_networks(peer, trusted_networks):
+        return peer
+    forwarded = request.headers.get("x-forwarded-for")
+    if not forwarded:
+        return peer
+    for candidate in reversed([part.strip() for part in forwarded.split(",")]):
+        if not candidate:
+            continue
+        if not _address_in_networks(candidate, trusted_networks):
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                return peer
+    return peer
+
+
+def add_inner_http_middleware(app: FastAPI, dispatch) -> None:
+    """Register an HTTP middleware inside the shared observability and CORS layers.
+
+    ``@app.middleware("http")`` wraps everything registered before it, so a
+    gateway auth middleware added that way short-circuits 401/429 responses
+    before they are counted or given CORS headers. Appending to
+    ``user_middleware`` places it innermost instead.
+    """
+    app.user_middleware.append(Middleware(BaseHTTPMiddleware, dispatch=dispatch))
+    app.middleware_stack = None
 
 
 class RoundRobinAsyncClientPool:
@@ -182,13 +302,18 @@ def build_error_response(
     )
 
 
-def require_internal_service_auth(
+def internal_service_auth_response(
     request: Request,
     runtime: ServiceRuntime,
-) -> None:
-    """Validate internal service auth for private service endpoints."""
+) -> Optional[JSONResponse]:
+    """Return a 401 response when a private endpoint lacks the internal key.
+
+    Middleware must return the response: an HTTPException raised from an
+    ``@app.middleware`` function bypasses the exception handlers and becomes a
+    500 with a traceback.
+    """
     if runtime.config is None:
-        return
+        return None
     path = request.url.path
     if path in {
         "/",
@@ -200,13 +325,28 @@ def require_internal_service_auth(
         "/redoc",
         "/openapi.json",
     }:
-        return
+        return None
     expected_key = runtime.config.security_config.internal_service_key
     if not expected_key:
-        return
+        return None
     header_name = runtime.config.security_config.internal_service_header
-    if request.headers.get(header_name) != expected_key:
-        raise HTTPException(status_code=401, detail="Invalid internal service key")
+    if constant_time_equals(request.headers.get(header_name), expected_key):
+        return None
+    request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
+    return build_error_response(
+        status_code=401,
+        code="UNAUTHORIZED",
+        message="Invalid internal service key",
+        request_id=request_id,
+        headers={runtime.config.monitoring_config.request_id_header: request_id},
+    )
+
+
+def constant_time_equals(provided: Optional[str], expected: Optional[str]) -> bool:
+    """Compare secrets without leaking their length-prefix through timing."""
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(provided.encode(), expected.encode())
 
 
 def build_liveness_payload(runtime: ServiceRuntime) -> Dict[str, Any]:
@@ -222,13 +362,46 @@ def build_liveness_payload(runtime: ServiceRuntime) -> Dict[str, Any]:
 def build_readiness_response(
     runtime: ServiceRuntime,
     checks: Dict[str, Dict[str, Any]],
+    *,
+    critical: Optional[Iterable[str]] = None,
+    redact_errors: bool = False,
 ) -> JSONResponse:
-    """Return a standardized readiness response."""
-    ready = all(check.get("status") == "healthy" for check in checks.values())
+    """Return a standardized readiness response.
+
+    Without ``critical`` every check must be healthy (legacy behaviour). With
+    ``critical``, only those checks decide readiness, and they may be healthy or
+    degraded; the other checks are reported but never fail the probe. A
+    shared downstream failure then shows up as ``degraded`` instead of
+    removing every pod from its Service at once.
+    """
+    if critical is None:
+        ready = all(check.get("status") == "healthy" for check in checks.values())
+        overall = "ready" if ready else "not_ready"
+    else:
+        critical_names = set(critical)
+        ready = all(
+            checks.get(name, {}).get("status") in {"healthy", "degraded"}
+            for name in critical_names
+        )
+        all_healthy = all(check.get("status") == "healthy" for check in checks.values())
+        overall = "not_ready" if not ready else "ready" if all_healthy else "degraded"
+        checks = {
+            name: {**check, "critical": name in critical_names}
+            for name, check in checks.items()
+        }
+    if redact_errors:
+        checks = {
+            name: {
+                key: value
+                for key, value in check.items()
+                if key in {"status", "critical", "response_time_ms"}
+            }
+            for name, check in checks.items()
+        }
     return JSONResponse(
         status_code=200 if ready else 503,
         content={
-            "status": "ready" if ready else "not_ready",
+            "status": overall,
             "service": runtime.service_name,
             "checks": checks,
             "request_id_header": (

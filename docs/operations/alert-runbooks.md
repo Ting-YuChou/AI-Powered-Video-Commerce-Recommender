@@ -133,7 +133,7 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
 - **Symptom:** a producer-owning service (`gateway-api`,
   `interaction-ingest-service`, `recommendation-service`) has had no connected
   Kafka producer for 5 minutes. With several uvicorn workers the value is the
-  maximum, so this fires when no worker is connected.
+  most recent worker observation, so a single stuck worker can make it flap.
 - **Impact:** uploads and interactions return 503; impression events back up in
   the outbox.
 - **First checks:** broker health (`docker compose ps kafka`, kafka-exporter
@@ -167,9 +167,8 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
   `RecommendationServiceUnavailable`, `PostgresExporterDown`, ...);
   `/readyz/full` on the reporting service for the error detail.
 - **Remediation:** restore the dependency. Producers and probes recover on their
-  own without restarting the reporting service. Multi-worker services keep each
-  worker's last probe result (`min`), so the value can lag until every worker
-  has been probed again.
+  own without restarting the reporting service. Multi-worker services report
+  the most recent probe result from any worker.
 
 ## KafkaConsumerLagHigh
 
@@ -278,6 +277,8 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
 ## RankingCoordinatorPoolTimeout
 
 - **Symptom:** the ranking coordinator client timed out (pool or request).
+  Counted by its callers: `recommendation-service` (direct mode) and the
+  ranking proxy (job `ranking-service-proxy`, path `/metrics/proxy`).
 - **Impact:** ranking requests fail for the affected callers.
 - **First checks:** coordinator CPU and connection pool saturation; runner
   dispatch latency; network between services.
@@ -312,6 +313,9 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
   ranking peer; any peer still running a release without the handshake.
 - **Remediation:** set the key everywhere, confirm `result="authenticated"`
   only, then switch to `required`.
+- **Blind spot:** only the coordinator's counters are scraped (through
+  `ranking-service` `/metrics`). Runners have no metrics endpoint, so
+  `role="runner"` never appears; check runner logs instead.
 
 ## RankingRuntimeAuthFailures
 
@@ -324,6 +328,8 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
   or an unexpected client address.
 - **Remediation:** roll the same key to every peer; fix NTP; block unknown
   clients with the ranking NetworkPolicy.
+- **Blind spot:** runner-side failures are not scraped (no runner metrics
+  endpoint); coordinator dispatch errors and runner logs show them.
 
 ## RankingTritonOverloadSustained
 
@@ -521,6 +527,10 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
 
 ## FeatureLakeIcebergCommitFailure
 
+- **Known gap:** no Flink job in `flink-jobs/` registers the
+  `iceberg_commit_failed` counter this rule reads, so it cannot fire today
+  (`tests/test_alert_metric_contract.py` tracks it). Watch the materializer job's
+  checkpoint failures and `FeatureLakeMaterializationLagHigh` instead.
 - **Symptom:** an Iceberg atomic commit failed.
 - **Impact:** materialization stalls; cutover must pause.
 - **First checks:** Flink checkpoint and commit errors; catalog (iceberg-rest)

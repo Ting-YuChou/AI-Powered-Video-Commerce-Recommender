@@ -380,6 +380,8 @@ services:
       API_PORT: 8000
       SERVICE_GATEWAY_PORT: 8000
       SERVICE_GATEWAY_WORKERS: ${SERVICE_GATEWAY_WORKERS:-4}
+      # Informational Flink job check in /readyz/full (flink profile).
+      FEATURE_PIPELINE_FLINK_REST_URL: ${FEATURE_PIPELINE_FLINK_REST_URL:-http://flink-jobmanager:8081}
     tmpfs:
       - /run/prometheus-multiproc:uid=10001,gid=10001,mode=0700,size=64m
     expose:
@@ -395,8 +397,11 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+      # Started, not healthy: gateway readiness no longer depends on
+      # downstream readiness, and an untrained ranker keeps recommendation
+      # degraded on a fresh stack while it still serves fallback slates.
       recommendation-service:
-        condition: service_healthy
+        condition: service_started
       interaction-ingest-service:
         condition: service_healthy
     healthcheck:

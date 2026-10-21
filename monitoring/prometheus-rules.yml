@@ -132,7 +132,8 @@ groups:
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#workerprocessingfailures
 
       # Every exporter carries the gauge (0 when it has no producer), so only
-      # the services that own a producer are evaluated, each on its own.
+      # the services that own a producer are evaluated, each on its own. Multi-
+      # worker services report the most recent worker observation.
       - alert: KafkaProducerDisconnected
         expr: |
           min by (job) (
@@ -156,9 +157,8 @@ groups:
           description: Rate-limit checks against Redis are erroring or timing out, so requests are admitted without a limit.
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#ratelimiterfailingopen
 
-      # Set on each readiness probe. Multi-worker services aggregate with "min",
-      # so one worker's last probe result can hold the value; the 10m window
-      # rides that out, and degraded (0.5) is reported but not alerted.
+      # Set on each readiness probe; multi-worker services keep the most recent
+      # probe result (mostrecent). Degraded (0.5) is reported but not alerted.
       - alert: DependencyUnhealthy
         expr: min by (job, service, dependency) (video_commerce_dependency_status) == 0
         for: 10m
@@ -316,7 +316,7 @@ groups:
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingcoordinatorpooltimeout
 
       - alert: Ranking5xxDetected
-        expr: sum(rate(video_commerce_http_requests_total{job=~"ranking-service|recommendation-service",status=~"5.."}[5m])) > 0
+        expr: sum(rate(video_commerce_http_requests_total{job=~"ranking-service|ranking-service-proxy|recommendation-service",status=~"5.."}[5m])) > 0
         for: 2m
         labels:
           severity: critical
@@ -346,7 +346,7 @@ groups:
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingruntimeunauthenticatedconnections
 
       - alert: RankingRuntimeAuthFailures
-        expr: sum by (job, role, result) (increase(video_commerce_ranking_runtime_auth_total{result=~"invalid_mac|expired|replayed|malformed|unsupported_version|rejected"}[10m])) > 0
+        expr: sum by (job, role, result) (increase(video_commerce_ranking_runtime_auth_total{result=~"invalid_mac|expired|replayed|malformed|unsupported_version|wrong_role|unconfigured|rejected"}[10m])) > 0
         for: 5m
         labels:
           severity: warning
@@ -462,11 +462,13 @@ groups:
           description: These impressions will never reach Kafka, so their attribution and training labels are lost.
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#recommendationoutboxterminal
 
+      # Denominator: one enqueue outcome per served slate. stage="served" also
+      # carries dispatcher events (published, publish_retry, ...), excluded here.
       - alert: RecommendationImpressionAttributionDegraded
         expr: |
           sum(rate(video_commerce_recommendation_impression_events_total{stage="served",status=~"timeout|unavailable"}[10m]))
             /
-          clamp_min(sum(rate(video_commerce_recommendation_impression_events_total{stage="served"}[10m])), 0.001)
+          clamp_min(sum(rate(video_commerce_recommendation_impression_events_total{stage="served",status=~"inserted|duplicate|unavailable|timeout"}[10m])), 0.001)
             > 0.05
         for: 15m
         labels:
@@ -516,10 +518,8 @@ groups:
           description: Check worker stalls, Postgres latency, and processing duration before retry takeover.
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contentprocessingleaselost
 
-      # The reaper labels a run that ran out of redrives "exhausted"; "terminal"
-      # is accepted too so the rule survives a rename in either direction.
       - alert: ContentProcessingRedrivesExhausted
-        expr: sum by (job) (increase(video_commerce_content_processing_redrives_total{outcome=~"exhausted|terminal"}[30m])) > 0
+        expr: sum by (job) (increase(video_commerce_content_processing_redrives_total{outcome="exhausted"}[30m])) > 0
         for: 1m
         labels:
           severity: warning

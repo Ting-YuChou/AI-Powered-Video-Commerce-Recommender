@@ -63,23 +63,44 @@ or tests and one-shot jobs also switch to multiprocess mode.
   container, including exited ones, so they stay monotonic.
 - Every Gauge declares `multiprocess_mode` (`tests/test_prometheus_multiprocess.py`
   fails otherwise): per-process counts such as in-flight requests, queue depth
-  and RSS use `livesum`; per-process health flags use `livemin`/`livemax`;
-  observations of shared state (Redis, outbox, release pointers) use
-  `mostrecent`; versions and timestamps use `max`.
-- Prometheus keeps one keep-alive connection, so one worker usually serves every
-  scrape. Gauges refreshed at scrape time (Redis info, consumer lag, worker
-  heartbeats, DB pool, Kafka producer state) reflect that worker. Process CPU
-  and RSS are refreshed by each worker from its request path at most every 15
-  seconds instead, so an idle worker reports its last value.
-- `video_commerce_kafka_producer_connected` uses `livemax`: it reads 1 while
-  any worker is connected, so `KafkaProducerDisconnected` fires only when no
-  worker in the pod is connected.
+  and RSS use `livesum`; per-process flags where any one worker matters use
+  `livemax` (`pit_orchestrator_run_in_progress`,
+  `model_release_runner_generation_mismatch`); observations of shared or
+  probed state (Redis, outbox, release pointers, Kafka producer state, Triton
+  readiness, `video_commerce_dependency_status`) use `mostrecent`; versions,
+  peaks and timestamps use `max`.
+- uvicorn's keep-alive (5 s) is shorter than the scrape interval, so each scrape
+  lands on an arbitrary worker. Gauges refreshed at scrape or probe time are
+  therefore only as fresh as that worker's last scrape:
+  - `mostrecent` gauges (Redis info, consumer lag, worker heartbeats, Kafka
+    producer state, dependency status) show the latest observation by any
+    worker. With one worker connected and another not,
+    `video_commerce_kafka_producer_connected` follows whichever was scraped last.
+  - `video_commerce_database_pool_connections` (`livesum`) adds each worker's
+    pool as of that worker's last scrape, so it lags by a few scrape intervals.
+  - Process CPU and RSS are refreshed by each worker from its request path at
+    most every 15 seconds; an idle worker reports its last value.
+- Labelled counters that alerts select with `increase()` are pre-created at 0
+  (`ObservabilityManager.ALERTED_LABEL_VALUES`), so the first event is not lost
+  to a series that did not exist yet.
 - A worker removes its `live*` gauge files on clean shutdown. uvicorn has no
   child-exit hook, so a worker that crashes keeps its live gauges in the
   aggregate until the container restarts.
-- `ranking-service` `/metrics` still forwards the coordinator's payload unless
-  the Triton backend is active; only then are its own (aggregated) metrics
-  exported.
+
+Ranking metrics are split across three places:
+
+- `ranking-service` `/metrics` (job `ranking-service`) forwards the
+  coordinator's single-process payload, so multiprocess mode does not change it
+  in the default coordinator topology. With the Triton backend it serves the
+  proxy's own aggregated metrics instead.
+- `ranking-service` `/metrics/proxy` (job `ranking-service-proxy`) always serves
+  the proxy workers' own aggregated metrics: HTTP traffic and
+  `video_commerce_ranking_coordinator_client_errors_total`. Compose scrapes it;
+  Helm adds it as an extra ServiceMonitor endpoint. With Triton it duplicates
+  `/metrics` under a different job.
+- Ranking runners have no HTTP metrics endpoint and are not scraped. Their
+  counters (including `video_commerce_ranking_runtime_auth_total{role="runner"}`)
+  are not visible to Prometheus.
 
 Check that a counter is monotonic across workers under light load:
 

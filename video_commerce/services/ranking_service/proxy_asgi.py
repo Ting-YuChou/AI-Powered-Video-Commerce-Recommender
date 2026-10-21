@@ -309,6 +309,19 @@ class RankingProxyApp:
                     request_id,
                 )
                 return
+            if path == "/metrics/proxy" and method == "GET":
+                # The proxy workers' own metrics (HTTP, coordinator client
+                # errors), aggregated across uvicorn workers. /metrics forwards
+                # the coordinator's payload instead, except with Triton.
+                status_code = 200
+                await self._send_response(
+                    send,
+                    status_code,
+                    self.runtime.observability.prometheus_content_type,
+                    self.runtime.observability.prometheus_payload(),
+                    request_id,
+                )
+                return
             if path == "/metrics" and method == "GET":
                 if self.inference_backend == "triton":
                     status_code = 200
