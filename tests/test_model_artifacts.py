@@ -168,7 +168,7 @@ def test_persist_ranking_checkpoint_records_model_metadata(tmp_path):
         fake_store.registered_releases[-1]["bundle_manifest"][
             "quality_gate_policy_version"
         ]
-        == "ranking_quality_gate_v5"
+        == "ranking_quality_gate_v6"
     )
     assert fake_store.registered_releases[-1]["lifecycle_state"] == "registered"
 
@@ -518,6 +518,87 @@ def test_pit_checkpoint_conflict_returns_and_verifies_existing_artifact(tmp_path
     assert record.checkpoint_path == str(existing_path)
     assert record.payload["artifact_sha256"] == existing_hash
 
+
+
+@pytest.mark.parametrize(
+    ("stored_release_policy", "winner_payload_policy", "expected"),
+    [
+        ("ranking_quality_gate_v5", None, "ranking_quality_gate_v5"),
+        (None, "ranking_quality_gate_v5", "ranking_quality_gate_v5"),
+        (None, None, "ranking_quality_gate_v6"),
+    ],
+)
+def test_pit_checkpoint_conflict_keeps_the_winner_quality_gate_policy(
+    tmp_path, stored_release_policy, winner_payload_policy, expected
+):
+    existing_path = tmp_path / "ranking-existing.pt"
+    existing_path.write_bytes(b"existing-ranking")
+    candidate_path = tmp_path / "ranking-candidate.pt"
+    candidate_path.write_bytes(b"different-ranking")
+
+    class ConflictStore(FakeSystemStore):
+        async def record_model_checkpoint(self, *args, **kwargs):
+            return False
+
+        async def register_model_release(self, *, model_name, model_version, bundle_manifest):
+            release = await super().register_model_release(
+                model_name=model_name,
+                model_version=model_version,
+                bundle_manifest=bundle_manifest,
+            )
+            if stored_release_policy:
+                # Idempotent registration returns the first, stored manifest.
+                release["bundle_manifest"] = {
+                    **bundle_manifest,
+                    "quality_gate_policy_version": stored_release_policy,
+                }
+            return release
+
+    store = ConflictStore()
+    winner_payload = {
+        "feature_lake_materialization_run_id": "run-42",
+        "artifact_sha256": hashlib.sha256(b"existing-ranking").hexdigest(),
+    }
+    if winner_payload_policy:
+        winner_payload["quality_gate_policy_version"] = winner_payload_policy
+    store.latest[ModelArtifactManager.RANKING_MODEL_NAME] = {
+        "model_name": ModelArtifactManager.RANKING_MODEL_NAME,
+        "model_version": "pit-run-42",
+        "checkpoint_path": str(existing_path),
+        "payload": winner_payload,
+        "created_at": 1.0,
+    }
+    manager = ModelArtifactManager(
+        system_store=store,
+        object_storage=ObjectStorage(
+            ObjectStorageConfig(
+                backend="local", download_dir=str(tmp_path / "downloads")
+            )
+        ),
+        model_config=ModelConfig(
+            ranking_model_path=str(candidate_path), cache_dir=str(tmp_path / "models")
+        ),
+        recommendation_config=RecommendationConfig(
+            cf_index_path=str(tmp_path / "cf.faiss")
+        ),
+    )
+
+    record = asyncio.run(
+        manager.persist_ranking_checkpoint(
+            local_path=str(candidate_path),
+            model_version="pit-run-42",
+            payload={"feature_lake_materialization_run_id": "run-42"},
+        )
+    )
+
+    assert record.payload["quality_gate_policy_version"] == expected
+    if not stored_release_policy:
+        assert (
+            store.registered_releases[-1]["bundle_manifest"][
+                "quality_gate_policy_version"
+            ]
+            == expected
+        )
 
 def test_persist_ranking_shadow_checkpoint_uses_non_activating_model_namespace(
     tmp_path,

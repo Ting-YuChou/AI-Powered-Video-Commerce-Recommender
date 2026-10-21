@@ -1274,6 +1274,9 @@ class ModelArtifactManager:
             "quality_gate_policy_version": QUALITY_GATE_POLICY_VERSION,
             "training_code_revision": os.getenv("GIT_COMMIT_SHA", "unknown"),
         }
+        # Persisted with the checkpoint so a later idempotent retry can keep
+        # the policy the winner was gated under.
+        record_payload["quality_gate_policy_version"] = QUALITY_GATE_POLICY_VERSION
         inserted = await self.system_store.record_model_checkpoint(
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
@@ -1297,6 +1300,10 @@ class ModelArtifactManager:
             winner_payload = dict(existing.get("payload") or {})
             winner_bundle_manifest = {
                 **bundle_manifest,
+                "quality_gate_policy_version": winner_payload.get(
+                    "quality_gate_policy_version"
+                )
+                or QUALITY_GATE_POLICY_VERSION,
                 "artifact_manifest": dict(
                     winner_payload.get("artifact_manifest") or {}
                 ),
@@ -1331,9 +1338,14 @@ class ModelArtifactManager:
             )
             existing_payload = winner_payload
             existing_payload["model_release_id"] = release["release_id"]
-            existing_payload[
-                "quality_gate_policy_version"
-            ] = QUALITY_GATE_POLICY_VERSION
+            # The registry keeps the first registration, so its manifest names
+            # the policy the winner was gated under; do not relabel it.
+            existing_payload["quality_gate_policy_version"] = (
+                dict(release.get("bundle_manifest") or {}).get(
+                    "quality_gate_policy_version"
+                )
+                or winner_bundle_manifest["quality_gate_policy_version"]
+            )
             return ModelArtifactRecord(
                 model_name=str(existing["model_name"]),
                 model_version=str(existing["model_version"]),
@@ -1346,7 +1358,6 @@ class ModelArtifactManager:
             bundle_manifest=bundle_manifest,
         )
         record_payload["model_release_id"] = release["release_id"]
-        record_payload["quality_gate_policy_version"] = QUALITY_GATE_POLICY_VERSION
         return ModelArtifactRecord(
             model_name=self.RANKING_MODEL_NAME,
             model_version=model_version,
