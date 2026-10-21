@@ -675,6 +675,20 @@ class ObservabilityManager:
             ["action", "status"],
             registry=self.registry,
         )
+        self.public_event_clock_skew_seconds = Histogram(
+            "video_commerce_public_event_clock_skew_seconds",
+            "Client event time minus server receive time for public events "
+            "(negative values include delivery delay)",
+            ["kind"],
+            buckets=(-300, -60, -10, -1, 0, 1, 10, 60, 300),
+            registry=self.registry,
+        )
+        self.public_event_time_clamped_total = Counter(
+            "video_commerce_public_event_time_clamped_total",
+            "Public events whose client time was clamped to a server bound",
+            ["kind", "bound"],
+            registry=self.registry,
+        )
         self.recommendation_impression_events_total = Counter(
             "video_commerce_recommendation_impression_events_total",
             "Recommendation impression lifecycle events by stage and status",
@@ -1554,6 +1568,22 @@ class ObservabilityManager:
 
     def record_interaction_ingest(self, action: str, status: str) -> None:
         self.interactions_ingested_total.labels(action=action, status=status).inc()
+
+    def record_public_event_time(
+        self,
+        kind: str,
+        *,
+        client_time: float,
+        server_received_at: float,
+        clamped_bound: Optional[str] = None,
+    ) -> None:
+        self.public_event_clock_skew_seconds.labels(kind=kind).observe(
+            float(client_time) - float(server_received_at)
+        )
+        if clamped_bound:
+            self.public_event_time_clamped_total.labels(
+                kind=kind, bound=clamped_bound
+            ).inc()
 
     def record_recommendation_impression(self, stage: str, status: str) -> None:
         self.recommendation_impression_events_total.labels(

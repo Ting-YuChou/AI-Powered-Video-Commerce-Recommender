@@ -1948,7 +1948,7 @@ class SystemStore:
     async def get_recommendation_impression_slate(
         self, impression_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Resolve the durable user and product positions for a served slate."""
+        """Resolve the durable user, served time and product positions for a slate."""
         if not self.enabled:
             return None
         async with self.session_factory() as session:
@@ -1972,6 +1972,7 @@ class SystemStore:
                 )
                 return {
                     "user_id": impression.user_id,
+                    "served_at": _coerce_datetime(impression.created_at).timestamp(),
                     "items": {item.product_id: item.position for item in items},
                 }
             outbox = await session.scalar(
@@ -1984,8 +1985,16 @@ class SystemStore:
             event = dict(outbox.event_payload or {})
             metadata = _safe_dict(event.get("metadata"))
             displayed_items = metadata.get("displayed_items") or []
+            # Same served-time precedence that record_recommendation_impression
+            # uses when it later materializes created_at from this payload.
+            served_at = (
+                _coerce_datetime(event.get("timestamp"))
+                or _coerce_datetime(metadata.get("created_at"))
+                or _coerce_datetime(outbox.created_at)
+            )
             return {
                 "user_id": str(event.get("user_id") or ""),
+                "served_at": served_at.timestamp() if served_at else None,
                 "items": {
                     str(item.get("product_id")): int(item.get("position") or 0)
                     for item in displayed_items

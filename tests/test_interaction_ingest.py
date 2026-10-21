@@ -353,6 +353,195 @@ async def test_viewed_impression_isolates_item_outside_durable_slate(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_clamped_interaction_retry_is_duplicate_not_collision(monkeypatch):
+    manager = DummyKafkaManager(should_succeed=True)
+    monkeypatch.setattr(interaction_ingest_api, "kafka_manager", manager)
+    monkeypatch.setattr(interaction_ingest_api, "feature_store", FakeFeatureStore())
+    monkeypatch.setattr(interaction_ingest_api, "system_store", None)
+    interaction_ingest_api.app.state.runtime.config = SimpleNamespace(
+        kafka_config=SimpleNamespace(enable=True)
+    )
+
+    async def noop_invalidation(user_id):
+        return None
+
+    monkeypatch.setattr(
+        interaction_ingest_api, "_invalidate_user_serving_cache", noop_invalidation
+    )
+    request = SimpleNamespace(state=SimpleNamespace(request_id="req-skew-retry"))
+    event_id = uuid4()
+    first_received_at = 1_700_000_000.0
+    client_time = first_received_at + 60.0
+    payload = UserInteractionRequest(
+        event_id=event_id,
+        user_id="u1",
+        product_id="p1",
+        action=InteractionType.CLICK,
+        event_time=client_time,
+    )
+
+    monkeypatch.setattr(interaction_ingest_api.time, "time", lambda: first_received_at)
+    first = await interaction_ingest_api.ingest_interaction(request, payload)
+    # The retry lands later, so its clamp bound (and clamped time) differs.
+    monkeypatch.setattr(
+        interaction_ingest_api.time, "time", lambda: first_received_at + 30.0
+    )
+    second = await interaction_ingest_api.ingest_interaction(request, payload)
+
+    assert len(manager.calls) == 1
+    assert manager.calls[0]["event_time"] == first_received_at
+    assert manager.calls[0]["client_event_time"] == client_time
+    assert json.loads(first.body)["duplicate"] is False
+    assert json.loads(second.body)["duplicate"] is True
+
+
+def _view_store(served_at):
+    class Store:
+        def __init__(self):
+            self.recorded_views = []
+
+        async def get_recommendation_impression_slate(self, impression_id):
+            return {"user_id": "u1", "served_at": served_at, "items": {"p1": 1}}
+
+        async def record_recommendation_impression_views(self, **kwargs):
+            self.recorded_views.append(kwargs)
+            return 1
+
+    return Store()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("skew_seconds", "expected_offset", "bound"),
+    [(-60.0, -20.0, "lower"), (60.0, 0.0, "upper")],
+)
+async def test_viewed_impression_clamps_client_skew_into_served_received_window(
+    monkeypatch, skew_seconds, expected_offset, bound
+):
+    received_at = 1_700_000_100.0
+    served_at = received_at - 20.0
+    manager = DummyKafkaManager(should_succeed=True)
+    store = _view_store(served_at)
+    monkeypatch.setattr(interaction_ingest_api, "kafka_manager", manager)
+    monkeypatch.setattr(interaction_ingest_api, "system_store", store)
+    monkeypatch.setattr(interaction_ingest_api.time, "time", lambda: received_at)
+    interaction_ingest_api.app.state.runtime.config = SimpleNamespace(
+        kafka_config=SimpleNamespace(enable=True)
+    )
+    registry = interaction_ingest_api.app.state.runtime.observability.registry
+    clamped_labels = {"kind": "view", "bound": bound}
+    clamped_before = (
+        registry.get_sample_value(
+            "video_commerce_public_event_time_clamped_total", clamped_labels
+        )
+        or 0.0
+    )
+    payload = ViewedImpressionRequest(
+        impression_id=uuid4(),
+        viewed_at=received_at + skew_seconds,
+        items=[{"event_id": uuid4(), "product_id": "p1", "position": 1}],
+    )
+
+    response = await interaction_ingest_api.ingest_viewed_impression(
+        SimpleNamespace(state=SimpleNamespace(request_id="req-view-skew")), payload
+    )
+
+    assert response.status_code == 202
+    call = manager.calls[0]
+    assert call["viewed_at"] == received_at + expected_offset
+    assert call["client_viewed_at"] == received_at + skew_seconds
+    assert call["served_at"] == served_at
+    assert call["server_received_at"] == received_at
+    assert store.recorded_views[0]["viewed_at"] == received_at + expected_offset
+    assert registry.get_sample_value(
+        "video_commerce_public_event_time_clamped_total", clamped_labels
+    ) == clamped_before + 1
+
+
+@pytest.mark.asyncio
+async def test_viewed_impression_inside_window_keeps_client_time(monkeypatch):
+    received_at = 1_700_000_100.0
+    manager = DummyKafkaManager(should_succeed=True)
+    monkeypatch.setattr(interaction_ingest_api, "kafka_manager", manager)
+    monkeypatch.setattr(
+        interaction_ingest_api, "system_store", _view_store(received_at - 20.0)
+    )
+    monkeypatch.setattr(interaction_ingest_api.time, "time", lambda: received_at)
+    interaction_ingest_api.app.state.runtime.config = SimpleNamespace(
+        kafka_config=SimpleNamespace(enable=True)
+    )
+    payload = ViewedImpressionRequest(
+        impression_id=uuid4(),
+        viewed_at=received_at - 5.0,
+        items=[{"event_id": uuid4(), "product_id": "p1", "position": 1}],
+    )
+
+    await interaction_ingest_api.ingest_viewed_impression(
+        SimpleNamespace(state=SimpleNamespace(request_id="req-view-ok")), payload
+    )
+
+    assert manager.calls[0]["viewed_at"] == received_at - 5.0
+    assert manager.calls[0]["client_viewed_at"] == received_at - 5.0
+
+
+class _SlateSession:
+    def __init__(self, scalars, items=()):
+        self._scalars = list(scalars)
+        self._items = list(items)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def scalar(self, _statement):
+        return self._scalars.pop(0)
+
+    async def execute(self, _statement):
+        items = self._items
+        return SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: items)
+        )
+
+
+@pytest.mark.asyncio
+async def test_impression_slate_reports_materialized_served_at():
+    from datetime import datetime, timezone
+
+    store = SystemStore(DatabaseConfig(enable=True))
+    created_at = datetime.fromtimestamp(1_700_000_000.0, tz=timezone.utc)
+    session = _SlateSession(
+        [SimpleNamespace(user_id="u1", created_at=created_at)],
+        [SimpleNamespace(product_id="p1", position=1)],
+    )
+    store.session_factory = lambda: session
+
+    slate = await store.get_recommendation_impression_slate("imp-1")
+
+    assert slate == {"user_id": "u1", "served_at": 1_700_000_000.0, "items": {"p1": 1}}
+
+
+@pytest.mark.asyncio
+async def test_impression_slate_reports_outbox_served_at():
+    store = SystemStore(DatabaseConfig(enable=True))
+    outbox = SimpleNamespace(
+        event_payload={
+            "user_id": "u1",
+            "timestamp": 1_700_000_000.0,
+            "metadata": {"displayed_items": [{"product_id": "p1", "position": 2}]},
+        },
+        created_at=None,
+    )
+    session = _SlateSession([None, outbox])
+    store.session_factory = lambda: session
+
+    slate = await store.get_recommendation_impression_slate("imp-1")
+
+    assert slate == {"user_id": "u1", "served_at": 1_700_000_000.0, "items": {"p1": 2}}
+
+
+@pytest.mark.asyncio
 async def test_postgres_interaction_ledger_rejects_stale_lease_owner():
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
