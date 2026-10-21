@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Optional
 import numpy as np
 
 from video_commerce.ml.retrieval_evaluation import (
+    MAX_CUTOFF,
     RetrievalEvaluationConfig,
     RetrievalGateDecision,
     RetrievalQualityGateResult,
@@ -21,8 +22,10 @@ from video_commerce.ml.retrieval_evaluation import (
     score_full_catalog_embeddings,
 )
 from video_commerce.ml.retrieval_training import (
+    DEFAULT_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE,
     RetrievalStreamingInputs,
     RetrievalTrainingInputs,
+    require_teacher_soft_coverage,
 )
 
 
@@ -79,15 +82,31 @@ class RetrievalReleaseTrainingRunner:
             torch.manual_seed(seed)
         except ImportError:
             pass
+        rejected_mode = (
+            str(getattr(self.config, "retrieval_ranker_rejected_mode", "weak"))
+            .strip()
+            .lower()
+        )
+        if isinstance(inputs, RetrievalStreamingInputs) and (
+            rejected_mode == "teacher_soft"
+        ):
+            require_teacher_soft_coverage(
+                getattr(inputs.source, "manifest", None),
+                min_coverage=float(
+                    getattr(
+                        self.config,
+                        "retrieval_teacher_soft_min_ranker_score_coverage",
+                        DEFAULT_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE,
+                    )
+                ),
+            )
         trainer = self.trainer_factory()
         try:
             if isinstance(inputs, RetrievalStreamingInputs):
                 prepared = trainer.prepare_streaming_source(
                     inputs.source,
                     batch_rows=int(inputs.batch_rows),
-                    ranker_rejected_mode=str(
-                        getattr(self.config, "retrieval_ranker_rejected_mode", "weak")
-                    ),
+                    ranker_rejected_mode=rejected_mode,
                 )
                 if int(prepared.get("num_samples", 0)) <= 0:
                     raise ValueError(
@@ -166,8 +185,13 @@ class RetrievalReleaseTrainingRunner:
         )
         popularity_scores = _popularity_scores(inputs)
         comparison_scores = champion_scores or popularity_scores
-        popularity_metrics = evaluate_full_catalog(queries, popularity_scores)
-        champion_metrics = evaluate_full_catalog(queries, comparison_scores)
+        # Persisted metrics omit per-query ranked lists (O(queries x 200) IDs).
+        popularity_metrics = evaluate_full_catalog(
+            queries, popularity_scores, include_ranked_product_ids=False
+        )
+        champion_metrics = evaluate_full_catalog(
+            queries, comparison_scores, include_ranked_product_ids=False
+        )
         encoding_coverage = len(bundle["item_embeddings"]) / max(
             len(inputs.product_metadata), 1
         )
@@ -175,6 +199,7 @@ class RetrievalReleaseTrainingRunner:
             queries,
             challenger_scores,
             encoding_coverage=encoding_coverage,
+            include_ranked_product_ids=False,
         )
         gate = evaluate_retrieval_gate(
             queries,
@@ -312,7 +337,17 @@ def write_two_tower_bundle(
     }
 
 
-def _popularity_scores(inputs: RetrievalTrainingInputs | RetrievalStreamingInputs):
+def _popularity_scores(
+    inputs: RetrievalTrainingInputs | RetrievalStreamingInputs,
+    *,
+    max_results: int = MAX_CUTOFF,
+):
+    """Training-positive counts, keeping each query's top (K + |seen|) items.
+
+    Evaluation drops seen items and never looks past rank K, so the rest of
+    the catalog cannot change any metric. Items are ordered by
+    (-count, product_id), matching evaluate_full_catalog's tie-break.
+    """
     counts: dict[str, float] = {
         product_id: 0.0 for product_id in inputs.product_metadata
     }
@@ -327,13 +362,27 @@ def _popularity_scores(inputs: RetrievalTrainingInputs | RetrievalStreamingInput
         for interaction in inputs.interactions:
             product_id = str(interaction["product_id"])
             counts[product_id] = counts.get(product_id, 0.0) + 1.0
-    return {
-        query.query_id: {
+    rankings: dict[int, tuple[tuple[str, ...], list[str], frozenset[str]]] = {}
+    scores: dict[str, dict[str, float]] = {}
+    for query in inputs.holdout_queries:
+        eligible = query.eligible_product_ids
+        cached = rankings.get(id(eligible))
+        if cached is None or cached[0] is not eligible:
+            ordered = sorted(
+                set(eligible),
+                key=lambda product_id: (-counts.get(product_id, 0.0), product_id),
+            )
+            cached = (eligible, ordered, frozenset(eligible))
+            rankings[id(eligible)] = cached
+        _, ordered, eligible_set = cached
+        limit = int(max_results) + sum(
+            product_id in eligible_set for product_id in query.seen_product_ids
+        )
+        scores[query.query_id] = {
             product_id: float(counts.get(product_id, 0.0))
-            for product_id in query.eligible_product_ids
+            for product_id in ordered[:limit]
         }
-        for query in inputs.holdout_queries
-    }
+    return scores
 
 
 def _gate_config_from_recommendation(config: Any) -> RetrievalEvaluationConfig:

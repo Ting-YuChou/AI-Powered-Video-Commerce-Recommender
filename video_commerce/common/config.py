@@ -712,6 +712,16 @@ class RecommendationConfig(BaseSettings):
         env="RETRIEVAL_RANKER_REJECTED_MODE",
         description="Ranker-rejected experiment mode: disabled, weak, or teacher_soft",
     )
+    retrieval_teacher_soft_min_ranker_score_coverage: float = Field(
+        0.9,
+        ge=0.0,
+        le=1.0,
+        env="RETRIEVAL_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE",
+        description=(
+            "Minimum share of ranker_rejected PIT rows with a real ranker_score "
+            "before teacher_soft training is allowed"
+        ),
+    )
     retrieval_gate_min_queries: int = Field(1000, ge=1)
     retrieval_gate_min_users: int = Field(200, ge=1)
     retrieval_gate_min_relevant_labels: int = Field(100, ge=1)

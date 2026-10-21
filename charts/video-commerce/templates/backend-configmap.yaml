@@ -35,6 +35,7 @@ data:
   RETRIEVAL_LABEL_POLICY_VERSION: {{ .Values.appConfig.recommendation.retrievalLabelPolicyVersion | quote }}
   RETRIEVAL_QUALITY_GATE_POLICY_VERSION: {{ .Values.appConfig.recommendation.retrievalQualityGatePolicyVersion | quote }}
   RETRIEVAL_RANKER_REJECTED_MODE: {{ .Values.appConfig.recommendation.retrievalRankerRejectedMode | quote }}
+  RETRIEVAL_TEACHER_SOFT_MIN_RANKER_SCORE_COVERAGE: {{ .Values.appConfig.recommendation.retrievalTeacherSoftMinRankerScoreCoverage | quote }}
   RECOMMENDATION_ONLINE_RETRAINING_ENABLED: {{ .Values.appConfig.recommendation.onlineRetrainingEnabled | quote }}
   RECOMMENDATION_TT_LOGQ_CORRECTION_ENABLED: {{ .Values.appConfig.recommendation.ttLogqCorrectionEnabled | quote }}
   API_CORS_ORIGINS: {{ .Values.appConfig.apiCorsOrigins | quote }}

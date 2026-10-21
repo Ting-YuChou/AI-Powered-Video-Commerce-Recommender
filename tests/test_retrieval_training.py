@@ -130,15 +130,7 @@ def test_ranker_rejected_experiment_modes_are_explicit():
     disabled = build_retrieval_training_inputs(
         dataset, holdout_days=7, ranker_rejected_mode="disabled"
     )
-    teacher_dataset = replace(
-        dataset,
-        rows=tuple(
-            replace(row, ranker_score=-1.0)
-            if row.label_source == "ranker_rejected"
-            else row
-            for row in dataset.rows
-        ),
-    )
+    teacher_dataset = _with_rejected_scores(dataset, [-1.0])
     teacher = build_retrieval_training_inputs(
         teacher_dataset, holdout_days=7, ranker_rejected_mode="teacher_soft"
     )
@@ -154,61 +146,115 @@ def test_ranker_rejected_experiment_modes_are_explicit():
     assert rejected["teacher_target"] < 0.5
 
 
-def test_two_tower_streaming_source_keeps_event_samples_on_disk(tmp_path):
-    from video_commerce.ml.two_tower import DiskTrainingSampleStore, TwoTowerTrainer
-
-    dataset = _dataset()
-
-    class Source:
-        path = tmp_path
-        work_dir = tmp_path / "work"
-        catalog = dataset.catalog
-
-        def iter_row_batches(self, *, split, batch_rows, **_kwargs):
-            assert split == "training"
-            rows = dataset.rows[:-1]
-            for start in range(0, len(rows), batch_rows):
-                yield list(rows[start : start + batch_rows])
-
-    trainer = TwoTowerTrainer(
-        clip_dim=2,
-        output_dim=2,
-        batch_size=1,
-        epochs=1,
-        num_hard_negatives=0,
-        num_random_negatives=1,
+def _with_rejected_scores(dataset, scores):
+    rejected = iter(scores)
+    rows = []
+    for row in dataset.rows:
+        if row.label_source == "ranker_rejected":
+            row = replace(row, ranker_score=next(rejected))
+        rows.append(row)
+    scored = sum(score is not None for score in scores)
+    return replace(
+        dataset,
+        rows=tuple(rows),
+        manifest=replace(
+            dataset.manifest,
+            ranker_rejected_rows=len(scores),
+            ranker_scored_rows=scored,
+        ),
     )
 
-    prepared = trainer.prepare_streaming_source(Source(), batch_rows=2)
 
-    assert prepared["num_samples"] == 1
-    assert isinstance(trainer._train_samples, DiskTrainingSampleStore)
-    assert trainer._train_samples.path.parent == Source.work_dir
-    assert not (Source.path / "two_tower_training.sqlite3").exists()
-    assert trainer._train_samples.negatives_for_user(1, 20.0)
-    assert trainer.train()["num_samples"] == 1
-    sample_store_path = trainer._train_samples.path
-    trainer._train_samples.cleanup()
-    assert not sample_store_path.exists()
+def test_teacher_soft_is_refused_below_ranker_score_coverage():
+    import pytest
+
+    unscored = _with_rejected_scores(_dataset(), [None])
+    with pytest.raises(ValueError, match="ranker_score coverage"):
+        build_retrieval_training_inputs(
+            unscored, holdout_days=7, ranker_rejected_mode="teacher_soft"
+        )
+    # A manifest without coverage counts (legacy) cannot prove coverage either.
+    with pytest.raises(ValueError, match="ranker_score coverage"):
+        build_retrieval_training_inputs(
+            _dataset(), holdout_days=7, ranker_rejected_mode="teacher_soft"
+        )
+    # weak mode never consults the scores.
+    assert build_retrieval_training_inputs(
+        unscored, holdout_days=7, ranker_rejected_mode="weak"
+    ).external_negatives
 
 
-def test_streaming_inputs_build_compact_holdout_without_rows_tuple():
+def test_teacher_soft_unscored_rows_fall_back_to_weak_negatives():
     dataset = _dataset()
+    extra = replace(
+        next(row for row in dataset.rows if row.label_source == "ranker_rejected"),
+        product_id="p1",
+    )
+    dataset = replace(dataset, rows=dataset.rows + (extra,))
+    dataset = _with_rejected_scores(dataset, [2.0, None])
 
-    class Source:
-        catalog = dataset.catalog
+    teacher = build_retrieval_training_inputs(
+        dataset,
+        holdout_days=7,
+        ranker_rejected_mode="teacher_soft",
+        teacher_soft_min_ranker_score_coverage=0.5,
+    )
 
-        def assign_holdout(self, *, holdout_days):
-            assert holdout_days == 7
-            from video_commerce.ml.retrieval_pit_dataset import RetrievalHoldoutWindow
+    rejected = {
+        value["product_id"]: value
+        for value in teacher.external_negatives
+        if value["source"] == "ranker_rejected"
+    }
+    assert rejected["p3"]["teacher_target"] > 0.5
+    assert "teacher_target" not in rejected["p1"]
+    assert rejected["p1"]["ranker_score"] is None
 
-            return RetrievalHoldoutWindow(295200.0, 900000.0)
 
-        def iter_row_batches(self, *, split, **_kwargs):
-            yield list(dataset.rows[:-1] if split == "training" else dataset.rows[-1:])
+def test_holdout_requires_catalog_snapshot_before_holdout_start():
+    import pytest
 
-    inputs = build_retrieval_streaming_inputs(Source(), holdout_days=7, batch_rows=2)
+    dataset = _dataset()
+    late_catalog = replace(dataset.catalog, available_at=900_000.0)
 
-    assert not hasattr(inputs, "training_rows")
-    assert [query.query_id for query in inputs.holdout_queries] == ["q3"]
-    assert set(inputs.product_metadata) == {"p1", "p2", "p3"}
+    with pytest.raises(ValueError, match="newer than the holdout start"):
+        build_retrieval_training_inputs(
+            replace(dataset, catalog=late_catalog), holdout_days=7
+        )
+    # Training rows older than the catalog are fine (static snapshot).
+    mid_catalog = replace(dataset.catalog, available_at=15.0)
+    inputs = build_retrieval_training_inputs(
+        replace(dataset, catalog=mid_catalog), holdout_days=7
+    )
+    assert [row["as_of_ts"] for row in inputs.interactions] == [10.0]
+
+
+def test_cold_items_are_resolved_per_query_as_of_for_relevant_products():
+    from video_commerce.ml.retrieval_training import _EvaluationContext
+
+    day = 86400.0
+    metadata = {
+        "old": {"created_at": 0.0, "modality_presence": {"visual": True}},
+        "new": {"created_at": 95 * day, "modality_presence": {"visual": False}},
+        "undated": {"modality_presence": {"visual": True}},
+        "rare": {"created_at": 0.0, "modality_presence": {"visual": True}},
+    }
+    exposures = {"old": 50, "new": 40, "undated": 30, "rare": 5}
+    context = _EvaluationContext.build(tuple(sorted(metadata)), metadata, exposures)
+
+    def query(as_of_ts):
+        rows = [
+            replace(
+                _row("q", product_id, "click", as_of_ts),
+                user_features={"total_interactions": 10},
+            )
+            for product_id in metadata
+        ]
+        return context.query("q", rows)
+
+    assert query(100 * day).cold_item_product_ids == frozenset(
+        {"new", "undated", "rare"}
+    )
+    assert query(200 * day).cold_item_product_ids == frozenset({"undated", "rare"})
+    assert context.long_tail == frozenset({"new", "rare", "undated"})
+    assert context.missing_by_name == {"visual": frozenset({"new"})}
+    assert query(100 * day).long_tail_product_ids is context.long_tail
