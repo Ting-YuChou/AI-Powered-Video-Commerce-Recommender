@@ -1325,6 +1325,7 @@ async def startup_event():
             observability=runtime.observability,
         )
         await system_store.initialize()
+        await _warm_impression_outbox_pool(runtime)
 
     if (
         os.getenv("ENVIRONMENT", "").lower() == "production"
@@ -1474,6 +1475,45 @@ async def startup_event():
             "configured_workers": runtime.config.service_topology_config.recommendation_workers,
             "torch_num_threads": torch.get_num_threads(),
             "torch_num_interop_threads": torch.get_num_interop_threads(),
+        },
+    )
+
+
+_IMPRESSION_OUTBOX_WARMUP_TIMEOUT_SECONDS = 5.0
+
+
+async def _warm_impression_outbox_pool(runtime) -> None:
+    """Prime the DB connections the served-impression write will use.
+
+    Without this the first impression after a deploy pays for connection
+    setup and statement prepare inside its own budget and can come back
+    impression_tracking "unavailable". Best effort: bounded, logged, and
+    never fails startup or readiness.
+    """
+    if system_store is None:
+        return
+    connections = max(1, int(runtime.config.database_config.pool_size))
+    started_at = time.perf_counter()
+    try:
+        primed = await asyncio.wait_for(
+            system_store.warm_hot_path_pool(connections),
+            timeout=_IMPRESSION_OUTBOX_WARMUP_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning(
+            "recommendation_impression_outbox_warmup_failed",
+            extra={
+                "connections": connections,
+                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                "error": repr(exc),
+            },
+        )
+        return
+    logger.info(
+        "recommendation_impression_outbox_warmup_complete",
+        extra={
+            "connections": primed,
+            "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
         },
     )
 

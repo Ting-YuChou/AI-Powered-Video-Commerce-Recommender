@@ -1433,6 +1433,32 @@ def _engine_options(config: DatabaseConfig) -> Dict[str, Any]:
     }
 
 
+def _recommendation_outbox_insert(
+    *,
+    event_id: str,
+    impression_id: str,
+    payload_hash: str,
+    payload: Dict[str, Any],
+    next_attempt_at: datetime,
+):
+    """The served-impression outbox INSERT, shared with the pool warmup."""
+    return (
+        pg_insert(RecommendationEventOutbox)
+        .values(
+            event_id=event_id,
+            impression_id=impression_id,
+            payload_hash=payload_hash,
+            event_payload=payload,
+            next_attempt_at=next_attempt_at,
+        )
+        .on_conflict_do_nothing(index_elements=[RecommendationEventOutbox.event_id])
+    )
+
+
+class _WarmupRollback(Exception):
+    """Ends a warmup transaction so its probe INSERT is rolled back."""
+
+
 class OutboxCommitDeadlineExceeded(RuntimeError):
     """The serving deadline passed before COMMIT, so the insert was rolled back."""
 
@@ -1865,6 +1891,60 @@ class SystemStore:
                 response_time_ms=round((time.time() - started_at) * 1000, 2),
                 error=str(exc),
             )
+
+    async def warm_hot_path_pool(self, connections: int) -> int:
+        """Open and prime pooled connections for the served-impression write.
+
+        The first outbox write on a new connection pays for connect and auth,
+        and every connection's first INSERT pays for statement compile and
+        prepare plus the backend loading the table's indexes; under the
+        serving budget that can miss. Holding ``connections`` hot-path
+        sessions at once makes the pool open that many distinct connections.
+        Each runs the production INSERT for a throwaway row and rolls back,
+        so nothing is committed or dispatched. Returns the number primed;
+        errors propagate to the caller.
+        """
+        if not self.enabled or self.session_factory is None:
+            return 0
+        target = max(1, int(connections))
+        primed = 0
+        all_primed = asyncio.Event()
+
+        async def prime() -> None:
+            nonlocal primed
+            probe_id = f"pool-warmup-{uuid.uuid4().hex}"
+            try:
+                async with self._hot_path_session() as session:
+                    await session.execute(
+                        _recommendation_outbox_insert(
+                            event_id=probe_id,
+                            impression_id=probe_id,
+                            payload_hash="0" * 64,
+                            payload={
+                                "event_id": probe_id,
+                                "metadata": {"impression_id": probe_id},
+                            },
+                            next_attempt_at=_utc_now(),
+                        )
+                    )
+                    primed += 1
+                    if primed == target:
+                        all_primed.set()
+                    # Hold this connection until every session has one;
+                    # releasing early would let the next session reuse it.
+                    await all_primed.wait()
+                    raise _WarmupRollback()
+            except _WarmupRollback:
+                pass
+
+        tasks = [asyncio.ensure_future(prime()) for _ in range(target)]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            self._update_pool_metrics()
+        return primed
 
     async def prune_interaction_events(self) -> int:
         """Delete raw interaction events older than the configured retention window."""
@@ -2379,16 +2459,13 @@ class SystemStore:
                 payload, sort_keys=True, separators=(",", ":"), default=str
             ).encode("utf-8")
         ).hexdigest()
-        stmt = pg_insert(RecommendationEventOutbox).values(
+        stmt = _recommendation_outbox_insert(
             event_id=event_id,
             impression_id=impression_id,
             payload_hash=payload_hash,
-            event_payload=payload,
+            payload=payload,
             next_attempt_at=_utc_now()
             + timedelta(seconds=max(0.0, float(publish_hold_seconds))),
-        )
-        stmt = stmt.on_conflict_do_nothing(
-            index_elements=[RecommendationEventOutbox.event_id]
         )
         async with self._hot_path_session() as session:
             result = await session.execute(stmt)
