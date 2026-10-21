@@ -431,6 +431,8 @@ def evaluate_quality_gate(
                 ),
             }
         )
+    # Overall CIs are needed even when evidence is short: a definite failure
+    # takes precedence over insufficient evidence.
     bootstrap = _cluster_bootstrap(statistics, config)
     overall = {**overall, **bootstrap}
     slice_results: Dict[str, Mapping[str, object]] = {}
@@ -438,8 +440,8 @@ def evaluate_quality_gate(
     slice_underpowered: list[str] = []
     failed_slices: list[str] = []
     slices = list(_quality_slices(rows, config))
-    # Bonferroni across the blocking slices that will be tested, so the
-    # family-wise false-failure rate of their CIs stays near 5%.
+    # Bonferroni across the blocking slices that are tested (not across the
+    # metrics within a slice): each blocking slice's CIs use alpha / k.
     blocking_tests = max(
         1,
         sum(1 for name, _, applicable in slices if applicable and name in BLOCKING_SLICES),
@@ -471,6 +473,7 @@ def evaluate_quality_gate(
             alpha=0.05 / blocking_tests if blocking else 0.05,
         )
         metrics = {**metrics, **ci}
+        metrics.update(_required_users_estimates(metrics, config, slice_name=name))
         failures = _metric_failures(metrics, config, slice_name=name)
         underpowered = (
             []
@@ -495,54 +498,39 @@ def evaluate_quality_gate(
         elif blocking and underpowered:
             slice_underpowered.extend(underpowered)
 
-    if evidence_reasons or insufficient_slices:
-        reasons = tuple(evidence_reasons) + tuple(
-            f"slice_{name}" for name in insufficient_slices
+    overall.update(_required_users_estimates(overall, config, slice_name=None))
+    if _ndcg_underpowered(overall, config, slice_name=None):
+        overall["ndcg_informative_impressions_required_estimate"] = (
+            _required_informative_impressions(overall, config)
+        )
+    requirement_failures, requirement_underpowered = _experiment_requirements(
+        overall, slice_results, config
+    )
+    # Definite failures (a CI wholly beyond its threshold, or a failed blocking
+    # slice) take precedence over missing evidence and underpowered metrics.
+    failures = (
+        _metric_failures(overall, config, slice_name=None)
+        + requirement_failures
+        + [f"slice_{name}" for name in failed_slices]
+    )
+    underpowered = (
+        _underpowered_reasons(overall, config, slice_name=None)
+        + requirement_underpowered
+        + slice_underpowered
+    )
+    if failures:
+        reasons = tuple(failures)
+        decision = GateDecision.FAILED
+    elif evidence_reasons or insufficient_slices or underpowered:
+        reasons = (
+            tuple(evidence_reasons)
+            + tuple(f"slice_{name}" for name in insufficient_slices)
+            + tuple(underpowered)
         )
         decision = GateDecision.INSUFFICIENT_EVIDENCE
     else:
-        failures = _metric_failures(overall, config, slice_name=None)
-        if config.experiment_kind == "features":
-            cold = dict(slice_results.get("cold_user", {}).get("metrics") or {})
-            if (
-                float(overall["ndcg_at_10_delta"]) < 0.005
-                and float(cold.get("ndcg_at_10_delta", float("-inf"))) < 0.01
-            ):
-                failures.append("feature_challenger_minimum_improvement")
-        elif config.experiment_kind == "fusion":
-            recall_delta = -float(
-                overall.get("candidate_recall_at_500_absolute_regression", 0.0)
-            )
-            if recall_delta < 0.005 and float(overall["ndcg_at_10_delta"]) < 0.005:
-                failures.append("fusion_challenger_minimum_improvement")
-        elif config.experiment_kind == "calibration":
-            for head in ("ctr", "ctcvr"):
-                old = float(overall[f"{head}_ece_champion"])
-                new = float(overall[f"{head}_ece_challenger"])
-                if old <= 0.0 or new > old * 0.9:
-                    failures.append(f"calibration_{head}_minimum_improvement")
-                if float(overall[f"{head}_brier_relative_regression"]) > 0.0:
-                    failures.append(f"calibration_{head}_brier_regression")
-            # Only a CI wholly below zero is a ranking regression; an
-            # equal-order calibration misses "point delta >= 0" half the time.
-            if float(overall["ndcg_at_10_delta_ci_upper"]) < 0.0:
-                failures.append("calibration_ndcg_regression")
-        failures.extend(f"slice_{name}" for name in failed_slices)
-        underpowered = _underpowered_reasons(overall, config, slice_name=None)
-        if _ndcg_underpowered(overall, config, slice_name=None):
-            overall["ndcg_informative_impressions_required_estimate"] = (
-                _required_informative_impressions(overall, config)
-            )
-        underpowered.extend(slice_underpowered)
-        if failures:
-            reasons = tuple(failures)
-            decision = GateDecision.FAILED
-        elif underpowered:
-            reasons = tuple(underpowered)
-            decision = GateDecision.INSUFFICIENT_EVIDENCE
-        else:
-            reasons = ()
-            decision = GateDecision.PASSED
+        reasons = ()
+        decision = GateDecision.PASSED
     return QualityGateResult(
         decision=decision,
         reasons=reasons,
@@ -1061,6 +1049,11 @@ _GATED_METRICS = (
     ("ctcvr_ece_absolute_regression", "ctcvr_ece", False),
     ("value_wape_relative_regression", "value_wape", False),
 )
+# Bootstrapped for the calibration experiment's 10% ECE improvement check.
+_BOOTSTRAP_METRICS = tuple(metric for metric, _, _ in _GATED_METRICS) + (
+    "ctr_ece_relative_regression",
+    "ctcvr_ece_relative_regression",
+)
 
 
 def _gated_metrics(values: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -1075,6 +1068,9 @@ def _gated_metrics(values: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
                 values[f"{head}_{name}"], lower_is_better=True
             )
         gated[f"{head}_ece_absolute_regression"] = delta(f"{head}_ece")
+        gated[f"{head}_ece_relative_regression"] = _relative_regression(
+            values[f"{head}_ece"], lower_is_better=True
+        )
     gated["value_wape_relative_regression"] = _relative_regression(
         values["value_wape"], lower_is_better=True
     )
@@ -1095,6 +1091,12 @@ def _comparison_metrics(
         "ndcg_at_10_champion": float(values["ndcg_at_10"][_CHAMPION]),
         "ndcg_at_10_challenger": float(values["ndcg_at_10"][_CHALLENGER]),
         "ndcg_informative_impressions": int(values["informative_slates"][0]),
+        # Per-head evidence: a head with no positives cannot be compared.
+        "ctr_positives": int(columns.clicked.sum()),
+        "ctr_negatives": int(len(columns.clicked) - columns.clicked.sum()),
+        "ctcvr_positives": int(columns.purchased.sum()),
+        "ctcvr_negatives": int(len(columns.purchased) - columns.purchased.sum()),
+        "value_rows": int(columns.value_row.sum()),
     }
     metrics.update(gated)
     for head in _PROBABILITY_HEADS:
@@ -1130,16 +1132,19 @@ def _cluster_bootstrap(
     *,
     alpha: float = 0.05,
 ) -> Dict[str, float]:
-    """Percentile CIs of every gated metric under user-cluster resampling."""
+    """Percentile CIs of every bootstrapped metric under user-cluster resampling."""
     if statistics.users == 0:
         return {
-            f"{name}_ci_{bound}": 0.0
-            for name, _, _ in _GATED_METRICS
-            for bound in ("lower", "upper", "half_width")
+            "ci_alpha": alpha,
+            **{
+                f"{name}_ci_{bound}": 0.0
+                for name in _BOOTSTRAP_METRICS
+                for bound in ("lower", "upper", "half_width")
+            },
         }
     samples = max(1, int(config.bootstrap_samples))
     generator = np.random.default_rng(config.random_seed)
-    draws = {name: np.empty(samples) for name, _, _ in _GATED_METRICS}
+    draws = {name: np.empty(samples) for name in _BOOTSTRAP_METRICS}
     step = max(1, _BOOTSTRAP_CHUNK_ELEMENTS // statistics.width)
     for begin in range(0, samples, step):
         weights = _bootstrap_weights(
@@ -1149,7 +1154,7 @@ def _cluster_bootstrap(
             _model_statistics(statistics, weights)
         ).items():
             draws[name][begin : begin + len(weights)] = value
-    result = {}
+    result = {"ci_alpha": alpha}
     for name, value in draws.items():
         lower = float(np.quantile(value, alpha / 2.0))
         upper = float(np.quantile(value, 1.0 - alpha / 2.0))
@@ -1206,6 +1211,29 @@ def _metric_threshold(metric: str, config, *, slice_name: str | None) -> float:
     )
 
 
+def _metric_has_evidence(metrics, metric: str, config, *, slice_name: str | None) -> bool:
+    """Whether the rows carry any signal for the metric's head.
+
+    Without it every resample scores both models identically (for example AP
+    of 0 with no purchases), and a [0, 0] CI would pass with false certainty.
+    """
+    sliced = slice_name is not None
+    if metric.startswith("ndcg_"):
+        return int(metrics.get("ndcg_informative_impressions") or 0) > 0
+    if metric.startswith("value_"):
+        floor = config.min_slice_positives if sliced else config.min_purchases
+        return int(metrics.get("value_rows") or 0) >= max(1, floor)
+    head = "ctcvr" if metric.startswith("ctcvr_") else "ctr"
+    if sliced:
+        floor = config.min_slice_positives
+    else:
+        floor = config.min_purchases if head == "ctcvr" else config.min_clicks
+    return (
+        int(metrics.get(f"{head}_positives") or 0) >= max(1, floor)
+        and int(metrics.get(f"{head}_negatives") or 0) > 0
+    )
+
+
 def _ci_decision(
     metrics, metric: str, higher_is_better: bool, threshold: float
 ) -> GateDecision:
@@ -1227,9 +1255,46 @@ def _ci_decision(
 
 
 def _ci_decisions(metrics, config, *, slice_name: str | None):
+    """(metric, decision, reason) per gated metric; reason is None on a pass."""
+    prefix = f"slice_{slice_name}" if slice_name else "overall"
     for metric, stem, higher_is_better in _GATED_METRICS:
+        if not _metric_has_evidence(metrics, metric, config, slice_name=slice_name):
+            yield metric, GateDecision.INSUFFICIENT_EVIDENCE, f"{prefix}_{stem}_no_evidence"
+            continue
         threshold = _metric_threshold(metric, config, slice_name=slice_name)
-        yield metric, stem, _ci_decision(metrics, metric, higher_is_better, threshold)
+        decision = _ci_decision(metrics, metric, higher_is_better, threshold)
+        if decision is GateDecision.FAILED:
+            reason = (
+                f"{prefix}_ndcg_regression" if stem == "ndcg" else f"{prefix}_{metric}"
+            )
+        elif decision is GateDecision.INSUFFICIENT_EVIDENCE:
+            reason = f"{prefix}_{stem}_underpowered"
+        else:
+            reason = None
+        yield metric, decision, reason
+
+
+def _ndcg_minimum_improvement(metrics, config, *, slice_name: str | None):
+    """A positive *_ndcg_min_delta is a superiority requirement on the CI."""
+    minimum = (
+        config.slice_ndcg_min_delta if slice_name else config.overall_ndcg_min_delta
+    )
+    if minimum <= 0.0:
+        # Non-inferiority, already covered by the NDCG margin test.
+        return GateDecision.PASSED
+    return _evidenced_decision(
+        metrics, "ndcg_at_10_delta", True, minimum, config, slice_name=slice_name
+    )
+
+
+def _evidenced_decision(
+    metrics, metric, higher_is_better, threshold, config, *, slice_name
+) -> GateDecision:
+    if not metrics or not _metric_has_evidence(
+        metrics, metric, config, slice_name=slice_name
+    ):
+        return GateDecision.INSUFFICIENT_EVIDENCE
+    return _ci_decision(metrics, metric, higher_is_better, threshold)
 
 
 def _ndcg_underpowered(metrics, config, *, slice_name: str | None) -> bool:
@@ -1246,12 +1311,160 @@ def _ndcg_underpowered(metrics, config, *, slice_name: str | None) -> bool:
 
 
 def _underpowered_reasons(metrics, config, *, slice_name: str | None) -> list[str]:
+    """Gated metrics with no head evidence or a CI straddling the threshold."""
     prefix = f"slice_{slice_name}" if slice_name else "overall"
-    return [
-        f"{prefix}_{stem}_underpowered"
-        for _, stem, decision in _ci_decisions(metrics, config, slice_name=slice_name)
+    reasons = [
+        reason
+        for _, decision, reason in _ci_decisions(metrics, config, slice_name=slice_name)
         if decision is GateDecision.INSUFFICIENT_EVIDENCE
     ]
+    if (
+        _ndcg_minimum_improvement(metrics, config, slice_name=slice_name)
+        is GateDecision.INSUFFICIENT_EVIDENCE
+    ):
+        reasons.append(f"{prefix}_ndcg_minimum_improvement_underpowered")
+    return reasons
+
+
+def _metric_failures(metrics, config, *, slice_name: str | None) -> list[str]:
+    """Definite failures: a CI wholly beyond its threshold."""
+    prefix = f"slice_{slice_name}" if slice_name else "overall"
+    failures = [
+        reason
+        for _, decision, reason in _ci_decisions(metrics, config, slice_name=slice_name)
+        if decision is GateDecision.FAILED
+    ]
+    if (
+        _ndcg_minimum_improvement(metrics, config, slice_name=slice_name)
+        is GateDecision.FAILED
+    ):
+        failures.append(f"{prefix}_ndcg_minimum_improvement")
+    # Candidate recall is external evidence with no holdout resample.
+    if (
+        slice_name is None
+        and "candidate_recall_at_500_absolute_regression" in metrics
+        and float(metrics["candidate_recall_at_500_absolute_regression"])
+        > config.candidate_recall_max_absolute_regression
+    ):
+        failures.append("overall_candidate_recall_at_500_absolute_regression")
+    return failures
+
+
+def _any_arm(decisions) -> GateDecision:
+    """An either-or requirement: one passing arm passes, all failing fails."""
+    decisions = list(decisions)
+    if GateDecision.PASSED in decisions:
+        return GateDecision.PASSED
+    if all(decision is GateDecision.FAILED for decision in decisions):
+        return GateDecision.FAILED
+    return GateDecision.INSUFFICIENT_EVIDENCE
+
+
+def _experiment_requirements(overall, slice_results, config):
+    """Per-kind superiority requirements, each a three-way CI decision.
+
+    Returns (failures, underpowered) reason lists.
+    """
+    checks: list[tuple[str, GateDecision]] = []
+    if config.experiment_kind == "features":
+        cold = dict(slice_results.get("cold_user", {}).get("metrics") or {})
+        checks.append(
+            (
+                "feature_challenger_minimum_improvement",
+                _any_arm(
+                    (
+                        _evidenced_decision(
+                            overall, "ndcg_at_10_delta", True, 0.005, config,
+                            slice_name=None,
+                        ),
+                        _evidenced_decision(
+                            cold, "ndcg_at_10_delta", True, 0.01, config,
+                            slice_name="cold_user",
+                        ),
+                    )
+                ),
+            )
+        )
+    elif config.experiment_kind == "fusion":
+        regression = overall.get("candidate_recall_at_500_absolute_regression")
+        if regression is None:
+            recall = GateDecision.INSUFFICIENT_EVIDENCE
+        elif -float(regression) >= 0.005:
+            recall = GateDecision.PASSED
+        else:
+            recall = GateDecision.FAILED
+        checks.append(
+            (
+                "fusion_challenger_minimum_improvement",
+                _any_arm(
+                    (
+                        recall,
+                        _evidenced_decision(
+                            overall, "ndcg_at_10_delta", True, 0.005, config,
+                            slice_name=None,
+                        ),
+                    )
+                ),
+            )
+        )
+    elif config.experiment_kind == "calibration":
+        for head in _PROBABILITY_HEADS:
+            # ECE must improve by 10% and Brier must not regress.
+            if float(overall[f"{head}_ece_champion"]) <= 0.0:
+                improvement = GateDecision.FAILED
+            else:
+                improvement = _evidenced_decision(
+                    overall, f"{head}_ece_relative_regression", False, -0.1, config,
+                    slice_name=None,
+                )
+            checks.append((f"calibration_{head}_minimum_improvement", improvement))
+            checks.append(
+                (
+                    f"calibration_{head}_brier_regression",
+                    _evidenced_decision(
+                        overall, f"{head}_brier_relative_regression", False, 0.0,
+                        config, slice_name=None,
+                    ),
+                )
+            )
+        # Only a CI wholly below zero is a ranking regression; an
+        # equal-order calibration misses "point delta >= 0" half the time.
+        if float(overall["ndcg_at_10_delta_ci_upper"]) < 0.0:
+            checks.append(("calibration_ndcg_regression", GateDecision.FAILED))
+    failures = [name for name, decision in checks if decision is GateDecision.FAILED]
+    underpowered = [
+        f"{name}_underpowered"
+        for name, decision in checks
+        if decision is GateDecision.INSUFFICIENT_EVIDENCE
+    ]
+    return failures, underpowered
+
+
+def _required_users_estimates(metrics, config, *, slice_name: str | None) -> dict:
+    """Rough user count at which each underpowered metric would clear its
+    threshold: the CI half-width shrinks with 1/sqrt(users), so
+    users_required = users * (half_width / gap)^2, where gap is the distance
+    from the point estimate to the threshold. None when the point estimate is
+    already on the failing side."""
+    users = int(metrics.get("users") or 0)
+    estimates = {}
+    for metric, stem, higher_is_better in _GATED_METRICS:
+        threshold = _metric_threshold(metric, config, slice_name=slice_name)
+        if (
+            not _metric_has_evidence(metrics, metric, config, slice_name=slice_name)
+            or _ci_decision(metrics, metric, higher_is_better, threshold)
+            is not GateDecision.INSUFFICIENT_EVIDENCE
+        ):
+            continue
+        point = float(metrics[metric])
+        gap = point - threshold if higher_is_better else threshold - point
+        half_width = float(metrics.get(f"{metric}_ci_half_width") or 0.0)
+        estimates[f"{metric}_required_users_estimate"] = (
+            int(math.ceil(users * (half_width / gap) ** 2))
+            if gap > 0.0 and half_width > 0.0 and users > 0
+            else None
+        )
+    return estimates
 
 
 def _required_informative_impressions(metrics, config) -> int | None:
@@ -1266,32 +1479,3 @@ def _required_informative_impressions(metrics, config) -> int | None:
     if gap <= 0.0 or half_width <= 0.0 or informative <= 0:
         return None
     return int(math.ceil(informative * (half_width / gap) ** 2))
-
-
-def _metric_failures(metrics, config, *, slice_name: str | None) -> list[str]:
-    prefix = f"slice_{slice_name}" if slice_name else "overall"
-    ndcg_min = (
-        config.slice_ndcg_min_delta if slice_name else config.overall_ndcg_min_delta
-    )
-    failures = []
-    # A non-positive minimum delta is a non-inferiority requirement, which the
-    # CI test below already covers; only a positive (superiority) minimum is
-    # checked on the point estimate.
-    if ndcg_min > 0.0 and float(metrics["ndcg_at_10_delta"]) < ndcg_min:
-        failures.append(f"{prefix}_ndcg_point_delta")
-    # Only a CI wholly beyond its threshold is a regression; a CI straddling it
-    # is reported by _underpowered_reasons.
-    for metric, stem, decision in _ci_decisions(metrics, config, slice_name=slice_name):
-        if decision is GateDecision.FAILED:
-            failures.append(
-                f"{prefix}_ndcg_regression" if stem == "ndcg" else f"{prefix}_{metric}"
-            )
-    # Candidate recall is external evidence with no holdout resample.
-    if (
-        slice_name is None
-        and "candidate_recall_at_500_absolute_regression" in metrics
-        and float(metrics["candidate_recall_at_500_absolute_regression"])
-        > config.candidate_recall_max_absolute_regression
-    ):
-        failures.append("overall_candidate_recall_at_500_absolute_regression")
-    return failures

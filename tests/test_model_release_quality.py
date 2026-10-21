@@ -558,7 +558,7 @@ def test_equivalent_challenger_rarely_fails_across_many_category_slices():
         slice_failures += bool(slice_reasons)
         category_failures += any("category_" in reason for reason in result.reasons)
         ndcg_failures += any(
-            reason.endswith(("_ndcg_regression", "_ndcg_point_delta"))
+            reason.endswith(("_ndcg_regression", "_ndcg_minimum_improvement"))
             for reason in result.reasons
         )
         underpowered += "overall_ndcg_underpowered" in result.reasons
@@ -573,7 +573,15 @@ def test_equivalent_challenger_rarely_fails_across_many_category_slices():
 
 
 def _ndcg_metrics(delta: float, lower: float, upper: float) -> dict:
-    metrics = {"ndcg_informative_impressions": 400}
+    metrics = {
+        "ndcg_informative_impressions": 400,
+        "users": 400,
+        "ctr_positives": 400,
+        "ctr_negatives": 400,
+        "ctcvr_positives": 400,
+        "ctcvr_negatives": 400,
+        "value_rows": 400,
+    }
     for metric, _, _ in _GATED_METRICS:
         metrics.update(
             {
@@ -612,7 +620,7 @@ def test_ndcg_is_a_three_way_non_inferiority_test(
     failures = _metric_failures(metrics, config, slice_name=None)
 
     assert ("overall_ndcg_regression" in failures) is failed
-    assert "overall_ndcg_point_delta" not in failures
+    assert "overall_ndcg_minimum_improvement" not in failures
     assert _ndcg_underpowered(metrics, config, slice_name=None) is underpowered
 
 
@@ -623,7 +631,7 @@ def test_positive_minimum_delta_is_still_a_superiority_requirement():
         _ndcg_metrics(0.001, -0.002, 0.004), config, slice_name=None
     )
 
-    assert "overall_ndcg_point_delta" in failures
+    assert "overall_ndcg_minimum_improvement" in failures
 
 
 def test_underpowered_holdout_is_insufficient_with_a_sample_size_estimate():
@@ -1077,6 +1085,276 @@ def test_v5_and_v6_evidence_both_remain_valid_for_phase_c(policy):
     # v6 changes decision rules only, not the config, so a v5 snapshot of the
     # frozen defaults still validates.
     assert quality_gate_snapshot_valid(asdict(default_gate_config("combined")))
+
+
+
+def _calibrated_fixture(seed: int, *, impressions: int, buy_rate: float = 0.3):
+    """Rows drawn from a known per-row CTR; models predict it with logit noise.
+
+    Lower noise is strictly better on ranking, calibration and value error, so
+    a less noisy challenger is a genuine non-regressing improvement.
+    """
+    rng = np.random.default_rng(seed)
+    rows, truth = [], {}
+    for impression in range(impressions):
+        for slot in range(4):
+            rate = float(rng.beta(1.5, 4.0))
+            clicked = bool(rng.random() < rate)
+            purchased = clicked and bool(rng.random() < buy_rate)
+            value = float(rng.gamma(4.0, 5.0)) if purchased else 0.0
+            row = _row(
+                impression=f"i{impression}",
+                user=f"u{impression // 2}",
+                product=f"i{impression}:p{slot}",
+                timestamp=1_700_000_000.0 + impression * 60,
+                relevance=3.0 if purchased else 2.0 if clicked else 1.0,
+                clicked=clicked,
+                purchased=purchased,
+                value=value,
+            )
+            rows.append(row)
+            truth[row.observation_id] = (rate, value)
+
+    def predictions(noise_seed: int, noise: float):
+        generator = np.random.default_rng(noise_seed)
+        out = {}
+        for row in rows:
+            rate, value = truth[row.observation_id]
+            logit = np.log(rate / (1.0 - rate)) + generator.normal(0.0, noise)
+            probability = float(1.0 / (1.0 + np.exp(-logit)))
+            predicted_value = (
+                value * float(np.exp(generator.normal(0.0, noise))) if value else 20.0
+            )
+            out[row.observation_id] = RankingPrediction(
+                serving_score=probability,
+                ctr=probability,
+                ctcvr=probability * buy_rate,
+                predicted_value=predicted_value,
+            )
+        return out
+
+    return rows, predictions
+
+
+def test_non_regressing_better_challenger_passes_on_a_large_holdout():
+    """16k rows / 2k users: a genuinely better challenger clears every CI."""
+    config = replace(_aa_config(), bootstrap_samples=500)
+    decisions = []
+    for seed in range(6):
+        rows, predictions = _calibrated_fixture(seed, impressions=4000)
+        result = evaluate_quality_gate(
+            rows, predictions(1000 + seed, 0.5), predictions(2000 + seed, 0.2), config
+        )
+        decisions.append(result.decision)
+        assert result.decision is not GateDecision.FAILED
+        assert result.overall["ndcg_at_10_delta_ci_lower"] > 0.0
+
+    assert decisions.count(GateDecision.PASSED) >= 4
+
+
+def test_equal_quality_challenger_can_pass_at_a_realistic_holdout():
+    """A/A at 16k rows / 2k users: v6 is passable, not only underpowered."""
+    config = replace(_aa_config(), bootstrap_samples=500)
+    decisions = []
+    for seed in range(4):
+        rows, predictions = _equal_quality_fixture(seed, impressions=4000, categories=5)
+        result = evaluate_quality_gate(
+            rows, predictions(1000 + seed), predictions(2000 + seed), config
+        )
+        decisions.append(result.decision)
+
+    assert GateDecision.FAILED not in decisions
+    assert decisions.count(GateDecision.PASSED) > 0
+
+
+def test_underpowered_metrics_report_a_required_user_estimate():
+    rows, predictions = _equal_quality_fixture(0)
+
+    result = evaluate_quality_gate(
+        rows, predictions(1000), predictions(2000), _aa_config()
+    )
+
+    underpowered = [
+        reason for reason in result.reasons if reason.startswith("overall_")
+    ]
+    assert underpowered
+    for metric, stem, _ in _GATED_METRICS:
+        key = f"{metric}_required_users_estimate"
+        if f"overall_{stem}_underpowered" in result.reasons:
+            assert key in result.overall
+            estimate = result.overall[key]
+            assert estimate is None or estimate > result.overall["users"]
+        else:
+            assert key not in result.overall
+
+
+def test_head_without_positives_is_no_evidence_not_a_pass():
+    """A blocking slice with clicks but no purchases cannot vouch for ctcvr."""
+    rows, predictions = _equal_quality_fixture(0)
+    rows = [
+        replace(row, price=300.0, purchased=False)
+        if int(row.impression_id[1:]) % 4 == 0
+        else row
+        for row in rows
+    ]
+    champion = predictions(1000)
+
+    result = evaluate_quality_gate(rows, champion, dict(champion), _aa_config())
+
+    high = result.slices["price_high"]
+    assert high["blocking"] is True
+    assert high["status"] == GateDecision.INSUFFICIENT_EVIDENCE.value
+    for stem in ("ctcvr_pr_auc", "ctcvr_log_loss", "ctcvr_brier", "ctcvr_ece", "value_wape"):
+        assert f"slice_price_high_{stem}_no_evidence" in high["reasons"]
+        assert f"slice_price_high_{stem}_no_evidence" in result.reasons
+    assert "slice_price_high_ctr_pr_auc_no_evidence" not in high["reasons"]
+    assert result.decision is GateDecision.INSUFFICIENT_EVIDENCE
+
+
+def test_definite_failure_takes_precedence_over_a_slice_without_evidence():
+    rows, predictions = _equal_quality_fixture(0)
+    # One brand-new item makes a cold_item slice far below its evidence floor.
+    rows = [
+        replace(row, product_created_at=row.as_of_ts, pre_holdout_exposures=0)
+        if row.impression_id == "i0"
+        else row
+        for row in rows
+    ]
+    champion = predictions(1000)
+    rng = np.random.default_rng(5)
+    challenger = {
+        key: replace(value, serving_score=float(rng.random()))
+        for key, value in champion.items()
+    }
+
+    result = evaluate_quality_gate(
+        rows, champion, challenger, replace(_aa_config(), bootstrap_samples=500)
+    )
+
+    assert result.slices["cold_item"]["status"] == GateDecision.INSUFFICIENT_EVIDENCE.value
+    assert result.decision is GateDecision.FAILED
+    assert "overall_ndcg_regression" in result.reasons
+    assert "slice_cold_item" not in result.reasons
+
+
+def _requirement_metrics(**cis) -> dict:
+    metrics = _ndcg_metrics(0.0, 0.0, 0.0)
+    for head in ("ctr", "ctcvr"):
+        metrics[f"{head}_ece_champion"] = 0.05
+        metrics[f"{head}_ece_relative_regression"] = 0.0
+        metrics[f"{head}_ece_relative_regression_ci_lower"] = 0.0
+        metrics[f"{head}_ece_relative_regression_ci_upper"] = 0.0
+    for metric, (lower, upper) in cis.items():
+        metrics.update(
+            {
+                metric: (lower + upper) / 2.0,
+                f"{metric}_ci_lower": lower,
+                f"{metric}_ci_upper": upper,
+                f"{metric}_ci_half_width": (upper - lower) / 2.0,
+            }
+        )
+    return metrics
+
+
+@pytest.mark.parametrize(
+    ("kind", "overall_cis", "cold_cis", "failed", "underpowered"),
+    [
+        # Features: overall NDCG >= 0.005 or cold-user NDCG >= 0.01.
+        ("features", {"ndcg_at_10_delta": (0.006, 0.01)}, None, False, False),
+        ("features", {"ndcg_at_10_delta": (-0.002, 0.01)}, None, False, True),
+        ("features", {"ndcg_at_10_delta": (-0.002, 0.004)}, (-0.01, 0.005), True, False),
+        ("features", {"ndcg_at_10_delta": (-0.002, 0.004)}, (0.011, 0.03), False, False),
+        # Calibration: noise around zero Brier change is underpowered, not a failure.
+        (
+            "calibration",
+            {
+                "ctr_ece_relative_regression": (-0.4, -0.2),
+                "ctcvr_ece_relative_regression": (-0.4, -0.2),
+                "ctr_brier_relative_regression": (-0.01, 0.01),
+                "ctcvr_brier_relative_regression": (-0.02, -0.01),
+            },
+            None,
+            False,
+            True,
+        ),
+        (
+            "calibration",
+            {
+                "ctr_ece_relative_regression": (-0.05, 0.05),
+                "ctcvr_ece_relative_regression": (-0.4, -0.2),
+                "ctr_brier_relative_regression": (-0.02, -0.01),
+                "ctcvr_brier_relative_regression": (-0.02, -0.01),
+            },
+            None,
+            True,
+            False,
+        ),
+    ],
+)
+def test_experiment_requirements_are_three_way_ci_tests(
+    kind, overall_cis, cold_cis, failed, underpowered
+):
+    from video_commerce.ml.model_release_quality import _experiment_requirements
+
+    config = RankingQualityGateConfig(experiment_kind=kind)
+    slices = {}
+    if cold_cis is not None:
+        slices["cold_user"] = {
+            "metrics": _requirement_metrics(ndcg_at_10_delta=cold_cis)
+        }
+
+    failures, insufficient = _experiment_requirements(
+        _requirement_metrics(**overall_cis), slices, config
+    )
+
+    assert bool(failures) is failed
+    assert bool(insufficient) is underpowered
+    assert all(reason.endswith("_underpowered") for reason in insufficient)
+
+
+def _priced_rows():
+    rows, predictions = _equal_quality_fixture(3, impressions=120, categories=3)
+    prices = (20.0, 100.0, 300.0)
+    rows = [
+        replace(row, price=prices[int(row.impression_id[1:]) % 3]) for row in rows
+    ]
+    return rows, predictions(1003), predictions(2003)
+
+
+def test_blocking_slices_share_one_bonferroni_alpha_and_match_the_row_path():
+    rows, champion, challenger = _priced_rows()
+    config = replace(_aa_config(), bootstrap_samples=2000)
+
+    result = evaluate_quality_gate(rows, champion, challenger, config)
+
+    assert result.overall["ci_alpha"] == pytest.approx(0.05)
+    for name in ("price_low", "price_mid", "price_high"):
+        metrics = result.slices[name]["metrics"]
+        assert result.slices[name]["blocking"] is True
+        assert metrics["ci_alpha"] == pytest.approx(0.05 / 3)
+        selected = [row for row in rows if _price_slice(row) == name]
+        expected = _cluster_bootstrap_rows(
+            selected, champion, challenger, config, alpha=0.05 / 3
+        )
+        for key, value in expected.items():
+            assert metrics[key] == pytest.approx(value, abs=1e-12), (name, key)
+
+
+def _price_slice(row) -> str:
+    return "price_low" if row.price < 50 else "price_mid" if row.price < 200 else "price_high"
+
+
+def test_slice_path_matches_row_level_resampling():
+    rows, champion, challenger = _priced_rows()
+    config = replace(_small_config(), bootstrap_samples=40)
+
+    result = evaluate_quality_gate(rows, champion, challenger, config)
+
+    metrics = result.slices["price_high"]["metrics"]
+    selected = [row for row in rows if _price_slice(row) == "price_high"]
+    slow = _slow_bootstrap(selected, champion, challenger, config, alpha=0.05 / 3)
+    for key, value in slow.items():
+        assert metrics[key] == pytest.approx(value, abs=1e-9), key
 
 
 # --- opt-in scale benchmark ----------------------------------------------------

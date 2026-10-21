@@ -160,11 +160,85 @@ v2–v5 evidence stays valid for promotion):
   or `slice_price_mid_ctcvr_pr_auc_underpowered`. Otherwise the metric passes.
 - Each gated metric reports `<metric>_ci_lower`, `_ci_upper` and
   `_ci_half_width` in `overall`, in every evaluated slice and in `bootstrap`.
-- Blocking slices use one Bonferroni-adjusted alpha for all of their metrics.
-- The superiority requirements are unchanged point checks: features and
-  fusion minimum improvement, calibration ECE improvement and no Brier
-  regression, and a positive `*_ndcg_min_delta`. Candidate recall@500 is
-  external evidence and is still a point threshold.
+  `ci_alpha` records the CI level used.
+- Per-head evidence. A metric whose head has no signal is
+  `<prefix>_<metric>_no_evidence` (insufficient), not a pass. Without signal,
+  every resample scores both models the same, for example ctcvr AP 0 with no
+  purchases, and the CI would be a falsely certain [0, 0]. Each head needs a
+  minimum number of positives and at least one negative:
+
+  | Head | Overall floor | Slice floor |
+  | --- | --- | --- |
+  | ctr | `min_clicks` | `min_slice_positives` |
+  | ctcvr | `min_purchases` | `min_slice_positives` |
+  | value | `min_purchases` value-labelled purchases | `min_slice_positives` |
+  | NDCG | 1 informative slate | 1 informative slate |
+
+  A blocking slice with clicks but too few purchases is therefore
+  insufficient on its ctcvr and value metrics.
+- Precedence: a definite failure is any of:
+  - an overall CI wholly beyond its threshold;
+  - a failed blocking slice;
+  - a failed experiment requirement;
+  - a candidate-recall regression.
+
+  Definite failures win over everything else, including missing overall or
+  slice evidence, so a tiny `cold_item` slice cannot mask an overall
+  regression. Next comes missing evidence, then underpowered metrics, then a
+  pass. The overall bootstrap therefore always runs.
+- Experiment requirements (superiority) are also three-way CI tests:
+  - Features: overall NDCG delta ≥ 0.005 or cold-user NDCG delta ≥ 0.01.
+    Either arm's CI lower bound at or above its minimum passes. Both CI upper
+    bounds below their minimums fail. A missing cold-user slice counts as
+    unknown, not as a failure.
+  - Fusion: candidate recall@500 improves by ≥ 0.005 (an external point
+    value), or the NDCG delta CI lower bound is ≥ 0.005.
+  - Calibration, per head:
+    - The ECE relative change CI must be ≤ -10%. This is the bootstrapped
+      `*_ece_relative_regression`.
+    - The Brier relative regression CI must be ≤ 0.
+    - A CI straddling either bound is `<requirement>_underpowered`.
+    - `calibration_ndcg_regression` still fires only when the NDCG CI is
+      wholly below 0.
+  - A positive `*_ndcg_min_delta` fails as `<prefix>_ndcg_minimum_improvement`
+    when the NDCG CI is wholly below it. In v5 this reason was
+    `_ndcg_point_delta`.
+  - Candidate recall@500 is external evidence and stays a point threshold.
+- Multiple comparisons: Bonferroni covers the blocking slices only. Each
+  blocking slice's CIs use `0.05 / k`, where k is the number of blocking
+  slices tested; overall CIs use 0.05.
+  - There is no adjustment across the 10 metrics within a slice or overall.
+    When every metric sits exactly on its threshold, the worst-case
+    family-wise false-failure bound is about 10 × 2.5% per family.
+  - An equal-quality challenger is well inside every threshold, so its
+    realized false-failure rate is far lower: 0 of 160 A/A runs failed.
+  - Keep `bootstrap_samples × ci_alpha / 2 ≥ 10`. The default 2000 samples
+    allow up to 5 blocking slices.
+- Underpowered metrics also report `<metric>_required_users_estimate`. This is
+  a rough user count at which the observed point estimate would clear its
+  threshold: `users × (half_width / gap)²`. It is null when the point estimate
+  is already on the failing side.
+- When v6 can pass. The evidence floors (`min_impressions` 1000,
+  `min_users` 200, `min_clicks` 50, `min_purchases` 30) only make a
+  comparison possible. At those sizes the 0.005 PR-AUC and ECE thresholds and
+  the 5% WAPE threshold are tighter than sampling noise, so nearly every
+  result is `insufficient_evidence`. Synthetic results (4-row slates,
+  2 impressions per user, 500 samples):
+
+  | Fixture | Rows / users | Clicks / purchases | Result |
+  | --- | --- | --- | --- |
+  | A/A, score noise 0.01 and 0.05 | 960 / 120 | ~290 / ~85 | 1/160 passed, 0 failed |
+  | A/A, score noise 0.01 | 16k / 2k | ~4.8k / ~1.4k | 5/6 passed |
+  | A/A, score noise 0.01 | 64k / 8k | ~19k / ~5.8k | 6/6 passed |
+  | Calibrated A/A, logit noise 0.1 | 64k / 8k | ~17k / ~5k | 3/6 passed; the rest underpowered on value WAPE |
+  | Calibrated, challenger noise 0.2 vs champion 0.5 | 16k / 2k | ~4.3k / ~1.3k | 5/6 passed |
+  | A/A, rare purchases (8% CTR, 10% of clicks buy) | 64k / 8k | ~5k / ~500 | 3/5 passed |
+  | A/A, rare purchases | 256k / 32k | ~20k / ~2k | 5/5 passed |
+
+  ctcvr PR-AUC, ECE and value WAPE bind first. Plan holdouts for thousands of
+  purchases, not the 30-purchase floor. Raising the floors or loosening those
+  thresholds is a separate policy decision. Changing the defaults would also
+  invalidate existing v2–v6 config snapshots.
 - The ECE CI keeps each row in its equal-frequency bin from the evaluated
   rows. Resamples reweight users within those bins and do not re-bin.
 - A slate is one user's rows of one impression. This matches v5 whenever every
@@ -173,11 +247,11 @@ v2–v5 evidence stays valid for promotion):
   A/A simulations ran 160 equal-quality runs at score noise 0.01 and 0.05.
   None failed, and 159 were underpowered, mostly on ECE, ctcvr PR-AUC and
   NDCG. An underpowered result is not a regression: collect a larger holdout
-  before you decide.
+  before you decide (see "When v6 can pass").
 - Bootstrap cost: per-user sums are computed once. Each sample is a
   multinomial user weight vector, and samples are processed in chunks as matrix
   products. PR-AUC is a weighted average precision over one sort. On a laptop,
-  the overall bootstrap for 1M rows × 2000 samples takes about 26 s with a
+  the overall bootstrap for 1M rows × 2000 samples takes 26–36 s with a
   300 MB traced peak, which does not grow with the sample count. With 632k
   single-row users it takes 70 s. The full gate on 1M rows with 29 slices
   takes about 2.2 minutes; v5 needed hours. Run the benchmark with
