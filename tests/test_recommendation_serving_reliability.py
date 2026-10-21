@@ -633,6 +633,48 @@ async def test_closed_batcher_skips_tracking_instead_of_building_a_new_one(
 
 
 @pytest.mark.asyncio
+async def test_admission_refusal_skips_tracking_without_waiting(monkeypatch):
+    runtime = _install_runtime(
+        monkeypatch,
+        recommendation_config=RecommendationConfig(impression_outbox_timeout_ms=100),
+    )
+    store = SlowOutboxStore(delay_seconds=0.15)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    batcher = ImpressionOutboxBatcher(
+        recommendation_api._write_impression_outbox_batch,
+        max_inflight=1,
+        max_batch_size=16,
+        max_pending=16,
+        publish_hold_seconds=2.6,
+    )
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", batcher)
+    # Learn a 150 ms write time, then occupy the only slot.
+    await batcher.submit(
+        {"event_id": "w", "metadata": {"impression_id": "w"}}, time.monotonic() + 1
+    )
+    busy = batcher.submit(
+        {"event_id": "b", "metadata": {"impression_id": "b"}}, time.monotonic() + 1
+    )
+
+    started = time.perf_counter()
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-admission"},
+    )
+    elapsed = time.perf_counter() - started
+    await busy
+
+    assert durable is False
+    assert elapsed < 0.05
+    assert runtime.observability.impressions == [("served", "unavailable")]
+    assert runtime.observability.untracked == ["admission"]
+
+
+@pytest.mark.asyncio
 async def test_rejected_row_is_not_retired(monkeypatch):
     _install_runtime(monkeypatch)
     store = SlowOutboxStore(delay_seconds=0)

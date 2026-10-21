@@ -29,6 +29,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Union,
 )
 
 # Receives (event, commit_deadline) pairs; returns one outcome or exception per
@@ -38,6 +39,13 @@ OutboxBatchWriter = Callable[[Sequence[tuple], float], Awaitable[List[Any]]]
 RetireManyWriter = Callable[[List[str]], Awaitable[Dict[str, str]]]
 
 EXPIRED = "expired"
+# submit() refusals: the row was not queued and nothing will be written.
+REFUSED_CLOSED = "closed"
+REFUSED_QUEUE_FULL = "queue_full"
+REFUSED_ADMISSION = "admission"
+
+# Weight of the newest write in the write-duration EWMA.
+_WRITE_EWMA_ALPHA = 0.3
 
 
 @dataclass
@@ -55,6 +63,13 @@ class ImpressionOutboxBatcher:
     ``max_pending`` rows wait; beyond that ``submit`` refuses instead of
     queueing. A queued row whose deadline passes before its batch starts is
     resolved ``"expired"`` without touching the database.
+
+    Admission control: a row is also refused when its predicted wait (the
+    write batches queued ahead of it, the in-flight writes, and an EWMA of
+    recent write durations) exceeds the time left in its budget. Such a row
+    would only hold its response until the budget ran out and then go
+    untracked anyway. While no write is in flight, rows are always admitted,
+    so a stale estimate is refreshed by the next write.
 
     Writes are never cancelled while serving: the store bounds them server
     side (statement timeout) and rolls back rows that missed their deadline.
@@ -78,6 +93,7 @@ class ImpressionOutboxBatcher:
         self._pending: Deque[_PendingImpression] = deque()
         self._inflight = 0
         self._write_started_at: Dict[int, float] = {}
+        self._write_seconds_ewma: Optional[float] = None
         self._tasks: Set[asyncio.Task] = set()
         self._closed = False
 
@@ -101,6 +117,42 @@ class ImpressionOutboxBatcher:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def write_seconds_estimate(self) -> Optional[float]:
+        return self._write_seconds_ewma
+
+    def predicted_wait_seconds(self) -> float:
+        """Predicted time until a row submitted now has been written.
+
+        O(1) and lock-free: the queue depth decides which write round the row
+        joins, and each round costs one write-duration estimate, the first one
+        less the age of the oldest in-flight write.
+        """
+        estimate = self._write_seconds_ewma
+        if estimate is None:
+            return 0.0
+        batch_index = len(self._pending) // self._max_batch_size
+        free_slots = self._max_inflight - self._inflight
+        if batch_index < free_slots:
+            return estimate
+        rounds_ahead = -(-(batch_index - free_slots + 1) // self._max_inflight)
+        first_round_left = max(0.0, estimate - self.oldest_write_age_seconds())
+        return first_round_left + (rounds_ahead - 1) * estimate + estimate
+
+    def _refusal(self, commit_deadline: float) -> Optional[str]:
+        if self._closed:
+            return REFUSED_CLOSED
+        if len(self._pending) >= self._max_pending:
+            return REFUSED_QUEUE_FULL
+        remaining = commit_deadline - time.monotonic()
+        if remaining <= 0:
+            return REFUSED_ADMISSION
+        if self._inflight == 0 or self._write_seconds_ewma is None:
+            return None
+        if self.predicted_wait_seconds() > remaining:
+            return REFUSED_ADMISSION
+        return None
+
     def oldest_write_age_seconds(self) -> float:
         """Age of the longest-running write transaction, 0 when idle."""
         if not self._write_started_at:
@@ -109,10 +161,12 @@ class ImpressionOutboxBatcher:
 
     def submit(
         self, event: Dict[str, Any], commit_deadline: float
-    ) -> Optional[asyncio.Future]:
-        """Queue one row; return None when the queue is full or closed."""
-        if self._closed or len(self._pending) >= self._max_pending:
-            return None
+    ) -> Union[asyncio.Future, str]:
+        """Queue one row and return its future, or return why it was refused
+        (``REFUSED_CLOSED``, ``REFUSED_QUEUE_FULL`` or ``REFUSED_ADMISSION``)."""
+        refusal = self._refusal(commit_deadline)
+        if refusal is not None:
+            return refusal
         future = asyncio.get_running_loop().create_future()
         self._pending.append(_PendingImpression(event, commit_deadline, future))
         self._maybe_start_flush()
@@ -154,7 +208,8 @@ class ImpressionOutboxBatcher:
 
     async def _write(self, batch: List[_PendingImpression]) -> None:
         key = id(batch)
-        self._write_started_at[key] = time.monotonic()
+        started_at = time.monotonic()
+        self._write_started_at[key] = started_at
         try:
             outcomes = await self._writer(
                 [(entry.event, entry.commit_deadline) for entry in batch],
@@ -173,7 +228,16 @@ class ImpressionOutboxBatcher:
             outcomes = [exc] * len(batch)
         finally:
             self._write_started_at.pop(key, None)
+        self._record_write_seconds(time.monotonic() - started_at)
         self._resolve(batch, outcomes)
+
+    def _record_write_seconds(self, seconds: float) -> None:
+        previous = self._write_seconds_ewma
+        self._write_seconds_ewma = (
+            seconds
+            if previous is None
+            else previous + _WRITE_EWMA_ALPHA * (seconds - previous)
+        )
 
     @staticmethod
     def _resolve(batch: List[_PendingImpression], outcomes: List[Any]) -> None:

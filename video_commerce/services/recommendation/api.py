@@ -3493,8 +3493,8 @@ async def _stage_served_impression_event(
     concurrent impressions together in one transaction. The wait is bounded
     by RECOMMENDATION_IMPRESSION_OUTBOX_TIMEOUT_MS; on expiry the slate is
     still returned, just without an impression_id (outcome ``timeout``). A
-    full batcher queue skips the impression (``unavailable``) instead of
-    queueing. While serving, the write is never cancelled (only a bounded
+    full batcher queue, or a predicted write wait longer than the budget,
+    skips the impression immediately (``unavailable``) instead of queueing. While serving, the write is never cancelled (only a bounded
     shutdown cancels it), so asyncpg never returns a connection
     mid-transaction. A row whose deadline passed before COMMIT is rolled back
     or deleted inside the transaction. If the COMMIT itself lands late, or
@@ -3529,14 +3529,11 @@ async def _stage_served_impression_event(
         batcher.oldest_write_age_seconds()
     )
     write = batcher.submit(event, commit_deadline)
-    if write is None:
-        # Closed at shutdown, or the DB is already behind for this process;
-        # do not queue further.
-        _record_untracked_impression(
-            observability,
-            "unavailable",
-            "closed" if batcher.closed else "queue_full",
-        )
+    if isinstance(write, str):
+        # Refused without queueing: closed at shutdown, queue full, or the
+        # predicted write wait already exceeds the budget (admission). The
+        # response goes out now instead of waiting out the budget.
+        _record_untracked_impression(observability, "unavailable", write)
         return False
     try:
         outcome = await asyncio.wait_for(asyncio.shield(write), timeout=timeout_seconds)

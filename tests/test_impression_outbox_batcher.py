@@ -9,6 +9,9 @@ import pytest
 
 from video_commerce.services.recommendation.impression_outbox import (
     EXPIRED,
+    REFUSED_ADMISSION,
+    REFUSED_CLOSED,
+    REFUSED_QUEUE_FULL,
     ImpressionOutboxBatcher,
     LateImpressionRetirer,
 )
@@ -107,7 +110,7 @@ async def test_full_queue_refuses_instead_of_queueing():
     batcher = _batcher(writer, max_pending=2)
 
     accepted = [batcher.submit(_event(index), _deadline()) for index in range(2)]
-    assert batcher.submit(_event(2), _deadline()) is None
+    assert batcher.submit(_event(2), _deadline()) == REFUSED_QUEUE_FULL
     await asyncio.gather(*accepted)
     # Space frees up once the queue drains.
     assert await batcher.submit(_event(3), _deadline()) == "inserted"
@@ -192,7 +195,7 @@ async def test_write_age_tracks_the_oldest_inflight_write_and_close_refuses():
 
     await batcher.close()
     assert batcher.closed
-    assert batcher.submit(_event(1), _deadline()) is None
+    assert batcher.submit(_event(1), _deadline()) == REFUSED_CLOSED
 
 
 class RecordingRetire:
@@ -253,3 +256,74 @@ async def test_retirer_retries_until_retire_by_then_gives_up():
     assert results[-1] == ("e1", None)
     assert retirer.pending == 0
     await retirer.close()
+
+
+# ------------------------------------------------------------ admission
+
+
+async def _warm(batcher, writer, seconds):
+    """Run one write of ``seconds`` so the duration estimate is ``seconds``."""
+    writer.delay_seconds = seconds
+    await batcher.submit(_event("warm"), _deadline())
+    assert batcher.write_seconds_estimate == pytest.approx(seconds, abs=0.02)
+
+
+@pytest.mark.asyncio
+async def test_cold_estimator_admits_even_with_every_slot_busy():
+    writer = RecordingWriter(delay_seconds=0.05)
+    batcher = _batcher(writer, max_inflight=1)
+
+    busy = batcher.submit(_event(0), _deadline())
+    await asyncio.sleep(0.01)
+    # No write has finished yet: nothing to predict from, so admit.
+    assert batcher.write_seconds_estimate is None
+    queued = batcher.submit(_event(1), _deadline(0.01))
+    assert isinstance(queued, asyncio.Future)
+    await asyncio.gather(busy, queued)
+
+
+@pytest.mark.asyncio
+async def test_saturated_writer_refuses_rows_that_cannot_make_their_budget():
+    writer = RecordingWriter()
+    batcher = _batcher(writer, max_inflight=1, max_batch_size=2)
+    await _warm(batcher, writer, 0.08)
+
+    busy = batcher.submit(_event(0), _deadline())
+    await asyncio.sleep(0.01)
+    # Behind a write with ~70 ms left plus its own ~80 ms write.
+    assert batcher.predicted_wait_seconds() == pytest.approx(0.15, abs=0.03)
+    assert batcher.submit(_event(1), _deadline(0.1)) == REFUSED_ADMISSION
+    # A larger budget still fits.
+    admitted = batcher.submit(_event(2), _deadline(1.0))
+    assert isinstance(admitted, asyncio.Future)
+    # Two more queued rows fill the next batch; the row after them needs a
+    # third round.
+    batcher.submit(_event(3), _deadline(1.0))
+    assert batcher.predicted_wait_seconds() == pytest.approx(0.23, abs=0.03)
+    await asyncio.gather(busy, admitted)
+    await asyncio.sleep(0.2)
+    assert all("e1" not in batch for batch in writer.batches)
+
+
+@pytest.mark.asyncio
+async def test_expired_budget_is_refused_without_queueing():
+    writer = RecordingWriter()
+    batcher = _batcher(writer)
+
+    assert batcher.submit(_event(0), time.monotonic() - 0.001) == REFUSED_ADMISSION
+    assert batcher.pending == 0 and writer.batches == []
+
+
+@pytest.mark.asyncio
+async def test_idle_batcher_admits_despite_a_slow_estimate_and_relearns():
+    writer = RecordingWriter()
+    batcher = _batcher(writer)
+    await _warm(batcher, writer, 0.2)
+
+    # Nothing in flight: the row is a probe even though the estimate (200 ms)
+    # is over its 100 ms budget, so a recovered DB is noticed.
+    writer.delay_seconds = 0.0
+    probe = batcher.submit(_event(0), _deadline(0.1))
+    assert isinstance(probe, asyncio.Future)
+    assert await probe == "inserted"
+    assert batcher.write_seconds_estimate < 0.2

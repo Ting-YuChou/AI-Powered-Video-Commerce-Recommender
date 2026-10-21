@@ -448,7 +448,8 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
   excluded from attribution and training.
 - **First checks:** the cause in
   `video_commerce_recommendation_impression_untracked_total{reason}`
-  (`timeout`, `queue_full`, `pool_timeout`, `db_error`, `error`); Postgres
+  (`timeout`, `admission`, `queue_full`, `pool_timeout`, `db_error`,
+  `error`, `closed`); Postgres
   latency (`DatabaseP95LatencyHigh`); outbox write cap and batch size
   (`RECOMMENDATION_IMPRESSION_OUTBOX_MAX_INFLIGHT`,
   `RECOMMENDATION_IMPRESSION_OUTBOX_MAX_BATCH_SIZE`) and budget

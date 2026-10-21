@@ -128,6 +128,14 @@ impressions at concurrency 20 were skipped with a healthy database. Now:
 - At most `MAX_INFLIGHT * MAX_BATCH_SIZE` rows wait. Beyond that the impression
   is skipped immediately (`status="unavailable"`) instead of queueing.
 - A row still queued when its deadline passes is dropped without a DB write.
+- Admission control: a row is refused immediately (`status="unavailable"`,
+  reason `admission`) when its predicted wait exceeds the time left in its
+  budget. The prediction combines the batches queued ahead of it, the
+  in-flight writes, and an EWMA of recent write durations. Such a row would
+  otherwise hold its response for the whole budget and still go untracked.
+  When no write is in flight, rows are always admitted, so the estimate
+  recovers after the database does. The check is O(1), with no locks and no
+  I/O.
 - Writes are not cancelled while serving; the statement timeout bounds them
   server side. A write that hangs anyway (for example a blackholed
   connection) shows up as a growing
@@ -143,6 +151,7 @@ slate went out without an `impression_id`:
 | --- | --- |
 | `timeout` | The budget ran out (slow write, or queued behind slow writes). |
 | `queue_full` | The per-process queue was full; nothing was written. |
+| `admission` | The predicted write wait exceeded the remaining budget; nothing was written. |
 | `pool_timeout` | No pooled connection within `DATABASE_POOL_TIMEOUT_SECONDS`. |
 | `db_error` | The write failed before COMMIT, for example on the statement timeout. |
 | `error` | The write failed in a way that may have committed (see Retire), or the row was rejected (event_id collision). |
