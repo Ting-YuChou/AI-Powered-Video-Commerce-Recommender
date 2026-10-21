@@ -63,15 +63,18 @@ class SlowOutboxStore:
         self.outcome = outcome
         self.enqueued = []
         self.not_exposed = []
+        self.commit_deadlines = []
+        self.retire_succeeds = True
 
-    async def enqueue_recommendation_event(self, event):
+    async def enqueue_recommendation_event(self, event, *, commit_deadline=None):
+        self.commit_deadlines.append(commit_deadline)
         await asyncio.sleep(self.delay_seconds)
         self.enqueued.append(event)
         return self.outcome
 
     async def mark_recommendation_outbox_not_exposed(self, event_id):
         self.not_exposed.append(event_id)
-        return True
+        return self.retire_succeeds
 
 
 def _install_runtime(monkeypatch, *, recommendation_config=None):
@@ -293,6 +296,37 @@ async def test_slow_outbox_write_times_out_and_late_insert_is_retired(monkeypatc
     assert runtime.observability.terminal == ["not_exposed"]
     # The permit is released once the shielded write finishes.
     assert recommendation_api._impression_outbox_semaphore._value == 32
+
+
+@pytest.mark.asyncio
+async def test_outbox_write_gets_serving_deadline_and_reports_lost_retire_race(
+    monkeypatch,
+):
+    runtime = _install_runtime(
+        monkeypatch,
+        recommendation_config=RecommendationConfig(impression_outbox_timeout_ms=50),
+    )
+    store = SlowOutboxStore(delay_seconds=0.2)
+    store.retire_succeeds = False
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", None)
+
+    before = time.monotonic()
+    await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-deadline"},
+    )
+    await asyncio.sleep(0.3)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert before + 0.05 <= store.commit_deadlines[0] <= time.monotonic()
+    assert ("served", "not_exposed_published") in runtime.observability.impressions
+    assert runtime.observability.terminal == []
 
 
 @pytest.mark.asyncio
@@ -595,8 +629,28 @@ async def test_dispatcher_retries_transient_publish_failures(monkeypatch):
     await _run_dispatcher_until(store, lambda: store.failed)
 
     assert store.failed[0][2]["retryable"] is True
+    assert store.failed[0][2]["counts_toward_max_attempts"] is True
     assert runtime.observability.terminal == []
     assert ("served", "publish_retry") in runtime.observability.impressions
+
+
+@pytest.mark.asyncio
+async def test_broker_outage_does_not_count_toward_max_attempts(monkeypatch):
+    _install_runtime(monkeypatch)
+    store = OneShotOutboxStore([{"event_id": "evt-3"}])
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    monkeypatch.setattr(
+        recommendation_api,
+        "kafka_manager",
+        RaisingKafka(KafkaPublishError("broker unreachable", transient=True)),
+    )
+    monkeypatch.setattr(recommendation_api, "_recommendation_outbox_wakeup", None)
+
+    await _run_dispatcher_until(store, lambda: store.failed)
+
+    kwargs = store.failed[0][2]
+    assert kwargs["retryable"] is True
+    assert kwargs["counts_toward_max_attempts"] is False
 
 
 @pytest.mark.asyncio
@@ -663,6 +717,13 @@ async def test_send_or_raise_marks_other_failures_retryable_and_send_is_unchange
     assert raised.value.retryable is True
     assert not isinstance(raised.value, KafkaMessageTooLargeError)
 
+    assert raised.value.transient is False
+
+    unreachable = _connected_client(kafka_client_module.KafkaConnectionError())
+    with pytest.raises(KafkaPublishError) as raised:
+        await unreachable.send_or_raise("topic", {"a": 1})
+    assert raised.value.transient is True
+
     too_large = _connected_client(kafka_client_module.MessageSizeTooLargeError())
     assert await too_large.send("topic", {"a": 1}) is False
 
@@ -724,6 +785,7 @@ async def test_catalog_publisher_marks_oversized_event_terminal():
             "retryable": False,
             "terminal_reason": "message_too_large",
             "max_attempts": 20,
+            "counts_toward_max_attempts": True,
         }
     ]
     assert observability.catalog_terminal == ["message_too_large"]

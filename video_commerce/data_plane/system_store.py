@@ -1389,6 +1389,10 @@ def _engine_options(config: DatabaseConfig) -> Dict[str, Any]:
     }
 
 
+class OutboxCommitDeadlineExceeded(RuntimeError):
+    """The serving deadline passed before COMMIT, so the insert was rolled back."""
+
+
 @dataclass
 class DatabaseHealth:
     status: str
@@ -2221,8 +2225,19 @@ class SystemStore:
             )
         return bool(result.rowcount)
 
-    async def enqueue_recommendation_event(self, event: Mapping[str, Any]) -> str:
-        """Durably stage one served-impression event before returning its ID."""
+    async def enqueue_recommendation_event(
+        self,
+        event: Mapping[str, Any],
+        *,
+        commit_deadline: Optional[float] = None,
+    ) -> str:
+        """Durably stage one served-impression event before returning its ID.
+
+        ``commit_deadline`` is a ``time.monotonic()`` instant: when it has
+        passed by the time the insert is ready to commit, the transaction is
+        rolled back with ``OutboxCommitDeadlineExceeded`` because the caller
+        has already answered without the impression_id.
+        """
         if not self.enabled:
             return False
         metadata = _safe_dict(event.get("metadata"))
@@ -2261,6 +2276,10 @@ class SystemStore:
                 if existing is None or existing.payload_hash != payload_hash:
                     raise ValueError("recommendation outbox event_id payload collision")
                 outcome = "duplicate"
+            if commit_deadline is not None and time.monotonic() > commit_deadline:
+                raise OutboxCommitDeadlineExceeded(
+                    "served impression outbox insert missed its serving deadline"
+                )
         self._update_pool_metrics()
         return outcome
 
@@ -2325,12 +2344,15 @@ class SystemStore:
         retryable: bool = True,
         terminal_reason: Optional[str] = None,
         max_attempts: Optional[int] = None,
+        counts_toward_max_attempts: bool = True,
     ) -> Optional[str]:
         """Record a failed publish; return the terminal reason if the row stopped.
 
         A row goes terminal (never claimed again, excluded from stats) on a
         non-retryable error such as an oversized record, or once it has used
-        ``max_attempts`` publishes. Otherwise it backs off exponentially.
+        ``max_attempts`` publishes. Transient broker outages pass
+        ``counts_toward_max_attempts=False`` so a long Kafka outage cannot
+        retire every pending row; they still back off exponentially.
         """
         if not self.enabled:
             return None
@@ -2354,7 +2376,11 @@ class SystemStore:
             row.claim_expires_at = None
             if not retryable:
                 terminal = terminal_reason or "non_retryable"
-            elif max_attempts is not None and attempts >= int(max_attempts):
+            elif (
+                counts_toward_max_attempts
+                and max_attempts is not None
+                and attempts >= int(max_attempts)
+            ):
                 terminal = "max_attempts"
             if terminal is not None:
                 row.terminal_at = now
@@ -3810,6 +3836,7 @@ class SystemStore:
         retryable: bool = True,
         terminal_reason: Optional[str] = None,
         max_attempts: Optional[int] = None,
+        counts_toward_max_attempts: bool = True,
     ) -> Optional[str]:
         """Back off a failed catalog publish, or stop it; return the terminal reason."""
         if not self.enabled:
@@ -3832,7 +3859,11 @@ class SystemStore:
             row.claim_expires_at = None
             if not retryable:
                 terminal = terminal_reason or "non_retryable"
-            elif max_attempts is not None and attempts >= int(max_attempts):
+            elif (
+                counts_toward_max_attempts
+                and max_attempts is not None
+                and attempts >= int(max_attempts)
+            ):
                 terminal = "max_attempts"
             if terminal is not None:
                 row.terminal_at = now

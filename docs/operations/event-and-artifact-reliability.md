@@ -116,7 +116,9 @@ Outbox rows stop retrying in two cases. A non-retryable publish error, such as
 a record over the producer `KAFKA_PRODUCER_MAX_REQUEST_SIZE` (1 MiB, explicit)
 or the broker limit, ends the row at once. Any other row ends once it has used
 `RECOMMENDATION_OUTBOX_MAX_ATTEMPTS` (20) publishes with exponential backoff
-capped at 256 s, roughly four hours. Either way the row is marked terminal:
+capped at 256 s. Failures that aiokafka classifies as transient do not count
+toward the cap, such as an unreachable broker, a send timeout, or a
+leader election. Those rows keep retrying through an outage of any length. Either way the row is marked terminal:
 never claimed again, excluded from `video_commerce_recommendation_outbox_pending`,
 and counted in
 `video_commerce_recommendation_outbox_terminal_total{reason}`. The reason is

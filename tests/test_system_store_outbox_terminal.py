@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from video_commerce.common.config import DatabaseConfig
 from video_commerce.data_plane.system_store import (
+    OutboxCommitDeadlineExceeded,
     SystemStore,
     _engine_options,
     outbox_retry_delay_seconds,
@@ -213,20 +214,33 @@ async def test_recommendation_outbox_terminal_lifecycle():
         )
         assert terminal == "message_too_large"
 
-        reasons = []
-        for attempt in range(3):
-            if attempt:
-                await _force_due(store, flaky["event_id"])
-                assert flaky["event_id"] in await _claim_ids(store, "worker-1")
-            reasons.append(
+        # A broker outage backs off but never uses up the cap.
+        for _ in range(4):
+            await _force_due(store, flaky["event_id"])
+            await _claim_ids(store, "worker-1")
+            assert (
                 await store.mark_recommendation_outbox_failed(
                     flaky["event_id"],
-                    "broker down",
+                    "broker unreachable",
                     worker_id="worker-1",
                     max_attempts=3,
+                    counts_toward_max_attempts=False,
                 )
+                is None
             )
-        assert reasons == [None, None, "max_attempts"]
+        await _force_due(store, flaky["event_id"])
+        assert flaky["event_id"] in await _claim_ids(store, "worker-1")
+
+        # attempts is already past the cap; the first counted failure stops it.
+        assert (
+            await store.mark_recommendation_outbox_failed(
+                flaky["event_id"],
+                "broker rejected record",
+                worker_id="worker-1",
+                max_attempts=3,
+            )
+            == "max_attempts"
+        )
 
         await _force_due(store, flaky["event_id"])
         assert not (await _claim_ids(store, "worker-2")) & {
@@ -271,6 +285,12 @@ async def test_recommendation_outbox_terminal_lifecycle():
             late["event_id"]: "not_exposed",
         }
         assert pending_terminal == 3
+        expired = _event(f"{prefix}-expired")
+        with pytest.raises(OutboxCommitDeadlineExceeded):
+            await store.enqueue_recommendation_event(expired, commit_deadline=0.0)
+        assert not await store.is_known_recommendation_impression(
+            expired["metadata"]["impression_id"]
+        )
         stats_before = await store.get_recommendation_outbox_stats()
         extra = _event(f"{prefix}-pending")
         await store.enqueue_recommendation_event(extra)

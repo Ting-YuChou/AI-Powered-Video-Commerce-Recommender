@@ -70,6 +70,7 @@ class CatalogEventPublisher:
                     retryable=exc.retryable if classified else True,
                     terminal_reason=exc.reason if classified else None,
                     max_attempts=self.max_attempts,
+                    counts_toward_max_attempts=not (classified and exc.transient),
                 )
                 if terminal and self.observability is not None:
                     self.observability.record_catalog_outbox_terminal(terminal)

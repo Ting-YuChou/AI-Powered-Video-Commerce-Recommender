@@ -113,15 +113,19 @@ run per process; when they are all busy the impression is skipped immediately
 (`status="unavailable"`) instead of queueing on the pool.
 
 The insert is shielded, not cancelled: cancelling an asyncpg statement inside a
-transaction can return a broken connection to the pool. If the insert commits
-after the budget expired, the row is marked terminal `not_exposed`. It is never
-published, never resolves a view slate, and counts in
+transaction can return a broken connection to the pool. Instead, the insert
+carries the serving deadline. When the deadline has already passed by the time
+the INSERT is ready to commit, the transaction rolls back. Only a COMMIT round
+trip that itself straddles the deadline can leave a row the client never saw.
+That row is then marked terminal `not_exposed`: it is never published, never
+resolves a view slate, and counts in
 `video_commerce_recommendation_outbox_terminal_total{reason="not_exposed"}`.
-There is a small window between that late commit and the terminal mark in which
-another replica's dispatcher can publish the row. The result is a served event
-whose `impression_id` the client never saw. No view can reference it, and the
-PIT and training paths use viewed rows, so it only appears in served-funnel
-counts.
+Another replica's dispatcher can claim the row between that late commit and
+the terminal mark. That case is counted as
+`video_commerce_recommendation_impression_events_total{status="not_exposed_published"}`.
+The result is a served event whose `impression_id` the client never saw. No
+view can reference it, and the PIT and training paths use viewed rows, so it
+only appears in served-funnel counts.
 
 ## Startup DDL lock
 

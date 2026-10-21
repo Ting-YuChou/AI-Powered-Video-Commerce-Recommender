@@ -25,6 +25,7 @@ from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from aiokafka.errors import (
     KafkaConnectionError,
     KafkaError,
+    KafkaTimeoutError,
     MessageSizeTooLargeError,
 )
 
@@ -52,6 +53,12 @@ class KafkaPublishError(RuntimeError):
 
     reason = "publish_failed"
     retryable = True
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        # Broker unreachable / timed out: an outage, not a property of the
+        # record, so it must not use up the outbox attempt cap.
+        self.transient = transient
 
 
 class KafkaMessageTooLargeError(KafkaPublishError):
@@ -295,10 +302,12 @@ class KafkaProducerClient:
                 await self.start()
             except Exception as exc:
                 self._record_produce(topic, "error")
-                raise KafkaPublishError(f"Kafka producer unavailable: {exc}") from exc
+                raise KafkaPublishError(
+                    f"Kafka producer unavailable: {exc}", transient=True
+                ) from exc
             if not self.producer:
                 self._record_produce(topic, "error")
-                raise KafkaPublishError("Kafka producer unavailable")
+                raise KafkaPublishError("Kafka producer unavailable", transient=True)
 
         value["_kafka_timestamp"] = datetime.utcnow().isoformat()
         value["_kafka_topic"] = topic
@@ -314,8 +323,12 @@ class KafkaProducerClient:
             ) from exc
         except Exception as exc:
             self._record_produce(topic, "error")
+            transient = isinstance(
+                exc, (KafkaConnectionError, KafkaTimeoutError, asyncio.TimeoutError)
+            ) or bool(getattr(exc, "retriable", False))
             raise KafkaPublishError(
-                f"Failed to send message to topic '{topic}': {exc}"
+                f"Failed to send message to topic '{topic}': {exc}",
+                transient=transient,
             ) from exc
         self._record_produce(topic, "success")
 

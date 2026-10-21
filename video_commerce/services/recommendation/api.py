@@ -3281,6 +3281,17 @@ async def _retire_unexposed_impression(event_id: str, impression_id: str) -> Non
         app.state.runtime.observability.record_recommendation_outbox_terminal(
             "not_exposed"
         )
+        return
+    # Another replica's dispatcher claimed or published it in the window
+    # between the late COMMIT and this update; the event may reach Kafka with
+    # an impression_id no client holds (no view can reference it).
+    app.state.runtime.observability.record_recommendation_impression(
+        "served", "not_exposed_published"
+    )
+    logger.warning(
+        "recommendation_impression_late_insert_already_dispatched",
+        extra={"impression_id": impression_id},
+    )
 
 
 def _retire_if_inserted_late(
@@ -3300,10 +3311,14 @@ def _retire_if_inserted_late(
 
 
 async def _enqueue_impression_with_permit(
-    semaphore: Optional[asyncio.Semaphore], event: Dict[str, Any]
+    semaphore: Optional[asyncio.Semaphore],
+    event: Dict[str, Any],
+    commit_deadline: float,
 ) -> str:
     try:
-        return await system_store.enqueue_recommendation_event(event)
+        return await system_store.enqueue_recommendation_event(
+            event, commit_deadline=commit_deadline
+        )
     finally:
         if semaphore is not None:
             semaphore.release()
@@ -3322,8 +3337,9 @@ async def _stage_served_impression_event(
     The write is bounded by RECOMMENDATION_IMPRESSION_OUTBOX_TIMEOUT_MS. On
     expiry the slate is still returned, just without an impression_id
     (outcome ``timeout``). The insert itself is shielded rather than cancelled
-    so asyncpg never returns a connection mid-transaction; if it commits late
-    the row is retired as terminal ``not_exposed`` and never published.
+    so asyncpg never returns a connection mid-transaction. It rolls back if the
+    deadline passed before COMMIT; if the COMMIT itself lands late the row is
+    retired as terminal ``not_exposed`` so it is never published.
     """
     if kafka_manager is None or system_store is None:
         return False
@@ -3354,11 +3370,14 @@ async def _stage_served_impression_event(
         if semaphore is not None:
             semaphore.release()
         raise
-    write = asyncio.ensure_future(_enqueue_impression_with_permit(semaphore, event))
-    try:
-        outcome = await asyncio.wait_for(
-            asyncio.shield(write), timeout=_impression_outbox_timeout_seconds()
+    timeout_seconds = _impression_outbox_timeout_seconds()
+    write = asyncio.ensure_future(
+        _enqueue_impression_with_permit(
+            semaphore, event, time.monotonic() + timeout_seconds
         )
+    )
+    try:
+        outcome = await asyncio.wait_for(asyncio.shield(write), timeout=timeout_seconds)
     except asyncio.TimeoutError:
         write.add_done_callback(
             lambda task: _retire_if_inserted_late(event_id, impression_id, task)
@@ -3457,6 +3476,9 @@ async def _run_recommendation_outbox_dispatcher() -> None:
                         retryable=exc.retryable if classified else True,
                         terminal_reason=exc.reason if classified else None,
                         max_attempts=max_attempts,
+                        counts_toward_max_attempts=not (
+                            classified and exc.transient
+                        ),
                     )
                     if terminal:
                         observability.record_recommendation_outbox_terminal(terminal)
@@ -3575,20 +3597,27 @@ async def _sync_local_ranking_checkpoint(runtime, last_identity: Tuple) -> Tuple
         if ranking_batcher is not None:
             ranking_batcher.replace_ranking_model(replacement)
         ranking_model = replacement
-        await artifact_manager.record_generation_activation(
-            latest_ranking,
-            environment=environment,
-            state="ready",
-        )
-        await artifact_manager.cleanup_local_generations(
-            latest_ranking,
-            environment=environment,
-            inflight_identities=(
-                ranking_batcher.inflight_generation_identities()
-                if ranking_batcher is not None
-                else set()
-            ),
-        )
+        # The swap succeeded; bookkeeping failures must not make the next
+        # cycle reload and swap the same generation again.
+        try:
+            await artifact_manager.record_generation_activation(
+                latest_ranking,
+                environment=environment,
+                state="ready",
+            )
+            await artifact_manager.cleanup_local_generations(
+                latest_ranking,
+                environment=environment,
+                inflight_identities=(
+                    ranking_batcher.inflight_generation_identities()
+                    if ranking_batcher is not None
+                    else set()
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("ranking_generation_bookkeeping_failed: %s", exc)
         return selected_identity
     await artifact_manager.record_generation_activation(
         latest_ranking,
