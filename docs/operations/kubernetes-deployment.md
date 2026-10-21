@@ -263,6 +263,15 @@ Readiness semantics:
   acknowledges events after the Kafka publish and the idempotency ledger.
   Gateway and ingest reconnect to Kafka in the background after a failed
   start, so a short broker outage at boot no longer needs a pod restart.
+- A broker that goes away after ingest started does not flip readiness, since
+  the producer stays started. Ingest waits at most
+  `SERVICE_INTERACTION_INGEST_PUBLISH_TIMEOUT_MS` (3000 by default; keep it
+  below `SERVICE_PROXY_READ_TIMEOUT_SECONDS`) for each publish, then answers a
+  retryable 503 `KAFKA_PUBLISH_TIMEOUT` with `Retry-After: 1` instead of a
+  gateway 504. A disconnected producer answers 503 `KAFKA_UNAVAILABLE` at once.
+  A timed-out send can still land, so its event_id stays pending until Kafka
+  settles it: retries get 503 until then, and afterwards 202 (with
+  `duplicate: true` when the first send landed).
 
 Then run a small smoke baseline against the Ingress URL:
 
