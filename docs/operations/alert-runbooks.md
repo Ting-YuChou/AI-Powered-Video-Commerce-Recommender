@@ -388,11 +388,25 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
 
 ## FlinkCheckpointUnavailable
 
-- **Symptom:** no successful checkpoint for more than 5 minutes.
+- **Symptom:** the JobManager gauge
+  `flink_jobmanager_job_numberOfCompletedCheckpoints` has not changed for
+  5 minutes, and that held for another 5. With the 30s checkpoint interval,
+  that means about 10 minutes without a completed checkpoint. Flink 1.20 does
+  not export a completion timestamp, so the alert watches the count.
 - **Impact:** a restart would replay a long backlog; savepoint upgrades are
   unsafe.
 - **First checks:** checkpoint storage health and permissions; checkpoint
-  failure reasons in the Flink UI; backpressure.
+  failure reasons in the Flink UI; backpressure. On the same job:
+  `numberOfFailedCheckpoints` rising means checkpoints fail (storage, timeouts);
+  `numberOfInProgressCheckpoints` stuck at 1 means one checkpoint is still
+  running toward its 10-minute timeout, usually because of backpressure or a
+  slow sink. `numRestarts` rising means a restart loop: past 3 consecutive failed
+  checkpoints the job fails and restarts, and the count stays flat.
+- **Blind spots:** a JobManager failover resets the gauge to 0, which counts
+  as a change and restarts the window. If the job is not registered on the
+  JobManager (missing, finished, or failed for good), the series is gone and
+  this alert stays quiet; `FlinkInteractionFeatureJobMissing` covers that case
+  and inhibits this alert.
 - **Remediation:** restore checkpoint storage; pause replay and cutover until
   checkpoints succeed.
 

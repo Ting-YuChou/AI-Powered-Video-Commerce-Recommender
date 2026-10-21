@@ -434,3 +434,41 @@ tests:
               summary: "gateway-api reports recommendation unhealthy"
               description: "gateway-api readiness has seen recommendation unhealthy for 10 minutes; features that need it are failing or degraded."
               runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#dependencyunhealthy"
+
+  # Completed checkpoints stop advancing at 10m: the 5m change window is empty
+  # from 15m and the alert fires after 5m pending. A restart loop that keeps the
+  # job registered looks the same and also fires.
+  - interval: 1m
+    input_series:
+      - series: 'flink_jobmanager_job_numberOfCompletedCheckpoints{job="flink",job_id="a",job_name="video-commerce-interaction-features"}'
+        values: '0+2x10 20x20'
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: FlinkCheckpointUnavailable
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: FlinkCheckpointUnavailable
+        exp_alerts:
+          - exp_labels:
+              job_name: video-commerce-interaction-features
+              severity: critical
+            exp_annotations:
+              summary: "Flink interaction job has no recent successful checkpoint"
+              description: "Pause replay and cutover until checkpoint storage and job health recover."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkcheckpointunavailable"
+
+  # A JobManager failover resets the gauge to 0, and a resubmitted job exports
+  # a new job_id series; neither is a stall while checkpoints keep completing.
+  - interval: 1m
+    input_series:
+      - series: 'flink_jobmanager_job_numberOfCompletedCheckpoints{job="flink",job_id="a",job_name="video-commerce-interaction-features"}'
+        values: '0+2x10 0+2x10'
+      - series: 'flink_jobmanager_job_numberOfCompletedCheckpoints{job="flink",job_id="b",job_name="video-commerce-interaction-features"}'
+        values: '_x21 0+2x15'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: FlinkCheckpointUnavailable
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: FlinkCheckpointUnavailable
+        exp_alerts: []
