@@ -50,6 +50,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -2349,6 +2350,37 @@ class SystemStore:
                 )
             )
         return bool(result.rowcount)
+
+    async def renew_interaction_event_claims(
+        self, claims: Sequence[Tuple[str, str]], *, lease_seconds: int
+    ) -> int:
+        """Extend the leases of (event_id, claim_token) claims still publishing.
+
+        Ingest keeps a claim pending while a timed-out Kafka send can still
+        land, which can outlast any fixed lease; renewing it in one batch keeps
+        a retry from reclaiming the event_id meanwhile.
+        """
+        if not claims:
+            return 0
+        now = _utc_now()
+        lease_expires_at = now + timedelta(seconds=max(1, int(lease_seconds)))
+        ledger = InteractionIdempotencyLedger
+        renewed = 0
+        async with self._hot_path_session() as session:
+            for start in range(0, len(claims), 500):
+                result = await session.execute(
+                    update(ledger)
+                    .where(
+                        ledger.status == "pending",
+                        tuple_(ledger.event_id, ledger.lease_owner).in_(
+                            list(claims[start : start + 500])
+                        ),
+                    )
+                    .values(lease_expires_at=lease_expires_at, updated_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+                renewed += result.rowcount or 0
+        return renewed
 
     async def release_interaction_event_claim(
         self, event_id: str, *, claim_token: str

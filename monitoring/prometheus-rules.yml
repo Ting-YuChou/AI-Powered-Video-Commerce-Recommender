@@ -84,6 +84,40 @@ groups:
           description: The interaction ingest service scrape target is down.
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#interactioningestserviceunavailable
 
+      # Ingest answers a retryable 503 rather than acknowledge without Kafka.
+      # late_publish_failed is left out: it always follows a publish_timeout
+      # that is already counted here.
+      - alert: InteractionIngestKafkaRejections
+        expr: |
+          (
+            sum by (job) (
+              rate(video_commerce_interactions_ingested_total{job="interaction-ingest-service",status=~"kafka_unavailable|publish_timeout|publish_failed"}[5m])
+            )
+            /
+            sum by (job) (
+              rate(video_commerce_interactions_ingested_total{job="interaction-ingest-service",status=~"accepted|kafka_unavailable|publish_timeout|publish_failed"}[5m])
+            )
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Interaction ingest is rejecting events because Kafka publishes fail
+          description: More than 5% of interactions got a retryable 503 (kafka_unavailable, publish_timeout or publish_failed) for 5 minutes; events are stored only if clients retry.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#interactioningestkafkarejections
+
+      - alert: InteractionIngestLeaseLost
+        expr: |
+          sum by (job) (
+            increase(video_commerce_interactions_ingested_total{job="interaction-ingest-service",status=~"late_publish_lost_lease|lease_lost"}[15m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Interaction ingest may have published an event_id twice
+          description: A Kafka publish landed after its idempotency lease lapsed, so a retry may have published the same event_id again; downstream dedup by event_id is the only guard left.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#interactioningestleaselost
+
       # feature-worker only runs (and heartbeats) when the Python feature pipeline
       # is active; in the default Flink mode it is not deployed at all.
       - alert: WorkerHeartbeatMissing

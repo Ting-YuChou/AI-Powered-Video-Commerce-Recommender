@@ -22,6 +22,7 @@ class DummyKafkaManager:
     def __init__(self, should_succeed: bool):
         self.should_succeed = should_succeed
         self.calls = []
+        self.producer = SimpleNamespace(is_connected=True)
 
     async def send_user_interaction(self, **kwargs):
         self.calls.append(kwargs)

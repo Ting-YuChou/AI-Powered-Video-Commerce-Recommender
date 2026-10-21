@@ -497,3 +497,51 @@ tests:
       - eval_time: 35m
         alertname: FlinkCheckpointUnavailable
         exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_interactions_ingested_total{job="interaction-ingest-service",action="click",status="accepted"}'
+        values: '0+60x20'
+      - series: 'video_commerce_interactions_ingested_total{job="interaction-ingest-service",action="click",status="publish_timeout"}'
+        values: '0+30x20'
+      - series: 'video_commerce_interactions_ingested_total{job="interaction-ingest-service",action="click",status="late_publish_failed"}'
+        values: '0+30x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: InteractionIngestKafkaRejections
+        exp_alerts:
+          - exp_labels:
+              job: interaction-ingest-service
+              severity: critical
+            exp_annotations:
+              summary: "Interaction ingest is rejecting events because Kafka publishes fail"
+              description: "More than 5% of interactions got a retryable 503 (kafka_unavailable, publish_timeout or publish_failed) for 5 minutes; events are stored only if clients retry."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#interactioningestkafkarejections"
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_interactions_ingested_total{job="interaction-ingest-service",action="click",status="accepted"}'
+        values: '0+60x20'
+      - series: 'video_commerce_interactions_ingested_total{job="interaction-ingest-service",action="click",status="publish_timeout"}'
+        values: '0+1x20'
+    alert_rule_test:
+      # 1/61 of interactions rejected stays under the 5% threshold.
+      - eval_time: 15m
+        alertname: InteractionIngestKafkaRejections
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_interactions_ingested_total{job="interaction-ingest-service",action="click",status="late_publish_lost_lease"}'
+        values: '0x5 1x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: InteractionIngestLeaseLost
+        exp_alerts:
+          - exp_labels:
+              job: interaction-ingest-service
+              severity: warning
+            exp_annotations:
+              summary: "Interaction ingest may have published an event_id twice"
+              description: "A Kafka publish landed after its idempotency lease lapsed, so a retry may have published the same event_id again; downstream dedup by event_id is the only guard left."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#interactioningestleaselost"

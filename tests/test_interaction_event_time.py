@@ -15,6 +15,7 @@ from video_commerce.services.interaction_ingest import api as interaction_ingest
 class DummyKafkaManager:
     def __init__(self):
         self.calls = []
+        self.producer = SimpleNamespace(is_connected=True)
 
     async def send_user_interaction(self, **kwargs):
         self.calls.append(kwargs)
