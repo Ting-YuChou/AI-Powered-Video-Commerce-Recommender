@@ -527,14 +527,21 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
 
 ## FeatureLakeIcebergCommitFailure
 
-- **Known gap:** no Flink job in `flink-jobs/` registers the
-  `iceberg_commit_failed` counter this rule reads, so it cannot fire today
-  (`tests/test_alert_metric_contract.py` tracks it). Watch the materializer job's
-  checkpoint failures and `FeatureLakeMaterializationLagHigh` instead.
-- **Symptom:** an Iceberg atomic commit failed.
+- **Symptom:** an Iceberg table written by
+  `video-commerce-feature-history-materializer` has had no successful commit
+  for more than 10 minutes (the checkpoint timeout; checkpoints run every 30s).
+  The signal is Iceberg's own committer gauge
+  `IcebergFilesCommitter_table_elapsedSecondsSinceLastSuccessfulCommit`, which
+  resets on every completed commit cycle, including skipped empty ones, so
+  quiet traffic does not trigger it. The `table` label names the table.
 - **Impact:** materialization stalls; cutover must pause.
-- **First checks:** Flink checkpoint and commit errors; catalog (iceberg-rest)
-  and object storage health.
+- **First checks:** Flink checkpoint and commit errors in the materializer job;
+  catalog (iceberg-rest) and object storage health.
+- **Blind spot:** a failed commit fails the committer task, and the gauge
+  restarts at zero (or is not registered at all if the catalog is unreachable
+  on restore). A job that restarts in a loop therefore keeps this alert quiet;
+  check `flink_jobmanager_job_numRestarts` and the checkpoint history for the
+  materializer job when Iceberg data looks stale.
 - **Remediation:** restore the catalog or storage and let the job retry from
   its checkpoint.
 

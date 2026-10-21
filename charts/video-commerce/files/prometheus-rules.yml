@@ -579,13 +579,13 @@ groups:
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#catalogoutboxbacklog
 
       - alert: FeatureLakeIcebergCommitFailure
-        expr: increase(flink_taskmanager_job_task_operator_iceberg_commit_failed_total[10m]) > 0
-        for: 1m
+        expr: max by (table) (flink_taskmanager_job_task_operator_IcebergFilesCommitter_table_elapsedSecondsSinceLastSuccessfulCommit{job_name="video-commerce-feature-history-materializer"}) > 600
+        for: 5m
         labels:
           severity: critical
         annotations:
-          summary: Iceberg atomic commit failed
-          description: Pause materialization cutover and inspect the Flink checkpoint/commit failure.
+          summary: Iceberg commits for {{ $labels.table }} have stalled
+          description: No Iceberg commit has succeeded for over the 10-minute checkpoint timeout; pause materialization cutover and inspect the Flink checkpoint/commit failure.
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#featurelakeicebergcommitfailure
 
       - alert: PitManifestValidationFailure
