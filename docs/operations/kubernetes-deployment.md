@@ -22,6 +22,10 @@ and S3-compatible object storage must be provided outside the chart.
   - `model-trainer`
 - `ranking-runner` uses a headless Service so `ranking-coordinator` can resolve
   individual pod endpoints through DNS.
+- The coordinator and runner TCP ports are covered by NetworkPolicies
+  (`networkPolicy.rankingRuntime`) and connection auth
+  (`appConfig.ranking.runtimeAuthMode`). Runner drain/undrain is accepted only
+  over loopback. See `docs/operations/ranking-runtime-auth.md`.
 - Uploads, model artifacts, and checkpoints use S3-compatible object storage.
   Pod-local paths such as `/app/models`, `/app/uploads`, and
   `/tmp/object-storage` are `emptyDir` scratch space.

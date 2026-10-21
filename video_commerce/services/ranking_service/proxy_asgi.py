@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from video_commerce.common.cache_codec import json_dumps, json_loads
 from video_commerce.common.config import Config
 from video_commerce.common.observability import configure_logging
+from video_commerce.ranking_runtime.ranking_auth import RankingRuntimeAuthSettings
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     RankingCoordinatorClientPool,
     RankingCoordinatorError,
@@ -28,7 +29,7 @@ from video_commerce.ranking_runtime.ranking_triton import (
     RankingTritonUnavailable,
     triton_numeric_model_version,
 )
-from video_commerce.common.service_common import ServiceRuntime
+from video_commerce.common.service_common import ServiceRuntime, constant_time_equals
 from video_commerce.common.telemetry import configure_tracing
 
 
@@ -116,6 +117,7 @@ class RankingProxyApp:
             pool_size=topology.ranking_coordinator_client_pool_size,
             connect_timeout_seconds=topology.ranking_coordinator_connect_timeout_seconds,
             request_timeout_seconds=topology.ranking_coordinator_request_timeout_seconds,
+            auth_settings=RankingRuntimeAuthSettings.from_config(self.runtime.config),
         )
         logger.info(
             "ranking_proxy_worker_started",
@@ -511,7 +513,8 @@ class RankingProxyApp:
         header_name = (
             self.runtime.config.security_config.internal_service_header.lower()
         )
-        return headers.get(header_name) == expected_key
+        # One comparison path for every internal-key check (constant time).
+        return constant_time_equals(headers.get(header_name), expected_key)
 
     def _request_id(self, scope) -> str:
         header_name = "x-request-id"

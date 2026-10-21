@@ -1201,6 +1201,10 @@ class RankingConfig(BaseSettings):
         True,
         description="Enable micro-batching queue for ranking inference",
     )
+    runtime_auth_mode: str = Field(
+        "permissive",
+        description="Ranking TCP protocol connection auth: disabled, permissive (send auth, accept and count unauthenticated peers), or required",
+    )
     allow_untrained_fallback: bool = Field(
         False,
         description="Allow deterministic candidate-score fallback when no trained ranking checkpoint is active; local/test only",
@@ -1699,6 +1703,15 @@ class RankingConfig(BaseSettings):
                     "training_min_epochs cannot exceed epochs for trimodal training"
                 )
         return values
+
+    @validator("runtime_auth_mode")
+    def validate_runtime_auth_mode(cls, value: str) -> str:
+        mode = (value or "").strip().lower()
+        if mode not in {"disabled", "permissive", "required"}:
+            raise ValueError(
+                "RANKING_RUNTIME_AUTH_MODE must be disabled, permissive, or required"
+            )
+        return mode
 
     @validator("runner_payload_max_bytes")
     def validate_runner_payload_max_bytes(cls, value: int) -> int:
@@ -3201,6 +3214,13 @@ class Config:
                 errors.append(
                     "FEATURE_LAKE_FLINK_JOBMANAGER is required when Iceberg maintenance is enabled"
                 )
+        if (
+            self.ranking_config.runtime_auth_mode == "required"
+            and not self.security_config.internal_service_key
+        ):
+            errors.append(
+                "SECURITY_INTERNAL_SERVICE_KEY or SECURITY_INTERNAL_SERVICE_KEY_FILE is required when RANKING_RUNTIME_AUTH_MODE=required"
+            )
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":
             if self.security_config.auth_mode == "disabled":
@@ -3238,6 +3258,10 @@ class Config:
             if self.security_config.internal_service_key == "change-me-in-production":
                 errors.append(
                     "Default internal service key is not allowed in production"
+                )
+            if self.ranking_config.runtime_auth_mode == "disabled":
+                errors.append(
+                    "RANKING_RUNTIME_AUTH_MODE=disabled is not allowed in production; use permissive or required"
                 )
             if not self.redis_config.password:
                 errors.append(

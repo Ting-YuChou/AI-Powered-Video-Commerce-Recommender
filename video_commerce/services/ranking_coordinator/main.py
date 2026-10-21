@@ -30,6 +30,12 @@ from video_commerce.ranking_runtime.ranking_batcher import (
     RankingQueueFullError,
     RankingQueueTimeoutError,
 )
+from video_commerce.ranking_runtime.ranking_auth import (
+    ConnectionAuthState,
+    RankingRuntimeAuthenticator,
+    RankingRuntimeAuthSettings,
+    warn_if_weak_production_auth,
+)
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     HEALTH_OPERATION,
     METRICS_OPERATION,
@@ -65,12 +71,24 @@ class RankingCoordinator:
         self.runner_pool: Optional[RankingRunnerClientPool] = None
         self.checkpoint_sync_task: Optional[asyncio.Task] = None
         self.server: Optional[asyncio.base_events.Server] = None
+        self.authenticator = RankingRuntimeAuthenticator(
+            RankingRuntimeAuthSettings(),
+            role="coordinator",
+            observability=self.runtime.observability,
+        )
 
     async def start(self) -> None:
         self.config = Config()
         self.runtime.config = self.config
         configure_service_logging(self.runtime)
         _configure_torch_runtime(self.runtime)
+        auth_settings = RankingRuntimeAuthSettings.from_config(self.config)
+        self.authenticator = RankingRuntimeAuthenticator(
+            auth_settings,
+            role="coordinator",
+            observability=self.runtime.observability,
+        )
+        warn_if_weak_production_auth(auth_settings, role="coordinator", logger=logger)
 
         if self.config.database_config.enable:
             self.system_store = SystemStore(
@@ -96,6 +114,7 @@ class RankingCoordinator:
                 endpoint_missing_refreshes=topology.ranking_runner_endpoint_missing_refreshes,
                 endpoint_missing_grace_seconds=topology.ranking_runner_endpoint_missing_grace_seconds,
                 observability=self.runtime.observability,
+                auth_settings=auth_settings,
             )
         else:
             self.object_storage = ObjectStorage(self.config.object_storage_config)
@@ -221,6 +240,8 @@ class RankingCoordinator:
                 "coordinator_dispatch_concurrency": self.config.ranking_config.coordinator_dispatch_concurrency,
                 "runner_queue_size": self.config.ranking_config.runner_queue_size,
                 "runner_batch_concurrency": self.config.ranking_config.runner_batch_concurrency,
+                "runtime_auth_mode": auth_settings.mode,
+                "runtime_auth_key_configured": self.authenticator.verifies_handshakes,
             },
         )
 
@@ -254,14 +275,38 @@ class RankingCoordinator:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        auth_state = ConnectionAuthState()
         try:
             while True:
+                pre_auth_limits = self.authenticator.pre_auth_limits(auth_state)
                 try:
-                    frame = await read_frame(reader)
+                    if pre_auth_limits is None:
+                        frame = await read_frame(reader)
+                    else:
+                        max_frame_bytes, timeout_seconds = pre_auth_limits
+                        frame = await asyncio.wait_for(
+                            read_frame(reader, max_frame_bytes),
+                            timeout=timeout_seconds,
+                        )
+                except (RankingCoordinatorProtocolError, asyncio.TimeoutError):
+                    if pre_auth_limits is not None:
+                        self.authenticator.record_pre_auth_violation()
+                    break
                 except Exception:
                     break
                 if not frame:
                     break
+                decision = self.authenticator.screen_frame(
+                    auth_state, frame[:1], frame[1:]
+                )
+                if decision is not None:
+                    writer.write(
+                        _json_response(decision.status_code, decision.payload)
+                    )
+                    await writer.drain()
+                    if decision.close_connection:
+                        break
+                    continue
                 response = await self._handle_frame(frame)
                 writer.write(response)
                 await writer.drain()

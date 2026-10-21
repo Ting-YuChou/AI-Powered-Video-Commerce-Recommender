@@ -1,0 +1,81 @@
+{{- /*
+Ingress isolation for the internal ranking TCP protocol. The coordinator only
+accepts recommendation-service and ranking-service pods; runners only accept
+the coordinator. Coordinator/runner metrics travel over the same protocol port
+(`M` frames), so the optional metrics peer is granted that port as well.
+Loopback traffic (probes, preStop drain) is not subject to NetworkPolicy.
+*/ -}}
+{{- $np := default dict .Values.networkPolicy.rankingRuntime -}}
+{{- if $np.enabled }}
+{{- $workloads := .Values.backend.workloads -}}
+{{- $coordinator := $workloads.rankingCoordinator -}}
+{{- $runner := $workloads.rankingRunner -}}
+{{- $metricsPeer := dict -}}
+{{- with $np.metricsFrom }}
+{{- if .namespaceSelector }}{{- $_ := set $metricsPeer "namespaceSelector" .namespaceSelector }}{{- end }}
+{{- if .podSelector }}{{- $_ := set $metricsPeer "podSelector" .podSelector }}{{- end }}
+{{- end }}
+{{- if $coordinator.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" $coordinator.name) }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $coordinator.name }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" . "component" $coordinator.name) | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "video-commerce.selectorLabels" (dict "root" . "component" $workloads.recommendationService.name) | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "video-commerce.selectorLabels" (dict "root" . "component" $workloads.rankingService.name) | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $coordinator.service.targetPort }}
+    {{- if $metricsPeer }}
+    - from:
+        {{- toYaml (list $metricsPeer) | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $coordinator.service.targetPort }}
+    {{- end }}
+{{- end }}
+{{- if $runner.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "video-commerce.componentName" (dict "root" . "name" $runner.name) }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $runner.name }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "video-commerce.selectorLabels" (dict "root" . "component" $runner.name) | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "video-commerce.selectorLabels" (dict "root" . "component" $coordinator.name) | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $runner.service.targetPort }}
+    {{- if $metricsPeer }}
+    - from:
+        {{- toYaml (list $metricsPeer) | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $runner.service.targetPort }}
+    {{- end }}
+{{- end }}
+{{- end }}
