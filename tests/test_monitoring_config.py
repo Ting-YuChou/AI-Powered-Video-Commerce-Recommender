@@ -97,6 +97,7 @@ def test_prometheus_rules_cover_service_worker_kafka_db_and_redis():
         "RankingTritonOverloadSustained",
         "KafkaProducerDisconnected",
         "RateLimiterFailingOpen",
+        "DependencyUnhealthy",
         "RankingRuntimeUnauthenticatedConnections",
         "RankingRuntimeAuthFailures",
         "RecommendationOutboxTerminal",

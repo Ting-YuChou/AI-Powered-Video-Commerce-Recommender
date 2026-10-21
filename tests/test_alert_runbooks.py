@@ -100,6 +100,7 @@ def test_new_and_changed_alerts_have_promtool_cases():
         "WorkerMetricsTargetDown",
         "KafkaProducerDisconnected",
         "RateLimiterFailingOpen",
+        "DependencyUnhealthy",
         "RankingRuntimeUnauthenticatedConnections",
         "RankingRuntimeAuthFailures",
         "RecommendationOutboxTerminal",

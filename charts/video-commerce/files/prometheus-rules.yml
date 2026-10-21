@@ -156,6 +156,19 @@ groups:
           description: Rate-limit checks against Redis are erroring or timing out, so requests are admitted without a limit.
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#ratelimiterfailingopen
 
+      # Set on each readiness probe. Multi-worker services aggregate with "min",
+      # so one worker's last probe result can hold the value; the 10m window
+      # rides that out, and degraded (0.5) is reported but not alerted.
+      - alert: DependencyUnhealthy
+        expr: min by (job, service, dependency) (video_commerce_dependency_status) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} reports {{ $labels.dependency }} unhealthy"
+          description: "{{ $labels.service }} readiness has seen {{ $labels.dependency }} unhealthy for 10 minutes; features that need it are failing or degraded."
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#dependencyunhealthy
+
       - alert: KafkaConsumerLagHigh
         expr: |
           max by (consumergroup, topic) (kafka_consumergroup_lag) > 1000

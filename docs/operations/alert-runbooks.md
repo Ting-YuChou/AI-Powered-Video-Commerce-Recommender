@@ -148,10 +148,28 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
   (`video_commerce_rate_limiter_errors_total`) for 10 minutes.
 - **Impact:** requests are admitted without a limit (fail-open by design), so
   abusive clients are not throttled.
-- **First checks:** state Redis latency and errors; `reason` label (timeout vs
-  error); `API_RATE_LIMIT_TIMEOUT_MS`.
+- **First checks:** state Redis latency and errors; `reason` label (`timeout`,
+  `error`, or `cooldown` while the limiter skips Redis after recent failures);
+  `API_RATE_LIMIT_TIMEOUT_MS`.
 - **Remediation:** restore Redis health. If abuse is ongoing, block it at the
   edge until the limiter recovers.
+
+## DependencyUnhealthy
+
+- **Symptom:** a service's readiness probe has reported a dependency unhealthy
+  (`video_commerce_dependency_status == 0`) for 10 minutes. Degraded (0.5) is
+  visible on the metric but not alerted.
+- **Impact:** depends on the dependency. Gateway readiness keeps only its own
+  checks critical, so the edge stays up while the features behind the
+  dependency fail (for example recommendations when `recommendation` is down).
+  For ingest, Kafka and Postgres are critical and it stops accepting events.
+- **First checks:** the dependency's own alert (`KafkaProducerDisconnected`,
+  `RecommendationServiceUnavailable`, `PostgresExporterDown`, ...);
+  `/readyz/full` on the reporting service for the error detail.
+- **Remediation:** restore the dependency. Producers and probes recover on their
+  own without restarting the reporting service. Multi-worker services keep each
+  worker's last probe result (`min`), so the value can lag until every worker
+  has been probed again.
 
 ## KafkaConsumerLagHigh
 

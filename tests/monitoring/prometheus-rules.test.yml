@@ -406,3 +406,26 @@ tests:
       - eval_time: 30m
         alertname: KnownUserFeaturesMissing
         exp_alerts: []
+
+  # Only a dependency that stays unhealthy alerts; degraded (0.5) does not.
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_dependency_status{job="gateway-api",service="gateway-api",dependency="recommendation"}'
+        values: '0x20'
+      - series: 'video_commerce_dependency_status{job="gateway-api",service="gateway-api",dependency="kafka"}'
+        values: '0.5x20'
+      - series: 'video_commerce_dependency_status{job="gateway-api",service="gateway-api",dependency="redis"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DependencyUnhealthy
+        exp_alerts:
+          - exp_labels:
+              job: gateway-api
+              service: gateway-api
+              dependency: recommendation
+              severity: warning
+            exp_annotations:
+              summary: "gateway-api reports recommendation unhealthy"
+              description: "gateway-api readiness has seen recommendation unhealthy for 10 minutes; features that need it are failing or degraded."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#dependencyunhealthy"
