@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import math
 import os
@@ -15,6 +16,7 @@ from fastapi import HTTPException
 from video_commerce.common.cache_codec import json_dumps, json_loads
 from video_commerce.common.config import Config
 from video_commerce.common.observability import configure_logging
+from video_commerce.ranking_runtime.ranking_auth import RankingRuntimeAuthSettings
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     RankingCoordinatorClientPool,
     RankingCoordinatorError,
@@ -116,6 +118,7 @@ class RankingProxyApp:
             pool_size=topology.ranking_coordinator_client_pool_size,
             connect_timeout_seconds=topology.ranking_coordinator_connect_timeout_seconds,
             request_timeout_seconds=topology.ranking_coordinator_request_timeout_seconds,
+            auth_settings=RankingRuntimeAuthSettings.from_config(self.runtime.config),
         )
         logger.info(
             "ranking_proxy_worker_started",
@@ -511,7 +514,12 @@ class RankingProxyApp:
         header_name = (
             self.runtime.config.security_config.internal_service_header.lower()
         )
-        return headers.get(header_name) == expected_key
+        provided_key = headers.get(header_name)
+        if provided_key is None:
+            return False
+        return hmac.compare_digest(
+            provided_key.encode("utf-8"), expected_key.encode("utf-8")
+        )
 
     def _request_id(self, scope) -> str:
         header_name = "x-request-id"

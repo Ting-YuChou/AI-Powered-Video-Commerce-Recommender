@@ -58,6 +58,26 @@ rankingTriton:
   networkPolicy:
     enabled: true
 
+networkPolicy:
+  # Ingress isolation for the internal ranking TCP protocol (coordinator 8013,
+  # runner 8014): coordinator <- recommendation-service, ranking-service;
+  # runner <- coordinator. Requires a CNI that enforces NetworkPolicy.
+  rankingRuntime:
+    enabled: true
+    # Optional extra peer for the protocol port, e.g. a scraper using the `M`
+    # frame (coordinator/runner have no HTTP /metrics port; ranking-service
+    # /metrics already proxies coordinator metrics). Empty selectors add no
+    # rule. Example:
+    #   namespaceSelector:
+    #     matchLabels:
+    #       kubernetes.io/metadata.name: monitoring
+    #   podSelector:
+    #     matchLabels:
+    #       app.kubernetes.io/name: prometheus
+    metricsFrom:
+      namespaceSelector: {}
+      podSelector: {}
+
 securityContext:
   pod:
     runAsNonRoot: true
@@ -377,6 +397,9 @@ appConfig:
     tritonOrtInterOpThreads: 1
     onnxExportEnabled: false
     allowUntrainedFallback: false
+    # Ranking TCP protocol connection auth: disabled | permissive | required.
+    # Production must stay >= permissive; see docs/operations/ranking-runtime-auth.md.
+    runtimeAuthMode: permissive
     requireVerifiedArtifact: true
     trimodalEnabled: false
     trimodalShadow: true

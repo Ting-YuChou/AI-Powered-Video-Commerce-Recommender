@@ -24,10 +24,17 @@ from video_commerce.ranking_runtime.ranking_batcher import (
     normalize_ranking_batch_payloads,
     run_ranking_batch_payloads,
 )
+from video_commerce.ranking_runtime.ranking_auth import (
+    ConnectionAuthState,
+    RankingRuntimeAuthenticator,
+    RankingRuntimeAuthSettings,
+    is_loopback_peer,
+)
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     DRAIN_OPERATION,
     HEALTH_OPERATION,
     METRICS_OPERATION,
+    UNDRAIN_OPERATION,
     RankingCoordinatorProtocolError,
     encode_response,
     read_frame,
@@ -72,12 +79,22 @@ class RankingRunner:
         self._runner_queue_size = 4
         self._draining = False
         self._admission_lock = asyncio.Lock()
+        self.authenticator = RankingRuntimeAuthenticator(
+            RankingRuntimeAuthSettings(),
+            role="runner",
+            observability=self.runtime.observability,
+        )
 
     async def start(self) -> None:
         self.config = Config()
         self.runtime.config = self.config
         configure_service_logging(self.runtime)
         _configure_torch_runtime(self.runtime)
+        self.authenticator = RankingRuntimeAuthenticator(
+            RankingRuntimeAuthSettings.from_config(self.config),
+            role="runner",
+            observability=self.runtime.observability,
+        )
 
         if self.config.database_config.enable:
             self.system_store = SystemStore(
@@ -184,6 +201,8 @@ class RankingRunner:
                 "torch_num_interop_threads": torch.get_num_interop_threads(),
                 "runner_batch_concurrency": runner_concurrency,
                 "runner_queue_size": runner_queue_size,
+                "runtime_auth_mode": self.authenticator.settings.mode,
+                "runtime_auth_key_configured": self.authenticator.verifies_handshakes,
                 "torch_compile_enabled": compile_status["torch_compile_enabled"],
                 "torch_compile_active": compile_status["torch_compile_active"],
                 "torch_compile_backend": compile_status["torch_compile_backend"],
@@ -236,6 +255,8 @@ class RankingRunner:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        peer = writer.get_extra_info("peername")
+        auth_state = ConnectionAuthState()
         try:
             while True:
                 try:
@@ -244,7 +265,18 @@ class RankingRunner:
                     break
                 if not frame:
                     break
-                response = await self._handle_frame(frame)
+                decision = self.authenticator.screen_frame(
+                    auth_state, frame[:1], frame[1:]
+                )
+                if decision is not None:
+                    writer.write(
+                        _json_response(decision.status_code, decision.payload)
+                    )
+                    await writer.drain()
+                    if decision.close_connection:
+                        break
+                    continue
+                response = await self._handle_frame(frame, peer=peer)
                 writer.write(response)
                 await writer.drain()
         except Exception as exc:
@@ -270,15 +302,32 @@ class RankingRunner:
             except Exception:
                 pass
 
-    async def _handle_frame(self, frame: bytes) -> bytes:
+    async def _handle_frame(self, frame: bytes, *, peer=None) -> bytes:
         operation = frame[:1]
         body = frame[1:]
         if operation == BATCH_RANK_OPERATION:
             return await self._handle_batch_rank(body)
         if operation == HEALTH_OPERATION:
             return await self._handle_health()
-        if operation == DRAIN_OPERATION:
-            return await self._handle_drain()
+        if operation in (DRAIN_OPERATION, UNDRAIN_OPERATION):
+            # Drain state is lifecycle control for the local pod (preStop,
+            # operator exec), never something a remote peer may toggle.
+            if not is_loopback_peer(peer):
+                logger.warning(
+                    "ranking_runner_lifecycle_forbidden",
+                    extra={
+                        "service": self.runtime.service_name,
+                        "process_id": os.getpid(),
+                        "operation": operation.decode("ascii", errors="replace"),
+                        "peer": str(peer[0]) if isinstance(peer, tuple) else None,
+                    },
+                )
+                return _json_response(
+                    403, {"detail": "ranking_runner_lifecycle_loopback_only"}
+                )
+            if operation == DRAIN_OPERATION:
+                return await self._handle_drain()
+            return await self._handle_undrain()
         if operation == METRICS_OPERATION:
             return await self._handle_metrics()
         return _json_response(400, {"detail": "invalid ranking runner operation"})
@@ -551,6 +600,15 @@ class RankingRunner:
                     },
                 )
         return _json_response(200, {"status": "drained"})
+
+    async def _handle_undrain(self) -> bytes:
+        async with self._admission_lock:
+            self._draining = False
+        logger.info(
+            "ranking_runner_undrained",
+            extra={"service": self.runtime.service_name, "process_id": os.getpid()},
+        )
+        return _json_response(200, {"status": "undrained"})
 
     async def _handle_metrics(self) -> bytes:
         if self.config and self.config.monitoring_config.enable_prometheus_metrics:

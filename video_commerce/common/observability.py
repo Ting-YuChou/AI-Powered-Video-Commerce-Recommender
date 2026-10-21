@@ -521,6 +521,12 @@ class ObservabilityManager:
             ["endpoint", "event"],
             registry=self.registry,
         )
+        self.ranking_runtime_auth_total = Counter(
+            "video_commerce_ranking_runtime_auth_total",
+            "Ranking TCP protocol connection auth outcomes by server role",
+            ["role", "result"],
+            registry=self.registry,
+        )
         self.ranking_runner_endpoint_state = Gauge(
             "video_commerce_ranking_runner_endpoint_state",
             "Coordinator runner endpoint state as a one-hot gauge",
@@ -1487,6 +1493,9 @@ class ObservabilityManager:
         self.ranking_runner_endpoint_available_connections.labels(
             endpoint=endpoint
         ).set(max(0, int(available_connections)))
+
+    def record_ranking_runtime_auth(self, role: str, result: str) -> None:
+        self.ranking_runtime_auth_total.labels(role=role, result=result).inc()
 
     def record_ranking_runner_endpoint_event(self, endpoint: str, event: str) -> None:
         self.ranking_runner_endpoint_events_total.labels(

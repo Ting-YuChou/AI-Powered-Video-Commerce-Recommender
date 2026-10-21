@@ -1,15 +1,24 @@
 import asyncio
+import json
 import time
 
 import pytest
 
+from video_commerce.ranking_runtime.ranking_auth import (
+    AUTH_OPERATION,
+    RankingRuntimeAuthenticator,
+    RankingRuntimeAuthSettings,
+)
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     HEALTH_OPERATION,
     RANK_OPERATION,
     RankingCoordinatorClientPool,
+    RankingCoordinatorResponse,
     RankingCoordinatorTimeout,
     RankingCoordinatorUnavailable,
+    RankingRuntimeAuthRejected,
     decode_response,
+    encode_request,
     encode_response,
     read_frame,
 )
@@ -20,6 +29,7 @@ from video_commerce.ranking_runtime.ranking_runner_client import (
     RankingRunnerOverloaded,
     RankingRunnerRequestUncertain,
     RankingRunnerTimeout,
+    RankingRunnerUnavailable,
     parse_runner_urls,
 )
 
@@ -524,14 +534,66 @@ async def test_protocol_draining_state_survives_dns_presence(monkeypatch):
         unhealthy_cooldown_seconds=0.1,
         dns_refresh_seconds=0.0,
     )
+    health_responses = []
+
+    async def fake_health(target):
+        return health_responses.pop(0)
+
+    monkeypatch.setattr(client, "_health_endpoint", fake_health)
     client._mark_draining(endpoint)
     try:
+        # DNS presence alone never proves the runner was undrained.
+        await client._refresh_endpoints_if_needed(force=True)
+        after_dns = (endpoint.draining, endpoint.drain_reason)
+
+        # A runner that still reports draining stays out of rotation.
+        health_responses.append(
+            RankingCoordinatorResponse(503, "application/json", b'{"status":"draining"}')
+        )
+        await client.health_check()
+        after_draining_health = endpoint.draining
+
+        # Only an explicit healthy, non-draining health response clears it.
+        health_responses.append(
+            RankingCoordinatorResponse(200, "application/json", b'{"status":"ready"}')
+        )
+        await client.health_check()
         await client._refresh_endpoints_if_needed(force=True)
     finally:
         await client.aclose()
 
+    assert after_dns == (True, "protocol")
+    assert after_draining_health is True
+    assert endpoint.draining is False
+    assert endpoint.drain_reason == ""
+    assert client.effective_capacity == 1
+
+
+@pytest.mark.asyncio
+async def test_healthy_response_does_not_clear_dns_missing_drain(monkeypatch):
+    endpoint = RankingRunnerEndpoint(host="10.0.0.2", port=8014, label="runner-b")
+    client = RankingRunnerClientPool(
+        [endpoint],
+        dispatch_concurrency=1,
+        connect_timeout_seconds=0.1,
+        request_timeout_seconds=0.1,
+    )
+
+    async def fake_health(target):
+        return RankingCoordinatorResponse(
+            200, "application/json", b'{"status":"ready"}'
+        )
+
+    monkeypatch.setattr(client, "_health_endpoint", fake_health)
+    endpoint.draining = True
+    endpoint.drain_reason = "dns_missing"
+    try:
+        await client.health_check()
+    finally:
+        await client.aclose()
+
     assert endpoint.draining is True
-    assert endpoint.drain_reason == "protocol"
+    assert endpoint.drain_reason == "dns_missing"
 
 
 @pytest.mark.asyncio
@@ -861,3 +923,561 @@ async def test_runner_client_connection_close_after_send_does_not_retry():
         await second.wait_closed()
 
     assert attempts == ["accepted"]
+
+
+async def _close_server(server):
+    server.close()
+    await server.wait_closed()
+    # Let per-connection handlers observe EOF before the loop shuts down.
+    await asyncio.sleep(0.05)
+
+
+# --- Connection auth (ranking-auth v1) -------------------------------------
+
+TEST_INTERNAL_KEY = "ranking-test-internal-key"
+
+
+class _AuthRecorder:
+    def __init__(self):
+        self.events = []
+
+    def record_ranking_runtime_auth(self, role, result):
+        self.events.append((role, result))
+
+
+def _auth_settings(mode, key=TEST_INTERNAL_KEY):
+    return RankingRuntimeAuthSettings.build(mode, key)
+
+
+async def _start_coordinator_server(mode, *, key=TEST_INTERNAL_KEY, stub=True):
+    """Serve the real coordinator connection loop with a stub frame handler."""
+    from video_commerce.services.ranking_coordinator.main import RankingCoordinator
+
+    coordinator = RankingCoordinator()
+    recorder = _AuthRecorder()
+    coordinator.authenticator = RankingRuntimeAuthenticator(
+        _auth_settings(mode, key),
+        role="coordinator",
+        observability=recorder,
+    )
+    handled = []
+
+    real_handle_frame = coordinator._handle_frame
+
+    async def handle_frame(frame):
+        handled.append(frame[:1])
+        if not stub:
+            return await real_handle_frame(frame)
+        return encode_response(200, "application/json", b'{"ok":true}')
+
+    coordinator._handle_frame = handle_frame
+    server = await asyncio.start_server(
+        coordinator._handle_client, host="127.0.0.1", port=0
+    )
+    return server, server.sockets[0].getsockname()[1], handled, recorder
+
+
+async def _start_legacy_server():
+    """A server that predates the A frame: unknown operations get a 400."""
+    handled = []
+
+    async def handle_client(reader, writer):
+        try:
+            while True:
+                try:
+                    frame = await read_frame(reader)
+                except Exception:
+                    break
+                handled.append(frame[:1])
+                if frame[:1] == RANK_OPERATION:
+                    writer.write(encode_response(200, "application/json", b'{"ok":true}'))
+                else:
+                    writer.write(
+                        encode_response(
+                            400,
+                            "application/json",
+                            b'{"detail":"invalid coordinator operation"}',
+                        )
+                    )
+                await writer.drain()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle_client, host="127.0.0.1", port=0)
+    return server, server.sockets[0].getsockname()[1], handled
+
+
+async def _raw_request(port, *frames):
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    responses = []
+    try:
+        for operation, body in frames:
+            writer.write(encode_request(operation, body))
+            await writer.drain()
+            try:
+                responses.append(decode_response(await read_frame(reader)))
+            except RankingCoordinatorUnavailable:
+                responses.append(None)
+                break
+    finally:
+        writer.close()
+    return responses
+
+
+def test_auth_handshake_round_trip_and_replay_rejected():
+    settings = _auth_settings("required")
+    now = 1_800_000_000
+    authenticator = RankingRuntimeAuthenticator(
+        settings, role="runner", clock=lambda: now
+    )
+    body = settings.build_handshake_body(now=now, nonce="a" * 32)
+
+    assert authenticator.verify_handshake(body) is None
+    assert authenticator.verify_handshake(body) == "replayed"
+
+
+def test_auth_handshake_rejects_expired_wrong_key_and_malformed():
+    settings = _auth_settings("required")
+    now = 1_800_000_000
+    authenticator = RankingRuntimeAuthenticator(
+        settings, role="runner", clock=lambda: now
+    )
+
+    stale = settings.build_handshake_body(now=now - 61, nonce="b" * 32)
+    future = settings.build_handshake_body(now=now + 61, nonce="c" * 32)
+    wrong_key = _auth_settings("required", "other-key").build_handshake_body(
+        now=now, nonce="d" * 32
+    )
+
+    assert authenticator.verify_handshake(stale) == "expired"
+    assert authenticator.verify_handshake(future) == "expired"
+    assert authenticator.verify_handshake(wrong_key) == "invalid_mac"
+    assert authenticator.verify_handshake(b"not-json") == "malformed"
+    assert authenticator.verify_handshake(b'{"v":2}') == "unsupported_version"
+    # Failed attempts must not consume nonces from the replay cache.
+    assert (
+        authenticator.verify_handshake(
+            settings.build_handshake_body(now=now, nonce="d" * 32)
+        )
+        is None
+    )
+
+
+def test_auth_nonce_cache_is_bounded():
+    settings = _auth_settings("required")
+    now = 1_800_000_000
+    authenticator = RankingRuntimeAuthenticator(
+        settings, role="runner", clock=lambda: now, nonce_cache_size=2
+    )
+    for index in range(3):
+        body = settings.build_handshake_body(now=now, nonce=f"{index:032d}")
+        assert authenticator.verify_handshake(body) is None
+
+    assert len(authenticator._seen_nonces) == 2
+
+
+def test_auth_settings_never_send_handshake_without_key_or_when_disabled():
+    assert not RankingRuntimeAuthSettings.build("permissive", "").client_sends_handshake
+    assert not RankingRuntimeAuthSettings.build(
+        "disabled", TEST_INTERNAL_KEY
+    ).client_sends_handshake
+    assert RankingRuntimeAuthSettings.build(
+        "permissive", TEST_INTERNAL_KEY
+    ).client_sends_handshake
+    with pytest.raises(ValueError):
+        RankingRuntimeAuthSettings.build("strict", TEST_INTERNAL_KEY)
+
+
+@pytest.mark.asyncio
+async def test_required_server_rejects_unauthenticated_frame_and_closes():
+    server, port, handled, recorder = await _start_coordinator_server("required")
+    try:
+        responses = await _raw_request(
+            port,
+            (RANK_OPERATION, b'{"request_id":"r1"}'),
+            (RANK_OPERATION, b'{"request_id":"r2"}'),
+        )
+    finally:
+        await _close_server(server)
+
+    assert responses[0].status_code == 401
+    assert json.loads(responses[0].body)["detail"] == "ranking_runtime_auth_required"
+    # The connection is closed after the rejection: no second response.
+    assert responses[1:] == [None]
+    assert handled == []
+    assert recorder.events == [("coordinator", "rejected")]
+
+
+@pytest.mark.asyncio
+async def test_required_server_accepts_authenticated_pool_and_skips_per_frame_checks():
+    server, port, handled, recorder = await _start_coordinator_server("required")
+    client = RankingCoordinatorClientPool(
+        "127.0.0.1",
+        port,
+        pool_size=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        auth_settings=_auth_settings("required"),
+    )
+    try:
+        first = await client.rank(b'{"request_id":"r1"}')
+        second = await client.health()
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert handled == [RANK_OPERATION, HEALTH_OPERATION]
+    assert recorder.events == [("coordinator", "authenticated")]
+
+
+@pytest.mark.asyncio
+async def test_required_server_rejects_replayed_handshake():
+    server, port, handled, recorder = await _start_coordinator_server("required")
+    body = _auth_settings("required").build_handshake_body()
+    try:
+        first = await _raw_request(
+            port, (AUTH_OPERATION, body), (HEALTH_OPERATION, b"")
+        )
+        replay = await _raw_request(
+            port, (AUTH_OPERATION, body), (HEALTH_OPERATION, b"")
+        )
+    finally:
+        await _close_server(server)
+
+    assert [response.status_code for response in first] == [200, 200]
+    assert replay[0].status_code == 401
+    assert json.loads(replay[0].body)["reason"] == "replayed"
+    assert replay[1:] == [None]
+    assert handled == [HEALTH_OPERATION]
+    assert recorder.events == [
+        ("coordinator", "authenticated"),
+        ("coordinator", "replayed"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_keyless_pool_against_required_server_raises_auth_rejected():
+    server, port, handled, recorder = await _start_coordinator_server("required")
+    client = RankingCoordinatorClientPool(
+        "127.0.0.1",
+        port,
+        pool_size=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        auth_settings=RankingRuntimeAuthSettings.build("permissive", ""),
+    )
+    try:
+        with pytest.raises(RankingRuntimeAuthRejected, match="auth_required"):
+            await client.rank(b'{"request_id":"r1"}')
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert handled == []
+    assert recorder.events == [("coordinator", "rejected")]
+
+
+@pytest.mark.asyncio
+async def test_keyless_runner_pool_marks_required_runner_failed():
+    from video_commerce.services.ranking_runner.main import RankingRunner
+
+    runner = RankingRunner()
+    runner.authenticator = RankingRuntimeAuthenticator(
+        _auth_settings("required"), role="runner"
+    )
+    server = await asyncio.start_server(
+        runner._handle_client, host="127.0.0.1", port=0
+    )
+    port = server.sockets[0].getsockname()[1]
+    endpoint = RankingRunnerEndpoint(host="127.0.0.1", port=port, label="local")
+    client = RankingRunnerClientPool(
+        [endpoint],
+        dispatch_concurrency=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=0.2,
+        unhealthy_cooldown_seconds=5.0,
+    )
+    try:
+        with pytest.raises(RankingRunnerUnavailable, match="auth"):
+            await client.rank_batch(b'{"requests":[]}')
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert endpoint.failed_until > time.monotonic()
+
+
+@pytest.mark.asyncio
+async def test_client_with_wrong_key_is_rejected_without_retry():
+    server, port, handled, recorder = await _start_coordinator_server("required")
+    client = RankingCoordinatorClientPool(
+        "127.0.0.1",
+        port,
+        pool_size=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        auth_settings=_auth_settings("permissive", "wrong-key"),
+    )
+    try:
+        with pytest.raises(RankingRuntimeAuthRejected, match="invalid_mac"):
+            await client.rank(b'{"request_id":"r1"}')
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert handled == []
+    assert recorder.events == [("coordinator", "invalid_mac")]
+
+
+@pytest.mark.asyncio
+async def test_permissive_server_accepts_and_counts_legacy_unauthenticated_client():
+    server, port, handled, recorder = await _start_coordinator_server("permissive")
+    client = RankingCoordinatorClientPool(
+        "127.0.0.1",
+        port,
+        pool_size=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+    )
+    try:
+        first = await client.rank(b'{"request_id":"r1"}')
+        second = await client.rank(b'{"request_id":"r2"}')
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert handled == [RANK_OPERATION, RANK_OPERATION]
+    # Counted once per connection, not per frame.
+    assert recorder.events == [("coordinator", "unauthenticated")]
+
+
+@pytest.mark.asyncio
+async def test_permissive_client_tolerates_legacy_server_rejecting_auth_op():
+    server, port, handled = await _start_legacy_server()
+    client = RankingCoordinatorClientPool(
+        "127.0.0.1",
+        port,
+        pool_size=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        auth_settings=_auth_settings("permissive"),
+    )
+    try:
+        response = await client.rank(b'{"request_id":"r1"}')
+        connection = client._queue.get_nowait()
+        client._queue.put_nowait(connection)
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert response.status_code == 200
+    assert handled == [AUTH_OPERATION, RANK_OPERATION]
+    assert connection.authenticated is False
+
+
+@pytest.mark.asyncio
+async def test_required_client_refuses_legacy_server():
+    server, port, handled = await _start_legacy_server()
+    client = RankingCoordinatorClientPool(
+        "127.0.0.1",
+        port,
+        pool_size=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        auth_settings=_auth_settings("required"),
+    )
+    try:
+        with pytest.raises(RankingRuntimeAuthRejected):
+            await client.rank(b'{"request_id":"r1"}')
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert handled == [AUTH_OPERATION]
+
+
+@pytest.mark.asyncio
+async def test_disabled_server_treats_auth_op_as_unknown():
+    server, port, handled, recorder = await _start_coordinator_server(
+        "disabled", stub=False
+    )
+    try:
+        responses = await _raw_request(
+            port,
+            (AUTH_OPERATION, _auth_settings("required").build_handshake_body()),
+        )
+    finally:
+        await _close_server(server)
+
+    # Disabled auth dispatches A like any frame, so it is an unknown op (400),
+    # which permissive clients already tolerate.
+    assert handled == [AUTH_OPERATION]
+    assert responses[0].status_code == 400
+    assert recorder.events == []
+
+
+@pytest.mark.asyncio
+async def test_runner_pool_authenticates_dispatch_and_health_connections():
+    from video_commerce.services.ranking_runner.main import RankingRunner
+
+    runner = RankingRunner()
+    recorder = _AuthRecorder()
+    runner.authenticator = RankingRuntimeAuthenticator(
+        _auth_settings("required"), role="runner", observability=recorder
+    )
+    handled = []
+
+    async def handle_frame(frame, *, peer=None):
+        handled.append(frame[:1])
+        return encode_response(200, "application/json", b'{"status":"ready"}')
+
+    runner._handle_frame = handle_frame
+    server = await asyncio.start_server(
+        runner._handle_client, host="127.0.0.1", port=0
+    )
+    port = server.sockets[0].getsockname()[1]
+    client = RankingRunnerClientPool(
+        [RankingRunnerEndpoint(host="127.0.0.1", port=port, label="local")],
+        dispatch_concurrency=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=1.0,
+        unhealthy_cooldown_seconds=1.0,
+        auth_settings=_auth_settings("required"),
+    )
+    try:
+        batch = await client.rank_batch(b'{"requests":[]}')
+        health = await client.health_check()
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert batch.status_code == 200
+    assert health["healthy_count"] == 1
+    assert handled == [BATCH_RANK_OPERATION, HEALTH_OPERATION]
+    assert recorder.events == [("runner", "authenticated"), ("runner", "authenticated")]
+
+
+# --- Cancellation safety ---------------------------------------------------
+
+
+async def _start_slow_echo_server():
+    """Echo each frame body; a body of b"slow" is answered after a delay."""
+    stats = {"connections": 0}
+
+    async def handle_client(reader, writer):
+        stats["connections"] += 1
+        try:
+            while True:
+                try:
+                    frame = await read_frame(reader)
+                except Exception:
+                    break
+                body = frame[1:]
+                if body == b"slow":
+                    await asyncio.sleep(0.3)
+                writer.write(encode_response(200, "application/octet-stream", body))
+                await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle_client, host="127.0.0.1", port=0)
+    return server, server.sockets[0].getsockname()[1], stats
+
+
+@pytest.mark.asyncio
+async def test_cancelled_coordinator_request_connection_is_not_reused():
+    server, port, stats = await _start_slow_echo_server()
+    client = RankingCoordinatorClientPool(
+        "127.0.0.1",
+        port,
+        pool_size=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=2.0,
+    )
+    try:
+        slow = asyncio.create_task(client.rank(b"slow"))
+        await asyncio.sleep(0.05)
+        slow.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await slow
+        # Without the fix the next borrower would read the late b"slow" reply.
+        response = await client.rank(b"fast")
+        await asyncio.sleep(0.35)
+        follow_up = await client.rank(b"again")
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert response.body == b"fast"
+    assert follow_up.body == b"again"
+    assert stats["connections"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runner_batch_connection_is_not_reused():
+    server, port, stats = await _start_slow_echo_server()
+    endpoint = RankingRunnerEndpoint(host="127.0.0.1", port=port, label="local")
+    client = RankingRunnerClientPool(
+        [endpoint],
+        dispatch_concurrency=1,
+        runner_max_inflight_batches=1,
+        connect_timeout_seconds=1.0,
+        request_timeout_seconds=2.0,
+        unhealthy_cooldown_seconds=0.1,
+    )
+    try:
+        slow = asyncio.create_task(client.rank_batch(b"slow"))
+        await asyncio.sleep(0.05)
+        slow.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await slow
+        assert endpoint.inflight_batches == 0
+        assert endpoint.connections.qsize() == 1
+        response = await client.rank_batch(b"fast")
+        await asyncio.sleep(0.35)
+        follow_up = await client.rank_batch(b"again")
+    finally:
+        await client.aclose()
+        await _close_server(server)
+
+    assert response.body == b"fast"
+    assert follow_up.body == b"again"
+    assert stats["connections"] == 2
+
+
+def test_pool_release_resets_connection_left_in_flight():
+    endpoint = RankingRunnerEndpoint(host="127.0.0.1", port=1, label="local")
+    client = RankingRunnerClientPool(
+        [endpoint],
+        dispatch_concurrency=1,
+        connect_timeout_seconds=0.1,
+        request_timeout_seconds=0.1,
+    )
+    acquired = client._acquire_endpoint_connection()
+    assert acquired is not None
+    _, connection = acquired
+
+    class _Writer:
+        closed = False
+
+        def is_closing(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+    writer = _Writer()
+    connection.writer = writer
+    connection.in_flight = True
+    client._release_endpoint(endpoint, connection)
+
+    assert writer.closed is True
+    assert connection.writer is None
+    assert connection.reusable is True
+    assert endpoint.connections.qsize() == 1

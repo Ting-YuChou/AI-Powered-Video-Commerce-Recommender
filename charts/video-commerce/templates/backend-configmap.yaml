@@ -184,6 +184,7 @@ data:
   OBJECT_STORAGE_DOWNLOAD_DIR: {{ .Values.appConfig.objectStorageDownloadDir | quote }}
   RANKING_BATCH_MAX_REQUESTS: {{ .Values.appConfig.ranking.batchMaxRequests | quote }}
   RANKING_ALLOW_UNTRAINED_FALLBACK: {{ .Values.appConfig.ranking.allowUntrainedFallback | quote }}
+  RANKING_RUNTIME_AUTH_MODE: {{ .Values.appConfig.ranking.runtimeAuthMode | default "permissive" | quote }}
   RANKING_REQUIRE_VERIFIED_ARTIFACT: {{ .Values.appConfig.ranking.requireVerifiedArtifact | quote }}
   RANKING_TRIMODAL_ENABLED: {{ .Values.appConfig.ranking.trimodalEnabled | quote }}
   RANKING_TRIMODAL_SHADOW: {{ .Values.appConfig.ranking.trimodalShadow | quote }}

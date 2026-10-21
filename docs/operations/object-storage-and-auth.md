@@ -56,3 +56,4 @@
   - `DATABASE_URL_FILE=/run/secrets/database_url`
   - `OBJECT_STORAGE_SECRET_ACCESS_KEY_FILE=/run/secrets/object_storage_secret_key`
 - Production config rejects empty API keys, empty internal service keys, empty Redis passwords, and the default Postgres/MinIO credentials. Leave the direct env var empty when using the matching `*_FILE` variable.
+- `SECURITY_INTERNAL_SERVICE_KEY` also authenticates the ranking coordinator/runner TCP protocol (`RANKING_RUNTIME_AUTH_MODE`, default `permissive`; production rejects `disabled`). See `docs/operations/ranking-runtime-auth.md` for the flip to `required`.

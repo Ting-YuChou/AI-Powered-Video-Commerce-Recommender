@@ -25,6 +25,7 @@ from video_commerce.ranking_runtime.ranking_batcher import (
     RankingQueueFullError,
     RankingQueueTimeoutError,
 )
+from video_commerce.ranking_runtime.ranking_auth import RankingRuntimeAuthSettings
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     RankingCoordinatorClientPool,
     RankingCoordinatorError,
@@ -88,6 +89,7 @@ async def startup_event():
             pool_size=topology.ranking_coordinator_client_pool_size,
             connect_timeout_seconds=topology.ranking_coordinator_connect_timeout_seconds,
             request_timeout_seconds=topology.ranking_coordinator_request_timeout_seconds,
+            auth_settings=RankingRuntimeAuthSettings.from_config(runtime.config),
         )
         logger.info(
             "ranking_service_proxy_worker_started",

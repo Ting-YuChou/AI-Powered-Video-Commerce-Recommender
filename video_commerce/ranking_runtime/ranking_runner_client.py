@@ -9,12 +9,17 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
+from video_commerce.ranking_runtime.ranking_auth import RankingRuntimeAuthSettings
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     HEALTH_OPERATION,
     RankingCoordinatorProtocolError,
     RankingCoordinatorResponse,
+    RankingRuntimeAuthRejected,
+    abort_writer,
+    auth_rejection_detail,
     decode_response,
     encode_request,
+    perform_client_handshake,
     read_frame,
 )
 
@@ -27,6 +32,8 @@ NON_UNHEALTHY_5XX_DETAILS = {
     "ranking_runner_unavailable",
 }
 ENDPOINT_STATES = ("active", "draining", "failed", "overloaded")
+# Health statuses that prove a runner is reachable and no longer draining.
+UNDRAINED_HEALTH_STATUSES = {"ready", "degraded"}
 
 
 class RankingRunnerUnavailable(RuntimeError):
@@ -43,6 +50,10 @@ class RankingRunnerTimeout(RankingRunnerUnavailable):
 
 class RankingRunnerRequestUncertain(RankingRunnerUnavailable):
     """Raised when a sent batch loses its response and must not be replayed."""
+
+
+class RankingRunnerAuthRejected(RankingRunnerUnavailable):
+    """Raised when a runner rejects the connection auth handshake."""
 
 
 @dataclass
@@ -78,12 +89,23 @@ class _RunnerConnection:
         *,
         connect_timeout_seconds: float,
         request_timeout_seconds: float,
+        auth_settings: Optional[RankingRuntimeAuthSettings] = None,
     ) -> None:
         self.endpoint = endpoint
         self.connect_timeout_seconds = connect_timeout_seconds
         self.request_timeout_seconds = request_timeout_seconds
+        self.auth_settings = auth_settings or RankingRuntimeAuthSettings()
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
+        self.authenticated = False
+        # See _CoordinatorConnection.in_flight.
+        self.in_flight = False
+
+    @property
+    def reusable(self) -> bool:
+        return not self.in_flight and (
+            self.writer is None or not self.writer.is_closing()
+        )
 
     async def request(
         self,
@@ -102,6 +124,7 @@ class _RunnerConnection:
         )
         frame_sent = False
         try:
+            self.in_flight = True
             self.writer.write(encode_request(operation, body))
             await asyncio.wait_for(
                 self.writer.drain(),
@@ -112,44 +135,89 @@ class _RunnerConnection:
                 read_frame(self.reader),
                 timeout=request_timeout_seconds,
             )
-            return decode_response(response_frame)
+            response = decode_response(response_frame)
+            self.in_flight = False
         except asyncio.TimeoutError as exc:
-            await self.close()
+            self.close_nowait()
             raise RankingRunnerTimeout(
                 f"ranking runner request timeout: {self.endpoint.label}"
             ) from exc
         except Exception as exc:
-            await self.close()
+            self.close_nowait()
             if frame_sent:
                 raise RankingRunnerRequestUncertain(
                     f"ranking runner response lost after batch send: {self.endpoint.label}"
                 ) from exc
             raise
+        except BaseException:
+            # CancelledError and friends: a late response would otherwise be
+            # read by the next batch on this connection.
+            self.close_nowait()
+            raise
+        rejection = auth_rejection_detail(response)
+        if rejection is not None:
+            # Refused before execution, so the batch is safe to try elsewhere.
+            self.close_nowait()
+            raise RankingRunnerAuthRejected(
+                f"ranking runtime auth rejected by {self.endpoint.label}: {rejection}"
+            )
+        return response
 
     async def _ensure_connected(self) -> None:
         if self.writer is not None and not self.writer.is_closing():
             return
+        self.close_nowait()
         last_error: Optional[BaseException] = None
         for _ in range(2):
             try:
-                self.reader, self.writer = await asyncio.wait_for(
+                reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(self.endpoint.host, self.endpoint.port),
                     timeout=self.connect_timeout_seconds,
                 )
-                return
             except Exception as exc:
                 last_error = exc
+                continue
+            authenticated = False
+            if self.auth_settings.client_sends_handshake:
+                try:
+                    authenticated = await perform_client_handshake(
+                        reader,
+                        writer,
+                        self.auth_settings,
+                        timeout_seconds=self.connect_timeout_seconds,
+                        peer_label=self.endpoint.label,
+                    )
+                except RankingRuntimeAuthRejected as exc:
+                    abort_writer(writer)
+                    raise RankingRunnerAuthRejected(str(exc)) from exc
+                except Exception as exc:
+                    abort_writer(writer)
+                    last_error = exc
+                    continue
+                except BaseException:
+                    abort_writer(writer)
+                    raise
+            self.reader, self.writer = reader, writer
+            self.authenticated = authenticated
+            self.in_flight = False
+            return
         raise RankingRunnerUnavailable(
             f"ranking runner unavailable: {self.endpoint.label}"
         ) from last_error
 
-    async def close(self) -> None:
+    def close_nowait(self) -> None:
         writer = self.writer
         self.reader = None
         self.writer = None
+        self.authenticated = False
+        self.in_flight = False
+        abort_writer(writer)
+
+    async def close(self) -> None:
+        writer = self.writer
+        self.close_nowait()
         if writer is None:
             return
-        writer.close()
         try:
             await writer.wait_closed()
         except Exception:
@@ -193,6 +261,7 @@ class RankingRunnerClientPool:
         endpoint_missing_refreshes: int = 3,
         endpoint_missing_grace_seconds: float = 30.0,
         observability=None,
+        auth_settings: Optional[RankingRuntimeAuthSettings] = None,
     ) -> None:
         if not endpoints:
             raise ValueError("at least one ranking runner endpoint is required")
@@ -210,6 +279,7 @@ class RankingRunnerClientPool:
             0.0, float(endpoint_missing_grace_seconds)
         )
         self.observability = observability
+        self.auth_settings = auth_settings or RankingRuntimeAuthSettings()
         self._semaphore = asyncio.Semaphore(self.dispatch_concurrency)
         self._next_index = 0
         self._closed = False
@@ -233,6 +303,7 @@ class RankingRunnerClientPool:
         endpoint_missing_refreshes: int = 3,
         endpoint_missing_grace_seconds: float = 30.0,
         observability=None,
+        auth_settings: Optional[RankingRuntimeAuthSettings] = None,
     ) -> "RankingRunnerClientPool":
         configured = parse_runner_urls(raw_urls, default_port)
         endpoints: List[RankingRunnerEndpoint] = []
@@ -267,6 +338,7 @@ class RankingRunnerClientPool:
             endpoint_missing_refreshes=endpoint_missing_refreshes,
             endpoint_missing_grace_seconds=endpoint_missing_grace_seconds,
             observability=observability,
+            auth_settings=auth_settings,
         )
 
     @staticmethod
@@ -489,6 +561,8 @@ class RankingRunnerClientPool:
                 self._update_endpoint_capabilities(endpoint, check)
                 health_payload = self._response_payload(check)
                 endpoint_status = str(health_payload.get("status") or "ready")
+                if endpoint_status in UNDRAINED_HEALTH_STATUSES:
+                    self._clear_protocol_drain(endpoint)
                 if endpoint_status == "degraded":
                     degraded += 1
                 else:
@@ -574,6 +648,7 @@ class RankingRunnerClientPool:
                     endpoint,
                     connect_timeout_seconds=self.connect_timeout_seconds,
                     request_timeout_seconds=self.request_timeout_seconds,
+                    auth_settings=self.auth_settings,
                 )
             )
         self._record_endpoint_capacity(endpoint)
@@ -621,11 +696,15 @@ class RankingRunnerClientPool:
         endpoint: RankingRunnerEndpoint,
         connection: _RunnerConnection,
     ) -> None:
+        if not connection.reusable:
+            # An interrupted request leaves an unread response on the stream;
+            # reset so the next borrower opens a clean connection.
+            connection.close_nowait()
         if endpoint.connections is not None:
             try:
                 endpoint.connections.put_nowait(connection)
             except asyncio.QueueFull:
-                asyncio.create_task(connection.close())
+                connection.close_nowait()
         endpoint.inflight_batches = max(0, endpoint.inflight_batches - 1)
         self._record_endpoint_inflight(endpoint)
         self._record_endpoint_capacity(endpoint)
@@ -644,6 +723,19 @@ class RankingRunnerClientPool:
         endpoint.draining = True
         endpoint.drain_reason = "protocol"
         self._record_endpoint_event(endpoint, "draining")
+        self._record_endpoint_capacity(endpoint)
+
+    def _clear_protocol_drain(self, endpoint: RankingRunnerEndpoint) -> None:
+        """Undo a protocol drain once the runner itself reports non-draining.
+
+        Only an explicit health response may clear it: DNS presence alone does
+        not prove the runner was undrained.
+        """
+        if not endpoint.draining or endpoint.drain_reason != "protocol":
+            return
+        endpoint.draining = False
+        endpoint.drain_reason = ""
+        self._record_endpoint_event(endpoint, "undrained")
         self._record_endpoint_capacity(endpoint)
 
     def _mark_slow_timeout(self, endpoint: RankingRunnerEndpoint) -> None:
@@ -702,11 +794,12 @@ class RankingRunnerClientPool:
             endpoint,
             connect_timeout_seconds=self.connect_timeout_seconds,
             request_timeout_seconds=self.request_timeout_seconds,
+            auth_settings=self.auth_settings,
         )
         try:
             return await connection.request(HEALTH_OPERATION)
         finally:
-            await connection.close()
+            connection.close_nowait()
 
     async def _request(
         self,

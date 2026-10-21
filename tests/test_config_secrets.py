@@ -494,3 +494,69 @@ def test_production_config_requires_explicit_pit_staging_limit(monkeypatch, tmp_
     with pytest.raises(ValueError):
         Config()
     reset_config()
+
+
+def _production_secret_env(monkeypatch, tmp_path):
+    internal_key_file = tmp_path / "internal_key.txt"
+    internal_key_file.write_text("internal-key\n", encoding="utf-8")
+    for env_name in ("API_API_KEY", "SECURITY_INTERNAL_SERVICE_KEY", "OBJECT_STORAGE_BACKEND"):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("RANKING_VALUE_CURRENCY", "USD")
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("VECTOR_BOOTSTRAP_MODE", "required")
+    monkeypatch.setenv("MODEL_RELEASE_GATE_MODE", "enforced")
+    monkeypatch.setenv("RETRIEVAL_TRAINING_SOURCE", "pit")
+    monkeypatch.setenv("RETRIEVAL_RELEASE_GATE_MODE", "enforced")
+    monkeypatch.setenv("RECOMMENDATION_ONLINE_RETRAINING_ENABLED", "false")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_READER_MODE", "streaming")
+    monkeypatch.setenv("FEATURE_LAKE_PIT_STAGING_MAX_BYTES", "1073741824")
+    monkeypatch.setenv("MODEL_ARTIFACT_GENERATION_ROOT", str(tmp_path / "generations"))
+    monkeypatch.setenv("SECURITY_AUTH_MODE", "api_key")
+    monkeypatch.setenv("API_API_KEY", "api-key")
+    monkeypatch.setenv("SECURITY_INTERNAL_SERVICE_KEY_FILE", str(internal_key_file))
+    monkeypatch.setenv("REDIS_PASSWORD", "redis-password")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://video_commerce:strong-password@postgres:5432/video_commerce",
+    )
+
+
+def test_ranking_runtime_auth_mode_defaults_to_permissive(monkeypatch):
+    monkeypatch.delenv("RANKING_RUNTIME_AUTH_MODE", raising=False)
+    reset_config()
+    config = Config()
+
+    assert config.ranking_config.runtime_auth_mode == "permissive"
+    reset_config()
+
+
+def test_production_config_rejects_disabled_ranking_runtime_auth(monkeypatch, tmp_path):
+    _production_secret_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("RANKING_RUNTIME_AUTH_MODE", "disabled")
+
+    reset_config()
+    with pytest.raises(ValueError):
+        Config()
+
+    monkeypatch.setenv("RANKING_RUNTIME_AUTH_MODE", "required")
+    reset_config()
+    config = Config()
+    assert config.ranking_config.runtime_auth_mode == "required"
+    reset_config()
+
+
+def test_required_ranking_runtime_auth_needs_internal_key(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("SECURITY_INTERNAL_SERVICE_KEY", raising=False)
+    monkeypatch.delenv("SECURITY_INTERNAL_SERVICE_KEY_FILE", raising=False)
+    monkeypatch.setenv("RANKING_RUNTIME_AUTH_MODE", "required")
+
+    reset_config()
+    with pytest.raises(ValueError):
+        Config()
+
+    monkeypatch.setenv("RANKING_RUNTIME_AUTH_MODE", "strict")
+    reset_config()
+    with pytest.raises(ValueError):
+        Config()
+    reset_config()
