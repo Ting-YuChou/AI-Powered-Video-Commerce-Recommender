@@ -1207,7 +1207,9 @@ async def startup_event():
         )
 
     feature_store = FeatureStore(
-        runtime.config.redis_config, runtime.config.cache_config
+        runtime.config.redis_config,
+        runtime.config.cache_config,
+        observability=runtime.observability,
     )
     feature_store.configure_known_user_snapshot(
         enabled=runtime.config.recommendation_config.known_user_snapshot_enabled,

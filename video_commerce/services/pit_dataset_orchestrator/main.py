@@ -32,6 +32,7 @@ class PitPublicationResult:
     quarantine_count: int
     snapshot_id: str
     manifest_uri: str
+    online_offline_parity_ratio: float | None = None
 
 
 def deterministic_flink_job_id(run_id: str, attempt: int) -> str:
@@ -66,6 +67,7 @@ class FlinkRestPitRunner:
         feature_definition_version: str,
         attribution_window_hours: int,
         allowed_lateness_hours: int,
+        feature_max_age_seconds: int = 604800,
         timeout_seconds: float = 7200,
         poll_seconds: float = 5,
         client: httpx.AsyncClient | None = None,
@@ -85,6 +87,7 @@ class FlinkRestPitRunner:
         self.feature_definition_version = feature_definition_version
         self.attribution_window_hours = int(attribution_window_hours)
         self.allowed_lateness_hours = int(allowed_lateness_hours)
+        self.feature_max_age_seconds = int(feature_max_age_seconds)
         self.timeout_seconds = max(0.001, float(timeout_seconds))
         self.poll_seconds = max(0.01, float(poll_seconds))
         self.client = client
@@ -117,6 +120,8 @@ class FlinkRestPitRunner:
             self.export_uri,
             "--export-attempt",
             str(max(1, int(attempt))),
+            "--feature-max-age-seconds",
+            str(self.feature_max_age_seconds),
         ]
 
     async def inspect(self, job_id: str) -> str | None:
@@ -248,12 +253,14 @@ class IcebergPitPublisher:
         feature_lake: Any,
         export_prefix: str,
         run_loader=load_pinned_iceberg_run,
+        feature_max_age_seconds: int | None = None,
     ) -> None:
         self.storage = storage
         self.manifest_publisher = manifest_publisher
         self.feature_lake = feature_lake
         self.export_prefix = export_prefix.rstrip("/")
         self.run_loader = run_loader
+        self.feature_max_age_seconds = feature_max_age_seconds
 
     async def publish(
         self, *, run_id: str, cutoff_ts: float, attempt: int
@@ -285,12 +292,16 @@ class IcebergPitPublisher:
             candidate_embedding_sidecar=(
                 _candidate_sidecar_reference_from_environment()
             ),
+            feature_max_age_seconds=self.feature_max_age_seconds,
         )
+        manifest = getattr(self.manifest_publisher, "last_manifest", None) or {}
+        parity = manifest.get("online_offline_parity_ratio")
         return PitPublicationResult(
             row_count=row_count,
             quarantine_count=quarantine_count,
             snapshot_id=snapshot_id,
             manifest_uri=(f"{self.export_prefix}/runs/{run_id}/manifest.json"),
+            online_offline_parity_ratio=(None if parity is None else float(parity)),
         )
 
 
@@ -329,6 +340,11 @@ class PitDatasetOrchestrator:
         lease_seconds: int = 7200,
         schedule_hour_utc: int = 2,
         observability: Any = None,
+        catchup_probe: Any = None,
+        catchup_timeout_seconds: float = 1800.0,
+        catchup_poll_seconds: float = 15.0,
+        catchup_max_poll_seconds: float = 300.0,
+        sleep=asyncio.sleep,
     ) -> None:
         self.system_store = system_store
         self.flink_runner = flink_runner
@@ -337,6 +353,44 @@ class PitDatasetOrchestrator:
         self.lease_seconds = max(60, int(lease_seconds))
         self.schedule_hour_utc = int(schedule_hour_utc)
         self.observability = observability
+        self.catchup_probe = catchup_probe
+        self.catchup_timeout_seconds = max(0.0, float(catchup_timeout_seconds))
+        self.catchup_poll_seconds = max(0.001, float(catchup_poll_seconds))
+        self.catchup_max_poll_seconds = max(
+            self.catchup_poll_seconds, float(catchup_max_poll_seconds)
+        )
+        self._sleep = sleep
+
+    async def _wait_for_materializer(
+        self, run_id: str, cutoff_ts: float, renew_lease
+    ) -> list[str]:
+        """Poll materializer catch-up with backoff; return the last blocking reasons."""
+        if self.catchup_probe is None:
+            return []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.catchup_timeout_seconds
+        delay = self.catchup_poll_seconds
+        while True:
+            try:
+                reasons = list(
+                    await self.catchup_probe.reasons(run_id=run_id, cutoff_ts=cutoff_ts)
+                )
+            except (
+                Exception
+            ) as exc:  # fail closed: an unreadable probe is not caught up
+                reasons = [f"catchup_probe_error:{type(exc).__name__}:{exc}"]
+            if not reasons:
+                return []
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "pit_materializer_not_caught_up",
+                    extra={"run_id": run_id, "reasons": reasons},
+                )
+                return reasons
+            await self._sleep(min(delay, remaining))
+            await renew_lease()
+            delay = min(delay * 2, self.catchup_max_poll_seconds)
 
     def _record_status(self, status: str) -> str:
         if self.observability is not None:
@@ -376,11 +430,32 @@ class PitDatasetOrchestrator:
                 remote_status = (
                     await self.flink_runner.inspect(job_id) if job_id else None
                 )
+
+                async def renew_lease() -> None:
+                    await self.system_store.renew_pit_materialization_lease(
+                        run_id,
+                        worker_id=self.worker_id,
+                        lease_seconds=self.lease_seconds,
+                    )
+
                 if (
                     phase == "export"
                     or not job_id
                     or remote_status in self.flink_runner.FAILED_STATUSES
                 ):
+                    # A new PIT job must only read history the materializer has
+                    # durably committed past the cutoff; late rows would silently
+                    # drop positives from an immutable manifest.
+                    blocking = await self._wait_for_materializer(
+                        run_id, cutoff_ts, renew_lease
+                    )
+                    if blocking:
+                        await self.system_store.mark_pit_materialization_waiting_for_materializer(
+                            run_id,
+                            worker_id=self.worker_id,
+                            reason=",".join(blocking),
+                        )
+                        return self._record_status("waiting_for_materializer")
                     job_id = deterministic_flink_job_id(run_id, attempt)
                     publication_attempt = attempt
                     await self.system_store.mark_pit_materialization_phase(
@@ -389,13 +464,6 @@ class PitDatasetOrchestrator:
                         worker_id=self.worker_id,
                         export_attempt=publication_attempt,
                         flink_job_id=job_id,
-                        lease_seconds=self.lease_seconds,
-                    )
-
-                async def renew_lease() -> None:
-                    await self.system_store.renew_pit_materialization_lease(
-                        run_id,
-                        worker_id=self.worker_id,
                         lease_seconds=self.lease_seconds,
                     )
 
@@ -436,6 +504,9 @@ class PitDatasetOrchestrator:
                 row_count=publication.row_count,
                 quarantine_count=publication.quarantine_count,
             )
+            parity = getattr(publication, "online_offline_parity_ratio", None)
+            if self.observability is not None and parity is not None:
+                self.observability.pit_online_offline_parity_ratio.set(float(parity))
             if run_id != requested_run_id:
                 self._record_status("completed")
                 return await self.run_once(scheduled_at)
@@ -466,6 +537,7 @@ async def _run_service(*, once: bool, run_date: str | None) -> None:
     )
     from video_commerce.data_plane.object_storage import ObjectStorage
     from video_commerce.data_plane.system_store import SystemStore
+    from video_commerce.ml.feature_lake_readiness import MaterializerCatchUpProbe
 
     config = Config()
     lake = config.feature_lake_config
@@ -493,18 +565,32 @@ async def _run_service(*, once: bool, run_date: str | None) -> None:
             feature_definition_version=lake.feature_definition_version,
             attribution_window_hours=lake.attribution_window_hours,
             allowed_lateness_hours=lake.allowed_lateness_hours,
+            feature_max_age_seconds=lake.feature_max_age_seconds,
             timeout_seconds=max(60, lake.pit_orchestrator_lease_seconds - 300),
         ),
         publisher=IcebergPitPublisher(
             storage=storage,
-            manifest_publisher=PitManifestPublisher(storage),
+            manifest_publisher=PitManifestPublisher(
+                storage,
+                max_positive_rate_relative_shift=(
+                    lake.pit_max_positive_rate_relative_shift
+                ),
+                positive_rate_min_rows=lake.pit_positive_rate_min_rows,
+            ),
             feature_lake=lake,
             export_prefix=lake.pit_export_uri,
+            feature_max_age_seconds=lake.feature_max_age_seconds,
         ),
         worker_id=worker_id,
         lease_seconds=lake.pit_orchestrator_lease_seconds,
         schedule_hour_utc=lake.pit_schedule_hour_utc,
         observability=observability,
+        catchup_probe=MaterializerCatchUpProbe(
+            flink_rest_url=lake.flink_jobmanager,
+            bootstrap_servers=config.kafka_config.bootstrap_servers,
+        ),
+        catchup_timeout_seconds=lake.pit_materializer_catchup_timeout_seconds,
+        catchup_poll_seconds=lake.pit_materializer_catchup_poll_seconds,
     )
     try:
         selected = _scheduled_datetime(run_date, hour_utc=lake.pit_schedule_hour_utc)

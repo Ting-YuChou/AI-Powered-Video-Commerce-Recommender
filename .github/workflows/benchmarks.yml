@@ -1,0 +1,20 @@
+name: Benchmarks
+
+# Manual only: benchmarks measure resource use and are not pass/fail tests for
+# every PR. Kept out of ci.yml so they do not show as skipped PR checks.
+on:
+  workflow_dispatch:
+
+jobs:
+  pit-memory-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build benchmark image
+        run: docker build --target test -t video-commerce-pit-benchmark:ci .
+      - name: Run bounded-memory 100k/500k comparison
+        run: >-
+          docker run --rm --memory=2g --memory-swap=2g
+          video-commerce-pit-benchmark:ci
+          python scripts/pit_memory_benchmark.py --rows 100000 500000

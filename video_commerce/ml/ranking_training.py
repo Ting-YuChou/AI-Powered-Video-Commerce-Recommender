@@ -13,7 +13,9 @@ from video_commerce.common.models import ContentFeatures
 from video_commerce.ml.ranking_features import FeatureBundle
 
 
-RANKING_LABEL_DEFINITION_VERSION = "ranking_labels_v1"
+# v2: PIT feedback is attributed per impression (context.impression_id) to displayed,
+# deduplicated observations only; must match PointInTimeFeatureJoinJob.
+RANKING_LABEL_DEFINITION_VERSION = "ranking_labels_v2_impression"
 GROSS_REVENUE_LABEL_DEFINITION_VERSION = "ranking_labels_v2_gross_revenue"
 # Graded relevance of an impression that was only viewed (no engagement).
 VIEW_RELEVANCE = 1.0
