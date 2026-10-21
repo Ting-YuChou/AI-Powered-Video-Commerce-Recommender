@@ -1,4 +1,5 @@
 import asyncio
+import enum
 import hashlib
 import json
 import time
@@ -11,7 +12,8 @@ import torch
 from fastapi import HTTPException
 from starlette.responses import Response
 
-from video_commerce.common.config import RankingConfig, RecommendationConfig
+from video_commerce.common.cache_codec import json_dumps
+from video_commerce.common.config import RankingConfig, RecommendationConfig, VectorConfig
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.common.models import (
     CandidateProduct,
@@ -66,6 +68,7 @@ from video_commerce.services.recommendation.api import (
     _user_feature_cache_token,
 )
 from video_commerce.ml.recommender import RecommendationEngine, TwoTowerRetrievalEngine
+from video_commerce.ml.vector_search import VectorSearchEngine
 from video_commerce.ml.slate_diversity import select_mmr_recommendations
 
 
@@ -148,6 +151,77 @@ def test_ranking_request_body_rejects_mapping_key_collisions():
             k=1,
             request_id="request-1",
         )
+
+
+class _StrEnumKey(str, enum.Enum):
+    MEMBER = "enum-value"
+
+
+def test_normalize_json_object_keys_converts_str_subclass_keys():
+    raw = {
+        np.str_("p1"): {_StrEnumKey.MEMBER: "metadata"},
+        "nested": [{np.str_("p2"): 1}],
+    }
+
+    normalized = recommendation_api_module._normalize_json_object_keys(raw)
+
+    assert normalized == {
+        "p1": {"enum-value": "metadata"},
+        "nested": [{"p2": 1}],
+    }
+    assert {type(key) for key in normalized} == {str}
+    assert type(next(iter(normalized["p1"]))) is str
+    assert type(next(iter(normalized["nested"][0]))) is str
+    # orjson rejects str-subclass keys with "Dict key must be str".
+    assert json.loads(json_dumps(normalized)) == normalized
+
+
+def test_ranking_request_body_accepts_random_fallback_candidate_ids():
+    vector_search = VectorSearchEngine(VectorConfig(embedding_dim=2))
+    vector_search.product_index_map = {0: "p1", 1: "p2", 2: "p3"}
+    vector_search.product_metadata = {}
+
+    candidates = vector_search.get_random_products_sync(k=3)
+
+    assert sorted(candidate.product_id for candidate in candidates) == [
+        "p1",
+        "p2",
+        "p3",
+    ]
+    assert all(type(candidate.product_id) is str for candidate in candidates)
+    body = recommendation_api_module._ranking_request_body(
+        candidates=candidates,
+        user_features=UserFeatures(user_id="u1"),
+        context={},
+        product_metadata_map={
+            candidate.product_id: {"title": candidate.product_id}
+            for candidate in candidates
+        },
+        k=3,
+        request_id="random-fallback",
+    )
+    payload = json.loads(body)
+    assert set(payload["product_metadata_map"]) == {"p1", "p2", "p3"}
+    assert sorted(item["product_id"] for item in payload["candidates"]) == [
+        "p1",
+        "p2",
+        "p3",
+    ]
+
+
+def test_ranking_request_body_normalizes_numpy_str_metadata_keys():
+    body = recommendation_api_module._ranking_request_body(
+        candidates=[
+            CandidateProduct(product_id="p1", combined_score=0.5, source="random")
+        ],
+        user_features=UserFeatures(user_id="u1"),
+        context={},
+        product_metadata_map={np.str_("p1"): {"title": "Product 1"}},
+        k=1,
+        request_id="numpy-key",
+    )
+
+    assert json.loads(body)["product_metadata_map"] == {"p1": {"title": "Product 1"}}
 
 
 def test_build_recommendations_constructs_only_top_k_in_business_score_order():

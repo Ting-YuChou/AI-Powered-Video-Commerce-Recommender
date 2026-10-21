@@ -2640,7 +2640,15 @@ def _normalize_json_object_keys(value: Any, *, path: str = "$") -> Any:
     if isinstance(value, Mapping):
         normalized: Dict[str, Any] = {}
         for raw_key, nested_value in value.items():
-            key = raw_key if isinstance(raw_key, str) else str(raw_key)
+            # orjson only accepts exact str keys. Subclasses such as numpy.str_
+            # or (str, Enum) pass isinstance() but are rejected, so take their
+            # underlying str value; str() would give "Cls.MEMBER" for enums.
+            if type(raw_key) is str:
+                key = raw_key
+            elif isinstance(raw_key, str):
+                key = str.__str__(raw_key)
+            else:
+                key = str(raw_key)
             if key in normalized:
                 raise ValueError(f"JSON object key collision at {path}.{key}")
             normalized[key] = _normalize_json_object_keys(

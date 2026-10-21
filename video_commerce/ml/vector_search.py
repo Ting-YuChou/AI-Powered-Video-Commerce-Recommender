@@ -998,13 +998,16 @@ class VectorSearchEngine:
             if not self.product_index_map:
                 return []
             
-            # Select random product IDs
+            # Sample positions rather than the ids themselves: np.random.choice
+            # over a list of str returns numpy.str_, which orjson rejects as a
+            # dict key once the id lands in product_metadata_map.
             product_ids = list(self.product_index_map.values())
-            selected_ids = np.random.choice(
-                product_ids, 
-                size=min(k, len(product_ids)), 
+            selected_positions = np.random.choice(
+                len(product_ids),
+                size=min(k, len(product_ids)),
                 replace=False
             )
+            selected_ids = [product_ids[int(position)] for position in selected_positions]
             
             candidates = []
             for product_id in selected_ids:
