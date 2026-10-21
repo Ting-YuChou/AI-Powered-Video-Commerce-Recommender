@@ -16,27 +16,33 @@ ROOT = Path(__file__).resolve().parents[1]
 # Emitted by exporters or by Prometheus itself, not by this codebase.
 EXTERNAL_METRICS = {"up", "pg_up", "kafka_consumergroup_lag"}
 # Flink built-in job/operator metrics; job-specific operator metrics are checked
-# against the Flink job sources below.
+# against the Flink job sources below. Names were read from flink-runtime and
+# flink-streaming-java at FLINK_VERSION (SchedulerBase.registerJobMetrics,
+# CheckpointStatsTracker, OneInputStreamTask); re-verify them when pom.xml moves.
+FLINK_VERSION = "1.20.1"
 FLINK_BUILTIN_METRICS = {
     "flink_jobmanager_job_uptime",
-    "flink_jobmanager_job_lastCheckpointCompletionTimestamp",
+    "flink_jobmanager_job_numberOfCompletedCheckpoints",
     "flink_taskmanager_job_task_operator_currentInputWatermark",
 }
 FLINK_OPERATOR_PREFIX = "flink_taskmanager_job_task_operator_"
+# Registered by Iceberg's IcebergFilesCommitterMetrics inside the Flink SQL
+# Iceberg sink, as addGroup("IcebergFilesCommitter").addGroup("table", name).
+# Names were read from iceberg-flink-runtime at ICEBERG_VERSION; re-verify them
+# when pom.xml moves.
+ICEBERG_VERSION = "1.11.0"
+ICEBERG_FLINK_METRICS = {
+    FLINK_OPERATOR_PREFIX
+    + "IcebergFilesCommitter_table_elapsedSecondsSinceLastSuccessfulCommit",
+}
 
 # Alerts on metrics nothing emits yet, kept visible instead of silently dead.
-# FeatureLakeIcebergCommitFailure predates Stage B: no Flink job registers an
-# iceberg_commit_failed counter (Iceberg's committer exposes different names).
-KNOWN_UNEMITTED_METRICS = {
-    "flink_taskmanager_job_task_operator_iceberg_commit_failed_total": (
-        "FeatureLakeIcebergCommitFailure"
-    ),
-}
+KNOWN_UNEMITTED_METRICS: dict[str, str] = {}
 
 _PROMQL_WORDS = {
     "sum", "min", "max", "avg", "count", "rate", "increase", "irate", "delta",
-    "histogram_quantile", "clamp_min", "clamp_max", "absent", "time", "and",
-    "or", "unless", "bool", "by", "without", "on", "ignoring", "group_left",
+    "changes", "histogram_quantile", "clamp_min", "clamp_max", "absent", "time",
+    "and", "or", "unless", "bool", "by", "without", "on", "ignoring", "group_left",
     "group_right", "offset",
 }
 _HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
@@ -118,7 +124,7 @@ def test_every_rule_metric_is_emitted():
     for rule in _rules():
         for name in _metric_names(rule["expr"]) - recorded:
             referenced.add(name)
-            if name in EXTERNAL_METRICS or name in FLINK_BUILTIN_METRICS:
+            if name in EXTERNAL_METRICS | FLINK_BUILTIN_METRICS | ICEBERG_FLINK_METRICS:
                 continue
             if name.startswith(FLINK_OPERATOR_PREFIX):
                 operator_metric = name[len(FLINK_OPERATOR_PREFIX):]
@@ -136,6 +142,23 @@ def test_every_rule_metric_is_emitted():
         assert not _flink_operator_metric_defined(
             name[len(FLINK_OPERATOR_PREFIX):], flink_sources
         ), f"{name} is emitted now; drop it from KNOWN_UNEMITTED_METRICS"
+
+
+def test_iceberg_metric_names_match_pinned_iceberg_version():
+    pom = (ROOT / "flink-jobs/interaction-features/pom.xml").read_text()
+    assert f"<iceberg.version>{ICEBERG_VERSION}</iceberg.version>" in pom
+
+
+def test_flink_job_name_selectors_match_job_sources():
+    flink_sources = _flink_sources()
+    for rule in _rules():
+        for job_name in re.findall(r'job_name="([^"]+)"', rule["expr"]):
+            assert f'"{job_name}"' in flink_sources, (rule.get("alert"), job_name)
+
+
+def test_flink_metric_names_match_pinned_flink_version():
+    pom = (ROOT / "flink-jobs/interaction-features/pom.xml").read_text()
+    assert f"<flink.version>{FLINK_VERSION}</flink.version>" in pom
 
 
 def test_alerted_label_values_are_precreated():
