@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Optional, Tuple
+from typing import AsyncIterator, Optional, Tuple
 from urllib.parse import urlparse
 
 from video_commerce.common.config import ObjectStorageConfig
@@ -320,6 +320,88 @@ class ObjectStorage:
                     )
                 )
         return sorted(result, key=lambda item: item.uri)
+
+    async def iter_upload_object_pages(
+        self, prefix_uri: str, *, page_size: int = 1000
+    ) -> AsyncIterator[list[StoredObject]]:
+        """Yield pages of upload objects stored directly under ``prefix_uri``.
+
+        Uploads are flat (``<prefix>/<content_id><suffix>``); nested keys such as
+        ``<prefix>/artifacts/`` and ``<prefix>/content-features/`` hold model and
+        feature artifacts that are not referenced by ``content_jobs`` and must
+        never be treated as orphan uploads. Only one page is held in memory.
+        """
+        page_size = max(1, int(page_size))
+        if self.is_remote and self.is_remote_uri(prefix_uri):
+            bucket, prefix = self._parse_s3_uri(prefix_uri.rstrip("/") + "/_")
+            prefix = prefix.rsplit("/", 1)[0] + "/"
+            token: Optional[str] = None
+            while True:
+                kwargs = {
+                    "Bucket": bucket,
+                    "Prefix": prefix,
+                    "Delimiter": "/",
+                    "MaxKeys": page_size,
+                }
+                if token:
+                    kwargs["ContinuationToken"] = token
+                response = await asyncio.to_thread(
+                    self._client.list_objects_v2, **kwargs
+                )
+                page = []
+                for item in response.get("Contents", []) or []:
+                    key = str(item.get("Key") or "")
+                    modified = item.get("LastModified")
+                    if key and key != prefix:
+                        page.append(
+                            StoredObject(
+                                uri=f"s3://{bucket}/{key}",
+                                size=int(item.get("Size") or 0),
+                                last_modified=float(
+                                    modified.timestamp() if modified else 0.0
+                                ),
+                            )
+                        )
+                if page:
+                    yield page
+                token = response.get("NextContinuationToken")
+                if not response.get("IsTruncated") or not token:
+                    return
+        root = Path(prefix_uri)
+        if not root.is_dir():
+            return
+        iterator = os.scandir(root)
+        try:
+            while True:
+                page = await asyncio.to_thread(
+                    self._next_local_object_page, iterator, page_size
+                )
+                if not page:
+                    return
+                yield page
+        finally:
+            iterator.close()
+
+    @staticmethod
+    def _next_local_object_page(iterator, page_size: int) -> list[StoredObject]:
+        page: list[StoredObject] = []
+        for entry in iterator:
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            page.append(
+                StoredObject(
+                    uri=str(Path(entry.path)),
+                    size=int(stat.st_size),
+                    last_modified=float(stat.st_mtime),
+                )
+            )
+            if len(page) >= page_size:
+                break
+        return page
 
     async def list_storage_uris(
         self, prefix_uri: str, *, suffix: str = ""

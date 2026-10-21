@@ -435,6 +435,31 @@ tests:
               description: "gateway-api readiness has seen recommendation unhealthy for 10 minutes; features that need it are failing or degraded."
               runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#dependencyunhealthy"
 
+  # A materializer table whose committer stops succeeding alerts; a healthy
+  # table and a long-running batch job's committer do not.
+  - interval: 1m
+    input_series:
+      - series: 'flink_taskmanager_job_task_operator_IcebergFilesCommitter_table_elapsedSecondsSinceLastSuccessfulCommit{job="flink",job_name="video-commerce-feature-history-materializer",table="feature_lake.feature_history.interaction_history"}'
+        values: '0+60x30'
+      - series: 'flink_taskmanager_job_task_operator_IcebergFilesCommitter_table_elapsedSecondsSinceLastSuccessfulCommit{job="flink",job_name="video-commerce-feature-history-materializer",table="feature_lake.feature_history.window_feature_history"}'
+        values: '15x30'
+      - series: 'flink_taskmanager_job_task_operator_IcebergFilesCommitter_table_elapsedSecondsSinceLastSuccessfulCommit{job="flink",job_name="video-commerce-pit-feature-join",table="feature_lake.training.ranking_training_pit"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: FeatureLakeIcebergCommitFailure
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: FeatureLakeIcebergCommitFailure
+        exp_alerts:
+          - exp_labels:
+              table: feature_lake.feature_history.interaction_history
+              severity: critical
+            exp_annotations:
+              summary: "Iceberg commits for feature_lake.feature_history.interaction_history have stalled"
+              description: "No Iceberg commit has succeeded for over the 10-minute checkpoint timeout; pause materialization cutover and inspect the Flink checkpoint/commit failure."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#featurelakeicebergcommitfailure"
+
   # Completed checkpoints stop advancing at 10m: the 5m change window is empty
   # from 15m and the alert fires after 5m pending. A restart loop that keeps the
   # job registered looks the same and also fires.

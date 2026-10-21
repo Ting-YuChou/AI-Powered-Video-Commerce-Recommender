@@ -296,3 +296,328 @@ async def test_content_status_prefers_authoritative_postgres_job(monkeypatch):
 
     assert response["status"] == "pending_publish"
     assert response["processed_at"] == 123.0
+
+
+class UploadObservability:
+    def __init__(self):
+        self.uploads = []
+
+    def record_content_upload(self, priority, status):
+        self.uploads.append((priority, status))
+
+
+class UploadStore:
+    """In-memory content_jobs/outbox with the gateway-facing store contract."""
+
+    def __init__(self):
+        self.jobs = {}
+        self.staged = []
+        self.stage_error = None
+        self.lookup_error = None
+        self.published = []
+
+    async def get_content_job_by_idempotency_key(self, *, user_id, idempotency_key):
+        for job in self.jobs.values():
+            if (
+                job["user_id"] == user_id
+                and job["idempotency_key"] == idempotency_key
+            ):
+                return dict(job)
+        return None
+
+    async def get_content_job(self, content_id):
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        job = self.jobs.get(content_id)
+        return dict(job) if job else None
+
+    async def stage_content_task(self, task, **job):
+        self.staged.append((task, job))
+        if self.stage_error is not None:
+            error, commit = self.stage_error
+            if commit:
+                self._commit(task, job)
+            raise error
+        self._commit(task, job)
+        return "inserted"
+
+    def _commit(self, task, job):
+        self.jobs[task.content_id] = {
+            "content_id": task.content_id,
+            "filename": job["filename"],
+            "storage_path": job["storage_path"],
+            "user_id": job["user_id"],
+            "status": "pending_publish",
+            "task_event_id": task.event_id,
+            "idempotency_key": job.get("idempotency_key"),
+            "request_fingerprint": job.get("request_fingerprint"),
+        }
+
+    async def claim_content_task_outbox_event(self, event_id, **_kwargs):
+        return {"event_id": event_id}
+
+    async def mark_content_task_outbox_published(self, event_id, *, worker_id):
+        self.published.append(event_id)
+        for job in self.jobs.values():
+            if job["task_event_id"] == event_id:
+                job["status"] = "queued"
+        return True
+
+    async def mark_content_task_outbox_failed(self, *_args, **_kwargs):
+        return True
+
+
+class UploadObjectStorage:
+    def __init__(self):
+        self.persisted = []
+        self.deleted = []
+
+    def build_object_name(self, *, content_id, suffix):
+        return f"uploads/{content_id}{suffix}"
+
+    async def persist_staged_file(self, local_path, *, object_name, content_type):
+        self.persisted.append(object_name)
+        return f"s3://bucket/{object_name}"
+
+    async def delete_uploaded_object(self, storage_path):
+        self.deleted.append(storage_path)
+
+
+class UploadFeatureStore:
+    def __init__(self):
+        self.statuses = []
+
+    async def update_content_status(self, content_id, status):
+        self.statuses.append((content_id, status))
+
+
+@pytest.fixture
+def upload_env(monkeypatch, tmp_path):
+    config = Config()
+    config.data_config.upload_dir = str(tmp_path)
+    runtime = SimpleNamespace(config=config, observability=UploadObservability())
+    store = UploadStore()
+    storage = UploadObjectStorage()
+    features = UploadFeatureStore()
+    monkeypatch.setattr(gateway_api.app.state, "runtime", runtime, raising=False)
+    monkeypatch.setattr(gateway_api, "system_store", store)
+    monkeypatch.setattr(gateway_api, "object_storage", storage)
+    monkeypatch.setattr(gateway_api, "feature_store", features)
+    monkeypatch.setattr(
+        gateway_api, "kafka_manager", DurableContentKafka(acknowledged=True)
+    )
+
+    async def healthy(_runtime):
+        return None
+
+    monkeypatch.setattr(gateway_api, "_content_upload_dependency_error", healthy)
+    return SimpleNamespace(
+        runtime=runtime, store=store, storage=storage, tmp_path=tmp_path
+    )
+
+
+async def _upload(
+    body, *, key=None, user_id="user-1", filename="clip.mp4", priority="normal"
+):
+    headers = {gateway_api.IDEMPOTENCY_KEY_HEADER: key} if key is not None else {}
+    request = SimpleNamespace(
+        headers=headers, state=SimpleNamespace(request_id="request-1")
+    )
+    file = UploadFile(
+        file=io.BytesIO(body),
+        filename=filename,
+        headers=Headers({"content-type": "video/mp4"}),
+    )
+    return await gateway_api.upload_content(
+        request, file=file, user_id=user_id, priority=priority
+    )
+
+
+def _json(response):
+    import json
+
+    return json.loads(response.body)
+
+
+@pytest.mark.asyncio
+async def test_upload_retry_with_same_idempotency_key_replays_original(upload_env):
+    first = await _upload(b"video-bytes", key="retry-1")
+    second = await _upload(b"video-bytes", key="retry-1")
+
+    assert first["status"] == "queued"
+    assert second["content_id"] == first["content_id"]
+    assert second["idempotent_replay"] is True
+    assert second["status"] == "queued"
+    # The retry neither re-uploads nor re-stages, and its temp file is gone.
+    assert len(upload_env.storage.persisted) == 1
+    assert len(upload_env.store.staged) == 1
+    assert list(upload_env.tmp_path.iterdir()) == []
+    _, job = upload_env.store.staged[0]
+    assert job["idempotency_key"] == "retry-1"
+    import hashlib
+
+    assert job["request_fingerprint"] == gateway_api.upload_request_fingerprint(
+        body_sha256=hashlib.sha256(b"video-bytes").hexdigest(),
+        size_bytes=11,
+        filename="clip.mp4",
+        priority="normal",
+    )
+    assert ("normal", "idempotent_replay") in upload_env.runtime.observability.uploads
+
+
+@pytest.mark.asyncio
+async def test_upload_reusing_key_with_different_bytes_is_409(upload_env):
+    first = await _upload(b"video-bytes", key="retry-1")
+    conflict = await _upload(b"other-bytes", key="retry-1")
+
+    assert conflict.status_code == 409
+    body = _json(conflict)
+    assert body["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert body["content_id"] == first["content_id"]
+    assert len(upload_env.store.staged) == 1
+    assert list(upload_env.tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_upload_key_is_scoped_to_user(upload_env):
+    first = await _upload(b"video-bytes", key="retry-1", user_id="user-1")
+    second = await _upload(b"video-bytes", key="retry-1", user_id="user-2")
+
+    assert second["content_id"] != first["content_id"]
+    assert "idempotent_replay" not in second
+
+
+@pytest.mark.asyncio
+async def test_upload_replay_republishes_pending_job(upload_env):
+    gateway_api.kafka_manager.acknowledged = False
+    first = await _upload(b"video-bytes", key="retry-1")
+    assert first.status_code == 503
+    assert _json(first)["status"] == "pending_publish"
+
+    gateway_api.kafka_manager.acknowledged = True
+    second = await _upload(b"video-bytes", key="retry-1")
+
+    assert second["content_id"] == _json(first)["content_id"]
+    assert second["status"] == "queued"
+    assert len(upload_env.store.published) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_key_loser_deletes_only_its_own_object(upload_env):
+    from video_commerce.data_plane.system_store import ContentIdempotencyKeyInUse
+
+    winner = await _upload(b"video-bytes", key="race-1")
+    original_lookup = upload_env.store.get_content_job_by_idempotency_key
+    calls = {"count": 0}
+
+    async def miss_then_hit(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None
+        return await original_lookup(**kwargs)
+
+    upload_env.store.get_content_job_by_idempotency_key = miss_then_hit
+    upload_env.store.stage_error = (ContentIdempotencyKeyInUse("race-1"), False)
+
+    loser = await _upload(b"video-bytes", key="race-1")
+
+    assert loser["content_id"] == winner["content_id"]
+    assert loser["idempotent_replay"] is True
+    loser_object = f"s3://bucket/{upload_env.storage.persisted[-1]}"
+    assert upload_env.storage.deleted == [loser_object]
+
+
+@pytest.mark.asyncio
+async def test_unknown_commit_outcome_keeps_object_when_lookup_fails(upload_env):
+    upload_env.store.stage_error = (RuntimeError("connection lost in COMMIT"), False)
+    upload_env.store.lookup_error = RuntimeError("database unavailable")
+
+    with pytest.raises(RuntimeError, match="COMMIT"):
+        await _upload(b"video-bytes")
+
+    assert upload_env.storage.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_commit_outcome_deletes_object_only_when_job_absent(
+    upload_env,
+):
+    upload_env.store.stage_error = (RuntimeError("connection lost in COMMIT"), False)
+
+    with pytest.raises(RuntimeError, match="COMMIT"):
+        await _upload(b"video-bytes")
+
+    assert upload_env.storage.deleted == [
+        f"s3://bucket/{upload_env.storage.persisted[-1]}"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_commit_that_succeeded_despite_error_keeps_object_and_is_pending(
+    upload_env,
+):
+    upload_env.store.stage_error = (RuntimeError("connection lost in COMMIT"), True)
+
+    response = await _upload(b"video-bytes")
+
+    assert response.status_code == 503
+    body = _json(response)
+    assert body["error"]["code"] == "CONTENT_ENQUEUE_PENDING"
+    assert body["content_id"] in upload_env.store.jobs
+    assert upload_env.storage.deleted == []
+
+
+@pytest.mark.parametrize("key", ["", " ", "a" * 129, "bad key", "key/1", "ключ"])
+def test_invalid_idempotency_key_is_rejected(key):
+    with pytest.raises(HTTPException) as exc:
+        gateway_api.parse_idempotency_key(key)
+
+    assert exc.value.status_code == 400
+
+
+def test_valid_idempotency_key_is_accepted():
+    assert gateway_api.parse_idempotency_key(None) is None
+    assert gateway_api.parse_idempotency_key("a" * 128) == "a" * 128
+    assert (
+        gateway_api.parse_idempotency_key("2026-10-20T00:00:00Z.retry_1~x")
+        == "2026-10-20T00:00:00Z.retry_1~x"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", [{"filename": "other.mp4"}, {"priority": "high"}]
+)
+async def test_upload_key_reuse_with_different_metadata_is_409(upload_env, change):
+    await _upload(b"video-bytes", key="retry-1")
+    conflict = await _upload(b"video-bytes", key="retry-1", **change)
+
+    assert conflict.status_code == 409
+    assert _json(conflict)["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_requires_user_scope(upload_env):
+    with pytest.raises(HTTPException) as exc:
+        await _upload(b"video-bytes", key="retry-1", user_id=None)
+
+    assert exc.value.status_code == 400
+    assert upload_env.store.staged == []
+    assert list(upload_env.tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["failed", "failed_missing_object"])
+async def test_upload_replay_of_failed_job_is_not_reported_as_success(
+    upload_env, terminal
+):
+    first = await _upload(b"video-bytes", key="retry-1")
+    upload_env.store.jobs[first["content_id"]]["status"] = terminal
+
+    replay = await _upload(b"video-bytes", key="retry-1")
+
+    assert replay.status_code == 409
+    body = _json(replay)
+    assert body["error"]["code"] == "IDEMPOTENCY_KEY_JOB_FAILED"
+    assert body["status"] == terminal
+    assert body["content_id"] == first["content_id"]
