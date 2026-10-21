@@ -1357,6 +1357,11 @@ async def init_kafka(config: KafkaConfig, observability=None) -> KafkaManager:
     return manager
 
 
+# A dropped producer means the broker was up a moment ago, so poll for it more
+# often than the startup retry does; failed attempts are cheap.
+RECONNECT_MAX_BACKOFF_SECONDS = 5.0
+
+
 class KafkaProducerSupervisor:
     """Start a service's Kafka manager and keep retrying in the background.
 
@@ -1445,7 +1450,9 @@ class KafkaProducerSupervisor:
                     "%s Kafka producer reconnect failed: %s", self.service_name, exc
                 )
                 await asyncio.sleep(delay)
-                delay = min(self.max_backoff_seconds, delay * 2)
+                delay = min(
+                    self.max_backoff_seconds, RECONNECT_MAX_BACKOFF_SECONDS, delay * 2
+                )
         logger.info("%s Kafka producer reconnected", self.service_name)
 
     async def stop(self) -> None:
