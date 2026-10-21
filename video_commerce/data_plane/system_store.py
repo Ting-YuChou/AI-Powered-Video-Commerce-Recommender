@@ -1463,6 +1463,10 @@ def _engine_options(config: DatabaseConfig) -> Dict[str, Any]:
     }
 
 
+class _WarmupRollback(Exception):
+    """Ends a warmup transaction so its probe INSERT is rolled back."""
+
+
 class OutboxWriteRolledBack(RuntimeError):
     """An outbox write failed before COMMIT was sent, so nothing committed.
 
@@ -1917,6 +1921,68 @@ class SystemStore:
                 response_time_ms=round((time.time() - started_at) * 1000, 2),
                 error=str(exc),
             )
+
+    async def warm_hot_path_pool(self, connections: int) -> int:
+        """Open and prime pooled connections for the served-impression write.
+
+        The first outbox write on a new connection pays for connect and auth,
+        and every connection's first INSERT pays for statement compile and
+        prepare plus the backend loading the table's indexes; under the
+        serving budget that can miss. Holding ``connections`` hot-path
+        sessions at once makes the pool open that many distinct connections.
+        Each runs the production INSERT for a throwaway row and rolls back,
+        so nothing is committed or dispatched. Returns the number primed;
+        errors propagate to the caller.
+        """
+        if not self.enabled or self.session_factory is None:
+            return 0
+        target = max(1, int(connections))
+        primed = 0
+        all_primed = asyncio.Event()
+
+        async def prime() -> None:
+            nonlocal primed
+            probe_id = f"pool-warmup-{uuid.uuid4().hex}"
+            try:
+                async with self._hot_path_session() as session:
+                    # A one-row list, as enqueue_recommendation_events sends
+                    # for a lone impression, so the same SQL is prepared.
+                    result = await session.execute(
+                        _RECOMMENDATION_OUTBOX_INSERT,
+                        [
+                            {
+                                "event_id": probe_id,
+                                "impression_id": probe_id,
+                                "payload_hash": "0" * 64,
+                                "payload_json": orjson.dumps(
+                                    {
+                                        "event_id": probe_id,
+                                        "metadata": {"impression_id": probe_id},
+                                    }
+                                ).decode("utf-8"),
+                                "next_attempt_at": _utc_now(),
+                            }
+                        ],
+                    )
+                    result.scalars().all()
+                    primed += 1
+                    if primed == target:
+                        all_primed.set()
+                    # Hold this connection until every session has one;
+                    # releasing early would let the next session reuse it.
+                    await all_primed.wait()
+                    raise _WarmupRollback()
+            except _WarmupRollback:
+                pass
+
+        tasks = [asyncio.ensure_future(prime()) for _ in range(target)]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            self._update_pool_metrics()
+        return primed
 
     async def prune_interaction_events(self) -> int:
         """Delete raw interaction events older than the configured retention window."""
