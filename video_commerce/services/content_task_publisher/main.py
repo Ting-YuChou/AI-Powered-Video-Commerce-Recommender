@@ -122,44 +122,39 @@ class ContentTaskPublisher:
             "deleted_objects": deleted_objects,
         }
 
-    async def run_iteration(self, state: "_LoopState") -> int:
-        """One publisher pass; maintenance runs on its own cadence."""
-        state.stage = "publish"
-        published = await self.publish_once()
+    async def record_outbox_stats(self) -> None:
         if self.observability is not None:
-            state.stage = "outbox_stats"
             self.observability.update_content_task_outbox(
                 **(await self.system_store.get_content_task_outbox_stats())
             )
-        now = time.monotonic()
-        if now - state.last_reaped_at >= float(
-            self.config.content_processing_reaper_interval_seconds
-        ):
-            state.stage = "reaper"
-            await self.reap_expired_processing_runs()
-            state.last_reaped_at = now
-        if now - state.last_reconciled_at >= 300.0:
-            state.stage = "reconcile"
-            counts = await self.reconcile_objects()
-            if self.observability is not None:
-                self.observability.update_content_orphans(**counts)
-            state.last_reconciled_at = now
-        if now - state.last_pruned_at >= 3600.0:
-            state.stage = "prune"
-            await self.system_store.prune_content_task_outbox(
-                retention_days=self.config.content_outbox_retention_days
-            )
-            state.last_pruned_at = now
-        return published
+
+    async def reconcile_and_record(self) -> None:
+        counts = await self.reconcile_objects()
+        if self.observability is not None:
+            self.observability.update_content_orphans(**counts)
+
+    async def prune_outbox(self) -> None:
+        await self.system_store.prune_content_task_outbox(
+            retention_days=self.config.content_outbox_retention_days
+        )
+
+    def maintenance_stages(self) -> list[tuple[str, float, Any]]:
+        """(stage, interval_seconds, action) run independently of publishing."""
+        return [
+            ("outbox_stats", OUTBOX_STATS_INTERVAL_SECONDS, self.record_outbox_stats),
+            (
+                "reaper",
+                float(self.config.content_processing_reaper_interval_seconds),
+                self.reap_expired_processing_runs,
+            ),
+            ("reconcile", RECONCILE_INTERVAL_SECONDS, self.reconcile_and_record),
+            ("prune", PRUNE_INTERVAL_SECONDS, self.prune_outbox),
+        ]
 
 
-class _LoopState:
-    def __init__(self) -> None:
-        self.stage = "publish"
-        self.last_reaped_at = float("-inf")
-        self.last_reconciled_at = float("-inf")
-        self.last_pruned_at = float("-inf")
-        self.consecutive_failures = 0
+OUTBOX_STATS_INTERVAL_SECONDS = 5.0
+RECONCILE_INTERVAL_SECONDS = 300.0
+PRUNE_INTERVAL_SECONDS = 3600.0
 
 
 def failure_backoff_seconds(
@@ -170,6 +165,30 @@ def failure_backoff_seconds(
     return min(float(max_seconds), max(0.05, float(base_seconds)) * (2**exponent))
 
 
+async def _wait_or_stop(stop_event: asyncio.Event, delay: float) -> None:
+    if delay <= 0:
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        pass
+
+
+def _record_stage_failure(
+    observability: Any, stage: str, consecutive_failures: int, delay: float
+) -> None:
+    logger.exception(
+        "content_task_publisher_stage_failed",
+        extra={
+            "stage": stage,
+            "consecutive_failures": consecutive_failures,
+            "backoff_seconds": delay,
+        },
+    )
+    if observability is not None:
+        observability.record_content_task_publisher_error(stage)
+
+
 async def run_publisher_loop(
     publisher: ContentTaskPublisher,
     stop_event: asyncio.Event,
@@ -177,35 +196,105 @@ async def run_publisher_loop(
     poll_seconds: float,
     observability: Any = None,
 ) -> None:
-    """Keep publishing until stopped; one failing iteration never ends the loop."""
-    state = _LoopState()
+    """Publish outbox rows until stopped; a failing pass backs off, never exits.
+
+    Only publishing runs here, so slow or failing maintenance (reaper, S3
+    reconciliation, pruning) can never delay draining the outbox.
+    """
+    consecutive_failures = 0
     while not stop_event.is_set():
         try:
-            published = await publisher.run_iteration(state)
-            state.consecutive_failures = 0
+            published = await publisher.publish_once()
+            consecutive_failures = 0
             delay = 0.0 if published else float(poll_seconds)
         except asyncio.CancelledError:
             raise
         except Exception:
-            state.consecutive_failures += 1
+            consecutive_failures += 1
             delay = failure_backoff_seconds(
-                state.consecutive_failures, base_seconds=poll_seconds
+                consecutive_failures, base_seconds=poll_seconds
             )
-            logger.exception(
-                "content_task_publisher_iteration_failed",
-                extra={
-                    "stage": state.stage,
-                    "consecutive_failures": state.consecutive_failures,
-                    "backoff_seconds": delay,
-                },
+            _record_stage_failure(observability, "publish", consecutive_failures, delay)
+        await _wait_or_stop(stop_event, delay)
+
+
+async def run_periodic_stage(
+    stop_event: asyncio.Event,
+    *,
+    stage: str,
+    interval_seconds: float,
+    action: Any,
+    observability: Any = None,
+) -> None:
+    """Run one maintenance action on its own cadence with its own error guard."""
+    consecutive_failures = 0
+    while not stop_event.is_set():
+        try:
+            await action()
+            consecutive_failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            consecutive_failures += 1
+            _record_stage_failure(
+                observability, stage, consecutive_failures, interval_seconds
             )
-            if observability is not None:
-                observability.record_content_task_publisher_error(state.stage)
-        if delay > 0:
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass
+        await _wait_or_stop(stop_event, float(interval_seconds))
+
+
+async def run_content_task_publisher(
+    publisher: ContentTaskPublisher,
+    stop_event: asyncio.Event,
+    *,
+    poll_seconds: float,
+    observability: Any = None,
+) -> None:
+    """Run publishing and every maintenance stage as independent tasks.
+
+    On stop the publish loop finishes its current pass (so an acknowledged
+    event is marked published) and in-flight maintenance is cancelled; a
+    cancelled reaper or reconcile pass is simply redone by the next process.
+    """
+    publish_task = asyncio.create_task(
+        run_publisher_loop(
+            publisher,
+            stop_event,
+            poll_seconds=poll_seconds,
+            observability=observability,
+        ),
+        name="content-task-publish",
+    )
+    maintenance_tasks = []
+    for stage, interval, action in publisher.maintenance_stages():
+        maintenance_tasks.append(
+            asyncio.create_task(
+                run_periodic_stage(
+                    stop_event,
+                    stage=stage,
+                    interval_seconds=interval,
+                    action=action,
+                    observability=observability,
+                ),
+                name=f"content-task-{stage}",
+            )
+        )
+    stopper = asyncio.create_task(stop_event.wait(), name="content-task-stop")
+    try:
+        await asyncio.wait(
+            [stopper, publish_task, *maintenance_tasks],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        stop_event.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(publish_task), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("content_task_publisher_stop_timeout")
+    finally:
+        for task in (stopper, publish_task, *maintenance_tasks):
+            task.cancel()
+        await asyncio.gather(
+            stopper, publish_task, *maintenance_tasks, return_exceptions=True
+        )
 
 
 async def main() -> None:
@@ -252,7 +341,7 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
     try:
-        await run_publisher_loop(
+        await run_content_task_publisher(
             publisher,
             stop_event,
             poll_seconds=config.service_topology_config.content_outbox_poll_seconds,

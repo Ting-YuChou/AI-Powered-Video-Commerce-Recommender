@@ -130,3 +130,25 @@ def test_handler_retry_backoff_bounds():
     assert backoff(4, base_ms=200, max_ms=10000, jitter=lambda: 1.0) == 1.6
     assert backoff(30, base_ms=200, max_ms=1000, jitter=lambda: 1.0) == 1.0
     assert backoff(3, base_ms=0, max_ms=1000) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_retries_stop_before_max_poll_interval_and_dead_letter(monkeypatch):
+    clock = {"now": 0.0}
+    calls = []
+
+    async def slow_handler(*_args):
+        calls.append(1)
+        clock["now"] += 200.0  # each attempt takes 200s of a 600s poll interval
+        raise RuntimeError("model server timeout")
+
+    client, sleeps = _consumer_with_handler(monkeypatch, slow_handler, retries=5)
+    client.config.consumer_max_poll_interval_ms = 600000
+    monkeypatch.setattr(kafka_client.time, "monotonic", lambda: clock["now"])
+
+    assert await client._process_message_with_retries(_Message()) is True
+
+    # 200 + 200 = 400s used; a third attempt would end past 0.9 * 600s.
+    assert len(calls) == 2
+    assert len(sleeps) == 1
+    assert len(client.dlq_producer.sent) == 1

@@ -728,9 +728,15 @@ async def upload_content(
         _enforce_bearer_user(request, user_id)
     if priority not in {"low", "normal", "high"}:
         raise HTTPException(status_code=400, detail="Invalid priority")
+    # Keys are scoped to the (already bearer-bound) user_id. Without a user an
+    # anonymous key namespace would be shared across callers, so require one.
     idempotency_key = parse_idempotency_key(
         request.headers.get(IDEMPOTENCY_KEY_HEADER)
     )
+    if idempotency_key and not user_id:
+        raise HTTPException(
+            status_code=400, detail="Idempotency-Key requires a user_id"
+        )
     if (
         not kafka_manager
         or not runtime.config.kafka_config.enable
@@ -756,7 +762,14 @@ async def upload_content(
         hasher=hasher,
     )
     request_fingerprint = (
-        f"sha256:{hasher.hexdigest()}:{size_bytes}" if hasher is not None else None
+        upload_request_fingerprint(
+            body_sha256=hasher.hexdigest(),
+            size_bytes=size_bytes,
+            filename=file.filename,
+            priority=priority,
+        )
+        if hasher is not None
+        else None
     )
     lease_seconds = runtime.config.service_topology_config.content_outbox_lease_seconds
     if idempotency_key:
@@ -850,6 +863,26 @@ async def upload_content(
         "status": "queued",
         "message": f"Content uploaded and queued for processing (priority: {priority}).",
     }
+
+
+def upload_request_fingerprint(
+    *, body_sha256: str, size_bytes: int, filename: Optional[str], priority: str
+) -> str:
+    """Identity of an upload request for Idempotency-Key replay comparison."""
+    canonical = json.dumps(
+        {
+            "body_sha256": body_sha256,
+            "filename": filename or "",
+            "priority": priority,
+            "size_bytes": int(size_bytes),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "v1:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+TERMINAL_FAILED_CONTENT_STATUSES = frozenset({"failed", "failed_missing_object"})
 
 
 def parse_idempotency_key(value: Optional[str]) -> Optional[str]:
@@ -960,6 +993,26 @@ async def _idempotent_upload_response(
             },
         )
     status = str(existing.get("status") or "")
+    if status in TERMINAL_FAILED_CONTENT_STATUSES:
+        # Replaying a terminal failure as 200 would hide it forever; the client
+        # must re-upload under a new key.
+        runtime.observability.record_content_upload(priority, "idempotency_failed")
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "IDEMPOTENCY_KEY_JOB_FAILED",
+                    "message": (
+                        "The upload for this Idempotency-Key failed; retry with a "
+                        "new Idempotency-Key"
+                    ),
+                    "request_id": request.state.request_id,
+                    "retryable": False,
+                },
+                "content_id": content_id,
+                "status": status,
+            },
+        )
     if status == "pending_publish" and existing.get("task_event_id"):
         published = await _publish_staged_content_task(
             system_store=system_store,

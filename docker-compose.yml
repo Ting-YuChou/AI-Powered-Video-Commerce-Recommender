@@ -1036,6 +1036,7 @@ services:
       - |
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic user-interactions --partitions 6 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic video-processing-tasks --partitions 12 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --alter --topic video-processing-tasks --partitions 12 2>/dev/null || true
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic recommendation-events --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-updates --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-history-snapshots --partitions 3 --replication-factor 1

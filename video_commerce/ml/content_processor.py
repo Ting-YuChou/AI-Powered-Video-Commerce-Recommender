@@ -1205,11 +1205,13 @@ class ContentProcessor:
         keyframes = []
         video_info = {}
 
+        if not os.path.exists(video_path):
+            # Not a decode problem: let the caller retry or classify it.
+            raise FileNotFoundError(f"Video file does not exist: {video_path}")
+        cap = cv2.VideoCapture(video_path)
         try:
-            cap = cv2.VideoCapture(video_path)
-
             if not cap.isOpened():
-                raise ValueError(f"Could not open video file: {video_path}")
+                raise InvalidVideoError(f"Could not open video file: {video_path}")
 
             # Get video properties
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1249,14 +1251,13 @@ class ContentProcessor:
                 else:
                     logger.warning(f"Could not read frame {frame_idx}")
 
-            cap.release()
-
             logger.info(f"Extracted {len(keyframes)} keyframes from video")
             return keyframes, video_info
-
-        except Exception as e:
-            logger.error(f"Error extracting keyframes: {e}")
-            return [], {}
+        except cv2.error as exc:
+            # OpenCV decode/convert failures mean the media is unusable.
+            raise InvalidVideoError(f"OpenCV could not decode video: {exc}") from exc
+        finally:
+            cap.release()
 
     async def _extract_visual_features(
         self, keyframes: List[np.ndarray]

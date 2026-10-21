@@ -44,18 +44,30 @@ unique index on `(COALESCE(user_id, ''), idempotency_key)`, an index on
 `auto_create_schema` applies the same statements idempotently at startup.
 
 - **Upload retries.** Clients may send `Idempotency-Key` (1-128 characters of
-  `A-Z a-z 0-9 _ . : ~ -`) on `POST /api/content/upload`. The gateway hashes
-  the body while streaming it and stores `sha256:<hex>:<size>`. A retry with the
-  same key and bytes returns the original `content_id` and current status with
-  `idempotent_replay: true` (a `pending_publish` job is re-published inline); the
-  same key with different bytes returns `409 IDEMPOTENCY_KEY_REUSED`. Keys are
-  scoped to the `user_id` query parameter.
+  `A-Z a-z 0-9 _ . : ~ -`) on `POST /api/content/upload`; a key requires a
+  `user_id`. The gateway hashes the body while streaming it and stores a `v1:`
+  fingerprint over the body SHA-256, size, filename, and priority.
+  - Same key and same request: the original `content_id` and current status
+    with `idempotent_replay: true` (a `pending_publish` job is re-published
+    inline).
+  - Same key, different request: `409 IDEMPOTENCY_KEY_REUSED`.
+  - Same key after the job terminally failed: `409 IDEMPOTENCY_KEY_JOB_FAILED`;
+    re-upload with a new key.
+  - Scope is `(user_id, key)`. With bearer auth `user_id` is bound to the token
+    subject, so keys are per authenticated user. In `disabled` or `api_key`
+    mode `user_id` is supplied by the trusted caller (the BFF), and two callers
+    that send the same `user_id` share one key namespace.
 - **Unknown staging outcome.** If staging the job raises (for example the
   connection drops during COMMIT), the gateway looks the job up before touching
   the object: it deletes the object only when the job is definitely absent, keeps
   it and returns `CONTENT_ENQUEUE_PENDING` when the job exists, and keeps it when
   the lookup also fails. The orphan reconciler removes unreferenced objects after
   `SERVICE_CONTENT_ORPHAN_GRACE_SECONDS`.
+- **Publisher tasks.** Publishing runs in its own loop. Outbox stats (5 s),
+  the reaper, orphan reconciliation (5 min), and pruning (1 h) each run as a
+  separate task with their own error guard, so a slow S3 listing or a failing
+  maintenance query never delays publishing. Failures are counted in
+  `video_commerce_content_task_publisher_errors_total{stage}`.
 - **Orphan reconciliation.** The publisher lists upload objects one page at a
   time (`SERVICE_CONTENT_RECONCILE_PAGE_SIZE`, default 1000) and checks each page
   against `content_jobs.storage_path` with one batched `IN` query. Only objects
@@ -66,7 +78,9 @@ unique index on `(COALESCE(user_id, ''), idempotency_key)`, an index on
   `SERVICE_CONTENT_PROCESSING_REAPER_INTERVAL_SECONDS`, default 15) finds
   `processing` runs whose lease expired more than
   `SERVICE_CONTENT_PROCESSING_REDRIVE_GRACE_SECONDS` (default 60) ago, using the
-  database clock, and resets their existing outbox row so the same event ID is
+  database clock (every lease timestamp is written with the database clock too,
+  so app/DB skew cannot expire a live lease), and resets their existing outbox
+  row so the same event ID is
   republished; the next worker takes over the expired lease. After
   `SERVICE_CONTENT_PROCESSING_MAX_REDRIVES` (default 3) the run, job, and outbox
   row become terminal `failed` with `processing_attempts_exhausted`. Watch
@@ -76,7 +90,13 @@ unique index on `(COALESCE(user_id, ''), idempotency_key)`, an index on
   with equal jitter (`KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS` base, capped at
   `KAFKA_CONSUMER_HANDLER_RETRY_MAX_BACKOFF_MS`). A `NonRetryableProcessingError`
   (pipeline version mismatch, missing source object, undecodable video) goes to
-  the DLQ without retries.
+  the DLQ without retries. A local source file that is not visible yet, I/O
+  errors, and model failures stay retryable. All attempts of one message stop
+  before 90% of `KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS` and the message is
+  dead-lettered, so retries never trigger a consumer rebalance.
+- **Lease renewal.** A failed renewal is retried while the current lease is
+  still valid; the worker reports `lease_lost` only when the lease was taken or
+  is about to expire.
 - **Modalities.** A CLIP failure fails the attempt (retryable) instead of
   storing a zero vector as completed. OCR and object-detection failures are
   recorded in `ContentFeatures.modality_status` (`failed`/`degraded`) and the
@@ -87,9 +107,11 @@ unique index on `(COALESCE(user_id, ''), idempotency_key)`, an index on
   materialized from S3 are removed.
 
 `video-processing-tasks` defaults to 12 partitions in Compose and Helm so up to
-12 content workers can consume in parallel. `kafka-topics --create
---if-not-exists` does not change an existing topic; increase it once, during a
-quiet period (partition count cannot be decreased, and keys are re-hashed):
+12 content workers can consume in parallel. The Compose `kafka-init` service and
+the Helm topic init job (`alterPartitions: true`) also run `kafka-topics --alter`
+for this topic, which grows an existing 3-partition topic and is a no-op
+otherwise. Keys are re-hashed after a partition increase, and partitions can
+never be decreased. To do it by hand, during a quiet period:
 
 ```bash
 kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --alter \

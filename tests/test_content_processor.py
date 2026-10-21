@@ -1069,3 +1069,47 @@ def test_embedding_has_signal_detects_zero_and_non_finite_vectors():
     assert not embedding_has_signal([0.0, 0.0])
     assert not embedding_has_signal([])
     assert not embedding_has_signal([float("nan"), 1.0])
+
+
+def test_opencv_missing_file_is_not_classified_as_invalid_video(tmp_path):
+    processor = _processor()
+
+    with pytest.raises(FileNotFoundError):
+        processor._extract_keyframes_opencv_sync(str(tmp_path / "missing.mp4"))
+
+
+def test_opencv_undecodable_file_is_invalid_video(tmp_path):
+    from video_commerce.ml.content_processor import InvalidVideoError
+
+    garbage = tmp_path / "garbage.mp4"
+    garbage.write_bytes(b"this is not a video container")
+    processor = _processor()
+
+    with pytest.raises(InvalidVideoError):
+        processor._extract_keyframes_opencv_sync(str(garbage))
+
+
+def test_opencv_io_errors_stay_retryable(monkeypatch, tmp_path):
+    from video_commerce.ml import content_processor as module
+    from video_commerce.ml.content_processor import InvalidVideoError
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+
+    class Capture:
+        def isOpened(self):
+            return True
+
+        def get(self, _prop):
+            raise MemoryError("cannot allocate frame buffer")
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(module.cv2, "VideoCapture", lambda _path: Capture())
+    processor = _processor()
+
+    with pytest.raises(MemoryError) as exc:
+        processor._extract_keyframes_opencv_sync(str(source))
+
+    assert not isinstance(exc.value, InvalidVideoError)

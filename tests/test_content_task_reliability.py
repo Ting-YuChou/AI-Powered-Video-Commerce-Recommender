@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -559,7 +560,7 @@ def test_reaper_passes_policy_to_store_and_counts_outcomes():
     assert observability.redrives == [("redriven", 2), ("exhausted", 1)]
 
 
-def test_publisher_loop_survives_failing_iterations_with_backoff(monkeypatch):
+def test_publisher_loop_survives_failing_publishes_with_backoff(monkeypatch):
     from video_commerce.services.content_task_publisher import main as publisher_main
 
     class FlakyStore(FakeStore):
@@ -567,7 +568,6 @@ def test_publisher_loop_survives_failing_iterations_with_backoff(monkeypatch):
             super().__init__([])
             self.stop_event = stop_event
             self.claims = 0
-            self.reaps = 0
 
         async def claim_content_task_outbox(self, **_kwargs):
             self.claims += 1
@@ -576,16 +576,6 @@ def test_publisher_loop_survives_failing_iterations_with_backoff(monkeypatch):
             if self.claims >= 4:
                 self.stop_event.set()
             return []
-
-        async def get_content_task_outbox_stats(self):
-            return {"pending": 0, "oldest_age_seconds": 0.0}
-
-        async def redrive_expired_content_processing_runs(self, **_kwargs):
-            self.reaps += 1
-            return {"redriven": 0, "exhausted": 0, "superseded": 0}
-
-        async def prune_content_task_outbox(self, **_kwargs):
-            return 0
 
     delays = []
 
@@ -600,14 +590,12 @@ def test_publisher_loop_survives_failing_iterations_with_backoff(monkeypatch):
             worker_id="publisher-1",
             observability=observability,
         )
-        original_wait_for = asyncio.wait_for
 
-        async def recording_wait_for(awaitable, timeout):
-            delays.append(timeout)
-            return await original_wait_for(awaitable, timeout=0)
+        async def record_wait(_stop_event, delay):
+            delays.append(delay)
 
-        monkeypatch.setattr(publisher_main.asyncio, "wait_for", recording_wait_for)
-        await original_wait_for(
+        monkeypatch.setattr(publisher_main, "_wait_or_stop", record_wait)
+        await asyncio.wait_for(
             publisher_main.run_publisher_loop(
                 publisher, stop_event, poll_seconds=0.25, observability=observability
             ),
@@ -621,8 +609,70 @@ def test_publisher_loop_survives_failing_iterations_with_backoff(monkeypatch):
     assert observability.errors == ["publish", "publish"]
     # Failures back off exponentially from the poll interval, then reset.
     assert delays[:3] == [0.25, 0.5, 0.25]
-    # Maintenance ran once the loop recovered.
-    assert store.reaps == 1
+
+
+def test_failing_or_slow_maintenance_never_delays_publishing():
+    from video_commerce.services.content_task_publisher import main as publisher_main
+
+    class MaintenanceStore(FakeStore):
+        def __init__(self):
+            super().__init__([])
+            self.claims = 0
+            self.reaps = 0
+            self.prunes = 0
+
+        async def claim_content_task_outbox(self, **_kwargs):
+            self.claims += 1
+            return []
+
+        async def get_content_task_outbox_stats(self):
+            raise RuntimeError("stats query failed")
+
+        async def redrive_expired_content_processing_runs(self, **_kwargs):
+            self.reaps += 1
+            raise RuntimeError("reaper deadlock")
+
+        async def prune_content_task_outbox(self, **_kwargs):
+            self.prunes += 1
+            return 0
+
+    class SlowStorage:
+        async def iter_upload_object_pages(self, _prefix, *, page_size):
+            await asyncio.sleep(3600)
+            yield []
+
+    async def exercise():
+        stop_event = asyncio.Event()
+        store = MaintenanceStore()
+        observability = RecordingObservability()
+        publisher = ContentTaskPublisher(
+            system_store=store,
+            kafka_manager=FakeKafka(),
+            object_storage=SlowStorage(),
+            upload_prefix="s3://bucket/uploads",
+            config=_reaper_config(content_processing_reaper_interval_seconds=0.01),
+            worker_id="publisher-1",
+            observability=observability,
+        )
+        runner = asyncio.create_task(
+            publisher_main.run_content_task_publisher(
+                publisher, stop_event, poll_seconds=0.01, observability=observability
+            )
+        )
+        await asyncio.sleep(0.3)
+        stop_event.set()
+        await asyncio.wait_for(runner, timeout=5)
+        return store, observability
+
+    store, observability = asyncio.run(exercise())
+
+    # Publishing kept polling every 10ms while reconcile hung on S3 and the
+    # reaper and stats stages failed on every pass.
+    assert store.claims >= 10
+    assert store.reaps >= 3
+    assert store.prunes == 1
+    assert "publish" not in observability.errors
+    assert {"reaper", "outbox_stats"} <= set(observability.errors)
 
 
 def test_failure_backoff_is_exponential_and_capped():
@@ -901,6 +951,66 @@ def test_upload_idempotency_key_is_unique_per_user_in_postgres():
             await _cleanup_content(
                 store, [first_id, second_id, other_user_id, *anon_ids]
             )
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_reaper_ignores_renewing_run_and_uses_database_clock(monkeypatch):
+    from video_commerce.data_plane import system_store as system_store_module
+
+    store = _postgres_store()
+
+    async def exercise() -> None:
+        content_id = f"content-clock-{uuid.uuid4().hex}"
+        await store.initialize()
+        try:
+            task = await _stage_published_task(store, content_id)
+            # The application clock runs an hour behind the database: leases
+            # must still be written with the database clock.
+            monkeypatch.setattr(
+                system_store_module,
+                "_utc_now",
+                lambda: datetime.now(timezone.utc) - timedelta(hours=1),
+            )
+            claim = await store.claim_content_processing_run(
+                content_id=content_id,
+                pipeline_version="pipeline-v1",
+                task_event_id=task.event_id,
+                worker_id="worker-1",
+                lease_seconds=60,
+            )
+            assert claim["outcome"] == "acquired"
+            assert await store.renew_content_processing_lease(
+                content_id=content_id,
+                pipeline_version="pipeline-v1",
+                worker_id="worker-1",
+                lease_seconds=60,
+            )
+            assert await store.assert_content_processing_lease(
+                content_id=content_id,
+                pipeline_version="pipeline-v1",
+                worker_id="worker-1",
+            )
+            assert await store.redrive_expired_content_processing_runs(
+                grace_seconds=0, max_redrives=3
+            ) == {"redriven": 0, "exhausted": 0, "superseded": 0}
+            async with store.session_factory() as session:
+                run = await session.get(
+                    ContentProcessingRun, (content_id, "pipeline-v1")
+                )
+            assert run.lease_expires_at > datetime.now(timezone.utc)
+            assert await store.complete_content_processing_run(
+                content_id=content_id,
+                pipeline_version="pipeline-v1",
+                worker_id="worker-1",
+                features={"content_id": content_id, "visual_embedding": [0.1]},
+                schema_version="temporal_multimodal_v2",
+                artifact_uri=None,
+                artifact_sha256=None,
+            )
+        finally:
+            await _cleanup_content(store, [content_id])
             await store.close()
 
     asyncio.run(exercise())

@@ -222,15 +222,34 @@ async def test_pipeline_version_mismatch_is_non_retryable(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_missing_source_is_non_retryable(monkeypatch, tmp_path):
+async def test_missing_local_source_is_retryable(monkeypatch, tmp_path):
+    # A shared-volume file that is not visible yet gets the bounded consumer
+    # retries before the DLQ, rather than going straight to the DLQ.
     worker, _ = _worker(monkeypatch, processor=Processor())
 
-    with pytest.raises(NonRetryableProcessingError) as exc:
+    with pytest.raises(FileNotFoundError) as exc:
         await worker._handle_video_task(
             "video-processing-tasks", "c", _task(tmp_path / "missing.mp4"), None
         )
 
-    assert isinstance(exc.value, FileNotFoundError)
+    assert not isinstance(exc.value, NonRetryableProcessingError)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_file_not_found_stays_retryable(monkeypatch, tmp_path):
+    upload = tmp_path / "upload.mp4"
+    upload.write_bytes(b"video")
+    worker, _ = _worker(
+        monkeypatch,
+        processor=Processor(error=FileNotFoundError("/models/clip/weights.bin")),
+    )
+
+    with pytest.raises(FileNotFoundError) as exc:
+        await worker._handle_video_task(
+            "video-processing-tasks", "c", _task(upload), None
+        )
+
+    assert not isinstance(exc.value, NonRetryableProcessingError)
 
 
 @pytest.mark.asyncio
@@ -328,3 +347,124 @@ async def test_real_embedding_reports_visual_and_modalities(monkeypatch, tmp_pat
     assert worker.observability.named("record_content_modality_status") == [
         ("clip", "completed")
     ]
+
+
+class _RenewStore:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    async def renew_content_processing_lease(self, **_kwargs):
+        self.calls += 1
+        outcome = self.outcomes.pop(0) if self.outcomes else True
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+async def _run_renewal(monkeypatch, worker, *, lease_seconds, max_sleeps):
+    import asyncio
+
+    clock = {"now": 1000.0}
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+        if len(sleeps) > max_sleeps:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(video_processor.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(video_processor.time, "monotonic", lambda: clock["now"])
+    lease_lost = asyncio.Event()
+    try:
+        await worker._renew_processing_lease(
+            content_id="content-1",
+            pipeline_version="pipeline-v1",
+            lease_seconds=lease_seconds,
+            lease_lost=lease_lost,
+        )
+    except asyncio.CancelledError:
+        pass
+    return lease_lost, sleeps
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_survives_transient_errors(monkeypatch):
+    worker, _ = _worker(monkeypatch, processor=Processor())
+    worker.system_store = _RenewStore(
+        [RuntimeError("db blip"), RuntimeError("db blip"), True, True]
+    )
+
+    lease_lost, sleeps = await _run_renewal(
+        monkeypatch, worker, lease_seconds=300, max_sleeps=4
+    )
+
+    assert not lease_lost.is_set()
+    assert worker.system_store.calls == 4
+    # Errors retry quickly (2s, 4s) instead of waiting a full interval.
+    assert sleeps[:3] == [100.0, 2.0, 4.0]
+    assert ("lease_renew_error",) in worker.observability.named(
+        "record_content_processing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_reports_lost_before_the_lease_expires(monkeypatch):
+    worker, _ = _worker(monkeypatch, processor=Processor())
+    worker.system_store = _RenewStore([RuntimeError("db down")] * 100)
+
+    lease_lost, sleeps = await _run_renewal(
+        monkeypatch, worker, lease_seconds=60, max_sleeps=100
+    )
+
+    assert lease_lost.is_set()
+    # Gave up while the last renewed lease (60s) was still valid.
+    assert sum(sleeps) < 60
+    assert ("lease_lost",) in worker.observability.named(
+        "record_content_processing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_marks_lost_when_lease_taken(monkeypatch):
+    worker, _ = _worker(monkeypatch, processor=Processor())
+    worker.system_store = _RenewStore([False])
+
+    lease_lost, _ = await _run_renewal(
+        monkeypatch, worker, lease_seconds=60, max_sleeps=5
+    )
+
+    assert lease_lost.is_set()
+
+
+@pytest.mark.asyncio
+async def test_failed_renewal_task_does_not_mask_processing_outcome(
+    monkeypatch, tmp_path
+):
+    upload = tmp_path / "upload.mp4"
+    upload.write_bytes(b"video")
+
+    class AcquiringStore:
+        async def claim_content_processing_run(self, **_kwargs):
+            return {"outcome": "acquired"}
+
+        async def assert_content_processing_lease(self, **_kwargs):
+            return True
+
+        async def complete_content_processing_run(self, **_kwargs):
+            return True
+
+    worker, kafka = _worker(
+        monkeypatch, processor=Processor(), system_store=AcquiringStore()
+    )
+
+    async def crashing_renewal(**_kwargs):
+        raise RuntimeError("renewal crashed")
+
+    monkeypatch.setattr(worker, "_renew_processing_lease", crashing_renewal)
+
+    await worker._handle_video_task("video-processing-tasks", "c", _task(upload), None)
+
+    assert worker.feature_store.statuses[-1] == "completed"
+    assert kafka.events

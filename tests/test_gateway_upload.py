@@ -416,18 +416,20 @@ def upload_env(monkeypatch, tmp_path):
     )
 
 
-async def _upload(body, *, key=None, user_id="user-1"):
+async def _upload(
+    body, *, key=None, user_id="user-1", filename="clip.mp4", priority="normal"
+):
     headers = {gateway_api.IDEMPOTENCY_KEY_HEADER: key} if key is not None else {}
     request = SimpleNamespace(
         headers=headers, state=SimpleNamespace(request_id="request-1")
     )
     file = UploadFile(
         file=io.BytesIO(body),
-        filename="clip.mp4",
+        filename=filename,
         headers=Headers({"content-type": "video/mp4"}),
     )
     return await gateway_api.upload_content(
-        request, file=file, user_id=user_id, priority="normal"
+        request, file=file, user_id=user_id, priority=priority
     )
 
 
@@ -454,8 +456,11 @@ async def test_upload_retry_with_same_idempotency_key_replays_original(upload_en
     assert job["idempotency_key"] == "retry-1"
     import hashlib
 
-    assert job["request_fingerprint"] == (
-        f"sha256:{hashlib.sha256(b'video-bytes').hexdigest()}:11"
+    assert job["request_fingerprint"] == gateway_api.upload_request_fingerprint(
+        body_sha256=hashlib.sha256(b"video-bytes").hexdigest(),
+        size_bytes=11,
+        filename="clip.mp4",
+        priority="normal",
     )
     assert ("normal", "idempotent_replay") in upload_env.runtime.observability.uploads
 
@@ -577,3 +582,42 @@ def test_valid_idempotency_key_is_accepted():
         gateway_api.parse_idempotency_key("2026-10-20T00:00:00Z.retry_1~x")
         == "2026-10-20T00:00:00Z.retry_1~x"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", [{"filename": "other.mp4"}, {"priority": "high"}]
+)
+async def test_upload_key_reuse_with_different_metadata_is_409(upload_env, change):
+    await _upload(b"video-bytes", key="retry-1")
+    conflict = await _upload(b"video-bytes", key="retry-1", **change)
+
+    assert conflict.status_code == 409
+    assert _json(conflict)["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_requires_user_scope(upload_env):
+    with pytest.raises(HTTPException) as exc:
+        await _upload(b"video-bytes", key="retry-1", user_id=None)
+
+    assert exc.value.status_code == 400
+    assert upload_env.store.staged == []
+    assert list(upload_env.tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["failed", "failed_missing_object"])
+async def test_upload_replay_of_failed_job_is_not_reported_as_success(
+    upload_env, terminal
+):
+    first = await _upload(b"video-bytes", key="retry-1")
+    upload_env.store.jobs[first["content_id"]]["status"] = terminal
+
+    replay = await _upload(b"video-bytes", key="retry-1")
+
+    assert replay.status_code == 409
+    body = _json(replay)
+    assert body["error"]["code"] == "IDEMPOTENCY_KEY_JOB_FAILED"
+    assert body["status"] == terminal
+    assert body["content_id"] == first["content_id"]

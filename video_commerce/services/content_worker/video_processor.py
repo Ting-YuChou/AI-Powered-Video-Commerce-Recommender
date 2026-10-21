@@ -70,9 +70,8 @@ class ContentInvalidVideoError(NonRetryableProcessingError, ValueError):
     """The uploaded source cannot be decoded into frames."""
 
 
-def _is_missing_object_error(exc: BaseException) -> bool:
-    if isinstance(exc, FileNotFoundError):
-        return True
+def _is_missing_remote_object_error(exc: BaseException) -> bool:
+    """True for an S3 404/NoSuchKey; never for local or model-file errors."""
     response = getattr(exc, "response", None) or {}
     if not isinstance(response, dict):
         return False
@@ -85,14 +84,15 @@ def classify_content_failure(exc: BaseException) -> BaseException:
     """Map failures retrying cannot fix onto NonRetryableProcessingError.
 
     The Kafka consumer sends non-retryable failures straight to the DLQ; all
-    other failures (including ContentModalityError) use the bounded retry path.
+    other failures (including ContentModalityError, I/O errors, and a local
+    source file that is not visible yet) use the bounded retry path. A missing
+    S3 object is mapped at the materialize call site, not here, so unrelated
+    FileNotFoundErrors (model weights, temp files) stay retryable.
     """
     if isinstance(exc, NonRetryableProcessingError):
         return exc
     if isinstance(exc, InvalidVideoError):
         return ContentInvalidVideoError(str(exc))
-    if _is_missing_object_error(exc):
-        return ContentSourceMissingError(str(exc))
     return exc
 
 
@@ -106,6 +106,9 @@ class VideoProcessorWorker:
     product vector index: content embeddings are consumed from the durable
     artifacts by recommendation and training.
     """
+
+    # Stop retrying a failed renewal this long before the lease would expire.
+    LEASE_RENEW_SAFETY_SECONDS = 5.0
 
     def __init__(self, config: Config):
         """Initialize the video processor worker."""
@@ -314,17 +317,25 @@ class VideoProcessorWorker:
                 )
 
             if self.object_storage:
-                (
-                    processing_path,
-                    cleanup_processing_path,
-                ) = await self.object_storage.materialize_for_processing(
-                    file_path,
-                    suggested_suffix=Path(filename or file_path).suffix,
-                )
+                try:
+                    (
+                        processing_path,
+                        cleanup_processing_path,
+                    ) = await self.object_storage.materialize_for_processing(
+                        file_path,
+                        suggested_suffix=Path(filename or file_path).suffix,
+                    )
+                except Exception as exc:
+                    if _is_missing_remote_object_error(exc):
+                        raise ContentSourceMissingError(
+                            f"Uploaded object is missing: {file_path}"
+                        ) from exc
+                    raise
 
-            # Check if file exists
+            # A local source that is not visible (yet) is retried a bounded
+            # number of times by the consumer, then dead-lettered.
             if not processing_path or not os.path.exists(processing_path):
-                raise ContentSourceMissingError(
+                raise FileNotFoundError(
                     f"Uploaded file missing before processing: {file_path}"
                 )
 
@@ -501,6 +512,12 @@ class VideoProcessorWorker:
                     await lease_task
                 except asyncio.CancelledError:
                     pass
+                except Exception as renew_error:
+                    # Never let the renewal task replace the processing outcome.
+                    logger.error(
+                        "content_lease_renewal_task_failed",
+                        extra={"content_id": content_id, "error": str(renew_error)},
+                    )
             self.observability.record_worker_message(
                 "content-worker",
                 topic,
@@ -549,19 +566,53 @@ class VideoProcessorWorker:
         lease_seconds: int,
         lease_lost: asyncio.Event,
     ) -> None:
+        """Keep the processing lease alive; signal lease_lost instead of dying.
+
+        A transient renewal error is retried with backoff while the current lease
+        is still valid. The worker gives up (and sets ``lease_lost``) only when
+        the lease was taken, or when the remaining validity is too short to keep
+        retrying, so a database blip never silently lets the lease expire under
+        a live run (which the reaper would then redrive).
+        """
         interval = max(10.0, float(lease_seconds) / 3.0)
+        lease_valid_until = time.monotonic() + float(lease_seconds)
+        delay = interval
+        failures = 0
         while True:
-            await asyncio.sleep(interval)
-            renewed = await self.system_store.renew_content_processing_lease(
-                content_id=content_id,
-                pipeline_version=pipeline_version,
-                worker_id=self.instance_id,
-                lease_seconds=lease_seconds,
-            )
+            await asyncio.sleep(delay)
+            try:
+                renewed = await self.system_store.renew_content_processing_lease(
+                    content_id=content_id,
+                    pipeline_version=pipeline_version,
+                    worker_id=self.instance_id,
+                    lease_seconds=lease_seconds,
+                )
+            except Exception as exc:
+                failures += 1
+                self.observability.record_content_processing("lease_renew_error")
+                remaining = lease_valid_until - time.monotonic()
+                delay = min(interval, float(2 ** min(failures, 5)))
+                logger.warning(
+                    "content_lease_renew_failed",
+                    extra={
+                        "content_id": content_id,
+                        "consecutive_failures": failures,
+                        "lease_remaining_seconds": remaining,
+                        "error": str(exc),
+                    },
+                )
+                if remaining <= delay + self.LEASE_RENEW_SAFETY_SECONDS:
+                    self.observability.record_content_processing("lease_lost")
+                    lease_lost.set()
+                    return
+                continue
             if not renewed:
                 self.observability.record_content_processing("lease_lost")
                 lease_lost.set()
                 return
+            failures = 0
+            delay = interval
+            lease_valid_until = time.monotonic() + float(lease_seconds)
 
     async def _publish_heartbeat(self):
         """Publish worker liveness into Redis for readiness checks."""

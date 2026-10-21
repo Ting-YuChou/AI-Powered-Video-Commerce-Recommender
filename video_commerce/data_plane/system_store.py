@@ -13,6 +13,7 @@ import logging
 import os
 import time
 import uuid
+from types import SimpleNamespace
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -90,6 +91,11 @@ class PreparedContentTask:
     pipeline_version: str
     payload_hash: str
     payload: Dict[str, Any]
+
+
+async def _database_now(session) -> datetime:
+    """Transaction timestamp from Postgres (the clock lease comparisons use)."""
+    return (await session.execute(select(func.now()))).scalar_one()
 
 
 def _content_job_dict(row: "ContentJob") -> Dict[str, Any]:
@@ -3074,9 +3080,11 @@ class SystemStore:
     ) -> Dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("content processing lease requires Postgres")
-        now = _utc_now()
-        lease_until = now + timedelta(seconds=max(30, int(lease_seconds)))
         async with self.session_factory.begin() as session:
+            # Leases use the database clock, the same clock the reaper compares
+            # against, so app/DB clock skew cannot expire a live lease.
+            now = await _database_now(session)
+            lease_until = now + timedelta(seconds=max(30, int(lease_seconds)))
             job = await session.get(ContentJob, content_id, with_for_update=True)
             if job is not None and (
                 (
@@ -3169,7 +3177,6 @@ class SystemStore:
     ) -> bool:
         if not self.enabled:
             return False
-        now = _utc_now()
         result = None
         async with self.session_factory.begin() as session:
             result = await session.execute(
@@ -3179,12 +3186,12 @@ class SystemStore:
                     ContentProcessingRun.pipeline_version == pipeline_version,
                     ContentProcessingRun.status == "processing",
                     ContentProcessingRun.lease_owner == worker_id,
-                    ContentProcessingRun.lease_expires_at >= now,
+                    ContentProcessingRun.lease_expires_at >= func.now(),
                 )
                 .values(
-                    lease_expires_at=now
+                    lease_expires_at=func.now()
                     + timedelta(seconds=max(30, int(lease_seconds))),
-                    updated_at=now,
+                    updated_at=func.now(),
                 )
             )
         return bool(result.rowcount)
@@ -3194,8 +3201,8 @@ class SystemStore:
     ) -> bool:
         if not self.enabled:
             return False
-        now = _utc_now()
         async with self.session_factory() as session:
+            now = await _database_now(session)
             row = await session.get(
                 ContentProcessingRun, (content_id, pipeline_version)
             )
@@ -3265,8 +3272,8 @@ class SystemStore:
         """Atomically activate durable features and complete the owned run."""
         if not self.enabled:
             return False
-        now = _utc_now()
         async with self.session_factory.begin() as session:
+            now = await _database_now(session)
             result = await session.execute(
                 update(ContentProcessingRun)
                 .where(
@@ -3504,35 +3511,86 @@ class SystemStore:
         if not self.enabled:
             return counts
         expired_before = func.now() - timedelta(seconds=max(0, int(grace_seconds)))
-        statement = (
+        expired_run = (
+            ContentProcessingRun.status == "processing",
+            ContentProcessingRun.lease_expires_at.is_not(None),
+            ContentProcessingRun.lease_expires_at < expired_before,
+        )
+        candidates_statement = (
             select(
                 ContentProcessingRun.content_id,
                 ContentProcessingRun.pipeline_version,
-                ContentProcessingRun.task_event_id,
-                ContentProcessingRun.redrive_count,
-                ContentJob.task_event_id.label("job_task_event_id"),
             )
             .join(
                 ContentTaskOutbox,
                 ContentTaskOutbox.event_id == ContentProcessingRun.task_event_id,
             )
-            .join(ContentJob, ContentJob.content_id == ContentProcessingRun.content_id)
             .where(
-                ContentProcessingRun.status == "processing",
-                ContentProcessingRun.lease_expires_at.is_not(None),
-                ContentProcessingRun.lease_expires_at < expired_before,
+                *expired_run,
                 ContentTaskOutbox.terminal_at.is_(None),
                 ContentTaskOutbox.published_at.is_not(None),
                 ContentTaskOutbox.published_at < ContentProcessingRun.lease_expires_at,
             )
             .order_by(ContentProcessingRun.lease_expires_at)
             .limit(max(1, int(batch_size)))
-            .with_for_update(
-                skip_locked=True, of=[ContentProcessingRun, ContentTaskOutbox]
-            )
         )
         async with self.session_factory.begin() as session:
-            rows = (await session.execute(statement)).all()
+            candidates = (await session.execute(candidates_statement)).all()
+            rows = []
+            # Lock in the claim path's order (job, then run, then outbox) and
+            # never wait (SKIP LOCKED), so the reaper cannot deadlock with
+            # claims or publishes; a busy row is simply retried next pass.
+            for candidate in candidates:
+                job = (
+                    await session.execute(
+                        select(ContentJob.task_event_id)
+                        .where(ContentJob.content_id == candidate.content_id)
+                        .with_for_update(skip_locked=True)
+                    )
+                ).one_or_none()
+                if job is None:
+                    continue
+                run = (
+                    await session.execute(
+                        select(
+                            ContentProcessingRun.task_event_id,
+                            ContentProcessingRun.redrive_count,
+                            ContentProcessingRun.lease_expires_at,
+                        )
+                        .where(
+                            ContentProcessingRun.content_id == candidate.content_id,
+                            ContentProcessingRun.pipeline_version
+                            == candidate.pipeline_version,
+                            *expired_run,
+                        )
+                        .with_for_update(skip_locked=True)
+                    )
+                ).one_or_none()
+                if run is None:
+                    continue
+                outbox = (
+                    await session.execute(
+                        select(ContentTaskOutbox.event_id)
+                        .where(
+                            ContentTaskOutbox.event_id == run.task_event_id,
+                            ContentTaskOutbox.terminal_at.is_(None),
+                            ContentTaskOutbox.published_at.is_not(None),
+                            ContentTaskOutbox.published_at < run.lease_expires_at,
+                        )
+                        .with_for_update(skip_locked=True)
+                    )
+                ).one_or_none()
+                if outbox is None:
+                    continue
+                rows.append(
+                    SimpleNamespace(
+                        content_id=candidate.content_id,
+                        pipeline_version=candidate.pipeline_version,
+                        task_event_id=run.task_event_id,
+                        redrive_count=run.redrive_count,
+                        job_task_event_id=job.task_event_id,
+                    )
+                )
             for row in rows:
                 run_filter = (
                     ContentProcessingRun.content_id == row.content_id,
