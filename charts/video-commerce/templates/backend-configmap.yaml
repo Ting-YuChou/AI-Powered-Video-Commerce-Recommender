@@ -75,6 +75,13 @@ data:
   FEATURE_LAKE_FEATURE_DEFINITION_VERSION: {{ .Values.external.featureLake.featureDefinitionVersion | quote }}
   FEATURE_LAKE_ATTRIBUTION_WINDOW_HOURS: {{ .Values.external.featureLake.attributionWindowHours | quote }}
   FEATURE_LAKE_ALLOWED_LATENESS_HOURS: {{ .Values.external.featureLake.allowedLatenessHours | quote }}
+  FEATURE_LAKE_FEATURE_MAX_AGE_SECONDS: {{ .Values.external.featureLake.featureMaxAgeSeconds | quote }}
+  FEATURE_LAKE_PIT_MIN_ONLINE_OFFLINE_PARITY_RATIO: {{ .Values.external.featureLake.pitMinOnlineOfflineParityRatio | quote }}
+  FEATURE_LAKE_PIT_MAX_QUARANTINE_RATIO: {{ .Values.external.featureLake.pitMaxQuarantineRatio | quote }}
+  FEATURE_LAKE_PIT_MAX_POSITIVE_RATE_RELATIVE_SHIFT: {{ .Values.external.featureLake.pitMaxPositiveRateRelativeShift | quote }}
+  FEATURE_LAKE_PIT_POSITIVE_RATE_MIN_ROWS: {{ .Values.external.featureLake.pitPositiveRateMinRows | quote }}
+  FEATURE_LAKE_PIT_MATERIALIZER_CATCHUP_TIMEOUT_SECONDS: {{ .Values.external.featureLake.pitMaterializerCatchupTimeoutSeconds | quote }}
+  FEATURE_LAKE_PIT_MATERIALIZER_CATCHUP_POLL_SECONDS: {{ .Values.external.featureLake.pitMaterializerCatchupPollSeconds | quote }}
   FEATURE_LAKE_CATALOG_OUTBOX_BATCH_SIZE: {{ .Values.external.featureLake.catalogOutboxBatchSize | quote }}
   FEATURE_LAKE_CATALOG_OUTBOX_LEASE_SECONDS: {{ .Values.external.featureLake.catalogOutboxLeaseSeconds | quote }}
   FEATURE_LAKE_CATALOG_OUTBOX_POLL_SECONDS: {{ .Values.external.featureLake.catalogOutboxPollSeconds | quote }}

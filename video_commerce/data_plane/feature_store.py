@@ -79,10 +79,16 @@ class FeatureStore:
         "cluster_pool",
     }
 
-    def __init__(self, redis_config: RedisConfig, cache_config: CacheConfig = None):
+    def __init__(
+        self,
+        redis_config: RedisConfig,
+        cache_config: CacheConfig = None,
+        observability: Any = None,
+    ):
         """Initialize the feature store with Redis configuration."""
         self.redis_config = redis_config
         self.cache_config = cache_config or CacheConfig()
+        self.observability = observability
         self.redis_client: Optional[redis.Redis] = None
         self.cache_redis_client: Optional[redis.Redis] = None
         self.is_connected = False
@@ -499,6 +505,11 @@ class FeatureStore:
                 user_features = self._decode_user_features(user_id, feature_data)
                 self.mark_user_known(user_id)
             else:
+                if token_data or user_id in self._known_user_ids:
+                    # The user has serving state (sequence or snapshot entry) but the
+                    # official uf: key expired or was never written: serving falls
+                    # back to defaults while PIT may still see real features.
+                    self._record_known_user_features_missing()
                 user_features = self._default_user_features(user_id)
                 if cache_default:
                     await self._set_user_features(user_id, user_features)
@@ -528,6 +539,14 @@ class FeatureStore:
                 user_id, limit=sequence_limit
             )
             return user_features, sequence_token
+
+    def _record_known_user_features_missing(self) -> None:
+        if self.observability is None:
+            return
+        try:
+            self.observability.record_known_user_features_missing()
+        except Exception:  # metrics must never fail a serving read
+            logger.debug("known_user_features_missing_metric_failed", exc_info=True)
 
     @staticmethod
     def _default_user_features(user_id: str) -> UserFeatures:

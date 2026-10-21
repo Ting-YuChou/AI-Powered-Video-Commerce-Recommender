@@ -15,7 +15,9 @@ import org.apache.flink.table.functions.ScalarFunction;
 
 /** Batch PIT join, Iceberg snapshot materialization, and immutable Parquet shard export. */
 public final class PointInTimeFeatureJoinJob {
-  static final String LABEL_DEFINITION_VERSION = "ranking_labels_v1";
+  // v2: impression-level attribution over deduplicated displayed observations only.
+  static final String LABEL_DEFINITION_VERSION = "ranking_labels_v2_impression";
+  static final long DEFAULT_FEATURE_MAX_AGE_SECONDS = 604_800L;
   private static final ObjectMapper JSON = new ObjectMapper();
   private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
 
@@ -49,7 +51,8 @@ public final class PointInTimeFeatureJoinJob {
                   config.allowedLatenessHours,
                   config.materializationCutoff,
                   config.runId,
-                  trainingColumns))
+                  trainingColumns,
+                  config.featureMaxAgeSeconds))
           .await();
     }
     if (existingRunCount(
@@ -63,7 +66,8 @@ public final class PointInTimeFeatureJoinJob {
                   config.attributionWindowHours,
                   config.allowedLatenessHours,
                   config.materializationCutoff,
-                  config.runId))
+                  config.runId,
+                  config.featureMaxAgeSeconds))
           .await();
     }
     tables.executeSql(
@@ -84,7 +88,8 @@ public final class PointInTimeFeatureJoinJob {
         "--materialization-cutoff",
         "--namespace",
         "--export-uri",
-        "--export-attempt");
+        "--export-attempt",
+        "--feature-max-age-seconds");
     final String catalog;
     final String catalogUri;
     final String warehouseUri;
@@ -97,6 +102,7 @@ public final class PointInTimeFeatureJoinJob {
     final String runId;
     final String exportPrefix;
     final int exportAttempt;
+    final long featureMaxAgeSeconds;
 
     private JobConfig(
         String catalog,
@@ -110,7 +116,8 @@ public final class PointInTimeFeatureJoinJob {
         double materializationCutoff,
         String runId,
         String exportPrefix,
-        int exportAttempt) {
+        int exportAttempt,
+        long featureMaxAgeSeconds) {
       this.catalog = catalog;
       this.catalogUri = catalogUri;
       this.warehouseUri = warehouseUri;
@@ -123,6 +130,8 @@ public final class PointInTimeFeatureJoinJob {
       this.runId = runId;
       this.exportPrefix = exportPrefix;
       this.exportAttempt = exportAttempt;
+      this.featureMaxAgeSeconds = featureMaxAgeSeconds;
+      validateFeatureMaxAge(featureMaxAgeSeconds);
     }
 
     static JobConfig resolve(String[] args, Map<String, String> environment) {
@@ -154,7 +163,14 @@ public final class PointInTimeFeatureJoinJob {
                   "--export-attempt",
                   environment,
                   "FEATURE_LAKE_EXPORT_ATTEMPT",
-                  "1")));
+                  "1")),
+          Long.parseLong(
+              option(
+                  options,
+                  "--feature-max-age-seconds",
+                  environment,
+                  "FEATURE_LAKE_FEATURE_MAX_AGE_SECONDS",
+                  Long.toString(DEFAULT_FEATURE_MAX_AGE_SECONDS))));
     }
 
     private static String option(
@@ -317,7 +333,52 @@ public final class PointInTimeFeatureJoinJob {
       double materializationCutoff,
       String runId,
       List<String> targetColumns) {
+    return buildPointInTimeInsertSql(
+        namespace,
+        featureDefinitionVersion,
+        attributionWindowHours,
+        allowedLatenessHours,
+        materializationCutoff,
+        runId,
+        targetColumns,
+        DEFAULT_FEATURE_MAX_AGE_SECONDS);
+  }
+
+  static String buildPointInTimeInsertSql(
+      String namespace,
+      String featureDefinitionVersion,
+      int attributionWindowHours,
+      int allowedLatenessHours,
+      double materializationCutoff,
+      String runId,
+      List<String> targetColumns,
+      long featureMaxAgeSeconds) {
+    return String.format(
+        "INSERT INTO `%s`.`ranking_training_pit`\n%s",
+        identifier(namespace),
+        buildPointInTimeSelectSql(
+            namespace,
+            featureDefinitionVersion,
+            attributionWindowHours,
+            allowedLatenessHours,
+            materializationCutoff,
+            runId,
+            targetColumns,
+            featureMaxAgeSeconds));
+  }
+
+  /** The PIT training query without its INSERT target, so tests can execute it directly. */
+  static String buildPointInTimeSelectSql(
+      String namespace,
+      String featureDefinitionVersion,
+      int attributionWindowHours,
+      int allowedLatenessHours,
+      double materializationCutoff,
+      String runId,
+      List<String> targetColumns,
+      long featureMaxAgeSeconds) {
     validateWindows(attributionWindowHours, allowedLatenessHours);
+    validateFeatureMaxAge(featureMaxAgeSeconds);
     String version = literal(featureDefinitionVersion);
     String run = literal(runId);
     String eligible =
@@ -326,14 +387,15 @@ public final class PointInTimeFeatureJoinJob {
             version,
             attributionWindowHours,
             allowedLatenessHours,
-            materializationCutoff);
+            materializationCutoff,
+            featureMaxAgeSeconds);
     String selectList = buildPitSelectList(targetColumns, run, version);
     String dinEligibility =
         "ranking_ltr_v2_din".equals(featureDefinitionVersion)
             ? "AND JSON_VALUE(o.context_json,'$._din_behavior_sequences.contract_version')='din_sequence_v1' "
             : "";
     return String.format(
-        "INSERT INTO `%s`.`ranking_training_pit`\n%s\n"
+        "%s\n"
             + "SELECT %s\n"
             + "FROM eligible_observations o\n"
             + "LEFT JOIN user_ranked u ON u.observation_id=o.observation_id AND u.feature_rank=1\n"
@@ -351,7 +413,7 @@ public final class PointInTimeFeatureJoinJob {
             + "JSON_VALUE(o.canonical_payload_json,'$.item_snapshot_complete')='true' "
             + "OR it.canonical_payload_json IS NOT NULL) "
             + dinEligibility,
-        identifier(namespace), eligible, selectList);
+        eligible, selectList);
   }
 
   private static String buildPitSelectList(
@@ -404,7 +466,47 @@ public final class PointInTimeFeatureJoinJob {
       int allowedLatenessHours,
       double materializationCutoff,
       String runId) {
+    return buildQuarantineInsertSql(
+        namespace,
+        featureDefinitionVersion,
+        attributionWindowHours,
+        allowedLatenessHours,
+        materializationCutoff,
+        runId,
+        DEFAULT_FEATURE_MAX_AGE_SECONDS);
+  }
+
+  static String buildQuarantineInsertSql(
+      String namespace,
+      String featureDefinitionVersion,
+      int attributionWindowHours,
+      int allowedLatenessHours,
+      double materializationCutoff,
+      String runId,
+      long featureMaxAgeSeconds) {
+    return String.format(
+        "INSERT INTO `%s`.`ranking_training_pit_quarantine`\n%s",
+        identifier(namespace),
+        buildQuarantineSelectSql(
+            namespace,
+            featureDefinitionVersion,
+            attributionWindowHours,
+            allowedLatenessHours,
+            materializationCutoff,
+            runId,
+            featureMaxAgeSeconds));
+  }
+
+  static String buildQuarantineSelectSql(
+      String namespace,
+      String featureDefinitionVersion,
+      int attributionWindowHours,
+      int allowedLatenessHours,
+      double materializationCutoff,
+      String runId,
+      long featureMaxAgeSeconds) {
     validateWindows(attributionWindowHours, allowedLatenessHours);
+    validateFeatureMaxAge(featureMaxAgeSeconds);
     String version = literal(featureDefinitionVersion);
     String eligible =
         eligibleCtes(
@@ -412,9 +514,10 @@ public final class PointInTimeFeatureJoinJob {
             version,
             attributionWindowHours,
             allowedLatenessHours,
-            materializationCutoff);
+            materializationCutoff,
+            featureMaxAgeSeconds);
     return String.format(
-        "INSERT INTO `%s`.`ranking_training_pit_quarantine`\n%s\n"
+        "%s\n"
             + "SELECT '%s',o.observation_id,CASE "
             + "WHEN JSON_VALUE(o.canonical_payload_json,'$.impression_id') IS NULL "
             + "THEN 'missing_impression_id' "
@@ -439,7 +542,7 @@ public final class PointInTimeFeatureJoinJob {
             + "u.canonical_payload_json IS NULL OR ("
             + "COALESCE(JSON_VALUE(o.canonical_payload_json,'$.item_snapshot_complete'),'false')<>'true' "
             + "AND it.canonical_payload_json IS NULL)",
-        identifier(namespace), eligible, literal(runId), version);
+        eligible, literal(runId), version);
   }
 
   private static String eligibleCtes(
@@ -447,22 +550,34 @@ public final class PointInTimeFeatureJoinJob {
       String version,
       int attributionHours,
       int latenessHours,
-      double materializationCutoff) {
+      double materializationCutoff,
+      long featureMaxAgeSeconds) {
     String ns = identifier(namespace);
     long attributionSeconds = attributionHours * 3600L;
     long finalizedSeconds = (attributionHours + latenessHours) * 3600L;
     double finalizedCutoff = materializationCutoff - finalizedSeconds;
+    // Only displayed slate items are training observations; ranker-rejected candidates
+    // share the table but were never shown. The table is append-only, so a replayed
+    // recommendation event can repeat an observation_id: keep the first one served.
+    // Feedback is attributed to the impression that carried it (context.impression_id),
+    // never to every earlier exposure of the same user x product. Its lower bound uses
+    // the server-side available_at because client event_time can lag the server; the
+    // same holds for the view that makes an observation eligible.
     return String.format(
         "WITH eligible_observations AS (\n"
-            + " SELECT * FROM `%s`.`ranking_observations` o WHERE o.feature_definition_version='%s' "
-            + "AND o.event_time_epoch <= CAST(%.3f AS DOUBLE)\n"
+            + " SELECT * FROM (SELECT o.*,ROW_NUMBER() OVER (PARTITION BY o.observation_id "
+            + "ORDER BY o.available_at_epoch ASC,o.source_event_id ASC) observation_rank "
+            + "FROM `%s`.`ranking_observations` o WHERE o.feature_definition_version='%s' "
+            + "AND o.event_type='ranking_observation' "
+            + "AND o.event_time_epoch <= CAST(%.3f AS DOUBLE)) ranked WHERE observation_rank=1\n"
             + "),user_ranked AS (\n"
             + " SELECT o.observation_id,u.canonical_payload_json,ROW_NUMBER() OVER ("
             + "PARTITION BY o.observation_id ORDER BY u.event_time_epoch DESC,"
             + "u.available_at_epoch DESC,u.source_event_id DESC) feature_rank "
             + "FROM eligible_observations o LEFT JOIN `%s`.`user_feature_history` u "
             + "ON u.user_id=o.user_id AND u.feature_definition_version='%s' "
-            + "AND u.event_time_epoch<=o.event_time_epoch AND u.available_at_epoch<=o.event_time_epoch\n"
+            + "AND u.event_time_epoch<=o.event_time_epoch AND u.available_at_epoch<=o.event_time_epoch "
+            + "AND u.event_time_epoch>=o.event_time_epoch-%d\n"
             + "),item_ranked AS (\n"
             + " SELECT o.observation_id,i.canonical_payload_json,ROW_NUMBER() OVER ("
             + "PARTITION BY o.observation_id ORDER BY i.event_time_epoch DESC,"
@@ -475,14 +590,16 @@ public final class PointInTimeFeatureJoinJob {
             + "i.available_at_epoch,i.source_event_id FROM eligible_observations o "
             + "LEFT JOIN `%s`.`interaction_history` i "
             + "ON i.user_id=o.user_id AND i.product_id=o.product_id "
-            + "AND i.event_time_epoch>=o.event_time_epoch "
+            + "AND JSON_VALUE(i.context_json,'$.impression_id')="
+            + "JSON_VALUE(o.canonical_payload_json,'$.impression_id') "
+            + "AND i.available_at_epoch>=o.event_time_epoch "
             + "AND i.event_time_epoch<=o.event_time_epoch+%d "
             + "AND i.available_at_epoch<=CAST(%.3f AS DOUBLE)\n"
             + "),viewed_observations AS (\n"
             + " SELECT DISTINCT o.observation_id FROM eligible_observations o "
             + "JOIN `%s`.`recommendation_view_history` v "
             + "ON v.observation_id=o.observation_id "
-            + "AND v.event_time_epoch>=o.event_time_epoch "
+            + "AND v.available_at_epoch>=o.event_time_epoch "
             + "AND v.event_time_epoch<=o.event_time_epoch+%d "
             + "AND v.available_at_epoch<=CAST(%.3f AS DOUBLE)\n"
             + "),feedback_aggregated AS (\n"
@@ -524,6 +641,7 @@ public final class PointInTimeFeatureJoinJob {
         finalizedCutoff,
         ns,
         version,
+        featureMaxAgeSeconds,
         ns,
         version,
         ns,
@@ -572,6 +690,12 @@ public final class PointInTimeFeatureJoinJob {
             + "feature_definition_version,label_definition_version "
             + "FROM `%s`.`ranking_training_pit` WHERE materialization_run_id='%s'",
         identifier(namespace), literal(runId));
+  }
+
+  private static void validateFeatureMaxAge(long featureMaxAgeSeconds) {
+    if (featureMaxAgeSeconds <= 0) {
+      throw new IllegalArgumentException("feature max age must be positive");
+    }
   }
 
   private static void validateWindows(int attributionHours, int latenessHours) {

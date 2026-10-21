@@ -19,7 +19,12 @@ recommendation path performs no Iceberg I/O.
 
 `feature-history-snapshots` is reserved for immutable Flink user/window
 snapshots. The legacy Python/content-worker `feature-updates` topic remains
-operational and is deliberately excluded from history materialization.
+operational and is deliberately excluded from history materialization. Both
+Flink jobs and the readiness checks read the snapshot topic from
+`KAFKA_FEATURE_HISTORY_SNAPSHOTS_TOPIC` (default `feature-history-snapshots`; the
+Flink jobs fall back to `KAFKA_FEATURE_UPDATES_TOPIC`). The materializer refuses
+to start on a topic that does not end in `feature-history-snapshots`, because
+it would otherwise send every record to the DLQ.
 
 Run the one-time Postgres backfill with a fixed immutable range. Reusing the
 same run ID resumes the `(time, id)` cursor. A second active run for the same
@@ -93,9 +98,21 @@ or CF state. The trainer resolves `latest.json` once per training run and fails
 closed on any manifest, shard, sidecar, schema, hash, timestamp, cutoff, or
 feature-definition mismatch.
 
-New Phase 3 manifests must also declare `label_definition_version` as
-`ranking_labels_v1`. Their shards contain finalized attribution facts rather
-than precomputed model targets. The typed reader validates every observation,
+New manifests must also declare `label_definition_version` as
+`ranking_labels_v2_impression`; `ranking_labels_v1` datasets are rejected. Their
+shards contain finalized attribution facts rather than precomputed model
+targets. Only displayed observations (`event_type='ranking_observation'`) are
+eligible; ranker-rejected candidates in the same table are excluded, and
+replayed rows are deduplicated by `observation_id`. Feedback is attributed per
+impression: an interaction counts only when its `context.impression_id` and
+product match the observation, so three exposures and one purchase give one
+positive, and organic interactions without an impression are not attributed.
+The feedback and view lower bound is the server-side `available_at >= as_of`,
+not the client `event_time`. User features older than
+`FEATURE_LAKE_FEATURE_MAX_AGE_SECONDS` (default 7 days, the same as the Flink
+`uf:` TTL `FLINK_USER_FEATURES_TTL_SECONDS`) are not joined; such rows are
+quarantined as `missing_user_feature`. Item snapshots have no max age because
+serving reads catalog metadata without a TTL. The typed reader validates every observation,
 impression, user/item snapshot, candidate score, version, and hash before it
 constructs a `RankingTrainingExample`. Actual purchase value comes only from
 feedback inside the attribution window; missing value remains null and produces
@@ -106,6 +123,19 @@ the current catalog. It executes the same versioned feature assembler used by
 online ranking, then the versioned label builder. A malformed row, unsupported
 feature/label version, non-finalized attribution, or NaN/Inf fails the entire
 PIT training run instead of falling back to legacy data.
+
+Dataset quality gates fail closed as well. The reader rejects a manifest whose
+`online_offline_parity_ratio` is below
+`FEATURE_LAKE_PIT_MIN_ONLINE_OFFLINE_PARITY_RATIO` (default 0.99) or whose
+quarantine share `quarantine_row_count / (row_count + quarantine_row_count)`
+exceeds `FEATURE_LAKE_PIT_MAX_QUARANTINE_RATIO` (default 0.2). The manifest
+publisher records `positive_rate` (share of click-attributed rows) and
+`feature_max_age_seconds`, and refuses to publish when the positive rate moves
+by more than `FEATURE_LAKE_PIT_MAX_POSITIVE_RATE_RELATIVE_SHIFT` (default 0.5,
+relative) against the previous published run, once both runs have
+`FEATURE_LAKE_PIT_POSITIVE_RATE_MIN_ROWS` rows. A genuine shift keeps failing
+until an operator raises the threshold for one run. The orchestrator sets
+`pit_online_offline_parity_ratio` from each published manifest.
 
 ## Streaming PIT reader and staging
 
@@ -138,8 +168,8 @@ docker run --rm --memory=2g --memory-swap=2g \
 
 The command fails when either run reaches 2 GiB peak RSS, 500k rows increase
 peak RSS by more than 25% relative to 100k, or an incomplete staging directory
-remains. The same job is available through the manual `pit-memory-benchmark`
-GitHub Actions check. Record host/container resources and the JSON output
+remains. The same job can be run by hand as `pit-memory-benchmark` in the
+`Benchmarks` GitHub Actions workflow. Record host/container resources and the JSON output
 before treating it as release evidence.
 
 ## Typed PIT shadow training
@@ -188,8 +218,21 @@ docker compose --env-file deploy/compose/pit-production.conf \
   pit-dataset-orchestrator --once --date 2026-07-11
 ```
 
-Waiting runs are terminal for that daily cutoff; the next daily run reevaluates
-newly eligible data. Failed runs are retryable. A run that already reached
+Before it submits a new PIT Flink job, the orchestrator checks that the
+feature-history materializer has caught up past the cutoff: the
+`FEATURE_HISTORY_CONSUMER_GROUP` committed offsets must reach the end offsets
+sampled at the first check, and the materializer must have completed a
+checkpoint after the cutoff. It retries with exponential backoff (from
+`FEATURE_LAKE_PIT_MATERIALIZER_CATCHUP_POLL_SECONDS`, capped at 5 minutes)
+while renewing its lease, for up to
+`FEATURE_LAKE_PIT_MATERIALIZER_CATCHUP_TIMEOUT_SECONDS`. If it is still behind,
+the run is parked as `waiting_for_materializer` (reasons in `last_error`)
+without publishing; the next claim, the same day or a later daily run, resumes
+it before starting a newer cutoff. A reattached running Flink job is not
+rechecked.
+
+Runs `waiting_for_eligible_rows` are terminal for that daily cutoff; the next
+daily run reevaluates newly eligible data. Failed runs are retryable. A run that already reached
 the manifest phase resumes there without appending a second PIT Iceberg run.
 An identical completed manifest may be republished to repair `latest.json`, but
 different content under the same run ID fails closed.

@@ -3721,16 +3721,35 @@ class SystemStore:
         lease_until = now + timedelta(seconds=max(60, int(lease_seconds)))
         async with self.session_factory.begin() as session:
             await session.execute(select(func.pg_advisory_xact_lock(1_947_420_117)))
+            # Resume the oldest unfinished run first: an expired lease, or a run
+            # parked until the feature-history materializer passed its cutoff.
             active_result = await session.execute(
                 select(PitMaterializationRun)
                 .where(
                     PitMaterializationRun.run_id != run_id,
-                    PitMaterializationRun.status == "running",
+                    PitMaterializationRun.status.in_(
+                        ("running", "waiting_for_materializer")
+                    ),
                 )
                 .order_by(PitMaterializationRun.cutoff_at)
                 .with_for_update()
             )
-            active = active_result.scalars().first()
+            active_rows = list(active_result.scalars().all())
+            # At most one row may be running (uq_pit_single_running_materialization),
+            # so a running run always wins; a parked run is only promoted when no
+            # other run, including the requested one, is still marked running.
+            active = next((row for row in active_rows if row.status == "running"), None)
+            if active is None and active_rows:
+                requested_running = await session.scalar(
+                    select(func.count())
+                    .select_from(PitMaterializationRun)
+                    .where(
+                        PitMaterializationRun.run_id == run_id,
+                        PitMaterializationRun.status == "running",
+                    )
+                )
+                if not requested_running:
+                    active = active_rows[0]
             if active is not None:
                 lease_valid = (
                     active.lease_expires_at is not None
@@ -3738,6 +3757,7 @@ class SystemStore:
                 )
                 if lease_valid:
                     return self._pit_materialization_run_dict(active, claimed=False)
+                active.status = "running"
                 active.attempts += 1
                 active.worker_id = worker_id
                 active.lease_expires_at = lease_until
@@ -3913,6 +3933,40 @@ class SystemStore:
             )
             if int(result.rowcount or 0) != 1:
                 raise RuntimeError("PIT materialization waiting update lost its lease")
+
+    async def mark_pit_materialization_waiting_for_materializer(
+        self, run_id: str, *, worker_id: str, reason: str
+    ) -> None:
+        """Release a run whose cutoff the history materializer has not yet passed.
+
+        Unlike ``waiting_for_eligible_rows`` this is not terminal: the next claim
+        (same day or a later daily run) resumes it before starting a newer cutoff.
+        """
+        now = _utc_now()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                update(PitMaterializationRun)
+                .where(
+                    PitMaterializationRun.run_id == run_id,
+                    PitMaterializationRun.status == "running",
+                    PitMaterializationRun.worker_id == worker_id,
+                    PitMaterializationRun.lease_expires_at >= now,
+                )
+                .values(
+                    status="waiting_for_materializer",
+                    phase="export",
+                    export_attempt=None,
+                    flink_job_id=None,
+                    worker_id=None,
+                    lease_expires_at=None,
+                    last_error=str(reason)[:4096],
+                    updated_at=now,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError(
+                    "PIT materialization materializer-wait update lost its lease"
+                )
 
     async def fail_pit_materialization_run(
         self, run_id: str, *, worker_id: str, error: str
@@ -4360,7 +4414,12 @@ class SystemStore:
                 select(PitMaterializationRun).where(
                     or_(
                         PitMaterializationRun.status.in_(
-                            ("pending", "running", "waiting_for_eligible_rows")
+                            (
+                                "pending",
+                                "running",
+                                "waiting_for_eligible_rows",
+                                "waiting_for_materializer",
+                            )
                         ),
                         PitMaterializationRun.completed_at >= cutoff,
                     )
