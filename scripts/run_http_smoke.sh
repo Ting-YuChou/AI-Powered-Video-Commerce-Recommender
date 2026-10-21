@@ -21,8 +21,9 @@ export SERVICE_RECOMMENDATION_SERVICE_URLS=http://recommendation-service:8001
 export SERVICE_INTERACTION_WORKERS=1
 export SERVICE_RANKING_WORKERS=1
 export RANKING_SERVICE_REPLICAS=1
-# One runner until SystemStore schema creation is serialized (Stage B WS-2).
-export RANKING_RUNNER_REPLICAS=1
+# SystemStore startup DDL is serialized by an advisory lock, so several
+# runners can initialize against the fresh database together.
+export RANKING_RUNNER_REPLICAS="${RANKING_RUNNER_REPLICAS:-2}"
 export SERVICE_RANKING_MIN_HEALTHY_RUNNERS=1
 export RANKING_BATCH_RUNNER_COUNT=1
 export RANKING_INFERENCE_EXECUTOR_WORKERS=1
