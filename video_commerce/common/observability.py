@@ -803,6 +803,19 @@ class ObservabilityManager:
             ["stage", "status"],
             registry=self.registry,
         )
+        self.recommendation_impression_untracked_total = Counter(
+            "video_commerce_recommendation_impression_untracked_total",
+            "Served slates returned without an impression_id, by cause",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.recommendation_impression_outbox_write_age_seconds = Gauge(
+            "video_commerce_recommendation_impression_outbox_write_age_seconds",
+            "Age of the longest-running served-impression outbox write, sampled "
+            "when an impression is staged; a growing value means a stuck write",
+            registry=self.registry,
+            multiprocess_mode="livemax",
+        )
         self.recommendation_outbox_pending = Gauge(
             "video_commerce_recommendation_outbox_pending",
             "Unpublished served-impression outbox rows",
@@ -1897,6 +1910,14 @@ class ObservabilityManager:
         self.recommendation_impression_events_total.labels(
             stage=stage, status=status
         ).inc()
+
+    def update_recommendation_impression_outbox_write_age(self, seconds: float) -> None:
+        self.recommendation_impression_outbox_write_age_seconds.set(
+            max(0.0, float(seconds))
+        )
+
+    def record_recommendation_impression_untracked(self, reason: str) -> None:
+        self.recommendation_impression_untracked_total.labels(reason=reason).inc()
 
     def record_recommendation_outbox_terminal(self, reason: str) -> None:
         self.recommendation_outbox_terminal_total.labels(reason=reason).inc()

@@ -404,6 +404,12 @@ appConfig:
     swingItemcfScoreWeight: 1.0
     impressionLoggingEnabled: true
     impressionMaxItems: 100
+    # Served-impression outbox: per-pod wait budget, concurrent write
+    # transactions (clamped to poolSize + maxOverflow - 1), rows per
+    # transaction.
+    impressionOutboxTimeoutMs: 100
+    impressionOutboxMaxInflight: 2
+    impressionOutboxMaxBatchSize: 16
   ranking:
     featureContractVersion: ranking_ltr_v1
     valueTargetPolicy: gross_revenue_v1

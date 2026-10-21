@@ -189,8 +189,10 @@ production activation reject missing policy or value-normalization metadata.
 The impression outbox write is bounded by
 `RECOMMENDATION_IMPRESSION_OUTBOX_TIMEOUT_MS` (100 ms). A slower write still
 returns the slate, without `impression_id`, and records `status="timeout"`.
-See `docs/operations/postgres-connection-budget.md` for the in-flight cap and
-the `not_exposed` terminal state of inserts that commit late.
+Concurrent impressions are committed together in micro-batches. See
+`docs/operations/postgres-connection-budget.md` for the batching limits, the
+untracked-cause metric, and the `not_exposed` terminal state of inserts that
+commit late.
 
 The serialized `feature_context` in a served event is capped at
 `RECOMMENDATION_FEATURE_CONTEXT_MAX_BYTES` (256 KiB). Over the cap, the ranker

@@ -17,8 +17,19 @@ import uuid
 from types import SimpleNamespace
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
+import orjson
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -30,6 +41,8 @@ from sqlalchemy import (
     String,
     Text,
     and_,
+    bindparam,
+    cast,
     delete,
     desc,
     event,
@@ -42,6 +55,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -774,6 +788,22 @@ class RecommendationEventOutbox(Base):
     )
 
 
+# Executed with one parameter set per row (insertmanyvalues): the statement
+# compiles once regardless of the batch size. Payloads arrive pre-serialized.
+_RECOMMENDATION_OUTBOX_INSERT = (
+    pg_insert(RecommendationEventOutbox)
+    .values(
+        event_id=bindparam("event_id"),
+        impression_id=bindparam("impression_id"),
+        payload_hash=bindparam("payload_hash"),
+        event_payload=cast(bindparam("payload_json", type_=Text), JSON),
+        next_attempt_at=bindparam("next_attempt_at"),
+    )
+    .on_conflict_do_nothing(index_elements=[RecommendationEventOutbox.event_id])
+    .returning(RecommendationEventOutbox.event_id)
+)
+
+
 class InteractionIdempotencyLedger(Base):
     __tablename__ = "interaction_idempotency_ledger"
 
@@ -1433,34 +1463,34 @@ def _engine_options(config: DatabaseConfig) -> Dict[str, Any]:
     }
 
 
-def _recommendation_outbox_insert(
-    *,
-    event_id: str,
-    impression_id: str,
-    payload_hash: str,
-    payload: Dict[str, Any],
-    next_attempt_at: datetime,
-):
-    """The served-impression outbox INSERT, shared with the pool warmup."""
-    return (
-        pg_insert(RecommendationEventOutbox)
-        .values(
-            event_id=event_id,
-            impression_id=impression_id,
-            payload_hash=payload_hash,
-            event_payload=payload,
-            next_attempt_at=next_attempt_at,
-        )
-        .on_conflict_do_nothing(index_elements=[RecommendationEventOutbox.event_id])
-    )
-
-
 class _WarmupRollback(Exception):
     """Ends a warmup transaction so its probe INSERT is rolled back."""
 
 
-class OutboxCommitDeadlineExceeded(RuntimeError):
+class OutboxWriteRolledBack(RuntimeError):
+    """An outbox write failed before COMMIT was sent, so nothing committed.
+
+    ``reason`` is ``pool_timeout`` when no pooled connection was free in time,
+    ``deadline`` for a missed serving deadline, otherwise ``db_error``.
+    """
+
+    def __init__(self, message: str, *, reason: str = "db_error"):
+        super().__init__(message)
+        self.reason = reason
+
+
+class OutboxCommitDeadlineExceeded(OutboxWriteRolledBack):
     """The serving deadline passed before COMMIT, so the insert was rolled back."""
+
+    def __init__(
+        self,
+        message: str = "served impression outbox insert missed its serving deadline",
+    ):
+        super().__init__(message, reason="deadline")
+
+
+class _OutboxBatchNothingToCommit(Exception):
+    """Internal: every row of an outbox batch missed its deadline; roll back."""
 
 
 @dataclass
@@ -1915,18 +1945,26 @@ class SystemStore:
             probe_id = f"pool-warmup-{uuid.uuid4().hex}"
             try:
                 async with self._hot_path_session() as session:
-                    await session.execute(
-                        _recommendation_outbox_insert(
-                            event_id=probe_id,
-                            impression_id=probe_id,
-                            payload_hash="0" * 64,
-                            payload={
+                    # A one-row list, as enqueue_recommendation_events sends
+                    # for a lone impression, so the same SQL is prepared.
+                    result = await session.execute(
+                        _RECOMMENDATION_OUTBOX_INSERT,
+                        [
+                            {
                                 "event_id": probe_id,
-                                "metadata": {"impression_id": probe_id},
-                            },
-                            next_attempt_at=_utc_now(),
-                        )
+                                "impression_id": probe_id,
+                                "payload_hash": "0" * 64,
+                                "payload_json": orjson.dumps(
+                                    {
+                                        "event_id": probe_id,
+                                        "metadata": {"impression_id": probe_id},
+                                    }
+                                ).decode("utf-8"),
+                                "next_attempt_at": _utc_now(),
+                            }
+                        ],
                     )
+                    result.scalars().all()
                     primed += 1
                     if primed == target:
                         all_primed.set()
@@ -2435,57 +2473,149 @@ class SystemStore:
     ) -> str:
         """Durably stage one served-impression event before returning its ID.
 
-        ``commit_deadline`` is a ``time.monotonic()`` instant: when it has
-        passed by the time the insert is ready to commit, the transaction is
-        rolled back with ``OutboxCommitDeadlineExceeded`` because the caller
-        has already answered without the impression_id.
+        Single-row form of ``enqueue_recommendation_events``; the row's
+        exception, if any, is raised.
+        """
+        (outcome,) = await self.enqueue_recommendation_events(
+            [(event, commit_deadline)], publish_hold_seconds=publish_hold_seconds
+        )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    async def enqueue_recommendation_events(
+        self,
+        entries: Sequence[Tuple[Mapping[str, Any], Optional[float]]],
+        *,
+        publish_hold_seconds: float = 0.0,
+    ) -> List[Any]:
+        """Durably stage served-impression events in one transaction.
+
+        Each entry is ``(event, commit_deadline)``, where the deadline is a
+        ``time.monotonic()`` instant after which the caller has answered
+        without the impression_id. The result holds, per entry and in order,
+        ``"inserted"``, ``"duplicate"``, or that row's exception:
+        ``OutboxCommitDeadlineExceeded`` when its deadline passed before
+        COMMIT (the row is deleted inside the transaction, or the whole
+        transaction rolls back), ``ValueError`` for a malformed event or an
+        event_id payload collision.
+
+        A failure before COMMIT is sent raises ``OutboxWriteRolledBack``:
+        nothing in the batch committed. An error from COMMIT itself propagates
+        unchanged because the rows may have committed.
 
         ``publish_hold_seconds`` delays the first claim so a COMMIT that lands
-        after the deadline can be retired as ``not_exposed`` before any
+        after a deadline can be retired as ``not_exposed`` before any
         dispatcher can pick the row up.
         """
         if not self.enabled:
-            return False
-        metadata = _safe_dict(event.get("metadata"))
-        event_id = str(event.get("event_id") or "").strip()
-        impression_id = str(metadata.get("impression_id") or "").strip()
-        if not event_id or not impression_id:
-            raise ValueError(
-                "recommendation outbox event requires event_id and impression_id"
-            )
-        payload = dict(event)
-        payload_hash = hashlib.sha256(
-            json.dumps(
-                payload, sort_keys=True, separators=(",", ":"), default=str
-            ).encode("utf-8")
-        ).hexdigest()
-        stmt = _recommendation_outbox_insert(
-            event_id=event_id,
-            impression_id=impression_id,
-            payload_hash=payload_hash,
-            payload=payload,
-            next_attempt_at=_utc_now()
-            + timedelta(seconds=max(0.0, float(publish_hold_seconds))),
+            return [False] * len(entries)
+        outcomes: List[Any] = [None] * len(entries)
+        rows: Dict[str, Dict[str, Any]] = {}
+        deadlines: Dict[str, Optional[float]] = {}
+        index_by_event: Dict[str, int] = {}
+        next_attempt_at = _utc_now() + timedelta(
+            seconds=max(0.0, float(publish_hold_seconds))
         )
-        async with self._hot_path_session() as session:
-            result = await session.execute(stmt)
-            if result.rowcount:
-                outcome = "inserted"
-            else:
-                existing = await session.scalar(
-                    select(RecommendationEventOutbox).where(
-                        RecommendationEventOutbox.event_id == event_id
+        now = time.monotonic()
+        for index, (event, commit_deadline) in enumerate(entries):
+            metadata = _safe_dict(event.get("metadata"))
+            event_id = str(event.get("event_id") or "").strip()
+            impression_id = str(metadata.get("impression_id") or "").strip()
+            if not event_id or not impression_id:
+                outcomes[index] = ValueError(
+                    "recommendation outbox event requires event_id and impression_id"
+                )
+                continue
+            if event_id in rows:
+                outcomes[index] = ValueError(
+                    "recommendation outbox event_id repeated within one batch"
+                )
+                continue
+            if commit_deadline is not None and now > commit_deadline:
+                outcomes[index] = OutboxCommitDeadlineExceeded()
+                continue
+            # Serialized once: the same bytes are hashed and stored (cast to
+            # JSON in SQL), instead of a sorted json.dumps for the hash plus
+            # another for the column, all on the serving event loop.
+            payload_json = orjson.dumps(
+                dict(event),
+                option=orjson.OPT_SORT_KEYS | orjson.OPT_NON_STR_KEYS,
+                default=str,
+            )
+            rows[event_id] = {
+                "event_id": event_id,
+                "impression_id": impression_id,
+                "payload_hash": hashlib.sha256(payload_json).hexdigest(),
+                "payload_json": payload_json.decode("utf-8"),
+                "next_attempt_at": next_attempt_at,
+            }
+            deadlines[event_id] = commit_deadline
+            index_by_event[event_id] = index
+        if not rows:
+            return outcomes
+
+        inserted: Set[str] = set()
+        late: Set[str] = set()
+        committing = False
+        try:
+            async with self._hot_path_session() as session:
+                result = await session.execute(
+                    _RECOMMENDATION_OUTBOX_INSERT, list(rows.values())
+                )
+                inserted = set(result.scalars().all())
+                conflicted = [event_id for event_id in rows if event_id not in inserted]
+                if conflicted:
+                    existing = dict(
+                        (
+                            await session.execute(
+                                select(
+                                    RecommendationEventOutbox.event_id,
+                                    RecommendationEventOutbox.payload_hash,
+                                ).where(
+                                    RecommendationEventOutbox.event_id.in_(conflicted)
+                                )
+                            )
+                        ).all()
                     )
-                )
-                if existing is None or existing.payload_hash != payload_hash:
-                    raise ValueError("recommendation outbox event_id payload collision")
-                outcome = "duplicate"
-            if commit_deadline is not None and time.monotonic() > commit_deadline:
-                raise OutboxCommitDeadlineExceeded(
-                    "served impression outbox insert missed its serving deadline"
-                )
+                    for event_id in conflicted:
+                        outcomes[index_by_event[event_id]] = (
+                            "duplicate"
+                            if existing.get(event_id) == rows[event_id]["payload_hash"]
+                            else ValueError(
+                                "recommendation outbox event_id payload collision"
+                            )
+                        )
+                now = time.monotonic()
+                late = {
+                    event_id
+                    for event_id, deadline in deadlines.items()
+                    if deadline is not None and now > deadline
+                }
+                if inserted and inserted <= late:
+                    raise _OutboxBatchNothingToCommit()
+                if late & inserted:
+                    await session.execute(
+                        delete(RecommendationEventOutbox).where(
+                            RecommendationEventOutbox.event_id.in_(late & inserted)
+                        )
+                    )
+                committing = True
+        except _OutboxBatchNothingToCommit:
+            inserted = set()
+        except Exception as exc:
+            if committing:
+                raise
+            reason = "pool_timeout" if isinstance(exc, PoolTimeoutError) else "db_error"
+            raise OutboxWriteRolledBack(
+                f"served impression outbox write rolled back: {exc}", reason=reason
+            ) from exc
+        for event_id in late:
+            outcomes[index_by_event[event_id]] = OutboxCommitDeadlineExceeded()
+        for event_id in inserted - late:
+            outcomes[index_by_event[event_id]] = "inserted"
         self._update_pool_metrics()
-        return outcome
+        return outcomes
 
     async def claim_recommendation_outbox(
         self, *, worker_id: str, batch_size: int = 50, lease_seconds: int = 30
@@ -2597,22 +2727,32 @@ class SystemStore:
         return terminal
 
     async def mark_recommendation_outbox_not_exposed(self, event_id: str) -> str:
-        """Retire a row whose insert committed after the serving budget expired.
+        """Retire one row; see ``mark_recommendation_outbox_not_exposed_many``."""
+        statuses = await self.mark_recommendation_outbox_not_exposed_many([event_id])
+        return statuses.get(event_id, "missing")
 
-        The response already went out without an impression_id, so the event
-        must never be published or used to resolve view slates. Returns
-        ``retired``, ``missing`` (nothing committed), ``already_terminal``, or
+    async def mark_recommendation_outbox_not_exposed_many(
+        self, event_ids: Sequence[str]
+    ) -> Dict[str, str]:
+        """Retire rows whose insert committed after the serving budget expired.
+
+        The responses already went out without these impression_ids, so the
+        events must never be published or used to resolve view slates. One
+        UPDATE covers the whole batch. Each id maps to ``retired``,
+        ``missing`` (nothing committed), ``already_terminal``, or
         ``already_dispatched`` when a dispatcher holds a live claim or has
         already published it (the race was lost).
         """
-        if not self.enabled:
-            return "missing"
+        ids = sorted({str(event_id) for event_id in event_ids if event_id})
+        if not self.enabled or not ids:
+            return {event_id: "missing" for event_id in ids}
         now = _utc_now()
+        statuses: Dict[str, str] = {}
         async with self._hot_path_session() as session:
             result = await session.execute(
                 update(RecommendationEventOutbox)
                 .where(
-                    RecommendationEventOutbox.event_id == event_id,
+                    RecommendationEventOutbox.event_id.in_(ids),
                     RecommendationEventOutbox.published_at.is_(None),
                     RecommendationEventOutbox.terminal_at.is_(None),
                     or_(
@@ -2626,19 +2766,31 @@ class SystemStore:
                     claimed_by=None,
                     claim_expires_at=None,
                 )
+                .returning(RecommendationEventOutbox.event_id)
+                .execution_options(synchronize_session=False)
             )
-            if result.rowcount:
-                status = "retired"
-            else:
-                row = await session.get(RecommendationEventOutbox, event_id)
-                if row is None:
-                    status = "missing"
-                elif row.terminal_at is not None:
-                    status = "already_terminal"
-                else:
-                    status = "already_dispatched"
+            for event_id in result.scalars().all():
+                statuses[event_id] = "retired"
+            remaining = [event_id for event_id in ids if event_id not in statuses]
+            if remaining:
+                rows = (
+                    await session.execute(
+                        select(
+                            RecommendationEventOutbox.event_id,
+                            RecommendationEventOutbox.terminal_at,
+                        ).where(RecommendationEventOutbox.event_id.in_(remaining))
+                    )
+                ).all()
+                found = {event_id: terminal_at for event_id, terminal_at in rows}
+                for event_id in remaining:
+                    if event_id not in found:
+                        statuses[event_id] = "missing"
+                    elif found[event_id] is not None:
+                        statuses[event_id] = "already_terminal"
+                    else:
+                        statuses[event_id] = "already_dispatched"
         self._update_pool_metrics()
-        return status
+        return statuses
 
     async def prune_terminal_recommendation_outbox(
         self, *, retention_days: int = 7, batch_size: int = 5000
