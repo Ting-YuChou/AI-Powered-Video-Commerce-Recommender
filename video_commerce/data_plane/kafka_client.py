@@ -291,23 +291,18 @@ class KafkaProducerClient:
 
         Unlike ``send`` this never returns False: callers that own a durable
         outbox need to tell an oversized record (never retryable) apart from a
-        transient broker failure.
+        transient broker failure. It never (re)starts the producer inline: a
+        disconnected producer fails fast as transient, so an outage costs one
+        cheap error per row instead of a reconnect per row; reconnecting is the
+        owner's (supervisor's) job.
         """
         if not self.config.enable:
             self._record_produce(topic, "disabled")
             return
 
         if not self.is_connected or not self.producer:
-            try:
-                await self.start()
-            except Exception as exc:
-                self._record_produce(topic, "error")
-                raise KafkaPublishError(
-                    f"Kafka producer unavailable: {exc}", transient=True
-                ) from exc
-            if not self.producer:
-                self._record_produce(topic, "error")
-                raise KafkaPublishError("Kafka producer unavailable", transient=True)
+            self._record_produce(topic, "error")
+            raise KafkaPublishError("Kafka producer not connected", transient=True)
 
         value["_kafka_timestamp"] = datetime.utcnow().isoformat()
         value["_kafka_topic"] = topic

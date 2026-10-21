@@ -627,12 +627,18 @@ class RecommendationConfig(BaseSettings):
         ),
     )
     impression_outbox_max_inflight: int = Field(
-        32,
+        3,
         ge=1,
         description=(
             "Per-process cap on concurrent served-impression outbox writes; when "
-            "full the impression is skipped instead of queueing on the DB pool"
+            "full the impression is skipped instead of queueing on the DB pool. "
+            "Keep it near DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW"
         ),
+    )
+    outbox_terminal_retention_days: int = Field(
+        7,
+        ge=1,
+        description="Days terminal outbox rows are kept for investigation",
     )
     feature_context_max_bytes: int = Field(
         262144,

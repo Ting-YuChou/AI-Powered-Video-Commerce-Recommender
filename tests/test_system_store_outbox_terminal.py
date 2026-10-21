@@ -189,7 +189,10 @@ async def test_recommendation_outbox_terminal_lifecycle():
             assert await store.enqueue_recommendation_event(event) == "inserted"
 
         # Insert committed after the serving budget: never published, never a slate.
-        assert await store.mark_recommendation_outbox_not_exposed(late["event_id"])
+        assert (
+            await store.mark_recommendation_outbox_not_exposed(late["event_id"])
+            == "retired"
+        )
         assert not await store.is_known_recommendation_impression(
             late["metadata"]["impression_id"]
         )
@@ -298,6 +301,88 @@ async def test_recommendation_outbox_terminal_lifecycle():
         # Terminal rows are excluded; only the new pending row is counted.
         assert stats_after["pending"] == stats_before["pending"] + 1
         await store.mark_recommendation_outbox_not_exposed(extra["event_id"])
+    finally:
+        async with store.session_factory.begin() as session:
+            await session.execute(
+                text(
+                    "DELETE FROM recommendation_event_outbox "
+                    "WHERE impression_id LIKE :prefix"
+                ),
+                {"prefix": f"{prefix}%"},
+            )
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_late_commit_hold_lets_retire_win_and_lost_race_is_reported():
+    store = _store(_database_url())
+    await store.initialize()
+    prefix = f"hold-{uuid.uuid4().hex[:8]}"
+    held = _event(f"{prefix}-held")
+    raced = _event(f"{prefix}-raced")
+    try:
+        async with store.session_factory() as session:
+            assert await session.scalar(
+                text("SELECT to_regclass('ix_recommendation_event_outbox_dispatchable')")
+            )
+        # Staged with a hold-off: no dispatcher can claim it before the retire.
+        await store.enqueue_recommendation_event(held, publish_hold_seconds=30)
+        assert held["event_id"] not in await _claim_ids(store, "worker-1")
+        assert (
+            await store.mark_recommendation_outbox_not_exposed(held["event_id"])
+            == "retired"
+        )
+
+        # Without the hold a dispatcher can claim between COMMIT and retire;
+        # the retire must not "succeed" on a live claim.
+        await store.enqueue_recommendation_event(raced)
+        assert raced["event_id"] in await _claim_ids(store, "worker-1")
+        assert (
+            await store.mark_recommendation_outbox_not_exposed(raced["event_id"])
+            == "already_dispatched"
+        )
+        async with store.session_factory() as session:
+            claimed_by = await session.scalar(
+                text(
+                    "SELECT claimed_by FROM recommendation_event_outbox "
+                    "WHERE event_id = :event_id"
+                ),
+                {"event_id": raced["event_id"]},
+            )
+        assert claimed_by == "worker-1"
+        assert (
+            await store.mark_recommendation_outbox_not_exposed(uuid.uuid4().hex)
+            == "missing"
+        )
+        assert (
+            await store.mark_recommendation_outbox_not_exposed(held["event_id"])
+            == "already_terminal"
+        )
+
+        # Terminal rows are pruned after retention; live rows are kept.
+        async with store.session_factory.begin() as session:
+            await session.execute(
+                text(
+                    "UPDATE recommendation_event_outbox "
+                    "SET terminal_at = now() - interval '30 days' "
+                    "WHERE event_id = :event_id"
+                ),
+                {"event_id": held["event_id"]},
+            )
+        assert await store.prune_terminal_recommendation_outbox(retention_days=7) >= 1
+        async with store.session_factory() as session:
+            remaining = set(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT event_id FROM recommendation_event_outbox "
+                            "WHERE event_id IN (:held, :raced)"
+                        ),
+                        {"held": held["event_id"], "raced": raced["event_id"]},
+                    )
+                ).scalars()
+            )
+        assert remaining == {raced["event_id"]}
     finally:
         async with store.session_factory.begin() as session:
             await session.execute(

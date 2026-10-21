@@ -77,7 +77,10 @@ from video_commerce.common.service_common import (
     RoundRobinAsyncClientPool,
 )
 from video_commerce.ml.slate_diversity import select_mmr_recommendations
-from video_commerce.data_plane.system_store import SystemStore
+from video_commerce.data_plane.system_store import (
+    OutboxCommitDeadlineExceeded,
+    SystemStore,
+)
 from video_commerce.ml.vector_search import VectorSearchEngine
 from video_commerce.common.telemetry import inject_http_headers
 
@@ -115,6 +118,8 @@ _background_tasks: Set[asyncio.Task] = set()
 _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MIN_SECONDS = 0.25
 _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MAX_SECONDS = 2.0
 _RECOMMENDATION_OUTBOX_STATS_INTERVAL_SECONDS = 10.0
+_RECOMMENDATION_OUTBOX_PRUNE_INTERVAL_SECONDS = 3600.0
+_READINESS_CHECK_TIMEOUT_SECONDS = 1.0
 # Dropped first when feature_context exceeds its byte budget: the bulky,
 # reconstructable ranker inputs. Remaining keys are then bounded per value.
 _FEATURE_CONTEXT_TRUNCATION_ORDER = (
@@ -1543,24 +1548,43 @@ async def livez():
 
 def _recommendation_readiness_response(
     runtime,
-    critical: Dict[str, Dict[str, Any]],
-    informational: Dict[str, Dict[str, Any]],
+    checks: Dict[str, Dict[str, Any]],
+    *,
+    critical: Set[str],
+    redact_errors: bool = True,
 ) -> JSONResponse:
     """Readiness gated only on what this pod needs to serve a slate.
 
-    Remote ranking, Kafka and Postgres degrade the response (fallback ranking,
-    no impression_id) but must not pull every recommendation pod out of the
-    Service at once, so they are reported without failing readiness.
+    Same contract as WS-1's ``service_common.build_readiness_response(...,
+    critical=..., redact_errors=...)``, which replaces this helper once it is on
+    main: critical checks pass when healthy or degraded, everything else is
+    reported but never fails the probe (remote ranking, Kafka and Postgres only
+    degrade a response, so they must not pull every pod out at once).
     """
-    ready = all(check.get("status") == "healthy" for check in critical.values())
+    ready = all(
+        checks.get(name, {}).get("status") in {"healthy", "degraded"}
+        for name in critical
+    )
+    all_healthy = all(check.get("status") == "healthy" for check in checks.values())
+    overall = "not_ready" if not ready else "ready" if all_healthy else "degraded"
+    checks = {
+        name: {**check, "critical": name in critical} for name, check in checks.items()
+    }
+    if redact_errors:
+        checks = {
+            name: {
+                key: value
+                for key, value in check.items()
+                if key in {"status", "critical", "response_time_ms"}
+            }
+            for name, check in checks.items()
+        }
     return JSONResponse(
         status_code=200 if ready else 503,
         content={
-            "status": "ready" if ready else "not_ready",
+            "status": overall,
             "service": runtime.service_name,
-            "checks": {**critical, **informational},
-            "critical": sorted(critical),
-            "informational": sorted(informational),
+            "checks": checks,
             "request_id_header": (
                 runtime.config.monitoring_config.request_id_header
                 if runtime.config
@@ -1570,56 +1594,87 @@ def _recommendation_readiness_response(
     )
 
 
-@app.get("/readyz")
-async def readyz():
-    runtime = app.state.runtime
-    feature_store_health = await feature_store.health_check()
-    ranking_health = (
-        ranking_model.health_check()
-        if ranking_model is not None
-        else {"status": "healthy", "mode": "remote"}
-    )
-    vector_health = vector_search.health_check()
-    database_health = {"status": "healthy", "response_time_ms": 0.0}
-    if system_store:
-        database_status = await system_store.health_check()
-        database_health = {
-            "status": database_status.status,
-            "response_time_ms": database_status.response_time_ms,
-            "error": database_status.error,
+async def _bounded_readiness_check(awaitable) -> Dict[str, Any]:
+    """Keep one slow dependency from pushing the probe past its timeout."""
+    started_at = time.perf_counter()
+    try:
+        return await asyncio.wait_for(
+            awaitable, timeout=_READINESS_CHECK_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        return {
+            "status": "unhealthy",
+            "response_time_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "error": "readiness check timed out",
         }
 
-    kafka_health = {"status": "healthy", "response_time_ms": 0.0}
+
+async def _database_readiness() -> Dict[str, Any]:
+    if not system_store:
+        return {"status": "healthy", "response_time_ms": 0.0}
+    database_status = await system_store.health_check()
+    return {
+        "status": database_status.status,
+        "response_time_ms": database_status.response_time_ms,
+        "error": database_status.error,
+    }
+
+
+async def _kafka_readiness(runtime) -> Dict[str, Any]:
     if kafka_manager:
         kafka_status = await kafka_manager.health_check()
         producer_health = kafka_status.get("producer", {})
-        kafka_health = {
+        return {
             "status": producer_health.get("status", "healthy"),
             "response_time_ms": 0.0,
             "error": None
             if producer_health.get("connected")
             else "Kafka producer unavailable",
         }
-    elif runtime.config.kafka_config.enable:
-        kafka_health = {"status": "degraded", "error": "Kafka producer unavailable"}
-    ranking_service_health = (
-        await _probe_ranking_service_ready(runtime)
-        if ranking_client_pool
-        else {"status": "healthy", "response_time_ms": 0.0}
+    if runtime.config.kafka_config.enable:
+        return {"status": "degraded", "error": "Kafka producer unavailable"}
+    return {"status": "healthy", "response_time_ms": 0.0}
+
+
+async def _healthy_check() -> Dict[str, Any]:
+    return {"status": "healthy", "response_time_ms": 0.0}
+
+
+@app.get("/readyz")
+async def readyz():
+    runtime = app.state.runtime
+    redis_health, database_health, kafka_health, ranking_service_health = (
+        await asyncio.gather(
+            _bounded_readiness_check(feature_store.health_check()),
+            _bounded_readiness_check(_database_readiness()),
+            _bounded_readiness_check(_kafka_readiness(runtime)),
+            _bounded_readiness_check(
+                _probe_ranking_service_ready(runtime)
+                if ranking_client_pool
+                else _healthy_check()
+            ),
+        )
     )
+    critical = {"redis", "vector_search"}
+    if ranking_model is not None:
+        # A loaded local ranker must actually work; an untrained one reports
+        # degraded and still passes.
+        critical.add("ranking_model")
+        ranking_health = ranking_model.health_check()
+    else:
+        ranking_health = {"status": "healthy", "mode": "remote"}
 
     return _recommendation_readiness_response(
         runtime,
         {
-            "redis": feature_store_health,
-            "vector_search": vector_health,
-        },
-        {
+            "redis": redis_health,
+            "vector_search": vector_search.health_check(),
             "database": database_health,
             "ranking_model": ranking_health,
             "ranking_service": ranking_service_health,
             "kafka": kafka_health,
         },
+        critical=critical,
     )
 
 
@@ -3263,44 +3318,72 @@ def _track_background_task(task: asyncio.Task) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
+_RETIRE_RETRY_DELAYS_SECONDS = (0.2, 0.5, 1.0)
+# A late COMMIT stays unclaimable for the serving budget plus this margin, so
+# the retire normally wins against every replica's dispatcher.
+_IMPRESSION_PUBLISH_HOLD_MARGIN_SECONDS = 1.0
+
+
 async def _retire_unexposed_impression(event_id: str, impression_id: str) -> None:
-    try:
-        retired = await asyncio.wait_for(
-            system_store.mark_recommendation_outbox_not_exposed(event_id),
-            timeout=5.0,
+    """Mark a late-committed impression not_exposed, retrying transient errors.
+
+    Each attempt is bounded server-side by the hot-path statement timeout
+    rather than a client-side cancel, which could abandon a statement inside
+    its transaction.
+    """
+    status = None
+    for attempt, delay in enumerate((0.0, *_RETIRE_RETRY_DELAYS_SECONDS)):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            status = await system_store.mark_recommendation_outbox_not_exposed(
+                event_id
+            )
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "recommendation_impression_retire_failed",
+                extra={
+                    "impression_id": impression_id,
+                    "attempt": attempt + 1,
+                    "error": str(exc),
+                },
+            )
+    observability = app.state.runtime.observability
+    if status == "retired":
+        observability.record_recommendation_outbox_terminal("not_exposed")
+    elif status == "already_dispatched":
+        # A dispatcher claimed or published it before the retire landed; the
+        # event may reach Kafka with an impression_id no client holds (no view
+        # can reference it).
+        observability.record_recommendation_impression(
+            "served", "not_exposed_published"
         )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
         logger.warning(
-            "recommendation_impression_retire_failed",
-            extra={"impression_id": impression_id, "error": str(exc)},
+            "recommendation_impression_late_insert_already_dispatched",
+            extra={"impression_id": impression_id},
         )
-        return
-    if retired:
-        app.state.runtime.observability.record_recommendation_outbox_terminal(
-            "not_exposed"
-        )
-        return
-    # Another replica's dispatcher claimed or published it in the window
-    # between the late COMMIT and this update; the event may reach Kafka with
-    # an impression_id no client holds (no view can reference it).
-    app.state.runtime.observability.record_recommendation_impression(
-        "served", "not_exposed_published"
-    )
-    logger.warning(
-        "recommendation_impression_late_insert_already_dispatched",
-        extra={"impression_id": impression_id},
-    )
+    elif status is None:
+        observability.record_recommendation_impression("served", "retire_failed")
 
 
 def _retire_if_inserted_late(
     event_id: str, impression_id: str, task: asyncio.Future
 ) -> None:
-    """Done-callback for an outbox write that outlived the serving budget."""
-    if task.cancelled() or task.exception() is not None:
+    """Done-callback for an outbox write whose result the client never saw.
+
+    Runs for an insert that committed after the budget, and for any failure
+    other than the explicit deadline rollback: an error raised around COMMIT
+    (for example a dropped connection) can still have committed the row.
+    """
+    if task.cancelled() or system_store is None:
         return
-    if task.result() != "inserted" or system_store is None:
+    exc = task.exception()
+    if isinstance(exc, OutboxCommitDeadlineExceeded):
+        return
+    if exc is None and task.result() != "inserted":
         return
     _track_background_task(
         asyncio.create_task(
@@ -3314,10 +3397,13 @@ async def _enqueue_impression_with_permit(
     semaphore: Optional[asyncio.Semaphore],
     event: Dict[str, Any],
     commit_deadline: float,
+    publish_hold_seconds: float,
 ) -> str:
     try:
         return await system_store.enqueue_recommendation_event(
-            event, commit_deadline=commit_deadline
+            event,
+            commit_deadline=commit_deadline,
+            publish_hold_seconds=publish_hold_seconds,
         )
     finally:
         if semaphore is not None:
@@ -3339,7 +3425,10 @@ async def _stage_served_impression_event(
     (outcome ``timeout``). The insert itself is shielded rather than cancelled
     so asyncpg never returns a connection mid-transaction. It rolls back if the
     deadline passed before COMMIT; if the COMMIT itself lands late the row is
-    retired as terminal ``not_exposed`` so it is never published.
+    retired as terminal ``not_exposed`` so it is never published. Rows are
+    staged unclaimable for the budget plus a margin so that retire wins the
+    race against dispatchers; impression events therefore reach Kafka about
+    one to two seconds after serving.
     """
     if kafka_manager is None or system_store is None:
         return False
@@ -3373,7 +3462,10 @@ async def _stage_served_impression_event(
     timeout_seconds = _impression_outbox_timeout_seconds()
     write = asyncio.ensure_future(
         _enqueue_impression_with_permit(
-            semaphore, event, time.monotonic() + timeout_seconds
+            semaphore,
+            event,
+            time.monotonic() + timeout_seconds,
+            timeout_seconds + _IMPRESSION_PUBLISH_HOLD_MARGIN_SECONDS,
         )
     )
     try:
@@ -3394,6 +3486,7 @@ async def _stage_served_impression_event(
         )
         raise
     except Exception as exc:
+        _retire_if_inserted_late(event_id, impression_id, write)
         observability.record_recommendation_impression("served", "unavailable")
         logger.warning(
             "recommendation_impression_outbox_failed",
@@ -3406,16 +3499,19 @@ async def _stage_served_impression_event(
     return outcome in {"inserted", "duplicate"}
 
 
-async def _wait_for_recommendation_outbox_work(timeout_seconds: float) -> None:
+async def _wait_for_recommendation_outbox_work(timeout_seconds: float) -> bool:
+    """Sleep until the timeout or a local insert; return True when woken."""
     wakeup = _recommendation_outbox_wakeup
     if wakeup is None:
         await asyncio.sleep(timeout_seconds)
-        return
+        return False
     try:
         await asyncio.wait_for(wakeup.wait(), timeout=timeout_seconds)
+        woken = True
     except asyncio.TimeoutError:
-        pass
+        woken = False
     wakeup.clear()
+    return woken
 
 
 async def _run_recommendation_outbox_dispatcher() -> None:
@@ -3428,8 +3524,16 @@ async def _run_recommendation_outbox_dispatcher() -> None:
             20,
         )
     )
+    retention_days = int(
+        getattr(
+            getattr(app.state.runtime.config, "recommendation_config", None),
+            "outbox_terminal_retention_days",
+            7,
+        )
+    )
     idle_sleep = _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MIN_SECONDS
     last_stats_at: Optional[float] = None
+    last_pruned_at = time.monotonic()
     while True:
         try:
             if system_store is None or kafka_manager is None:
@@ -3443,16 +3547,25 @@ async def _run_recommendation_outbox_dispatcher() -> None:
                 last_stats_at = now
                 outbox_stats = await system_store.get_recommendation_outbox_stats()
                 observability.update_recommendation_outbox(**outbox_stats)
+            if now - last_pruned_at >= _RECOMMENDATION_OUTBOX_PRUNE_INTERVAL_SECONDS:
+                last_pruned_at = now
+                await system_store.prune_terminal_recommendation_outbox(
+                    retention_days=retention_days
+                )
             events = await system_store.claim_recommendation_outbox(
                 worker_id=worker_id, batch_size=50, lease_seconds=30
             )
             if not events:
-                # Local inserts wake the dispatcher at once; otherwise back off
-                # so idle replicas do not poll Postgres four times a second.
-                await _wait_for_recommendation_outbox_work(idle_sleep)
-                idle_sleep = min(
-                    idle_sleep * 2, _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MAX_SECONDS
-                )
+                # A local insert restarts the short polls so its row (held for
+                # the serving budget plus a margin) goes out within ~2s;
+                # otherwise back off so idle replicas do not poll Postgres
+                # four times a second.
+                if await _wait_for_recommendation_outbox_work(idle_sleep):
+                    idle_sleep = _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MIN_SECONDS
+                else:
+                    idle_sleep = min(
+                        idle_sleep * 2, _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MAX_SECONDS
+                    )
                 continue
             idle_sleep = _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MIN_SECONDS
             for event in events:

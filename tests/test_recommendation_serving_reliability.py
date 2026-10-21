@@ -64,17 +64,27 @@ class SlowOutboxStore:
         self.enqueued = []
         self.not_exposed = []
         self.commit_deadlines = []
-        self.retire_succeeds = True
+        self.publish_holds = []
+        self.retire_status = "retired"
+        self.retire_errors = []
+        self.error = None
 
-    async def enqueue_recommendation_event(self, event, *, commit_deadline=None):
+    async def enqueue_recommendation_event(
+        self, event, *, commit_deadline=None, publish_hold_seconds=0.0
+    ):
         self.commit_deadlines.append(commit_deadline)
+        self.publish_holds.append(publish_hold_seconds)
         await asyncio.sleep(self.delay_seconds)
+        if self.error is not None:
+            raise self.error
         self.enqueued.append(event)
         return self.outcome
 
     async def mark_recommendation_outbox_not_exposed(self, event_id):
         self.not_exposed.append(event_id)
-        return self.retire_succeeds
+        if self.retire_errors:
+            raise self.retire_errors.pop(0)
+        return self.retire_status
 
 
 def _install_runtime(monkeypatch, *, recommendation_config=None):
@@ -307,7 +317,7 @@ async def test_outbox_write_gets_serving_deadline_and_reports_lost_retire_race(
         recommendation_config=RecommendationConfig(impression_outbox_timeout_ms=50),
     )
     store = SlowOutboxStore(delay_seconds=0.2)
-    store.retire_succeeds = False
+    store.retire_status = "already_dispatched"
     monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
     monkeypatch.setattr(recommendation_api, "system_store", store)
     monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", None)
@@ -325,8 +335,108 @@ async def test_outbox_write_gets_serving_deadline_and_reports_lost_retire_race(
         await asyncio.sleep(0)
 
     assert before + 0.05 <= store.commit_deadlines[0] <= time.monotonic()
+    # Held unclaimable for the budget plus a margin so the retire wins.
+    assert store.publish_holds[0] == pytest.approx(1.05)
     assert ("served", "not_exposed_published") in runtime.observability.impressions
     assert runtime.observability.terminal == []
+
+
+async def _drain(seconds):
+    await asyncio.sleep(seconds)
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_during_pending_write_still_retires_late_insert(
+    monkeypatch,
+):
+    runtime = _install_runtime(
+        monkeypatch,
+        recommendation_config=RecommendationConfig(impression_outbox_timeout_ms=500),
+    )
+    store = SlowOutboxStore(delay_seconds=0.1)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    semaphore = asyncio.Semaphore(3)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", semaphore)
+
+    staging = asyncio.create_task(
+        recommendation_api._stage_served_impression_event(
+            user_id="u1",
+            recommendations=["p1"],
+            response_time_ms=5,
+            request_id=None,
+            metadata={"impression_id": "imp-cancel"},
+        )
+    )
+    await asyncio.sleep(0.02)
+    staging.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await staging
+    await _drain(0.2)
+
+    assert len(store.enqueued) == 1
+    assert store.not_exposed == [store.enqueued[0]["event_id"]]
+    assert runtime.observability.terminal == ["not_exposed"]
+    assert semaphore._value == 3
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_write_error_triggers_retire_but_deadline_rollback_does_not(
+    monkeypatch,
+):
+    runtime = _install_runtime(monkeypatch)
+    store = SlowOutboxStore(delay_seconds=0)
+    store.error = ConnectionResetError("connection lost during COMMIT")
+    store.retire_status = "missing"
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", None)
+
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-ambiguous"},
+    )
+    await _drain(0)
+
+    assert durable is False
+    assert len(store.not_exposed) == 1
+    assert runtime.observability.terminal == []
+
+    store.error = recommendation_api.OutboxCommitDeadlineExceeded("late")
+    await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-rolled-back"},
+    )
+    await _drain(0)
+
+    assert len(store.not_exposed) == 1
+
+
+@pytest.mark.asyncio
+async def test_retire_retries_transient_errors(monkeypatch):
+    runtime = _install_runtime(monkeypatch)
+    store = SlowOutboxStore(delay_seconds=0)
+    store.retire_errors = [RuntimeError("db blip"), RuntimeError("db blip")]
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    monkeypatch.setattr(recommendation_api, "_RETIRE_RETRY_DELAYS_SECONDS", (0, 0, 0))
+
+    await recommendation_api._retire_unexposed_impression("evt", "imp")
+
+    assert len(store.not_exposed) == 3
+    assert runtime.observability.terminal == ["not_exposed"]
+
+    store.retire_errors = [RuntimeError("down")] * 4
+    await recommendation_api._retire_unexposed_impression("evt", "imp")
+
+    assert ("served", "retire_failed") in runtime.observability.impressions
 
 
 @pytest.mark.asyncio
@@ -676,6 +786,29 @@ async def test_idle_dispatcher_backs_off_and_reads_stats_on_an_interval(monkeypa
     assert len(runtime.observability.outbox_stats) == 1
 
 
+@pytest.mark.asyncio
+async def test_local_insert_wakeup_restarts_short_polls(monkeypatch):
+    _install_runtime(monkeypatch)
+    store = OneShotOutboxStore([])
+    sleeps = []
+    real_sleep = asyncio.sleep
+
+    async def fake_wait(timeout):
+        sleeps.append(timeout)
+        await real_sleep(0)
+        return len(sleeps) == 3
+
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", RaisingKafka(None))
+    monkeypatch.setattr(
+        recommendation_api, "_wait_for_recommendation_outbox_work", fake_wait
+    )
+
+    await _run_dispatcher_until(store, lambda: len(sleeps) >= 5)
+
+    assert sleeps[:5] == [0.25, 0.5, 1.0, 0.25, 0.5]
+
+
 # ---------------------------------------------------------- Kafka producer
 
 
@@ -726,6 +859,21 @@ async def test_send_or_raise_marks_other_failures_retryable_and_send_is_unchange
 
     too_large = _connected_client(kafka_client_module.MessageSizeTooLargeError())
     assert await too_large.send("topic", {"a": 1}) is False
+
+
+@pytest.mark.asyncio
+async def test_send_or_raise_fails_fast_without_reconnecting(monkeypatch):
+    client = KafkaProducerClient(KafkaConfig(enable=True))
+
+    async def must_not_start():
+        raise AssertionError("send_or_raise must not start the producer inline")
+
+    monkeypatch.setattr(client, "start", must_not_start)
+
+    with pytest.raises(KafkaPublishError) as raised:
+        await client.send_or_raise("topic", {"a": 1})
+
+    assert raised.value.transient is True
 
 
 @pytest.mark.asyncio
@@ -827,10 +975,15 @@ async def test_readiness_ignores_remote_ranking_and_kafka_failures(monkeypatch):
     body = json.loads(response.body)
 
     assert response.status_code == 200
-    assert body["status"] == "ready"
-    assert body["checks"]["kafka"]["status"] == "degraded"
+    assert body["status"] == "degraded"
+    assert body["checks"]["kafka"] == {"status": "degraded", "critical": False}
     assert body["checks"]["ranking_service"]["status"] == "unhealthy"
-    assert body["critical"] == ["redis", "vector_search"]
+    # Raw dependency errors are not exposed.
+    assert "error" not in body["checks"]["ranking_service"]
+    assert {name for name, check in body["checks"].items() if check["critical"]} == {
+        "redis",
+        "vector_search",
+    }
     assert runtime.service_name == body["service"]
 
 
@@ -851,4 +1004,52 @@ async def test_readiness_fails_without_vector_index(monkeypatch):
 
     response = await recommendation_api.readyz()
 
+    assert response.status_code == 503
+
+
+@pytest.mark.parametrize(
+    ("ranker_status", "expected_code"),
+    [("degraded", 200), ("unhealthy", 503)],
+)
+@pytest.mark.asyncio
+async def test_loaded_local_ranker_is_critical(monkeypatch, ranker_status, expected_code):
+    _install_runtime(monkeypatch)
+
+    class FeatureStore:
+        async def health_check(self):
+            return {"status": "healthy"}
+
+    monkeypatch.setattr(recommendation_api, "feature_store", FeatureStore())
+    monkeypatch.setattr(recommendation_api, "vector_search", _Health("healthy"))
+    monkeypatch.setattr(recommendation_api, "ranking_model", _Health(ranker_status))
+    monkeypatch.setattr(recommendation_api, "system_store", None)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", None)
+    monkeypatch.setattr(recommendation_api, "ranking_client_pool", None)
+
+    response = await recommendation_api.readyz()
+
+    assert response.status_code == expected_code
+    assert json.loads(response.body)["checks"]["ranking_model"]["critical"] is True
+
+
+@pytest.mark.asyncio
+async def test_slow_readiness_check_is_bounded(monkeypatch):
+    _install_runtime(monkeypatch)
+
+    class HangingFeatureStore:
+        async def health_check(self):
+            await asyncio.sleep(5)
+
+    monkeypatch.setattr(recommendation_api, "feature_store", HangingFeatureStore())
+    monkeypatch.setattr(recommendation_api, "vector_search", _Health("healthy"))
+    monkeypatch.setattr(recommendation_api, "ranking_model", None)
+    monkeypatch.setattr(recommendation_api, "system_store", None)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", None)
+    monkeypatch.setattr(recommendation_api, "ranking_client_pool", None)
+    monkeypatch.setattr(recommendation_api, "_READINESS_CHECK_TIMEOUT_SECONDS", 0.05)
+
+    started = time.perf_counter()
+    response = await recommendation_api.readyz()
+
+    assert time.perf_counter() - started < 1.0
     assert response.status_code == 503

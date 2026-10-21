@@ -28,6 +28,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    and_,
     delete,
     desc,
     event,
@@ -1479,6 +1480,22 @@ class SystemStore:
             await conn.execute(text(ddl))
 
     async def _ensure_operational_indexes(self, conn) -> None:
+        # migrations/postgres/012: claims filter on both NULLs, and terminal
+        # rows keep published_at NULL, so the old pending index stops helping.
+        await self._create_index_if_missing(
+            conn,
+            "ix_recommendation_event_outbox_dispatchable",
+            "CREATE INDEX IF NOT EXISTS ix_recommendation_event_outbox_dispatchable "
+            "ON recommendation_event_outbox (next_attempt_at, created_at) "
+            "WHERE published_at IS NULL AND terminal_at IS NULL",
+        )
+        await self._create_index_if_missing(
+            conn,
+            "ix_catalog_feature_outbox_dispatchable",
+            "CREATE INDEX IF NOT EXISTS ix_catalog_feature_outbox_dispatchable "
+            "ON catalog_feature_outbox (next_attempt_at, created_at) "
+            "WHERE published_at IS NULL AND terminal_at IS NULL",
+        )
         await self._create_index_if_missing(
             conn,
             "ix_interaction_events_occurred_at_desc",
@@ -2230,6 +2247,7 @@ class SystemStore:
         event: Mapping[str, Any],
         *,
         commit_deadline: Optional[float] = None,
+        publish_hold_seconds: float = 0.0,
     ) -> str:
         """Durably stage one served-impression event before returning its ID.
 
@@ -2237,6 +2255,10 @@ class SystemStore:
         passed by the time the insert is ready to commit, the transaction is
         rolled back with ``OutboxCommitDeadlineExceeded`` because the caller
         has already answered without the impression_id.
+
+        ``publish_hold_seconds`` delays the first claim so a COMMIT that lands
+        after the deadline can be retired as ``not_exposed`` before any
+        dispatcher can pick the row up.
         """
         if not self.enabled:
             return False
@@ -2258,7 +2280,8 @@ class SystemStore:
             impression_id=impression_id,
             payload_hash=payload_hash,
             event_payload=payload,
-            next_attempt_at=_utc_now(),
+            next_attempt_at=_utc_now()
+            + timedelta(seconds=max(0.0, float(publish_hold_seconds))),
         )
         stmt = stmt.on_conflict_do_nothing(
             index_elements=[RecommendationEventOutbox.event_id]
@@ -2392,31 +2415,79 @@ class SystemStore:
         self._update_pool_metrics()
         return terminal
 
-    async def mark_recommendation_outbox_not_exposed(self, event_id: str) -> bool:
+    async def mark_recommendation_outbox_not_exposed(self, event_id: str) -> str:
         """Retire a row whose insert committed after the serving budget expired.
 
         The response already went out without an impression_id, so the event
-        must never be published or used to resolve view slates.
+        must never be published or used to resolve view slates. Returns
+        ``retired``, ``missing`` (nothing committed), ``already_terminal``, or
+        ``already_dispatched`` when a dispatcher holds a live claim or has
+        already published it (the race was lost).
         """
         if not self.enabled:
-            return False
-        async with self.session_factory.begin() as session:
+            return "missing"
+        now = _utc_now()
+        async with self._hot_path_session() as session:
             result = await session.execute(
                 update(RecommendationEventOutbox)
                 .where(
                     RecommendationEventOutbox.event_id == event_id,
                     RecommendationEventOutbox.published_at.is_(None),
                     RecommendationEventOutbox.terminal_at.is_(None),
+                    or_(
+                        RecommendationEventOutbox.claimed_by.is_(None),
+                        RecommendationEventOutbox.claim_expires_at < now,
+                    ),
                 )
                 .values(
-                    terminal_at=_utc_now(),
+                    terminal_at=now,
                     terminal_reason="not_exposed",
                     claimed_by=None,
                     claim_expires_at=None,
                 )
             )
+            if result.rowcount:
+                status = "retired"
+            else:
+                row = await session.get(RecommendationEventOutbox, event_id)
+                if row is None:
+                    status = "missing"
+                elif row.terminal_at is not None:
+                    status = "already_terminal"
+                else:
+                    status = "already_dispatched"
         self._update_pool_metrics()
-        return bool(result.rowcount)
+        return status
+
+    async def prune_terminal_recommendation_outbox(
+        self, *, retention_days: int = 7, batch_size: int = 5000
+    ) -> int:
+        """Delete terminal rows past retention, in bounded batches.
+
+        Published rows are kept: view ingest may still resolve slates from the
+        outbox until the impression is materialized.
+        """
+        if not self.enabled:
+            return 0
+        cutoff = _utc_now() - timedelta(days=max(1, int(retention_days)))
+        doomed = (
+            select(RecommendationEventOutbox.event_id)
+            .where(
+                RecommendationEventOutbox.terminal_at.is_not(None),
+                RecommendationEventOutbox.terminal_at < cutoff,
+            )
+            .limit(max(1, int(batch_size)))
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                delete(RecommendationEventOutbox).where(
+                    RecommendationEventOutbox.event_id.in_(doomed)
+                )
+            )
+        self._update_pool_metrics()
+        return int(result.rowcount or 0)
 
     async def get_recommendation_outbox_stats(self) -> Dict[str, Any]:
         if not self.enabled:
@@ -3882,8 +3953,16 @@ class SystemStore:
         async with self.session_factory.begin() as session:
             result = await session.execute(
                 delete(CatalogFeatureOutbox).where(
-                    CatalogFeatureOutbox.published_at.is_not(None),
-                    CatalogFeatureOutbox.published_at < cutoff,
+                    or_(
+                        and_(
+                            CatalogFeatureOutbox.published_at.is_not(None),
+                            CatalogFeatureOutbox.published_at < cutoff,
+                        ),
+                        and_(
+                            CatalogFeatureOutbox.terminal_at.is_not(None),
+                            CatalogFeatureOutbox.terminal_at < cutoff,
+                        ),
+                    )
                 )
             )
         self._update_pool_metrics()

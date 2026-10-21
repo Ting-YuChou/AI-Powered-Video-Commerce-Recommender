@@ -33,6 +33,13 @@ id while some slates were scored by the previous generation. Use
 `wait-rollout` above before attributing a metric change to the new release.
 When the pointer lookup fails, the last known release is kept.
 
+Known gap: the recommendation cache key switches with the pointer, so in that
+window a slate scored by the previous generation can be cached under the new
+release's key. It is served until the recommendation cache TTL expires or the
+user's feature or sequence token changes. Lineage and the cache key only follow
+loaded runner generations once runner-reported generations are fed back into
+serving (not implemented).
+
 Local cleanup retains the current generation, all pointer-referenced generations, in-flight batch generations, the configured newest generations, and every generation younger than the minimum age. Do not manually delete generation directories while a service is running. Rollback changes the durable pointer through `model-release rollback`; each instance then installs and validates that generation through the same path.
 
 When `RANKING_INFERENCE_PROCESS_WORKERS` is non-zero, use a rolling restart for activation. Forked process workers cannot safely replace their initialized model in place, so the service leaves the previous generation active and reports rollout failure rather than mixing processes.

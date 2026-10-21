@@ -108,24 +108,38 @@ The recommendation response waits at most
 including cache hits and singleflight joiners. Over budget, the slate is still
 returned, but without `impression_id` (`impression_tracking: unavailable`), and
 `video_commerce_recommendation_impression_events_total{stage="served",status="timeout"}`
-increments. At most `RECOMMENDATION_IMPRESSION_OUTBOX_MAX_INFLIGHT` (32) writes
+increments. At most `RECOMMENDATION_IMPRESSION_OUTBOX_MAX_INFLIGHT` (3) writes
 run per process; when they are all busy the impression is skipped immediately
-(`status="unavailable"`) instead of queueing on the pool.
+(`status="unavailable"`) instead of queueing on the pool. Keep the cap near
+`DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW`. Writes that outlive their response
+keep their permit, so a larger cap only queues more of them on the pool.
 
 The insert is shielded, not cancelled: cancelling an asyncpg statement inside a
-transaction can return a broken connection to the pool. Instead, the insert
-carries the serving deadline. When the deadline has already passed by the time
-the INSERT is ready to commit, the transaction rolls back. Only a COMMIT round
-trip that itself straddles the deadline can leave a row the client never saw.
-That row is then marked terminal `not_exposed`: it is never published, never
-resolves a view slate, and counts in
-`video_commerce_recommendation_outbox_terminal_total{reason="not_exposed"}`.
-Another replica's dispatcher can claim the row between that late commit and
-the terminal mark. That case is counted as
-`video_commerce_recommendation_impression_events_total{status="not_exposed_published"}`.
-The result is a served event whose `impression_id` the client never saw. No
-view can reference it, and the PIT and training paths use viewed rows, so it
-only appears in served-funnel counts.
+transaction can return a broken connection to the pool. Instead:
+
+1. **Deadline rollback.** The insert carries the serving deadline. If the
+   deadline has already passed when the INSERT is ready to commit, the
+   transaction rolls back.
+2. **Hold-off.** Rows are staged with `next_attempt_at = now + budget + 1 s`, so
+   no replica's dispatcher can claim them for that long. Impression events
+   therefore reach Kafka about one to two seconds after serving. A local insert
+   restarts the dispatcher's short polls.
+3. **Retire.** A COMMIT that lands after the deadline, or a write that fails
+   with any error other than the deadline rollback (a dropped connection can
+   still have committed), is retired as terminal `not_exposed`:
+   - It is never published and never resolves a view slate.
+   - It counts in
+     `video_commerce_recommendation_outbox_terminal_total{reason="not_exposed"}`.
+   - The retire is a conditional UPDATE that refuses rows with a live claim.
+     It is bounded by the hot-path statement timeout and retried three times
+     with backoff; a client-side cancel could abandon the statement mid-write.
+
+Outcomes in `video_commerce_recommendation_impression_events_total{stage="served"}`:
+
+| Status | Meaning |
+| --- | --- |
+| `not_exposed_published` | A dispatcher still claimed or published the row first, which is only possible when the hold-off was exceeded. The event can reach Kafka with an `impression_id` no client holds. No view can reference it, and the PIT and training paths use viewed rows, so it only appears in served-funnel counts. |
+| `retire_failed` | Every retire attempt errored. The row will publish normally, with the same served-funnel impact. |
 
 ## Startup DDL lock
 
@@ -142,8 +156,17 @@ wedge behind a long-running reader. The additive steps check
 the impression outbox on every pod restart.
 
 If the holder's DDL hits `lock_timeout`, that replica fails startup and is
-restarted. Apply the numbered migrations in `migrations/postgres/` ahead of a
-deploy to keep startup DDL a no-op in production.
+restarted.
+
+**Production: run migrations as a pre-deploy step.** Apply the numbered files
+in `migrations/postgres/` (including `012_recommendation_outbox_terminal.sql`,
+whose indexes use `CREATE INDEX CONCURRENTLY`; run it with psql autocommit,
+not inside a transaction) before rolling out. Then run the services with
+`DATABASE_AUTO_CREATE_SCHEMA=false`. Otherwise the first new pod performs the
+`ALTER TABLE` on the hot impression outbox during the rolling deploy. That ALTER
+holds `ACCESS EXCLUSIVE` and can stall every replica's impression inserts for up
+to `DATABASE_SCHEMA_LOCK_TIMEOUT_MS`; the serving budget then turns those into
+`timeout` outcomes.
 
 ## PgBouncer (documented, not deployed)
 

@@ -126,9 +126,14 @@ and counted in
 catalog outbox uses the same rules and counts in
 `catalog_outbox_terminal_total{reason}`. Terminal rows stay in the table for
 investigation. To retry one after fixing the cause, clear `terminal_at` and set
-`next_attempt_at = now()`. The idle dispatcher backs off from 0.25 s to 2 s
-between empty claims, is woken immediately by a local insert, and reads outbox
-stats every 10 s instead of every loop.
+`next_attempt_at = now()`. Impression rows become claimable one second after the serving budget (see
+the hold-off in `postgres-connection-budget.md`). The idle dispatcher backs off
+from 0.25 s to 2 s between empty claims. A local insert restarts the short
+polls, and outbox stats are read every 10 s instead of every loop. Terminal
+rows older than `RECOMMENDATION_OUTBOX_TERMINAL_RETENTION_DAYS` (7) are deleted
+hourly in batches; published rows are kept, because view ingest may still
+resolve slates from them. Catalog terminal rows are pruned with the published
+ones.
 
 Use `video_commerce_recommendation_impression_events_total` by stage and
 status together with Kafka consumer lag, Flink job state, and the durable
