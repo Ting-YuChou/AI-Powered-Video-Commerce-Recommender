@@ -1053,3 +1053,35 @@ async def test_slow_readiness_check_is_bounded(monkeypatch):
 
     assert time.perf_counter() - started < 1.0
     assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_kafka_reconnect_publishes_manager_and_starts_dispatcher_once(
+    monkeypatch,
+):
+    _install_runtime(monkeypatch)
+    started = []
+
+    async def fake_dispatcher():
+        started.append(True)
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(
+        recommendation_api, "_run_recommendation_outbox_dispatcher", fake_dispatcher
+    )
+    monkeypatch.setattr(recommendation_api, "system_store", object())
+    monkeypatch.setattr(recommendation_api, "kafka_manager", None)
+    monkeypatch.setattr(recommendation_api, "recommendation_outbox_task", None)
+    manager = object()
+
+    recommendation_api._on_kafka_connected(manager)
+    recommendation_api._on_kafka_connected(manager)
+    await asyncio.sleep(0)
+    task = recommendation_api.recommendation_outbox_task
+    try:
+        assert recommendation_api.kafka_manager is manager
+        assert started == [True]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

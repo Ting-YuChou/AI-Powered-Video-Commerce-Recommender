@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import httpx
 from fastapi import Body, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
 import orjson
 import torch
 
@@ -30,9 +29,9 @@ from video_commerce.common.feature_history_contracts import (
 )
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.kafka_client import (
+    KafkaProducerSupervisor,
     KafkaPublishError,
     close_kafka,
-    init_kafka,
 )
 from video_commerce.ml.content_artifacts import content_artifact_reference
 from video_commerce.ml.model_artifacts import ModelArtifactManager
@@ -70,6 +69,7 @@ from video_commerce.common.service_common import (
     build_health_response,
     build_liveness_payload,
     build_metrics_response,
+    build_readiness_response,
     component_health,
     configure_service_logging,
     create_service_app,
@@ -100,6 +100,7 @@ ranking_batcher: Optional[RankingBatcher] = None
 ranking_client_pool: Optional[RoundRobinAsyncClientPool] = None
 ranking_coordinator_client_pool: Optional[RankingCoordinatorClientPool] = None
 kafka_manager = None
+kafka_supervisor: Optional[KafkaProducerSupervisor] = None
 system_store: Optional[SystemStore] = None
 serving_artifact_sync_task: Optional[asyncio.Task] = None
 known_user_snapshot_refresh_task: Optional[asyncio.Task] = None
@@ -1229,7 +1230,7 @@ async def startup_event():
     global best_effort_task_queue, recommendation_outbox_task
     global _serving_version_context_cache, _serving_version_context_paths
     global _remote_ranking_release, _impression_outbox_semaphore
-    global _recommendation_outbox_wakeup
+    global _recommendation_outbox_wakeup, kafka_supervisor
 
     runtime = app.state.runtime
     _serving_version_context_cache = None
@@ -1451,19 +1452,17 @@ async def startup_event():
         )
 
     if runtime.config.kafka_config.enable:
-        try:
-            kafka_manager = await init_kafka(
-                runtime.config.kafka_config,
-                observability=runtime.observability,
-            )
-        except Exception as exc:
-            logger.warning(f"Recommendation service Kafka init failed: {exc}")
-            kafka_manager = None
-    if kafka_manager is not None and system_store is not None:
-        recommendation_outbox_task = asyncio.create_task(
-            _run_recommendation_outbox_dispatcher(),
-            name="recommendation-event-outbox",
+        # Kafka being down at boot no longer disables impressions until a
+        # restart: the supervisor keeps retrying and the outbox dispatcher
+        # starts from on_connected. Until then responses carry no
+        # impression_id (impression_tracking: unavailable).
+        kafka_supervisor = KafkaProducerSupervisor(
+            runtime.config.kafka_config,
+            service_name=runtime.service_name,
+            observability=runtime.observability,
+            on_connected=_on_kafka_connected,
         )
+        await kafka_supervisor.start()
 
     logger.info(
         "recommendation_service_worker_started",
@@ -1477,11 +1476,24 @@ async def startup_event():
     )
 
 
+def _on_kafka_connected(manager) -> None:
+    """Publish the manager and start the outbox dispatcher (once) on connect."""
+    global kafka_manager, recommendation_outbox_task
+    kafka_manager = manager
+    if system_store is None:
+        return
+    if recommendation_outbox_task is None or recommendation_outbox_task.done():
+        recommendation_outbox_task = asyncio.create_task(
+            _run_recommendation_outbox_dispatcher(),
+            name="recommendation-event-outbox",
+        )
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     global serving_artifact_sync_task, known_user_snapshot_refresh_task
     global best_effort_task_queue, ranking_coordinator_client_pool
-    global recommendation_outbox_task
+    global recommendation_outbox_task, kafka_supervisor, kafka_manager
 
     if recommendation_outbox_task:
         recommendation_outbox_task.cancel()
@@ -1528,8 +1540,12 @@ async def shutdown_event():
         await feature_store.close()
     if system_store:
         await system_store.close()
-    if kafka_manager:
+    if kafka_supervisor:
+        await kafka_supervisor.stop()
+        kafka_supervisor = None
+    elif kafka_manager:
         await close_kafka()
+    kafka_manager = None
 
 
 @app.get("/")
@@ -1546,54 +1562,6 @@ async def root():
 @app.get("/livez")
 async def livez():
     return build_liveness_payload(app.state.runtime)
-
-
-def _recommendation_readiness_response(
-    runtime,
-    checks: Dict[str, Dict[str, Any]],
-    *,
-    critical: Set[str],
-    redact_errors: bool = True,
-) -> JSONResponse:
-    """Readiness gated only on what this pod needs to serve a slate.
-
-    Same contract as WS-1's ``service_common.build_readiness_response(...,
-    critical=..., redact_errors=...)``, which replaces this helper once it is on
-    main: critical checks pass when healthy or degraded, everything else is
-    reported but never fails the probe (remote ranking, Kafka and Postgres only
-    degrade a response, so they must not pull every pod out at once).
-    """
-    ready = all(
-        checks.get(name, {}).get("status") in {"healthy", "degraded"}
-        for name in critical
-    )
-    all_healthy = all(check.get("status") == "healthy" for check in checks.values())
-    overall = "not_ready" if not ready else "ready" if all_healthy else "degraded"
-    checks = {
-        name: {**check, "critical": name in critical} for name, check in checks.items()
-    }
-    if redact_errors:
-        checks = {
-            name: {
-                key: value
-                for key, value in check.items()
-                if key in {"status", "critical", "response_time_ms"}
-            }
-            for name, check in checks.items()
-        }
-    return JSONResponse(
-        status_code=200 if ready else 503,
-        content={
-            "status": overall,
-            "service": runtime.service_name,
-            "checks": checks,
-            "request_id_header": (
-                runtime.config.monitoring_config.request_id_header
-                if runtime.config
-                else "X-Request-ID"
-            ),
-        },
-    )
 
 
 async def _bounded_readiness_check(awaitable) -> Dict[str, Any]:
@@ -1666,7 +1634,10 @@ async def readyz():
     else:
         ranking_health = {"status": "healthy", "mode": "remote"}
 
-    return _recommendation_readiness_response(
+    # Critical checks pass when healthy or degraded; everything else (remote
+    # ranking, Kafka, Postgres only degrade a response) is reported but never
+    # pulls every pod out of the Service at once.
+    return build_readiness_response(
         runtime,
         {
             "redis": redis_health,
@@ -1677,6 +1648,7 @@ async def readyz():
             "kafka": kafka_health,
         },
         critical=critical,
+        redact_errors=True,
     )
 
 
