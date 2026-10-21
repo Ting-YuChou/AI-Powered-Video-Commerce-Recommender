@@ -627,12 +627,23 @@ class RecommendationConfig(BaseSettings):
         ),
     )
     impression_outbox_max_inflight: int = Field(
-        3,
+        2,
         ge=1,
         description=(
-            "Per-process cap on concurrent served-impression outbox writes; when "
-            "full the impression is skipped instead of queueing on the DB pool. "
-            "Keep it near DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW"
+            "Per-process cap on concurrent served-impression outbox write "
+            "transactions (pooled connections). Impressions that arrive while "
+            "they are busy join the next batch. Keep it below "
+            "DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW so the outbox "
+            "dispatcher keeps a connection"
+        ),
+    )
+    impression_outbox_max_batch_size: int = Field(
+        32,
+        ge=1,
+        description=(
+            "Maximum served impressions committed in one outbox transaction; "
+            "at most max_inflight * max_batch_size wait before new ones are "
+            "skipped"
         ),
     )
     outbox_terminal_retention_days: int = Field(

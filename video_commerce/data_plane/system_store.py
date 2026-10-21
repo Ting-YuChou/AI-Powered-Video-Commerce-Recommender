@@ -17,7 +17,17 @@ import uuid
 from types import SimpleNamespace
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Set
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from sqlalchemy import (
     BigInteger,
@@ -41,6 +51,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -1432,8 +1443,30 @@ def _engine_options(config: DatabaseConfig) -> Dict[str, Any]:
     }
 
 
-class OutboxCommitDeadlineExceeded(RuntimeError):
+class OutboxWriteRolledBack(RuntimeError):
+    """An outbox write failed before COMMIT was sent, so nothing committed.
+
+    ``reason`` is ``pool_timeout`` when no pooled connection was free in time,
+    ``deadline`` for a missed serving deadline, otherwise ``db_error``.
+    """
+
+    def __init__(self, message: str, *, reason: str = "db_error"):
+        super().__init__(message)
+        self.reason = reason
+
+
+class OutboxCommitDeadlineExceeded(OutboxWriteRolledBack):
     """The serving deadline passed before COMMIT, so the insert was rolled back."""
+
+    def __init__(
+        self,
+        message: str = "served impression outbox insert missed its serving deadline",
+    ):
+        super().__init__(message, reason="deadline")
+
+
+class _OutboxBatchNothingToCommit(Exception):
+    """Internal: every row of an outbox batch missed its deadline; roll back."""
 
 
 @dataclass
@@ -2323,60 +2356,151 @@ class SystemStore:
     ) -> str:
         """Durably stage one served-impression event before returning its ID.
 
-        ``commit_deadline`` is a ``time.monotonic()`` instant: when it has
-        passed by the time the insert is ready to commit, the transaction is
-        rolled back with ``OutboxCommitDeadlineExceeded`` because the caller
-        has already answered without the impression_id.
+        Single-row form of ``enqueue_recommendation_events``; the row's
+        exception, if any, is raised.
+        """
+        (outcome,) = await self.enqueue_recommendation_events(
+            [(event, commit_deadline)], publish_hold_seconds=publish_hold_seconds
+        )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    async def enqueue_recommendation_events(
+        self,
+        entries: Sequence[Tuple[Mapping[str, Any], Optional[float]]],
+        *,
+        publish_hold_seconds: float = 0.0,
+    ) -> List[Any]:
+        """Durably stage served-impression events in one transaction.
+
+        Each entry is ``(event, commit_deadline)``, where the deadline is a
+        ``time.monotonic()`` instant after which the caller has answered
+        without the impression_id. The result holds, per entry and in order,
+        ``"inserted"``, ``"duplicate"``, or that row's exception:
+        ``OutboxCommitDeadlineExceeded`` when its deadline passed before
+        COMMIT (the row is deleted inside the transaction, or the whole
+        transaction rolls back), ``ValueError`` for a malformed event or an
+        event_id payload collision.
+
+        A failure before COMMIT is sent raises ``OutboxWriteRolledBack``:
+        nothing in the batch committed. An error from COMMIT itself propagates
+        unchanged because the rows may have committed.
 
         ``publish_hold_seconds`` delays the first claim so a COMMIT that lands
-        after the deadline can be retired as ``not_exposed`` before any
+        after a deadline can be retired as ``not_exposed`` before any
         dispatcher can pick the row up.
         """
         if not self.enabled:
-            return False
-        metadata = _safe_dict(event.get("metadata"))
-        event_id = str(event.get("event_id") or "").strip()
-        impression_id = str(metadata.get("impression_id") or "").strip()
-        if not event_id or not impression_id:
-            raise ValueError(
-                "recommendation outbox event requires event_id and impression_id"
-            )
-        payload = dict(event)
-        payload_hash = hashlib.sha256(
-            json.dumps(
-                payload, sort_keys=True, separators=(",", ":"), default=str
-            ).encode("utf-8")
-        ).hexdigest()
-        stmt = pg_insert(RecommendationEventOutbox).values(
-            event_id=event_id,
-            impression_id=impression_id,
-            payload_hash=payload_hash,
-            event_payload=payload,
-            next_attempt_at=_utc_now()
-            + timedelta(seconds=max(0.0, float(publish_hold_seconds))),
+            return [False] * len(entries)
+        outcomes: List[Any] = [None] * len(entries)
+        rows: Dict[str, Dict[str, Any]] = {}
+        deadlines: Dict[str, Optional[float]] = {}
+        index_by_event: Dict[str, int] = {}
+        next_attempt_at = _utc_now() + timedelta(
+            seconds=max(0.0, float(publish_hold_seconds))
         )
-        stmt = stmt.on_conflict_do_nothing(
-            index_elements=[RecommendationEventOutbox.event_id]
-        )
-        async with self._hot_path_session() as session:
-            result = await session.execute(stmt)
-            if result.rowcount:
-                outcome = "inserted"
-            else:
-                existing = await session.scalar(
-                    select(RecommendationEventOutbox).where(
-                        RecommendationEventOutbox.event_id == event_id
+        now = time.monotonic()
+        for index, (event, commit_deadline) in enumerate(entries):
+            metadata = _safe_dict(event.get("metadata"))
+            event_id = str(event.get("event_id") or "").strip()
+            impression_id = str(metadata.get("impression_id") or "").strip()
+            if not event_id or not impression_id:
+                outcomes[index] = ValueError(
+                    "recommendation outbox event requires event_id and impression_id"
+                )
+                continue
+            if event_id in rows:
+                outcomes[index] = ValueError(
+                    "recommendation outbox event_id repeated within one batch"
+                )
+                continue
+            if commit_deadline is not None and now > commit_deadline:
+                outcomes[index] = OutboxCommitDeadlineExceeded()
+                continue
+            payload = dict(event)
+            rows[event_id] = {
+                "event_id": event_id,
+                "impression_id": impression_id,
+                "payload_hash": hashlib.sha256(
+                    json.dumps(
+                        payload, sort_keys=True, separators=(",", ":"), default=str
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "event_payload": payload,
+                "next_attempt_at": next_attempt_at,
+            }
+            deadlines[event_id] = commit_deadline
+            index_by_event[event_id] = index
+        if not rows:
+            return outcomes
+
+        inserted: Set[str] = set()
+        late: Set[str] = set()
+        committing = False
+        try:
+            async with self._hot_path_session() as session:
+                result = await session.execute(
+                    pg_insert(RecommendationEventOutbox)
+                    .values(list(rows.values()))
+                    .on_conflict_do_nothing(
+                        index_elements=[RecommendationEventOutbox.event_id]
                     )
+                    .returning(RecommendationEventOutbox.event_id)
                 )
-                if existing is None or existing.payload_hash != payload_hash:
-                    raise ValueError("recommendation outbox event_id payload collision")
-                outcome = "duplicate"
-            if commit_deadline is not None and time.monotonic() > commit_deadline:
-                raise OutboxCommitDeadlineExceeded(
-                    "served impression outbox insert missed its serving deadline"
-                )
+                inserted = set(result.scalars().all())
+                conflicted = [event_id for event_id in rows if event_id not in inserted]
+                if conflicted:
+                    existing = dict(
+                        (
+                            await session.execute(
+                                select(
+                                    RecommendationEventOutbox.event_id,
+                                    RecommendationEventOutbox.payload_hash,
+                                ).where(
+                                    RecommendationEventOutbox.event_id.in_(conflicted)
+                                )
+                            )
+                        ).all()
+                    )
+                    for event_id in conflicted:
+                        outcomes[index_by_event[event_id]] = (
+                            "duplicate"
+                            if existing.get(event_id) == rows[event_id]["payload_hash"]
+                            else ValueError(
+                                "recommendation outbox event_id payload collision"
+                            )
+                        )
+                now = time.monotonic()
+                late = {
+                    event_id
+                    for event_id, deadline in deadlines.items()
+                    if deadline is not None and now > deadline
+                }
+                if inserted and inserted <= late:
+                    raise _OutboxBatchNothingToCommit()
+                if late & inserted:
+                    await session.execute(
+                        delete(RecommendationEventOutbox).where(
+                            RecommendationEventOutbox.event_id.in_(late & inserted)
+                        )
+                    )
+                committing = True
+        except _OutboxBatchNothingToCommit:
+            inserted = set()
+        except Exception as exc:
+            if committing:
+                raise
+            reason = "pool_timeout" if isinstance(exc, PoolTimeoutError) else "db_error"
+            raise OutboxWriteRolledBack(
+                f"served impression outbox write rolled back: {exc}", reason=reason
+            ) from exc
+        for event_id in late:
+            outcomes[index_by_event[event_id]] = OutboxCommitDeadlineExceeded()
+        for event_id in inserted - late:
+            outcomes[index_by_event[event_id]] = "inserted"
         self._update_pool_metrics()
-        return outcome
+        return outcomes
 
     async def claim_recommendation_outbox(
         self, *, worker_id: str, batch_size: int = 50, lease_seconds: int = 30

@@ -289,11 +289,12 @@ async def test_existing_matching_served_event_remains_durable(monkeypatch):
             }
 
     class Store:
-        async def enqueue_recommendation_event(self, event, **kwargs):
-            return "duplicate"
+        async def enqueue_recommendation_events(self, entries, **kwargs):
+            return ["duplicate"] * len(entries)
 
     monkeypatch.setattr(recommendation_api, "kafka_manager", Kafka())
     monkeypatch.setattr(recommendation_api, "system_store", Store())
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
     monkeypatch.setattr(
         recommendation_api.app.state.runtime.observability,
         "record_recommendation_impression",

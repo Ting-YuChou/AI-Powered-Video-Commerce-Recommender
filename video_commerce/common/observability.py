@@ -803,6 +803,12 @@ class ObservabilityManager:
             ["stage", "status"],
             registry=self.registry,
         )
+        self.recommendation_impression_untracked_total = Counter(
+            "video_commerce_recommendation_impression_untracked_total",
+            "Served slates returned without an impression_id, by cause",
+            ["reason"],
+            registry=self.registry,
+        )
         self.recommendation_outbox_pending = Gauge(
             "video_commerce_recommendation_outbox_pending",
             "Unpublished served-impression outbox rows",
@@ -1897,6 +1903,9 @@ class ObservabilityManager:
         self.recommendation_impression_events_total.labels(
             stage=stage, status=status
         ).inc()
+
+    def record_recommendation_impression_untracked(self, reason: str) -> None:
+        self.recommendation_impression_untracked_total.labels(reason=reason).inc()
 
     def record_recommendation_outbox_terminal(self, reason: str) -> None:
         self.recommendation_outbox_terminal_total.labels(reason=reason).inc()

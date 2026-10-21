@@ -79,8 +79,12 @@ from video_commerce.common.service_common import (
 )
 from video_commerce.ml.slate_diversity import select_mmr_recommendations
 from video_commerce.data_plane.system_store import (
-    OutboxCommitDeadlineExceeded,
+    OutboxWriteRolledBack,
     SystemStore,
+)
+from video_commerce.services.recommendation.impression_outbox import (
+    EXPIRED as IMPRESSION_OUTBOX_EXPIRED,
+    ImpressionOutboxBatcher,
 )
 from video_commerce.ml.vector_search import VectorSearchEngine
 from video_commerce.common.telemetry import inject_http_headers
@@ -114,7 +118,7 @@ recommendation_outbox_task: Optional[asyncio.Task] = None
 # (coordinator/ranking-service). During a rolling activation the pointer can
 # lead what every runner has actually loaded; lineage follows the pointer.
 _remote_ranking_release: Optional[Dict[str, Any]] = None
-_impression_outbox_semaphore: Optional[asyncio.Semaphore] = None
+_impression_outbox_batcher: Optional[ImpressionOutboxBatcher] = None
 _recommendation_outbox_wakeup: Optional[asyncio.Event] = None
 _background_tasks: Set[asyncio.Task] = set()
 _RECOMMENDATION_OUTBOX_IDLE_SLEEP_MIN_SECONDS = 0.25
@@ -1230,7 +1234,7 @@ async def startup_event():
     global object_storage, artifact_manager
     global best_effort_task_queue, recommendation_outbox_task
     global _serving_version_context_cache, _serving_version_context_paths
-    global _remote_ranking_release, _impression_outbox_semaphore
+    global _remote_ranking_release, _impression_outbox_batcher
     global _recommendation_outbox_wakeup, kafka_supervisor
 
     runtime = app.state.runtime
@@ -1238,8 +1242,8 @@ async def startup_event():
     _serving_version_context_paths = None
     _remote_ranking_release = None
     runtime.config = Config()
-    _impression_outbox_semaphore = asyncio.Semaphore(
-        int(runtime.config.recommendation_config.impression_outbox_max_inflight)
+    _impression_outbox_batcher = _build_impression_outbox_batcher(
+        runtime.config.recommendation_config
     )
     _recommendation_outbox_wakeup = asyncio.Event()
     configure_service_logging(runtime)
@@ -1496,6 +1500,11 @@ async def shutdown_event():
     global serving_artifact_sync_task, known_user_snapshot_refresh_task
     global best_effort_task_queue, ranking_coordinator_client_pool
     global recommendation_outbox_task, kafka_supervisor, kafka_manager
+    global _impression_outbox_batcher
+
+    if _impression_outbox_batcher is not None:
+        await _impression_outbox_batcher.close()
+        _impression_outbox_batcher = None
 
     if recommendation_outbox_task:
         recommendation_outbox_task.cancel()
@@ -3350,14 +3359,16 @@ def _retire_if_inserted_late(
 ) -> None:
     """Done-callback for an outbox write whose result the client never saw.
 
-    Runs for an insert that committed after the budget, and for any failure
-    other than the explicit deadline rollback: an error raised around COMMIT
-    (for example a dropped connection) can still have committed the row.
+    Runs for an insert that committed after the budget, and for a failure
+    raised by COMMIT itself (for example a dropped connection), which can
+    still have committed the row.
     """
     if task.cancelled() or system_store is None:
         return
     exc = task.exception()
-    if isinstance(exc, OutboxCommitDeadlineExceeded):
+    if isinstance(exc, OutboxWriteRolledBack):
+        # Failed before COMMIT was sent (pool timeout, statement timeout,
+        # missed deadline): nothing committed, so there is nothing to retire.
         return
     if exc is None and task.result() != "inserted":
         return
@@ -3369,21 +3380,50 @@ def _retire_if_inserted_late(
     )
 
 
-async def _enqueue_impression_with_permit(
-    semaphore: Optional[asyncio.Semaphore],
-    event: Dict[str, Any],
-    commit_deadline: float,
-    publish_hold_seconds: float,
-) -> str:
-    try:
-        return await system_store.enqueue_recommendation_event(
-            event,
-            commit_deadline=commit_deadline,
-            publish_hold_seconds=publish_hold_seconds,
+def _build_impression_outbox_batcher(recommendation_config) -> ImpressionOutboxBatcher:
+    timeout_ms = getattr(recommendation_config, "impression_outbox_timeout_ms", 100)
+    max_inflight = int(
+        getattr(recommendation_config, "impression_outbox_max_inflight", 2)
+    )
+    max_batch_size = int(
+        getattr(recommendation_config, "impression_outbox_max_batch_size", 32)
+    )
+    return ImpressionOutboxBatcher(
+        _write_impression_outbox_batch,
+        max_inflight=max_inflight,
+        max_batch_size=max_batch_size,
+        # Rows only wait for a free write; a burst larger than this would
+        # mostly miss the budget anyway.
+        max_pending=max_inflight * max_batch_size,
+        publish_hold_seconds=max(0.001, float(timeout_ms or 100) / 1000.0)
+        + _IMPRESSION_PUBLISH_HOLD_MARGIN_SECONDS,
+    )
+
+
+def _impression_outbox_batcher_or_default() -> ImpressionOutboxBatcher:
+    global _impression_outbox_batcher
+    if _impression_outbox_batcher is None:
+        runtime_config = getattr(app.state.runtime, "config", None)
+        _impression_outbox_batcher = _build_impression_outbox_batcher(
+            getattr(runtime_config, "recommendation_config", None)
         )
-    finally:
-        if semaphore is not None:
-            semaphore.release()
+    return _impression_outbox_batcher
+
+
+async def _write_impression_outbox_batch(
+    entries: List[tuple], publish_hold_seconds: float
+) -> List[Any]:
+    store = system_store
+    if store is None:
+        raise OutboxWriteRolledBack("system store is not initialized")
+    return await store.enqueue_recommendation_events(
+        entries, publish_hold_seconds=publish_hold_seconds
+    )
+
+
+def _record_untracked_impression(observability, status: str, reason: str) -> None:
+    observability.record_recommendation_impression("served", status)
+    observability.record_recommendation_impression_untracked(reason)
 
 
 async def _stage_served_impression_event(
@@ -3396,15 +3436,18 @@ async def _stage_served_impression_event(
 ) -> bool:
     """Persist a stable served-impression event before exposing its ID.
 
-    The write is bounded by RECOMMENDATION_IMPRESSION_OUTBOX_TIMEOUT_MS. On
-    expiry the slate is still returned, just without an impression_id
-    (outcome ``timeout``). The insert itself is shielded rather than cancelled
-    so asyncpg never returns a connection mid-transaction. It rolls back if the
-    deadline passed before COMMIT; if the COMMIT itself lands late the row is
-    retired as terminal ``not_exposed`` so it is never published. Rows are
-    staged unclaimable for the budget plus a margin so that retire wins the
-    race against dispatchers; impression events therefore reach Kafka about
-    one to two seconds after serving.
+    The row joins the process's impression outbox batcher, which commits
+    concurrent impressions together in one transaction. The wait is bounded
+    by RECOMMENDATION_IMPRESSION_OUTBOX_TIMEOUT_MS; on expiry the slate is
+    still returned, just without an impression_id (outcome ``timeout``). A
+    full batcher queue skips the impression (``unavailable``) instead of
+    queueing. The write itself is never cancelled, so asyncpg never returns a
+    connection mid-transaction. A row whose deadline passed before COMMIT is
+    rolled back or deleted inside the transaction; if the COMMIT itself lands
+    late the row is retired as terminal ``not_exposed`` so it is never
+    published. Rows are staged unclaimable for the budget plus a margin so
+    that retire wins the race against dispatchers; impression events
+    therefore reach Kafka about one to two seconds after serving.
     """
     if kafka_manager is None or system_store is None:
         return False
@@ -3412,45 +3455,32 @@ async def _stage_served_impression_event(
     if not impression_id:
         return False
     observability = app.state.runtime.observability
-    semaphore = _impression_outbox_semaphore
-    if semaphore is not None:
-        if semaphore.locked():
-            # The DB is already slow for this process; do not queue on the pool.
-            observability.record_recommendation_impression("served", "unavailable")
-            return False
-        await semaphore.acquire()
     event_id = uuid.uuid5(
         uuid.NAMESPACE_URL, f"video-commerce:recommendation-served:{impression_id}"
     ).hex
-    try:
-        event = kafka_manager.build_recommendation_event(
-            user_id=user_id,
-            recommendations=recommendations,
-            response_time_ms=response_time_ms,
-            metadata=_bounded_impression_metadata(metadata),
-            request_id=request_id,
-            event_id=event_id,
-        )
-    except BaseException:
-        if semaphore is not None:
-            semaphore.release()
-        raise
-    timeout_seconds = _impression_outbox_timeout_seconds()
-    write = asyncio.ensure_future(
-        _enqueue_impression_with_permit(
-            semaphore,
-            event,
-            time.monotonic() + timeout_seconds,
-            timeout_seconds + _IMPRESSION_PUBLISH_HOLD_MARGIN_SECONDS,
-        )
+    event = kafka_manager.build_recommendation_event(
+        user_id=user_id,
+        recommendations=recommendations,
+        response_time_ms=response_time_ms,
+        metadata=_bounded_impression_metadata(metadata),
+        request_id=request_id,
+        event_id=event_id,
     )
+    timeout_seconds = _impression_outbox_timeout_seconds()
+    write = _impression_outbox_batcher_or_default().submit(
+        event, time.monotonic() + timeout_seconds
+    )
+    if write is None:
+        # The DB is already behind for this process; do not queue further.
+        _record_untracked_impression(observability, "unavailable", "queue_full")
+        return False
     try:
         outcome = await asyncio.wait_for(asyncio.shield(write), timeout=timeout_seconds)
     except asyncio.TimeoutError:
         write.add_done_callback(
             lambda task: _retire_if_inserted_late(event_id, impression_id, task)
         )
-        observability.record_recommendation_impression("served", "timeout")
+        _record_untracked_impression(observability, "timeout", "timeout")
         logger.warning(
             "recommendation_impression_outbox_timeout",
             extra={"impression_id": impression_id},
@@ -3463,11 +3493,21 @@ async def _stage_served_impression_event(
         raise
     except Exception as exc:
         _retire_if_inserted_late(event_id, impression_id, write)
-        observability.record_recommendation_impression("served", "unavailable")
-        logger.warning(
-            "recommendation_impression_outbox_failed",
-            extra={"impression_id": impression_id, "error": str(exc)},
-        )
+        if isinstance(exc, OutboxWriteRolledBack) and exc.reason == "deadline":
+            _record_untracked_impression(observability, "timeout", "timeout")
+        else:
+            _record_untracked_impression(
+                observability,
+                "unavailable",
+                exc.reason if isinstance(exc, OutboxWriteRolledBack) else "error",
+            )
+            logger.warning(
+                "recommendation_impression_outbox_failed",
+                extra={"impression_id": impression_id, "error": str(exc)},
+            )
+        return False
+    if outcome == IMPRESSION_OUTBOX_EXPIRED:
+        _record_untracked_impression(observability, "timeout", "timeout")
         return False
     observability.record_recommendation_impression("served", outcome)
     if outcome == "inserted" and _recommendation_outbox_wakeup is not None:
