@@ -423,7 +423,10 @@ groups:
           runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkinteractionwatermarklag
 
       - alert: FlinkCheckpointUnavailable
-        expr: time() - max(flink_jobmanager_job_lastCheckpointCompletionTimestamp{job_name="video-commerce-interaction-features"}) / 1000 > 300
+        # numberOfCompletedCheckpoints is a JobManager gauge (Flink exports no
+        # completion timestamp). No change in 5m, held for 5m, means ~10 minutes
+        # without a completed checkpoint at a 30s interval.
+        expr: sum by (job_name) (changes(flink_jobmanager_job_numberOfCompletedCheckpoints{job_name="video-commerce-interaction-features"}[5m])) == 0
         for: 5m
         labels:
           severity: critical

@@ -16,10 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 # Emitted by exporters or by Prometheus itself, not by this codebase.
 EXTERNAL_METRICS = {"up", "pg_up", "kafka_consumergroup_lag"}
 # Flink built-in job/operator metrics; job-specific operator metrics are checked
-# against the Flink job sources below.
+# against the Flink job sources below. Names were read from flink-runtime and
+# flink-streaming-java at FLINK_VERSION (SchedulerBase.registerJobMetrics,
+# CheckpointStatsTracker, OneInputStreamTask); re-verify them when pom.xml moves.
+FLINK_VERSION = "1.20.1"
 FLINK_BUILTIN_METRICS = {
     "flink_jobmanager_job_uptime",
-    "flink_jobmanager_job_lastCheckpointCompletionTimestamp",
+    "flink_jobmanager_job_numberOfCompletedCheckpoints",
     "flink_taskmanager_job_task_operator_currentInputWatermark",
 }
 FLINK_OPERATOR_PREFIX = "flink_taskmanager_job_task_operator_"
@@ -38,8 +41,8 @@ KNOWN_UNEMITTED_METRICS: dict[str, str] = {}
 
 _PROMQL_WORDS = {
     "sum", "min", "max", "avg", "count", "rate", "increase", "irate", "delta",
-    "histogram_quantile", "clamp_min", "clamp_max", "absent", "time", "and",
-    "or", "unless", "bool", "by", "without", "on", "ignoring", "group_left",
+    "changes", "histogram_quantile", "clamp_min", "clamp_max", "absent", "time",
+    "and", "or", "unless", "bool", "by", "without", "on", "ignoring", "group_left",
     "group_right", "offset",
 }
 _HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
@@ -151,6 +154,11 @@ def test_flink_job_name_selectors_match_job_sources():
     for rule in _rules():
         for job_name in re.findall(r'job_name="([^"]+)"', rule["expr"]):
             assert f'"{job_name}"' in flink_sources, (rule.get("alert"), job_name)
+
+
+def test_flink_metric_names_match_pinned_flink_version():
+    pom = (ROOT / "flink-jobs/interaction-features/pom.xml").read_text()
+    assert f"<flink.version>{FLINK_VERSION}</flink.version>" in pom
 
 
 def test_alerted_label_values_are_precreated():

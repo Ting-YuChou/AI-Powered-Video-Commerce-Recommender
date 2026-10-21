@@ -67,6 +67,37 @@
 
 `ranking_quality_gate_v2` 的 evidence 目前仍被視為有效的 Phase C 晉升依據，所以既有 release 不受影響；是否強制改以 v3 重新評估，需要另外決定。
 
+## Stage A／B 實作進度（2026-10-21，已 merge 至 `c0ad7fa`）
+
+| 階段 | 項目 | PR | 狀態 |
+| --- | --- | --- | --- |
+| A | 37、27、41、40 | #46 | PIT 改以 impression 歸因；`uf:` 與 PIT 共用 7 天 max-age；reader 依 parity／quarantine fail-closed；orchestrator 等 materializer 追上 |
+| A | 38、46、10 activation、41 trainer 端、37 purge | #45 | champion 為現役 release；只阻擋預先登記的切片；activation 檢查 `champion_not_active`；移除寫死的 PIT gauge |
+| A | 42、43 | #47 | retrieval PIT 帶真實的 seen／ranker_score；評估改為矩陣運算 |
+| A | 28 | #44 | ingest 把 client 時間 clamp 到 `[served_at, received_at]` |
+| A 遺留 | A/A 檢定力 | #49 | gate v5：NDCG CI 跨過 margin 時判 INSUFFICIENT，不再判 FAILED |
+| B | 59、63、64、22（伺服器端）、32（gateway）、01 | #52 | readiness 分層；Caddy 只檢查自身；Kafka 背景重連；限流依身分分桶並 fail-open；body 上限；bearer 身分範圍；恢復 HTTP smoke |
+| B | 58、62、05、create_all 鎖 | #51 | 遠端拓撲熱切換並帶 release id；熱路徑 statement timeout；outbox 時間預算與 terminal 狀態 |
+| B | 60、65（取消安全） | #50 | ranking TCP HMAC 握手（預設 permissive）；DRAIN 只接受 loopback；NetworkPolicy；連線池取消安全 |
+| B | 02、53、54、06 | #54 | reaper 重新驅動過期的 run；推論改用 `to_thread`；主模態失敗時 raise；上傳 Idempotency-Key |
+| B | 61、69、32（監控） | #53 | prometheus multiprocess；Alertmanager 透過 `url_file` 送出；每條 alert 都有 runbook；ServiceMonitor job relabel |
+
+**整合驗證（`c0ad7fa`）。** Docker backend-tests 1129 passed；HTTP smoke（含停掉 coordinator 的情境）、Flink closed-loop、recovery drill、helm／kubeconform、promtool、amtool 全數通過。故障演練：
+- `required` 模式下，未驗證的 frame 收到 401。
+- 多 worker 下 counter 單調遞增。
+- Kafka 停機時 edge 與 readiness 不受影響，恢復後自動重連。
+- outbox 表被鎖 45 秒：推薦全部 200，p99 由 306ms 升到 360ms。
+- critical alert 送達 webhook 並附 runbook。
+- content reaper smoke 通過。
+
+**仍未完成。**
+- Kafka 停機時，ingest 等待 30 秒的 Kafka timeout，比 gateway 的 10 秒 proxy timeout 長，所以回 504 而不是 503。
+- outbox 的 in-flight 上限在併發 20 下讓 32% 的曝光沒被追蹤。
+- gate 的機率類指標仍是點估計門檻（50）。
+- `http-smoke` 尚未列為 required check。
+- 沒有在真實 K8s 上演練。
+- 線上 shadow／canary 與 SRM（09／10）仍待後續。
+
 ## 嚴重度與規模
 
 - **P0**：預設路徑會靜默做出錯誤決策，或在例行操作下讓核心鏈路停擺。應立即處理。
