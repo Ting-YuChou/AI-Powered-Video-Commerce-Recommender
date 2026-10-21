@@ -35,5 +35,8 @@ spec:
             - |
               {{- range $topic, $config := .Values.kafkaTopicInitJob.topics }}
               kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --create --if-not-exists --topic {{ $topic }} --partitions {{ $config.partitions }} --replication-factor {{ $config.replicationFactor }}
+              {{- if $config.alterPartitions }}
+              kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --alter --topic {{ $topic }} --partitions {{ $config.partitions }} 2>/dev/null || true
+              {{- end }}
               {{- end }}
 {{- end }}

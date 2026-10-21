@@ -809,6 +809,30 @@ class ObservabilityManager:
             ["outcome"],
             registry=self.registry,
         )
+        self.content_processing_redrives_total = Counter(
+            "video_commerce_content_processing_redrives_total",
+            "Expired content processing leases handled by the reaper "
+            "(redriven, exhausted, superseded)",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.content_modality_status_total = Counter(
+            "video_commerce_content_modality_status_total",
+            "Per-modality content extraction outcomes",
+            ["modality", "status"],
+            registry=self.registry,
+        )
+        self.content_zero_norm_embeddings_total = Counter(
+            "video_commerce_content_zero_norm_embeddings_total",
+            "Content visual embeddings with (near) zero L2 norm",
+            registry=self.registry,
+        )
+        self.content_task_publisher_errors_total = Counter(
+            "video_commerce_content_task_publisher_errors_total",
+            "Content task publisher loop iterations that raised, by stage",
+            ["stage"],
+            registry=self.registry,
+        )
         self.pit_export_rows = Gauge(
             "pit_export_rows",
             "Rows in the latest PIT Parquet export",
@@ -1270,6 +1294,23 @@ class ObservabilityManager:
 
     def record_content_processing(self, outcome: str) -> None:
         self.content_processing_events_total.labels(outcome=str(outcome)).inc()
+
+    def record_content_processing_redrives(self, outcome: str, count: int = 1) -> None:
+        if int(count) > 0:
+            self.content_processing_redrives_total.labels(outcome=str(outcome)).inc(
+                int(count)
+            )
+
+    def record_content_modality_status(self, modality: str, status: str) -> None:
+        self.content_modality_status_total.labels(
+            modality=str(modality), status=str(status)
+        ).inc()
+
+    def record_content_zero_norm_embedding(self) -> None:
+        self.content_zero_norm_embeddings_total.inc()
+
+    def record_content_task_publisher_error(self, stage: str) -> None:
+        self.content_task_publisher_errors_total.labels(stage=str(stage)).inc()
 
     def record_pit_manifest_validation_failure(self, reason: str) -> None:
         self.pit_manifest_validation_failures_total.labels(reason=reason).inc()

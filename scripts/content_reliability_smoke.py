@@ -32,14 +32,9 @@ class _SmokeFeatureStore:
 
     async def store_content_features(self, _content_id, features):
         self.features = features
+        self.projection_updates += 1
 
-
-class _SmokeVectorSearch:
-    def __init__(self) -> None:
-        self.updates = 0
-
-    async def add_content_embedding(self, _content_id, _embedding):
-        self.updates += 1
+    projection_updates = 0
 
 
 class _SmokeProcessor:
@@ -70,6 +65,15 @@ class _SmokeObservability:
         return None
 
     def record_kafka_produce(self, _topic, _status):
+        return None
+
+    def record_content_modality_status(self, _modality, _status):
+        return None
+
+    def record_content_zero_norm_embedding(self):
+        return None
+
+    def record_content_processing_redrives(self, _outcome, _count=1):
         return None
 
 
@@ -113,7 +117,8 @@ async def main() -> None:
         pipeline_version = config.model_config.content_pipeline_version
         normal_content_id = f"smoke-normal-{uuid.uuid4().hex}"
         crash_content_id = f"smoke-crash-{uuid.uuid4().hex}"
-        content_ids.extend([normal_content_id, crash_content_id])
+        dead_worker_content_id = f"smoke-dead-worker-{uuid.uuid4().hex}"
+        content_ids.extend([normal_content_id, crash_content_id, dead_worker_content_id])
 
         tasks = []
         for content_id in content_ids:
@@ -157,6 +162,16 @@ async def main() -> None:
         assert await publisher.publish_once() == 1
         assert (await store.get_content_job(normal_content_id))["status"] == "queued"
 
+        dead_task = tasks[2]
+        dead_claim = await store.claim_content_task_outbox_event(
+            dead_task.event_id, worker_id="smoke-dead-publisher", lease_seconds=30
+        )
+        assert dead_claim is not None
+        assert await kafka.publish_video_processing_task_payload(dead_claim)
+        assert await store.mark_content_task_outbox_published(
+            dead_task.event_id, worker_id="smoke-dead-publisher"
+        )
+
         crash_task = tasks[1]
         claimed = await store.claim_content_task_outbox_event(
             crash_task.event_id,
@@ -193,10 +208,8 @@ async def main() -> None:
         worker = VideoProcessorWorker(config)
         processor = _SmokeProcessor()
         feature_store = _SmokeFeatureStore()
-        vector_search = _SmokeVectorSearch()
         worker.content_processor = processor
         worker.feature_store = feature_store
-        worker.vector_search = vector_search
         worker.system_store = store
         worker.object_storage = None
         worker.observability = _SmokeObservability()
@@ -214,8 +227,73 @@ async def main() -> None:
             None,
         )
         assert processor.calls == 1
-        assert vector_search.updates == 2
+        assert feature_store.projection_updates == 2
         assert feature_store.features.content_id == crash_content_id
+
+        # A worker dies holding the processing lease: duplicates see lease_held
+        # and ack, then the reaper redrives the same event once the lease expires.
+        dead_run = await store.claim_content_processing_run(
+            content_id=dead_worker_content_id,
+            pipeline_version=pipeline_version,
+            task_event_id=dead_task.event_id,
+            worker_id="smoke-dead-worker",
+            lease_seconds=60,
+        )
+        assert dead_run["outcome"] == "acquired"
+        await worker._handle_video_task(
+            config.kafka_config.video_processing_topic,
+            dead_worker_content_id,
+            dict(dead_task.payload),
+            None,
+        )
+        assert processor.calls == 1
+        reaper = ContentTaskPublisher(
+            system_store=store,
+            kafka_manager=kafka,
+            object_storage=storage,
+            config=SimpleNamespace(
+                content_outbox_batch_size=10,
+                content_outbox_lease_seconds=30,
+                content_processing_redrive_grace_seconds=0,
+                content_processing_max_redrives=1,
+            ),
+            worker_id="smoke-reaper",
+            observability=_SmokeObservability(),
+        )
+        assert (await reaper.reap_expired_processing_runs())["redriven"] == 0
+        async with store.session_factory.begin() as session:
+            await session.execute(
+                text(
+                    "UPDATE content_processing_runs "
+                    "SET lease_expires_at = now() - interval '5 minutes' "
+                    "WHERE content_id = :content_id"
+                ),
+                {"content_id": dead_worker_content_id},
+            )
+            # Keep the real ordering: the task was published before the lease began.
+            await session.execute(
+                text(
+                    "UPDATE content_task_outbox "
+                    "SET published_at = now() - interval '10 minutes' "
+                    "WHERE content_id = :content_id"
+                ),
+                {"content_id": dead_worker_content_id},
+            )
+        assert (await reaper.reap_expired_processing_runs())["redriven"] == 1
+        assert (await reaper.reap_expired_processing_runs())["redriven"] == 0
+        assert await reaper.publish_once() == 1
+        redrive_counts = await _collect_event_ids(config, {dead_task.event_id: 2})
+        assert redrive_counts[dead_task.event_id] >= 2
+        await worker._handle_video_task(
+            config.kafka_config.video_processing_topic,
+            dead_worker_content_id,
+            dict(dead_task.payload),
+            None,
+        )
+        assert processor.calls == 2
+        assert (await store.get_content_job(dead_worker_content_id))[
+            "status"
+        ] == "completed"
 
         claim = await store.claim_content_processing_run(
             content_id=normal_content_id,
@@ -256,7 +334,10 @@ async def main() -> None:
                     "normal_event_count": counts[tasks[0].event_id],
                     "redelivered_event_count": counts[crash_task.event_id],
                     "worker_model_calls": processor.calls,
-                    "worker_projection_updates": vector_search.updates,
+                    "worker_projection_updates": feature_store.projection_updates,
+                    "dead_worker_redrive_event_count": redrive_counts[
+                        dead_task.event_id
+                    ],
                     "durable_repair_outcome": repair["outcome"],
                 },
                 sort_keys=True,

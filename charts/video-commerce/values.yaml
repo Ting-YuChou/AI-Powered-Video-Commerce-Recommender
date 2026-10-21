@@ -135,6 +135,7 @@ external:
     consumerMaxPollIntervalMs: 600000
     consumerHandlerRetries: 3
     consumerHandlerRetryBackoffMs: 250
+    consumerHandlerRetryMaxBackoffMs: 10000
     deadLetterEnable: true
     deadLetterTopic: dead-letter-events
   database:
@@ -311,6 +312,9 @@ appConfig:
   contentOutboxRetentionDays: 7
   contentOrphanGraceSeconds: 86400
   contentProcessingLeaseSeconds: 300
+  contentProcessingMaxRedrives: 3
+  contentProcessingRedriveGraceSeconds: 60
+  contentProcessingReaperIntervalSeconds: 15
   vectorIndexPath: /app/models/vector_index.faiss
   vectorBootstrapMode: required
   vectorModelVersion: clip-vit-base-patch16
@@ -1152,9 +1156,13 @@ kafkaTopicInitJob:
     user-interactions:
       partitions: 6
       replicationFactor: 3
+    # Partitions bound content-worker parallelism. alterPartitions grows an
+    # existing topic (never shrinks it; a lower count is ignored). See
+    # docs/operations/event-and-artifact-reliability.md before raising it.
     video-processing-tasks:
-      partitions: 3
+      partitions: 12
       replicationFactor: 3
+      alterPartitions: true
     recommendation-events:
       partitions: 3
       replicationFactor: 3

@@ -16,6 +16,7 @@ Features:
 import json
 import asyncio
 import logging
+import random
 from typing import Dict, Any, Optional, Callable, List
 from datetime import datetime
 import time
@@ -423,6 +424,28 @@ class KafkaProducerClient:
             self.observability.record_kafka_produce(topic, status)
 
 
+class NonRetryableProcessingError(Exception):
+    """A handler failure that retrying cannot fix; the message goes to the DLQ.
+
+    Examples: a task for another pipeline version, a source object that no longer
+    exists, or a video that cannot be decoded.
+    """
+
+
+def handler_retry_backoff_seconds(
+    attempt: int,
+    *,
+    base_ms: int,
+    max_ms: int,
+    jitter: Callable[[], float] = random.random,
+) -> float:
+    """Exponential backoff with equal jitter: delay/2 + U(0, delay/2)."""
+    exponent = min(max(0, int(attempt) - 1), 16)
+    delay_ms = min(max(0, int(max_ms)), max(0, int(base_ms)) * (2**exponent))
+    half = delay_ms / 2.0
+    return (half + half * float(jitter())) / 1000.0
+
+
 class KafkaConsumerClient:
     """
     Async Kafka consumer for processing messages from topics.
@@ -569,15 +592,26 @@ class KafkaConsumerClient:
 
     async def _process_message_with_retries(self, message) -> bool:
         max_attempts = max(1, int(self.config.consumer_handler_retries))
+        # All attempts of one message must finish inside max.poll.interval, or
+        # the broker rebalances the partition away mid-retry.
+        retry_budget_seconds = 0.9 * (
+            max(0, int(getattr(self.config, "consumer_max_poll_interval_ms", 0) or 0))
+            / 1000.0
+        )
+        started_at = time.monotonic()
+        longest_attempt = 0.0
         last_error: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
+            attempt_started = time.monotonic()
             try:
                 await self._process_message_once(message)
                 return True
             except Exception as exc:
                 last_error = exc
-                if self.observability is not None:
-                    self.observability.record_kafka_retry(message.topic, self.group_id)
+                longest_attempt = max(
+                    longest_attempt, time.monotonic() - attempt_started
+                )
+                retryable = not isinstance(exc, NonRetryableProcessingError)
                 logger.error(
                     "Error processing Kafka message",
                     extra={
@@ -586,14 +620,42 @@ class KafkaConsumerClient:
                         "offset": message.offset,
                         "attempt": attempt,
                         "max_attempts": max_attempts,
+                        "retryable": retryable,
                         "error": str(exc),
                     },
                 )
+                if not retryable:
+                    break
                 if attempt < max_attempts:
-                    backoff_seconds = (
-                        max(0, self.config.consumer_handler_retry_backoff_ms) / 1000.0
-                    ) * attempt
-                    await asyncio.sleep(backoff_seconds)
+                    backoff = handler_retry_backoff_seconds(
+                        attempt,
+                        base_ms=self.config.consumer_handler_retry_backoff_ms,
+                        max_ms=getattr(
+                            self.config,
+                            "consumer_handler_retry_max_backoff_ms",
+                            10000,
+                        ),
+                    )
+                    projected = (
+                        time.monotonic() - started_at + backoff + longest_attempt
+                    )
+                    if retry_budget_seconds and projected > retry_budget_seconds:
+                        logger.error(
+                            "Kafka handler retry budget exhausted",
+                            extra={
+                                "topic": message.topic,
+                                "partition": message.partition,
+                                "offset": message.offset,
+                                "attempt": attempt,
+                                "budget_seconds": retry_budget_seconds,
+                            },
+                        )
+                        break
+                    if self.observability is not None:
+                        self.observability.record_kafka_retry(
+                            message.topic, self.group_id
+                        )
+                    await asyncio.sleep(backoff)
 
         if last_error and self.config.dead_letter_enable:
             return await self._publish_dead_letter(message, last_error)

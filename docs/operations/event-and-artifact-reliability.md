@@ -34,12 +34,101 @@ Content workers claim `(content_id, pipeline_version)` in
 `content_processing_runs`. A valid competing lease skips duplicate model work,
 an expired or failed lease can be taken over, and an old owner cannot complete a
 new owner's run. Feature artifacts are immutable and committed with the run and
-job completion in one database transaction before Redis and vector projections
-are updated. A redelivery after that commit repairs projections from the durable
+job completion in one database transaction before the Redis projection is
+updated. A redelivery after that commit repairs projections from the durable
 artifact without recomputing the model. Keep
 `MODEL_CONTENT_PIPELINE_VERSION` identical on the gateway and workers; an
 explicit mismatched event is failed for investigation. Legacy events without a
 version map to the configured worker version during migration.
+
+### Content pipeline failure handling (migration 013)
+
+Apply `migrations/postgres/013_content_upload_idempotency.sql` before deploying
+the gateway, content-task publisher, or content workers from Stage B. It is
+additive: `content_jobs.idempotency_key`, `content_jobs.request_fingerprint`, a
+unique index on `(COALESCE(user_id, ''), idempotency_key)`, an index on
+`content_jobs.storage_path`, and `content_processing_runs.redrive_count`.
+`auto_create_schema` applies the same statements idempotently at startup.
+
+- **Upload retries.** Clients may send `Idempotency-Key` (1-128 characters of
+  `A-Z a-z 0-9 _ . : ~ -`) on `POST /api/content/upload`; a key requires a
+  `user_id`. The gateway hashes the body while streaming it and stores a `v1:`
+  fingerprint over the body SHA-256, size, filename, and priority.
+  - Same key and same request: the original `content_id` and current status
+    with `idempotent_replay: true` (a `pending_publish` job is re-published
+    inline).
+  - Same key, different request: `409 IDEMPOTENCY_KEY_REUSED`.
+  - Same key after the job terminally failed: `409 IDEMPOTENCY_KEY_JOB_FAILED`;
+    re-upload with a new key.
+  - Scope is `(user_id, key)`. With bearer auth `user_id` is bound to the token
+    subject, so keys are per authenticated user. In `disabled` or `api_key`
+    mode `user_id` is supplied by the trusted caller (the BFF), and two callers
+    that send the same `user_id` share one key namespace.
+- **Unknown staging outcome.** If staging the job raises (for example the
+  connection drops during COMMIT), the gateway looks the job up before touching
+  the object: it deletes the object only when the job is definitely absent, keeps
+  it and returns `CONTENT_ENQUEUE_PENDING` when the job exists, and keeps it when
+  the lookup also fails. The orphan reconciler removes unreferenced objects after
+  `SERVICE_CONTENT_ORPHAN_GRACE_SECONDS`.
+- **Publisher tasks.** Publishing runs in its own loop. Outbox stats (5 s),
+  the reaper, orphan reconciliation (5 min), and pruning (1 h) each run as a
+  separate task with their own error guard, so a slow S3 listing or a failing
+  maintenance query never delays publishing. Failures are counted in
+  `video_commerce_content_task_publisher_errors_total{stage}`.
+- **Orphan reconciliation.** The publisher lists upload objects one page at a
+  time (`SERVICE_CONTENT_RECONCILE_PAGE_SIZE`, default 1000) and checks each page
+  against `content_jobs.storage_path` with one batched `IN` query. Only objects
+  directly under the upload prefix are considered; `artifacts/` and
+  `content-features/` under the same S3 prefix are never treated as orphans.
+- **Dead workers.** A delivery that finds a live competing lease (`lease_held`)
+  commits its offset. The publisher's reaper (every
+  `SERVICE_CONTENT_PROCESSING_REAPER_INTERVAL_SECONDS`, default 15) finds
+  `processing` runs whose lease expired more than
+  `SERVICE_CONTENT_PROCESSING_REDRIVE_GRACE_SECONDS` (default 60) ago, using the
+  database clock (every lease timestamp is written with the database clock too,
+  so app/DB skew cannot expire a live lease), and resets their existing outbox
+  row so the same event ID is
+  republished; the next worker takes over the expired lease. After
+  `SERVICE_CONTENT_PROCESSING_MAX_REDRIVES` (default 3) the run, job, and outbox
+  row become terminal `failed` with `processing_attempts_exhausted`. Watch
+  `video_commerce_content_processing_redrives_total{outcome}` (`redriven`,
+  `exhausted`, `superseded`).
+- **Retry classification.** Consumer handler retries use exponential backoff
+  with equal jitter (`KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS` base, capped at
+  `KAFKA_CONSUMER_HANDLER_RETRY_MAX_BACKOFF_MS`). A `NonRetryableProcessingError`
+  (pipeline version mismatch, missing source object, undecodable video) goes to
+  the DLQ without retries. A local source file that is not visible yet, I/O
+  errors, and model failures stay retryable. All attempts of one message stop
+  before 90% of `KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS` and the message is
+  dead-lettered, so retries never trigger a consumer rebalance.
+- **Lease renewal.** A failed renewal is retried while the current lease is
+  still valid; the worker reports `lease_lost` only when the lease was taken or
+  is about to expire.
+- **Modalities.** A CLIP failure fails the attempt (retryable) instead of
+  storing a zero vector as completed. OCR and object-detection failures are
+  recorded in `ContentFeatures.modality_status` (`failed`/`degraded`) and the
+  job still completes. Watch `video_commerce_content_modality_status_total` and
+  `video_commerce_content_zero_norm_embeddings_total`.
+- **Local sources.** In `OBJECT_STORAGE_BACKEND=local` mode the upload path is
+  the durable source and the worker never deletes it; only temporary files
+  materialized from S3 are removed.
+
+`video-processing-tasks` defaults to 12 partitions in Compose and Helm so up to
+12 content workers can consume in parallel. The Compose `kafka-init` service and
+the Helm topic init job (`alterPartitions: true`) also run `kafka-topics --alter`
+for this topic, which grows an existing 3-partition topic and is a no-op
+otherwise. Keys are re-hashed after a partition increase, and partitions can
+never be decreased. To do it by hand, during a quiet period:
+
+```bash
+kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --alter \
+  --topic video-processing-tasks --partitions 12
+kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --describe \
+  --topic video-processing-tasks
+```
+
+In Compose, run the same command with
+`docker compose exec kafka kafka-topics --bootstrap-server kafka:9092 ...`.
 
 Production must set `VECTOR_BOOTSTRAP_MODE=required`. A vector activation is
 accepted only when the FAISS file, metadata, optional embedding sidecar, and
