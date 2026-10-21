@@ -1668,32 +1668,31 @@ class SystemStore:
 
     async def _ensure_content_reliability_schema(self, conn) -> None:
         """Apply migration 013 additively for existing content tables."""
-        await conn.execute(
-            text(
-                "ALTER TABLE content_jobs "
-                "ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128), "
-                "ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(128)"
-            )
+        await self._add_missing_columns(
+            conn,
+            "content_jobs",
+            {
+                "idempotency_key": "VARCHAR(128)",
+                "request_fingerprint": "VARCHAR(128)",
+            },
         )
-        await conn.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS "
-                f"{CONTENT_UPLOAD_IDEMPOTENCY_INDEX} "
-                "ON content_jobs ((COALESCE(user_id, '')), idempotency_key) "
-                "WHERE idempotency_key IS NOT NULL"
-            )
+        await self._create_index_if_missing(
+            conn,
+            CONTENT_UPLOAD_IDEMPOTENCY_INDEX,
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {CONTENT_UPLOAD_IDEMPOTENCY_INDEX} "
+            "ON content_jobs ((COALESCE(user_id, '')), idempotency_key) "
+            "WHERE idempotency_key IS NOT NULL",
         )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_content_jobs_storage_path "
-                "ON content_jobs (storage_path)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_content_jobs_storage_path",
+            "CREATE INDEX IF NOT EXISTS ix_content_jobs_storage_path "
+            "ON content_jobs (storage_path)",
         )
-        await conn.execute(
-            text(
-                "ALTER TABLE content_processing_runs "
-                "ADD COLUMN IF NOT EXISTS redrive_count INTEGER NOT NULL DEFAULT 0"
-            )
+        await self._add_missing_columns(
+            conn,
+            "content_processing_runs",
+            {"redrive_count": "INTEGER NOT NULL DEFAULT 0"},
         )
 
     async def _ensure_partitioned_interaction_events(self, conn) -> None:
