@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 PUBLIC_EVENT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 PUBLIC_EVENT_MAX_FUTURE_SKEW_SECONDS = 5 * 60
@@ -28,3 +29,22 @@ def validate_public_event_time(event_time: float, server_received_at: float) -> 
     if resolved_event_time > received_at + PUBLIC_EVENT_MAX_FUTURE_SKEW_SECONDS:
         raise ValueError("event_time exceeds the 5-minute future acceptance window")
     return resolved_event_time
+
+
+def clamp_public_event_time(
+    event_time: float,
+    *,
+    upper_bound: float,
+    lower_bound: Optional[float] = None,
+) -> float:
+    """Clamp a validated client timestamp into server-observed bounds.
+
+    PIT joins anchor on ``event_time``, so a public event may not claim to have
+    happened after the server received it (``upper_bound``) or, for slate views,
+    before the slate was served (``lower_bound``). The lower bound wins when
+    server clocks disagree, keeping a view ordered after its serve.
+    """
+    clamped = min(float(event_time), float(upper_bound))
+    if lower_bound is not None:
+        clamped = max(clamped, float(lower_bound))
+    return clamped

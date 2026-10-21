@@ -16,7 +16,10 @@ from fastapi import Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from video_commerce.common.config import Config
-from video_commerce.common.event_time import validate_public_event_time
+from video_commerce.common.event_time import (
+    clamp_public_event_time,
+    validate_public_event_time,
+)
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.kafka_client import close_kafka, init_kafka
 from video_commerce.common.models import UserInteractionRequest, ViewedImpressionRequest
@@ -154,9 +157,19 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
     action = request.action.value if hasattr(request.action, "value") else str(request.action)
     server_received_at = time.time()
     try:
-        event_time = validate_public_event_time(request.event_time, server_received_at)
+        client_event_time = validate_public_event_time(
+            request.event_time, server_received_at
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # The model fills a missing event_time with time.time() at parse; only a
+    # client-supplied value is a client clock reading worth keeping.
+    client_supplied_time = bool({"event_time", "timestamp"} & request.__fields_set__)
+    # No served-slate lookup on this hot path: the PIT jobs bound feedback from
+    # below with the server available_at, so only the future side is clamped.
+    event_time = clamp_public_event_time(
+        client_event_time, upper_bound=server_received_at
+    )
 
     if not kafka_manager or not app.state.runtime.config.kafka_config.enable:
         app.state.runtime.observability.record_interaction_ingest(action, "kafka_unavailable")
@@ -169,9 +182,9 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         "action": action,
         "context": request.context,
     }
-    # The model fills a missing event_time with time.time(), so only hash it when
-    # the client sent one; otherwise retries of the same event_id look like collisions.
-    if {"event_time", "timestamp"} & request.__fields_set__:
+    # Hash the client-supplied time, never the clamped one: the clamp depends on
+    # each retry's receive time, so hashing it would turn retries into collisions.
+    if client_supplied_time:
         hashed_fields["event_time"] = request.event_time
     payload_hash = hashlib.sha256(
         json.dumps(
@@ -190,6 +203,7 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         "action": action,
         "context": request.context,
         "event_time": event_time,
+        "client_event_time": client_event_time if client_supplied_time else None,
         "server_received_at": server_received_at,
         "request_id": http_request.state.request_id,
     }
@@ -269,6 +283,7 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         event_time=event_payload["event_time"],
         server_received_at=event_payload["server_received_at"],
         request_id=event_payload["request_id"],
+        client_event_time=event_payload.get("client_event_time"),
     )
     if not success:
         if owns_claim and uses_postgres_ledger:
@@ -296,6 +311,14 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         )
     app.state.runtime.observability.record_interaction_ingest(action, "accepted")
 
+    if not duplicate and client_supplied_time:
+        app.state.runtime.observability.record_public_event_time(
+            "interaction",
+            client_time=client_event_time,
+            server_received_at=server_received_at,
+            clamped_bound=_clamped_bound(client_event_time, event_time),
+        )
+
     if not duplicate:
         asyncio.create_task(
             _invalidate_user_serving_cache(request.user_id),
@@ -312,6 +335,14 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
             "duplicate": duplicate,
         },
     )
+
+
+def _clamped_bound(client_time: float, server_time: float) -> Optional[str]:
+    if server_time < client_time:
+        return "upper"
+    if server_time > client_time:
+        return "lower"
+    return None
 
 
 async def _invalidate_user_serving_cache(user_id: str) -> None:
@@ -335,7 +366,7 @@ async def ingest_viewed_impression(
 ):
     received_at = time.time()
     try:
-        viewed_at = validate_public_event_time(request.viewed_at, received_at)
+        client_viewed_at = validate_public_event_time(request.viewed_at, received_at)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not kafka_manager or not app.state.runtime.config.kafka_config.enable:
@@ -364,6 +395,12 @@ async def ingest_viewed_impression(
         or request.context.get("user_id")
         or request.impression_id
     )
+    # A view cannot precede its serve or follow its receipt; the PIT jobs anchor
+    # on this value, so the client clock only places it inside that window.
+    served_at = (slate or {}).get("served_at")
+    viewed_at = clamp_public_event_time(
+        client_viewed_at, upper_bound=received_at, lower_bound=served_at
+    )
     for item in request.items:
         success = await kafka_manager.send_recommendation_view(
             event_id=str(item.event_id),
@@ -374,6 +411,9 @@ async def ingest_viewed_impression(
             viewed_at=viewed_at,
             context=request.context,
             request_id=http_request.state.request_id,
+            client_viewed_at=client_viewed_at,
+            served_at=served_at,
+            server_received_at=received_at,
         )
         if not success:
             raise HTTPException(
@@ -389,6 +429,12 @@ async def ingest_viewed_impression(
         )
     app.state.runtime.observability.record_recommendation_impression(
         "viewed", "accepted"
+    )
+    app.state.runtime.observability.record_public_event_time(
+        "view",
+        client_time=client_viewed_at,
+        server_received_at=received_at,
+        clamped_bound=_clamped_bound(client_viewed_at, viewed_at),
     )
     return JSONResponse(
         status_code=202,

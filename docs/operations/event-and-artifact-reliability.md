@@ -68,6 +68,19 @@ counted. Training negatives are drawn from viewed items inside the configured
 attribution window;
 legacy served-only rows remain useful for delivery-funnel analysis only.
 
+Public event times come from client clocks, but the PIT jobs anchor on
+`event_time`, so ingest bounds them with server times. A view's `event_time`
+is the client `viewed_at` clamped into `[served_at, server_received_at]`, where
+`served_at` is the durable slate's `created_at`. An interaction's `event_time`
+is clamped to at most `server_received_at`; its lower bound is the PIT jobs'
+server `available_at`, not an ingest lookup. Events keep the raw client value
+as `client_viewed_at` or `client_event_time` (null when the server filled the
+time). Interaction idempotency hashes the client value, so retries stay
+duplicates even when each retry clamps differently. Watch
+`video_commerce_public_event_clock_skew_seconds{kind}` (client minus receive
+time; signed buckets, so no `_sum`) and
+`video_commerce_public_event_time_clamped_total{kind,bound}`.
+
 The ranking artifact records `score_policy_version` and value-normalization
 metadata. `business-value-v1` computes the canonical serving score as clipped
 CTCVR multiplied by inverse-transformed predicted value; disabling business
