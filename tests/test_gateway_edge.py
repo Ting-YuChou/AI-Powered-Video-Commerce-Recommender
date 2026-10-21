@@ -442,7 +442,7 @@ def test_internal_service_auth_returns_401_instead_of_raising():
 @pytest.mark.asyncio
 async def test_kafka_supervisor_retries_until_connected(monkeypatch):
     attempts = []
-    manager = object()
+    manager = SimpleNamespace(producer=SimpleNamespace(on_unreachable=None))
 
     async def fake_init(_config, observability=None):
         attempts.append(1)
