@@ -109,6 +109,8 @@ def test_new_and_changed_alerts_have_promtool_cases():
         "WorkerHeartbeatMissing",
         "WorkerMetricsTargetDown",
         "KafkaProducerDisconnected",
+        "InteractionIngestKafkaRejections",
+        "InteractionIngestLeaseLost",
         "RateLimiterFailingOpen",
         "DependencyUnhealthy",
         "RankingRuntimeUnauthenticatedConnections",

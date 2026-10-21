@@ -97,6 +97,42 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
 - **Remediation:** fix the dependency and restart. Clients retry with the same
   event ID, so no deduplication cleanup is needed.
 
+## InteractionIngestKafkaRejections
+
+- **Symptom:** more than 5% of `POST /api/interactions` got a retryable 503
+  for 5 minutes (`video_commerce_interactions_ingested_total` with status
+  `kafka_unavailable`, `publish_timeout` or `publish_failed`).
+- **Impact:** those interactions are stored only if the client retries with the
+  same `event_id` (the 503 body returns it). `late_publish_failed` counts the
+  timed-out ones that never reached Kafka; `published_late` counts the ones
+  that landed anyway and will be acknowledged as duplicates on retry.
+- **First checks:** broker health and `KafkaProducerDisconnected`; ingest logs
+  for `Kafka broker unreachable`; the status mix: `kafka_unavailable` means
+  ingest is failing fast (producer down, breaker open after
+  `SERVICE_INTERACTION_INGEST_BREAKER_FAILURE_THRESHOLD` failures in a row, or
+  more than `SERVICE_INTERACTION_INGEST_MAX_OUTSTANDING_PUBLISHES` sends
+  unresolved), `publish_timeout` means sends take longer than
+  `SERVICE_INTERACTION_INGEST_PUBLISH_TIMEOUT_MS`.
+- **Remediation:** restore the broker. The producer reconnects in the
+  background and the breaker closes after one probe publish succeeds, so no
+  restart is needed. Raise the publish timeout only if the broker is healthy but
+  slow, and keep it below `SERVICE_PROXY_READ_TIMEOUT_SECONDS`.
+
+## InteractionIngestLeaseLost
+
+- **Symptom:** an interaction publish landed after its idempotency lease
+  lapsed (`late_publish_lost_lease`, or `lease_lost` inside the publish
+  timeout).
+- **Impact:** a retry may have published the same `event_id` a second time.
+  Flink's `EventIdDeduplicator` drops the copy for features, but other
+  consumers of `user-interactions` see it twice.
+- **First checks:** Postgres latency and errors around the alert
+  (`DatabaseErrors`, `DatabaseP95LatencyHigh`); ingest logs for
+  `late_interaction_claim_renewal_failed`, since a lease only lapses when
+  renewal fails for a whole lease.
+- **Remediation:** fix the ledger database. No replay is needed; downstream
+  consumers must tolerate the duplicate `event_id`.
+
 ## WorkerHeartbeatMissing
 
 - **Symptom:** the gateway sees zero live instances of a background worker for
