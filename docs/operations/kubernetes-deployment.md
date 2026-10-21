@@ -17,7 +17,8 @@ and S3-compatible object storage must be provided outside the chart.
   - `ranking-runner`
   - `content-worker`
   - optional GPU-backed `asr-service` for uploaded-video speech transcription
-  - `feature-worker`
+  - `feature-worker` (only when `appConfig.featurePipelineMode=python`; it is
+    disabled by default because the Flink job owns official feature writes)
   - `model-trainer`
 - `ranking-runner` uses a headless Service so `ranking-coordinator` can resolve
   individual pod endpoints through DNS.
@@ -33,15 +34,45 @@ Create or provision these before installing the chart:
 - Redis for state and optionally a separate Redis for recommendation cache.
 - Kafka brokers reachable from the cluster.
 - S3-compatible object storage bucket.
+- Flink (see below) for the default `featurePipelineMode: flink`.
 - NVIDIA GPU nodes and a model-cache volume when `asr.enabled=true`.
 
-Kafka topics must exist unless `kafkaTopicInitJob.enabled=true` is used:
+Kafka topics must exist unless `kafkaTopicInitJob.enabled=true` is used. The
+chart's `kafkaTopicInitJob.topics` is the full list:
 
 - `user-interactions`
 - `video-processing-tasks`
 - `recommendation-events`
 - `feature-updates`
+- `feature-history-snapshots`
+- `catalog-feature-events`
+- `late-interaction-events`
 - `dead-letter-events`
+- backfill topics: `user-interactions-backfill`,
+  `recommendation-events-backfill`, `feature-updates-backfill`,
+  `catalog-feature-events-backfill`, `feature-history-backfill-quarantine`
+
+### Flink (external)
+
+The chart does not deploy Flink, but the default feature pipeline depends on it:
+with `featurePipelineMode: flink` the Python feature worker is off and only the
+Flink interaction job writes official Redis/Postgres features. Run the job
+outside the chart (Flink Kubernetes operator or a session cluster) with this
+contract:
+
+- Job name `video-commerce-interaction-features`, exactly one non-terminal
+  instance (the Compose submitter and alerts assume this).
+- Reads `user-interactions` and `recommendation-events`; writes
+  `feature-history-snapshots`, `late-interaction-events` and
+  `dead-letter-events`, plus Redis features and Postgres views.
+- Durable checkpoints and savepoints under runtime subdirectories (for example
+  `s3://.../flink/checkpoints/runtime` and `.../savepoints/runtime`), restored
+  on every resubmit; see `docs/operations/flink-realtime-recovery.md`.
+- `FLINK_KAFKA_TRANSACTION_TIMEOUT_MS` within the broker transaction timeout.
+
+Set `appConfig.flinkRestUrl` to the JobManager REST URL so the gateway's
+`/readyz/full` reports the job state and last checkpoint age. It is reported
+only and never fails readiness.
 
 For production Kafka, prefer managing topics outside this chart so partition and
 replication settings are reviewed with the platform team.
@@ -205,8 +236,27 @@ kubectl -n video-commerce rollout status deploy/video-commerce-ranking-service
 kubectl -n video-commerce rollout status deploy/video-commerce-ranking-coordinator
 kubectl -n video-commerce rollout status deploy/video-commerce-ranking-runner
 curl -fsS https://video-commerce.example.com/readyz
-curl -fsS https://video-commerce.example.com/readyz/full
+curl -fsS -H "x-api-key: $API_API_KEY" https://video-commerce.example.com/readyz/full
 ```
+
+Readiness semantics:
+
+- Caddy's readiness probe is its own `/caddy-healthz`, so the edge and the
+  static frontend stay up while the gateway is degraded.
+- Gateway `/readyz` is public, cached for `API_READINESS_CACHE_SECONDS`, and
+  checks only the gateway itself (startup, auth configured, Redis). It does not
+  probe shared dependencies, so a ranking or Kafka outage shows up as 503s on
+  the affected routes instead of removing every gateway pod at once. Error
+  details are redacted.
+- Gateway `/readyz/full` needs credentials. It probes recommendation, ranking,
+  ingest, Kafka, Postgres, object storage, worker heartbeats (feature-worker
+  only in python mode) and, when configured, the Flink job. It returns 503 when
+  any of them is unhealthy (degraded is allowed), so use it as the deep
+  post-deploy check, not as a Kubernetes probe.
+- Interaction ingest stays unready without Kafka or Postgres, because it only
+  acknowledges events after the Kafka publish and the idempotency ledger.
+  Gateway and ingest reconnect to Kafka in the background after a failed
+  start, so a short broker outage at boot no longer needs a pod restart.
 
 Then run a small smoke baseline against the Ingress URL:
 

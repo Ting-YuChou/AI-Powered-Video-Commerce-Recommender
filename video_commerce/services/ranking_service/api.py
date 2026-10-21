@@ -42,7 +42,7 @@ from video_commerce.common.service_common import (
     component_health,
     configure_service_logging,
     create_service_app,
-    require_internal_service_auth,
+    internal_service_auth_response,
 )
 from video_commerce.data_plane.system_store import SystemStore
 
@@ -65,7 +65,9 @@ ranking_coordinator_client: Optional[RankingCoordinatorClientPool] = None
 
 @app.middleware("http")
 async def internal_auth(request: Request, call_next):
-    require_internal_service_auth(request, app.state.runtime)
+    denied = internal_service_auth_response(request, app.state.runtime)
+    if denied is not None:
+        return denied
     return await call_next(request)
 
 

@@ -62,7 +62,7 @@ spec:
             failureThreshold: 6
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /caddy-healthz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10

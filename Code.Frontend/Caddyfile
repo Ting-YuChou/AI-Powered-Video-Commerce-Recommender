@@ -2,6 +2,24 @@
     encode zstd gzip
 
     route {
+        # Caddy's own readiness: the edge stays Ready (and keeps serving the
+        # SPA) while the gateway or its dependencies are degraded.
+        respond /caddy-healthz 200
+
+        # Bound request bodies before they reach the gateway. Uploads allow
+        # DATA_MAX_FILE_SIZE (500MiB) plus multipart overhead.
+        @upload path /api/content/upload
+        request_body @upload {
+            max_size {$EDGE_MAX_UPLOAD_BODY:501MiB}
+        }
+        @api_body {
+            path /api/*
+            not path /api/content/upload
+        }
+        request_body @api_body {
+            max_size {$EDGE_MAX_JSON_BODY:1MiB}
+        }
+
         @gateway path /api/* /health /livez /readyz /readyz/full /docs /redoc /openapi.json
         reverse_proxy @gateway gateway-api:8000 {
             transport http {

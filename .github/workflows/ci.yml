@@ -116,6 +116,25 @@ jobs:
           path: /tmp/flink-closed-loop-artifacts
           if-no-files-found: warn
 
+  http-smoke:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: vc-http-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      HTTP_SMOKE_ARTIFACT_DIR: /tmp/http-smoke-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run fresh-stack HTTP smoke and ranking outage check
+        run: scripts/run_http_smoke.sh
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/http-smoke-artifacts
+          if-no-files-found: warn
+
   flink-recovery-drill:
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
