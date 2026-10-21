@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 import math
 import os
@@ -30,7 +29,7 @@ from video_commerce.ranking_runtime.ranking_triton import (
     RankingTritonUnavailable,
     triton_numeric_model_version,
 )
-from video_commerce.common.service_common import ServiceRuntime
+from video_commerce.common.service_common import ServiceRuntime, constant_time_equals
 from video_commerce.common.telemetry import configure_tracing
 
 
@@ -514,14 +513,8 @@ class RankingProxyApp:
         header_name = (
             self.runtime.config.security_config.internal_service_header.lower()
         )
-        provided_key = headers.get(header_name)
-        if provided_key is None:
-            return False
-        # _headers() decoded the raw header bytes as latin-1; re-encode the
-        # same way so the comparison sees exactly the bytes on the wire.
-        return hmac.compare_digest(
-            provided_key.encode("latin-1"), expected_key.encode("utf-8")
-        )
+        # One comparison path for every internal-key check (constant time).
+        return constant_time_equals(headers.get(header_name), expected_key)
 
     def _request_id(self, scope) -> str:
         header_name = "x-request-id"
