@@ -11,15 +11,8 @@ import sqlite3
 from typing import Dict, Mapping, Sequence, Tuple
 
 import numpy as np
-from sklearn.metrics import (
-    average_precision_score,
-    brier_score_loss,
-    log_loss,
-)
-from video_commerce.ml.probability_calibration import (
-    expected_calibration_error,
-    reliability_table,
-)
+from scipy import sparse
+from video_commerce.ml.probability_calibration import reliability_table
 from video_commerce.ml.ranking_training import VIEW_RELEVANCE
 
 
@@ -37,13 +30,19 @@ QUALITY_GATE_POLICY_V4 = "ranking_quality_gate_v4"
 # below the margin fails, a CI straddling it is insufficient evidence
 # (underpowered holdout), and the "point delta >= 0" check is dropped because
 # an equal-quality challenger misses it half the time.
-QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v5"
+QUALITY_GATE_POLICY_V5 = "ranking_quality_gate_v5"
+# v6: every gated metric (NDCG, PR-AUC, log loss, Brier, ECE, value WAPE) is a
+# three-way test of its user-cluster bootstrap CI against its threshold, so a
+# small holdout reports insufficient evidence instead of failing an
+# equal-quality challenger on a noisy point estimate.
+QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v6"
 SUPPORTED_QUALITY_GATE_POLICY_VERSIONS = frozenset(
     {
         QUALITY_GATE_POLICY_V1,
         QUALITY_GATE_POLICY_V2,
         QUALITY_GATE_POLICY_V3,
         QUALITY_GATE_POLICY_V4,
+        QUALITY_GATE_POLICY_V5,
         QUALITY_GATE_POLICY_VERSION,
     }
 )
@@ -54,6 +53,7 @@ PHASE_C_QUALITY_GATE_POLICY_VERSIONS = frozenset(
         QUALITY_GATE_POLICY_V2,
         QUALITY_GATE_POLICY_V3,
         QUALITY_GATE_POLICY_V4,
+        QUALITY_GATE_POLICY_V5,
         QUALITY_GATE_POLICY_VERSION,
     }
 )
@@ -413,7 +413,9 @@ def evaluate_quality_gate(
             slices={},
             bootstrap={},
         )
-    overall = _comparison_metrics(rows, champion, challenger, ece_bins=config.ece_bins)
+    columns = _gate_columns(rows, champion, challenger)
+    statistics = _gate_statistics(columns, ece_bins=config.ece_bins)
+    overall = _comparison_metrics(columns, statistics, ece_bins=config.ece_bins)
     if (
         config.candidate_recall_at_500_champion is not None
         and config.candidate_recall_at_500_challenger is not None
@@ -429,24 +431,25 @@ def evaluate_quality_gate(
                 ),
             }
         )
-    bootstrap = _cluster_bootstrap_ndcg(rows, champion, challenger, config)
+    bootstrap = _cluster_bootstrap(statistics, config)
     overall = {**overall, **bootstrap}
     slice_results: Dict[str, Mapping[str, object]] = {}
     insufficient_slices: list[str] = []
-    underpowered_slices: list[str] = []
+    slice_underpowered: list[str] = []
     failed_slices: list[str] = []
     slices = list(_quality_slices(rows, config))
     # Bonferroni across the blocking slices that will be tested, so the
-    # family-wise false-failure rate of their NDCG CIs stays near 5%.
+    # family-wise false-failure rate of their CIs stays near 5%.
     blocking_tests = max(
         1,
         sum(1 for name, _, applicable in slices if applicable and name in BLOCKING_SLICES),
     )
-    for name, selected, applicable in slices:
+    for name, indices, applicable in slices:
         blocking = name in BLOCKING_SLICES
         if not applicable:
             slice_results[name] = {"status": "not_applicable", "blocking": blocking}
             continue
+        selected = [rows[index] for index in indices]
         slice_evidence = _evidence_reasons(selected, config, slice_name=name)
         if slice_evidence:
             slice_results[name] = {
@@ -457,26 +460,28 @@ def evaluate_quality_gate(
             if blocking:
                 insufficient_slices.append(name)
             continue
+        slice_columns = columns.take(indices)
+        slice_statistics = _gate_statistics(slice_columns, ece_bins=config.ece_bins)
         metrics = _comparison_metrics(
-            selected, champion, challenger, ece_bins=config.ece_bins
+            slice_columns, slice_statistics, ece_bins=config.ece_bins
         )
-        ci = _cluster_bootstrap_ndcg(
-            selected,
-            champion,
-            challenger,
+        ci = _cluster_bootstrap(
+            slice_statistics,
             config,
             alpha=0.05 / blocking_tests if blocking else 0.05,
         )
         metrics = {**metrics, **ci}
         failures = _metric_failures(metrics, config, slice_name=name)
-        underpowered = not failures and _ndcg_underpowered(
-            metrics, config, slice_name=name
+        underpowered = (
+            []
+            if failures
+            else _underpowered_reasons(metrics, config, slice_name=name)
         )
         if failures:
             status = GateDecision.FAILED.value
         elif underpowered:
             status = GateDecision.INSUFFICIENT_EVIDENCE.value
-            failures = [f"slice_{name}_ndcg_underpowered"]
+            failures = underpowered
         else:
             status = GateDecision.PASSED.value
         slice_results[name] = {
@@ -488,7 +493,7 @@ def evaluate_quality_gate(
         if blocking and status == GateDecision.FAILED.value:
             failed_slices.append(name)
         elif blocking and underpowered:
-            underpowered_slices.append(name)
+            slice_underpowered.extend(underpowered)
 
     if evidence_reasons or insufficient_slices:
         reasons = tuple(evidence_reasons) + tuple(
@@ -523,15 +528,12 @@ def evaluate_quality_gate(
             if float(overall["ndcg_at_10_delta_ci_upper"]) < 0.0:
                 failures.append("calibration_ndcg_regression")
         failures.extend(f"slice_{name}" for name in failed_slices)
-        underpowered = []
+        underpowered = _underpowered_reasons(overall, config, slice_name=None)
         if _ndcg_underpowered(overall, config, slice_name=None):
-            underpowered.append("overall_ndcg_underpowered")
             overall["ndcg_informative_impressions_required_estimate"] = (
                 _required_informative_impressions(overall, config)
             )
-        underpowered.extend(
-            f"slice_{name}_ndcg_underpowered" for name in underpowered_slices
-        )
+        underpowered.extend(slice_underpowered)
         if failures:
             reasons = tuple(failures)
             decision = GateDecision.FAILED
@@ -614,6 +616,11 @@ def _evidence_reasons(
 def _quality_slices(
     rows: Sequence[RankingEvaluationRow], config: RankingQualityGateConfig
 ):
+    """Yield (name, row indices, applicable) for every reported slice."""
+
+    def where(selector) -> list[int]:
+        return [index for index, row in enumerate(rows) if selector(row)]
+
     selectors = {
         "cold_user": lambda row: row.total_interactions
         <= config.cold_user_max_interactions,
@@ -628,14 +635,14 @@ def _quality_slices(
         "high_price": lambda row: row.is_high_price,
     }
     for name, selector in selectors.items():
-        selected = [row for row in rows if selector(row)]
+        selected = where(selector)
         yield name, selected, bool(selected)
     for name, lower, upper in (
         ("price_low", 0.0, 50.0),
         ("price_mid", 50.0, 200.0),
         ("price_high", 200.0, float("inf")),
     ):
-        selected = [row for row in rows if lower <= row.price < upper]
+        selected = where(lambda row: lower <= row.price < upper)
         yield name, selected, bool(selected)
     yield from _top_n_slices(
         rows,
@@ -658,224 +665,593 @@ def _quality_slices(
         "candidate_two_tower",
     ):
         applicable = any(modality in row.modality_presence for row in rows)
-        selected = [
-            row
-            for row in rows
-            if modality in row.modality_presence and not row.modality_presence[modality]
-        ]
+        selected = where(
+            lambda row: modality in row.modality_presence
+            and not row.modality_presence[modality]
+        )
         yield f"missing_{modality}", selected, applicable and bool(selected)
 
 
 def _top_n_slices(rows, *, prefix: str, values_of, top_n: int):
     """Top-N values by impression count, plus one "other" bucket for the rest."""
     impressions: Dict[str, set] = {}
-    for row in rows:
-        for value in values_of(row):
-            impressions.setdefault(str(value), set()).add(row.impression_id)
+    members: Dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        for value in {str(item) for item in values_of(row)}:
+            impressions.setdefault(value, set()).add(row.impression_id)
+            members.setdefault(value, []).append(index)
     ranked = sorted(impressions, key=lambda value: (-len(impressions[value]), value))
     kept = set(ranked[: max(0, int(top_n))])
     for value in sorted(kept):
-        yield f"{prefix}_{value}", [
-            row for row in rows if value in {str(item) for item in values_of(row)}
-        ], True
+        yield f"{prefix}_{value}", members[value], True
     if len(ranked) > len(kept):
         selected = [
-            row
-            for row in rows
+            index
+            for index, row in enumerate(rows)
             if any(str(item) not in kept for item in values_of(row))
         ]
         yield f"{prefix}_other", selected, bool(selected)
 
 
-def _comparison_metrics(
-    rows, champion, challenger, *, ece_bins: int = 15
-) -> Dict[str, float | int | None]:
-    champion_metrics = _model_metrics(rows, champion, ece_bins=ece_bins)
-    challenger_metrics = _model_metrics(rows, challenger, ece_bins=ece_bins)
+# Elements in one bootstrap work array (samples x users, or samples x PR-AUC
+# segments). Peak memory stays bounded however many samples are drawn.
+_BOOTSTRAP_CHUNK_ELEMENTS = 1 << 22
+_PROBABILITY_HEADS = ("ctr", "ctcvr")
+_CHAMPION, _CHALLENGER = 0, 1
 
-    def delta(name: str) -> float:
-        return float(challenger_metrics[name]) - float(champion_metrics[name])
+# Per-user sum columns of _GateStatistics.dense.
+_ROWS = 0
+_SLATES = 1  # informative slates
+_NDCG_SUM = (2, 3)
+_LOG_LOSS_SUM = {"ctr": (4, 5), "ctcvr": (6, 7)}
+_BRIER_SUM = {"ctr": (8, 9), "ctcvr": (10, 11)}
+_VALUE_ACTUAL = 12
+_VALUE_ERROR = (13, 14)
+_VALUE_ROWS = 15
 
-    def relative_regression(name: str, *, lower_is_better: bool) -> float:
-        old = float(champion_metrics[name])
-        new = float(challenger_metrics[name])
-        denominator = max(abs(old), 1e-12)
-        return (
-            (new - old) / denominator if lower_is_better else (old - new) / denominator
+
+@dataclass(frozen=True)
+class _GateColumns:
+    """Columnar evaluation rows; predictions are (champion, challenger) rows."""
+
+    user: np.ndarray  # codes in sorted user-id order
+    impression: np.ndarray
+    product_rank: np.ndarray  # lexicographic product-id rank: the NDCG tie break
+    relevance: np.ndarray
+    clicked: np.ndarray
+    purchased: np.ndarray
+    value_row: np.ndarray  # purchased with a usable value label
+    business_value: np.ndarray
+    serving_score: np.ndarray
+    ctr: np.ndarray  # clipped to (0, 1) like the log loss inputs
+    ctcvr: np.ndarray
+    predicted_value: np.ndarray
+
+    @property
+    def users(self) -> int:
+        return int(self.user.max()) + 1 if len(self.user) else 0
+
+    def take(self, indices: np.ndarray) -> "_GateColumns":
+        """A slice; user codes are recompacted in the same sorted order."""
+        indices = np.asarray(indices, dtype=np.int64)
+        user = np.unique(self.user[indices], return_inverse=True)[1].reshape(-1)
+        return _GateColumns(
+            user=user.astype(np.int64),
+            impression=self.impression[indices],
+            product_rank=self.product_rank[indices],
+            relevance=self.relevance[indices],
+            clicked=self.clicked[indices],
+            purchased=self.purchased[indices],
+            value_row=self.value_row[indices],
+            business_value=self.business_value[indices],
+            serving_score=self.serving_score[:, indices],
+            ctr=self.ctr[:, indices],
+            ctcvr=self.ctcvr[:, indices],
+            predicted_value=self.predicted_value[:, indices],
         )
 
-    return {
-        "impressions": len({row.impression_id for row in rows}),
-        "users": len({row.user_id for row in rows}),
-        "ndcg_at_10_champion": champion_metrics["ndcg_at_10"],
-        "ndcg_at_10_challenger": challenger_metrics["ndcg_at_10"],
-        "ndcg_at_10_delta": delta("ndcg_at_10"),
-        "ndcg_informative_impressions": _informative_impression_count(rows),
-        "ctr_pr_auc_delta": delta("ctr_pr_auc"),
-        "ctcvr_pr_auc_delta": delta("ctcvr_pr_auc"),
-        "ctr_log_loss_relative_regression": relative_regression(
-            "ctr_log_loss", lower_is_better=True
+
+def _codes(values: Sequence[str]) -> np.ndarray:
+    index = {value: code for code, value in enumerate(sorted(set(values)))}
+    return np.fromiter((index[value] for value in values), np.int64, len(values))
+
+
+def _gate_columns(rows, champion, challenger) -> _GateColumns:
+    ids = [row.observation_id for row in rows]
+    models = (champion, challenger)
+
+    def predicted(field_name: str) -> np.ndarray:
+        return np.array(
+            [
+                [float(getattr(model[key], field_name)) for key in ids]
+                for model in models
+            ],
+            dtype=np.float64,
+        ).reshape(2, len(ids))
+
+    purchased = np.array([bool(row.purchased) for row in rows], dtype=bool)
+    return _GateColumns(
+        user=_codes([row.user_id for row in rows]),
+        impression=_codes([row.impression_id for row in rows]),
+        product_rank=_codes([row.product_id for row in rows]),
+        relevance=np.array([float(row.relevance) for row in rows], dtype=np.float64),
+        clicked=np.array([float(row.clicked) for row in rows], dtype=np.float64),
+        purchased=purchased.astype(np.float64),
+        value_row=purchased
+        & np.array([bool(row.value_mask) for row in rows], dtype=bool),
+        business_value=np.array(
+            [float(row.business_value) for row in rows], dtype=np.float64
         ),
-        "ctcvr_log_loss_relative_regression": relative_regression(
-            "ctcvr_log_loss", lower_is_better=True
+        serving_score=predicted("serving_score"),
+        ctr=np.clip(predicted("ctr"), 1e-7, 1 - 1e-7),
+        ctcvr=np.clip(predicted("ctcvr"), 1e-7, 1 - 1e-7),
+        predicted_value=predicted("predicted_value"),
+    )
+
+
+def _dcg_at_10(slate, order_key, product_rank, gain, slates: int) -> np.ndarray:
+    """DCG@10 per slate, ranked by descending key then product id."""
+    order = np.lexsort((product_rank, -order_key, slate))
+    ranked_slate = slate[order]
+    starts = np.flatnonzero(np.r_[True, ranked_slate[1:] != ranked_slate[:-1]])
+    position = np.arange(len(order)) - np.repeat(
+        starts, np.diff(np.r_[starts, len(order)])
+    )
+    top = position < 10
+    return np.bincount(
+        ranked_slate[top],
+        weights=gain[order][top] / np.log2(position[top] + 2.0),
+        minlength=slates,
+    )
+
+
+def _slate_ndcg(columns: _GateColumns):
+    """Per-slate NDCG@10 for both models, computed once.
+
+    A slate is one user's rows of one impression. Graded gain is relevance
+    above a plain view; only slates with 2+ rows and some engagement are
+    informative, so all-view slates do not dilute the mean.
+    """
+    slate = np.unique(
+        columns.impression * max(columns.users, 1) + columns.user,
+        return_inverse=True,
+    )[1].reshape(-1)
+    slates = int(slate.max()) + 1 if len(slate) else 0
+    gain = np.maximum(columns.relevance - VIEW_RELEVANCE, 0.0)
+    size = np.bincount(slate, minlength=slates)
+    engaged = np.bincount(slate, weights=gain > 0.0, minlength=slates) > 0.0
+    informative = (size >= 2) & engaged
+    slate_user = np.zeros(slates, dtype=np.int64)
+    slate_user[slate] = columns.user
+    ideal = _dcg_at_10(slate, columns.relevance, columns.product_rank, gain, slates)
+    ndcg = np.zeros((2, slates))
+    for model in (_CHAMPION, _CHALLENGER):
+        dcg = _dcg_at_10(
+            slate, columns.serving_score[model], columns.product_rank, gain, slates
+        )
+        np.divide(dcg, ideal, out=ndcg[model], where=informative)
+    return slate_user, informative, ndcg
+
+
+@dataclass(frozen=True)
+class _RankedLabels:
+    """One model head's rows cut at each score group holding a positive.
+
+    Rows are ranked by descending score; tied scores form one threshold, as in
+    sklearn. Segment k is the rows after positive group k-1 through positive
+    group k, so cumulative segment weights give the weight above each
+    threshold at which recall changes.
+    """
+
+    segment_rows: sparse.csr_matrix  # (segments, users) row counts
+    segment_positives: sparse.csr_matrix  # (segments, users) positive counts
+
+
+def _ranked_labels(scores, labels, user, users: int) -> _RankedLabels:
+    order = np.argsort(-scores, kind="stable")
+    ranked_scores = scores[order]
+    starts = np.flatnonzero(np.r_[True, ranked_scores[1:] != ranked_scores[:-1]])
+    ends = np.r_[starts[1:], len(order)]
+    positions = np.flatnonzero(labels[order] > 0.0)
+    positive_groups, positive_segment = np.unique(
+        np.searchsorted(starts, positions, side="right") - 1, return_inverse=True
+    )
+    segment_ends = ends[positive_groups]
+    covered = int(segment_ends[-1]) if len(segment_ends) else 0
+    ranked_users = user[order]
+    shape = (len(segment_ends), users)
+    return _RankedLabels(
+        segment_rows=sparse.csr_matrix(
+            (
+                np.ones(covered),
+                (
+                    np.searchsorted(segment_ends, np.arange(covered), side="right"),
+                    ranked_users[:covered],
+                ),
+            ),
+            shape=shape,
         ),
-        "ctr_brier_relative_regression": relative_regression(
-            "ctr_brier", lower_is_better=True
+        segment_positives=sparse.csr_matrix(
+            (
+                np.ones(len(positions)),
+                (positive_segment.reshape(-1), ranked_users[positions]),
+            ),
+            shape=shape,
         ),
-        "ctcvr_brier_relative_regression": relative_regression(
-            "ctcvr_brier", lower_is_better=True
+    )
+
+
+def _weighted_average_precision(ranked: _RankedLabels, weights) -> np.ndarray:
+    """Average precision per row of user weights, as sklearn's step sum.
+
+    AP = sum over positive score groups of recall gain * precision there.
+    """
+    if ranked.segment_rows.shape[0] == 0:
+        return np.zeros(weights.shape[0])
+    seen = np.cumsum(np.asarray(ranked.segment_rows @ weights.T), axis=0)
+    gained = np.asarray(ranked.segment_positives @ weights.T)
+    true_positives = np.cumsum(gained, axis=0)
+    precision = np.divide(
+        true_positives,
+        seen,
+        out=np.zeros_like(true_positives),
+        where=seen > 0.0,
+    )
+    total = true_positives[-1]
+    return np.divide(
+        (gained * precision).sum(axis=0),
+        total,
+        out=np.zeros_like(total),
+        where=total > 0.0,
+    )
+
+
+@dataclass(frozen=True)
+class _GateStatistics:
+    """Per-user sums from which every gated metric follows for any user weights.
+
+    The champion and challenger share user weights, so each bootstrap sample
+    evaluates both models on the same resampled users.
+    """
+
+    users: int
+    dense: np.ndarray  # (users, 16); see the column constants above
+    ece_gaps: sparse.csr_matrix  # (4 * bins, users): per-bin sum(p - y)
+    ece_bins: int
+    ranked: Mapping[Tuple[str, int], _RankedLabels]
+
+    @property
+    def width(self) -> int:
+        """Widest per-sample work array: users, or PR-AUC segments."""
+        return max(
+            [self.users]
+            + [ranked.segment_rows.shape[0] for ranked in self.ranked.values()]
+        )
+
+
+def _gate_statistics(columns: _GateColumns, *, ece_bins: int) -> _GateStatistics:
+    users = columns.users
+    user = columns.user
+
+    def per_user(values) -> np.ndarray:
+        return np.bincount(user, weights=values, minlength=users)
+
+    slate_user, informative, ndcg = _slate_ndcg(columns)
+    dense = np.zeros((users, 16))
+    dense[:, _ROWS] = np.bincount(user, minlength=users)
+    dense[:, _SLATES] = np.bincount(slate_user[informative], minlength=users)
+    labels = {"ctr": columns.clicked, "ctcvr": columns.purchased}
+    probabilities = {"ctr": columns.ctr, "ctcvr": columns.ctcvr}
+    errors = np.abs(columns.business_value - columns.predicted_value)
+    dense[:, _VALUE_ACTUAL] = per_user(columns.business_value * columns.value_row)
+    dense[:, _VALUE_ROWS] = per_user(columns.value_row.astype(np.float64))
+    ranked = {}
+    gap_rows, gap_cols, gap_values = [], [], []
+    bins = max(1, int(ece_bins))
+    rows = len(user)
+    for model in (_CHAMPION, _CHALLENGER):
+        dense[:, _NDCG_SUM[model]] = np.bincount(
+            slate_user[informative],
+            weights=ndcg[model][informative],
+            minlength=users,
+        )
+        dense[:, _VALUE_ERROR[model]] = per_user(errors[model] * columns.value_row)
+        for head_index, head in enumerate(_PROBABILITY_HEADS):
+            y = labels[head]
+            p = probabilities[head][model]
+            dense[:, _LOG_LOSS_SUM[head][model]] = per_user(
+                -(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
+            )
+            dense[:, _BRIER_SUM[head][model]] = per_user((p - y) ** 2)
+            ranked[(head, model)] = _ranked_labels(p, y, user, users)
+            # Equal-frequency bins are fixed on the evaluated rows (as in
+            # reliability_table); resamples reweight users within them.
+            order = np.argsort(p, kind="mergesort")
+            used = min(bins, rows)
+            sizes = np.full(used, rows // used)
+            sizes[: rows % used] += 1
+            row_bin = np.empty(rows, dtype=np.int64)
+            row_bin[order] = np.repeat(np.arange(used), sizes)
+            block = (head_index * 2 + model) * bins
+            gap_rows.append(block + row_bin)
+            gap_cols.append(user)
+            gap_values.append(p - y)
+    ece_gaps = sparse.csr_matrix(
+        (
+            np.concatenate(gap_values),
+            (np.concatenate(gap_rows), np.concatenate(gap_cols)),
         ),
-        "ctr_ece_champion": champion_metrics["ctr_ece"],
-        "ctr_ece_challenger": challenger_metrics["ctr_ece"],
-        "ctr_ece_absolute_regression": delta("ctr_ece"),
-        "ctcvr_ece_champion": champion_metrics["ctcvr_ece"],
-        "ctcvr_ece_challenger": challenger_metrics["ctcvr_ece"],
-        "ctcvr_ece_absolute_regression": delta("ctcvr_ece"),
-        "ctr_reliability_champion": champion_metrics["ctr_reliability"],
-        "ctr_reliability_challenger": challenger_metrics["ctr_reliability"],
-        "ctcvr_reliability_champion": champion_metrics["ctcvr_reliability"],
-        "ctcvr_reliability_challenger": challenger_metrics["ctcvr_reliability"],
-        "value_wape_relative_regression": relative_regression(
-            "value_wape", lower_is_better=True
-        ),
-        "value_mae_champion": champion_metrics["value_mae"],
-        "value_mae_challenger": challenger_metrics["value_mae"],
+        shape=(4 * bins, users),
+    )
+    return _GateStatistics(
+        users=users, dense=dense, ece_gaps=ece_gaps, ece_bins=bins, ranked=ranked
+    )
+
+
+def _model_statistics(statistics: _GateStatistics, weights) -> Dict[str, np.ndarray]:
+    """Each model's metric values per row of user weights: name -> (2, samples)."""
+    sums = weights @ statistics.dense
+    rows = sums[:, _ROWS]
+    gaps = np.abs(np.asarray(statistics.ece_gaps @ weights.T)).T
+    bins = statistics.ece_bins
+
+    def ratio(numerator, denominator) -> np.ndarray:
+        return np.divide(
+            numerator,
+            denominator,
+            out=np.zeros_like(numerator),
+            where=denominator > 0.0,
+        )
+
+    values: Dict[str, np.ndarray] = {}
+    values["ndcg_at_10"] = np.stack(
+        [ratio(sums[:, column], sums[:, _SLATES]) for column in _NDCG_SUM]
+    )
+    for head_index, head in enumerate(_PROBABILITY_HEADS):
+        values[f"{head}_pr_auc"] = np.stack(
+            [
+                _weighted_average_precision(statistics.ranked[(head, model)], weights)
+                for model in (_CHAMPION, _CHALLENGER)
+            ]
+        )
+        values[f"{head}_log_loss"] = np.stack(
+            [ratio(sums[:, column], rows) for column in _LOG_LOSS_SUM[head]]
+        )
+        values[f"{head}_brier"] = np.stack(
+            [ratio(sums[:, column], rows) for column in _BRIER_SUM[head]]
+        )
+        values[f"{head}_ece"] = np.stack(
+            [
+                ratio(
+                    gaps[
+                        :,
+                        (head_index * 2 + model) * bins : (head_index * 2 + model + 1)
+                        * bins,
+                    ].sum(axis=1),
+                    rows,
+                )
+                for model in (_CHAMPION, _CHALLENGER)
+            ]
+        )
+    actual = np.maximum(sums[:, _VALUE_ACTUAL], 1e-12)
+    values["value_wape"] = np.stack([sums[:, column] / actual for column in _VALUE_ERROR])
+    values["value_mae"] = np.stack(
+        [ratio(sums[:, column], sums[:, _VALUE_ROWS]) for column in _VALUE_ERROR]
+    )
+    values["informative_slates"] = np.stack([sums[:, _SLATES], sums[:, _SLATES]])
+    return values
+
+
+def _relative_regression(values, *, lower_is_better: bool) -> np.ndarray:
+    old, new = values[_CHAMPION], values[_CHALLENGER]
+    denominator = np.maximum(np.abs(old), 1e-12)
+    return (new - old) / denominator if lower_is_better else (old - new) / denominator
+
+
+# Gated v6 metrics: (metric, reason stem, higher is better).
+_GATED_METRICS = (
+    ("ndcg_at_10_delta", "ndcg", True),
+    ("ctr_pr_auc_delta", "ctr_pr_auc", True),
+    ("ctcvr_pr_auc_delta", "ctcvr_pr_auc", True),
+    ("ctr_log_loss_relative_regression", "ctr_log_loss", False),
+    ("ctcvr_log_loss_relative_regression", "ctcvr_log_loss", False),
+    ("ctr_brier_relative_regression", "ctr_brier", False),
+    ("ctcvr_brier_relative_regression", "ctcvr_brier", False),
+    ("ctr_ece_absolute_regression", "ctr_ece", False),
+    ("ctcvr_ece_absolute_regression", "ctcvr_ece", False),
+    ("value_wape_relative_regression", "value_wape", False),
+)
+
+
+def _gated_metrics(values: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    def delta(name: str) -> np.ndarray:
+        return values[name][_CHALLENGER] - values[name][_CHAMPION]
+
+    gated = {"ndcg_at_10_delta": delta("ndcg_at_10")}
+    for head in _PROBABILITY_HEADS:
+        gated[f"{head}_pr_auc_delta"] = delta(f"{head}_pr_auc")
+        for name in ("log_loss", "brier"):
+            gated[f"{head}_{name}_relative_regression"] = _relative_regression(
+                values[f"{head}_{name}"], lower_is_better=True
+            )
+        gated[f"{head}_ece_absolute_regression"] = delta(f"{head}_ece")
+    gated["value_wape_relative_regression"] = _relative_regression(
+        values["value_wape"], lower_is_better=True
+    )
+    return gated
+
+
+def _comparison_metrics(
+    columns: _GateColumns, statistics: _GateStatistics, *, ece_bins: int = 15
+) -> Dict[str, object]:
+    """Point estimates: the bootstrap statistics with every user weighted once."""
+    unit = _model_statistics(statistics, np.ones((1, statistics.users)))
+    gated = {name: float(value[0]) for name, value in _gated_metrics(unit).items()}
+    values = {name: value[:, 0] for name, value in unit.items()}
+    labels = {"ctr": columns.clicked, "ctcvr": columns.purchased}
+    metrics: Dict[str, object] = {
+        "impressions": int(len(np.unique(columns.impression))),
+        "users": statistics.users,
+        "ndcg_at_10_champion": float(values["ndcg_at_10"][_CHAMPION]),
+        "ndcg_at_10_challenger": float(values["ndcg_at_10"][_CHALLENGER]),
+        "ndcg_informative_impressions": int(values["informative_slates"][0]),
     }
+    metrics.update(gated)
+    for head in _PROBABILITY_HEADS:
+        probabilities = getattr(columns, head)
+        for model, role in ((_CHAMPION, "champion"), (_CHALLENGER, "challenger")):
+            metrics[f"{head}_ece_{role}"] = float(values[f"{head}_ece"][model])
+            metrics[f"{head}_reliability_{role}"] = reliability_table(
+                probabilities[model], labels[head], bins=ece_bins
+            )
+    metrics["value_mae_champion"] = float(values["value_mae"][_CHAMPION])
+    metrics["value_mae_challenger"] = float(values["value_mae"][_CHALLENGER])
+    return metrics
 
 
-def _model_metrics(rows, predictions, *, ece_bins: int = 15):
-    clicked = np.asarray([float(row.clicked) for row in rows], dtype=np.float64)
-    purchased = np.asarray([float(row.purchased) for row in rows], dtype=np.float64)
-    ctr = np.clip(
-        np.asarray([predictions[row.observation_id].ctr for row in rows]),
-        1e-7,
-        1 - 1e-7,
+def _bootstrap_weights(generator, users: int, samples: int) -> np.ndarray:
+    """Multinomial user multiplicities, one row per bootstrap sample.
+
+    Each row consumes the generator exactly like v5's
+    generator.choice(users, size=len(users)), so a seed reproduces the v5
+    resamples.
+    """
+    weights = np.empty((samples, users))
+    for sample in range(samples):
+        weights[sample] = np.bincount(
+            generator.integers(0, users, size=users), minlength=users
+        )
+    return weights
+
+
+def _cluster_bootstrap(
+    statistics: _GateStatistics,
+    config: RankingQualityGateConfig,
+    *,
+    alpha: float = 0.05,
+) -> Dict[str, float]:
+    """Percentile CIs of every gated metric under user-cluster resampling."""
+    if statistics.users == 0:
+        return {
+            f"{name}_ci_{bound}": 0.0
+            for name, _, _ in _GATED_METRICS
+            for bound in ("lower", "upper", "half_width")
+        }
+    samples = max(1, int(config.bootstrap_samples))
+    generator = np.random.default_rng(config.random_seed)
+    draws = {name: np.empty(samples) for name, _, _ in _GATED_METRICS}
+    step = max(1, _BOOTSTRAP_CHUNK_ELEMENTS // statistics.width)
+    for begin in range(0, samples, step):
+        weights = _bootstrap_weights(
+            generator, statistics.users, min(step, samples - begin)
+        )
+        for name, value in _gated_metrics(
+            _model_statistics(statistics, weights)
+        ).items():
+            draws[name][begin : begin + len(weights)] = value
+    result = {}
+    for name, value in draws.items():
+        lower = float(np.quantile(value, alpha / 2.0))
+        upper = float(np.quantile(value, 1.0 - alpha / 2.0))
+        result[f"{name}_ci_lower"] = lower
+        result[f"{name}_ci_upper"] = upper
+        result[f"{name}_ci_half_width"] = (upper - lower) / 2.0
+    return result
+
+
+def _cluster_bootstrap_rows(rows, champion, challenger, config, *, alpha=0.05):
+    columns = _gate_columns(rows, champion, challenger)
+    return _cluster_bootstrap(
+        _gate_statistics(columns, ece_bins=config.ece_bins), config, alpha=alpha
     )
-    ctcvr = np.clip(
-        np.asarray([predictions[row.observation_id].ctcvr for row in rows]),
-        1e-7,
-        1 - 1e-7,
-    )
-    purchase_rows = [row for row in rows if row.purchased and row.value_mask]
-    actual_values = np.asarray(
-        [row.business_value for row in purchase_rows], dtype=np.float64
-    )
-    predicted_values = np.asarray(
-        [predictions[row.observation_id].predicted_value for row in purchase_rows],
-        dtype=np.float64,
-    )
-    value_errors = np.abs(actual_values - predicted_values)
-    return {
-        "ndcg_at_10": _mean_ndcg(rows, predictions),
-        "ctr_pr_auc": float(average_precision_score(clicked, ctr)),
-        "ctcvr_pr_auc": float(average_precision_score(purchased, ctcvr)),
-        "ctr_log_loss": float(log_loss(clicked, ctr, labels=[0.0, 1.0])),
-        "ctcvr_log_loss": float(log_loss(purchased, ctcvr, labels=[0.0, 1.0])),
-        "ctr_brier": float(brier_score_loss(clicked, ctr)),
-        "ctcvr_brier": float(brier_score_loss(purchased, ctcvr)),
-        "ctr_ece": expected_calibration_error(ctr, clicked, bins=ece_bins),
-        "ctcvr_ece": expected_calibration_error(ctcvr, purchased, bins=ece_bins),
-        "ctr_reliability": reliability_table(ctr, clicked, bins=ece_bins),
-        "ctcvr_reliability": reliability_table(ctcvr, purchased, bins=ece_bins),
-        "value_wape": float(value_errors.sum() / max(actual_values.sum(), 1e-12)),
-        "value_mae": float(value_errors.mean()) if len(value_errors) else 0.0,
-    }
-
-
-def _ndcg_gain(row: RankingEvaluationRow) -> float:
-    """Graded gain above a plain view; view-only rows carry no ranking signal."""
-    return max(float(row.relevance) - VIEW_RELEVANCE, 0.0)
-
-
-def _informative_impressions(rows) -> list[list[RankingEvaluationRow]]:
-    """Slates NDCG can score: 2+ rows with at least one engagement above view."""
-    grouped: Dict[str, list[RankingEvaluationRow]] = {}
-    for row in rows:
-        grouped.setdefault(row.impression_id, []).append(row)
-    return [
-        impression_rows
-        for impression_rows in grouped.values()
-        if len(impression_rows) >= 2
-        and any(_ndcg_gain(row) > 0.0 for row in impression_rows)
-    ]
-
-
-def _informative_impression_count(rows) -> int:
-    return len(_informative_impressions(rows))
 
 
 def _mean_ndcg(rows, predictions) -> float:
-    values = []
-    for impression_rows in _informative_impressions(rows):
-        ranked = sorted(
-            impression_rows,
-            key=lambda row: (
-                -predictions[row.observation_id].serving_score,
-                row.product_id,
-            ),
-        )[:10]
-        ideal = sorted(
-            impression_rows, key=lambda row: (-row.relevance, row.product_id)
-        )[:10]
-
-        def dcg(selected):
-            return sum(
-                _ndcg_gain(row) / math.log2(position + 2)
-                for position, row in enumerate(selected)
-            )
-
-        values.append(dcg(ranked) / dcg(ideal))
-    return float(np.mean(values)) if values else 0.0
+    """Mean NDCG@10 over informative slates for one model."""
+    if not rows:
+        return 0.0
+    _, informative, ndcg = _slate_ndcg(_gate_columns(rows, predictions, predictions))
+    return float(ndcg[_CHAMPION][informative].mean()) if informative.any() else 0.0
 
 
-def _cluster_bootstrap_ndcg(rows, champion, challenger, config, *, alpha: float = 0.05):
-    # Resampled users keep all their rows; _mean_ndcg applies the same
-    # informative-slate filter, so CI bounds match ndcg_at_10_delta.
-    rows_by_user: Dict[str, list[RankingEvaluationRow]] = {}
-    for row in rows:
-        rows_by_user.setdefault(row.user_id, []).append(row)
-    users = sorted(rows_by_user)
-    if not users:
-        return {
-            "ndcg_at_10_delta_ci_lower": 0.0,
-            "ndcg_at_10_delta_ci_upper": 0.0,
-            "ndcg_at_10_delta_ci_half_width": 0.0,
-        }
-    generator = np.random.default_rng(config.random_seed)
-    deltas = []
-    for _ in range(max(1, int(config.bootstrap_samples))):
-        sampled_users = generator.choice(users, size=len(users), replace=True)
-        sampled_rows = []
-        for sample_index, user in enumerate(sampled_users):
-            for row in rows_by_user[str(user)]:
-                sampled_rows.append(
-                    RankingEvaluationRow(
-                        **{
-                            **row.__dict__,
-                            "impression_id": f"{sample_index}:{row.impression_id}",
-                        }
-                    )
-                )
-        deltas.append(
-            _mean_ndcg(sampled_rows, challenger) - _mean_ndcg(sampled_rows, champion)
+def _informative_impression_count(rows) -> int:
+    if not rows:
+        return 0
+    blank = {row.observation_id: RankingPrediction(0.0, 0.5, 0.5, 0.0) for row in rows}
+    return int(_slate_ndcg(_gate_columns(rows, blank, blank))[1].sum())
+
+
+def _metric_threshold(metric: str, config, *, slice_name: str | None) -> float:
+    sliced = slice_name is not None
+    if metric == "ndcg_at_10_delta":
+        return config.slice_ndcg_ci_lower if sliced else config.overall_ndcg_ci_lower
+    if metric.endswith("_pr_auc_delta"):
+        return -config.pr_auc_max_absolute_regression
+    if metric.endswith("_ece_absolute_regression"):
+        return (
+            config.slice_ece_max_absolute_regression
+            if sliced
+            else config.ece_max_absolute_regression
         )
-    lower = float(np.quantile(deltas, alpha / 2.0))
-    upper = float(np.quantile(deltas, 1.0 - alpha / 2.0))
-    return {
-        "ndcg_at_10_delta_ci_lower": lower,
-        "ndcg_at_10_delta_ci_upper": upper,
-        "ndcg_at_10_delta_ci_half_width": (upper - lower) / 2.0,
-    }
+    if metric == "value_wape_relative_regression":
+        return (
+            config.slice_error_max_relative_regression
+            if sliced
+            else config.value_wape_max_relative_regression
+        )
+    return (
+        config.slice_error_max_relative_regression
+        if sliced
+        else config.probability_error_max_relative_regression
+    )
+
+
+def _ci_decision(
+    metrics, metric: str, higher_is_better: bool, threshold: float
+) -> GateDecision:
+    """Three-way CI test: wholly beyond the threshold fails, straddling it is
+    insufficient evidence (underpowered holdout), otherwise it passes."""
+    lower = float(metrics[f"{metric}_ci_lower"])
+    upper = float(metrics[f"{metric}_ci_upper"])
+    if higher_is_better:
+        if upper < threshold:
+            return GateDecision.FAILED
+        if lower < threshold:
+            return GateDecision.INSUFFICIENT_EVIDENCE
+    else:
+        if lower > threshold:
+            return GateDecision.FAILED
+        if upper > threshold:
+            return GateDecision.INSUFFICIENT_EVIDENCE
+    return GateDecision.PASSED
+
+
+def _ci_decisions(metrics, config, *, slice_name: str | None):
+    for metric, stem, higher_is_better in _GATED_METRICS:
+        threshold = _metric_threshold(metric, config, slice_name=slice_name)
+        yield metric, stem, _ci_decision(metrics, metric, higher_is_better, threshold)
 
 
 def _ndcg_underpowered(metrics, config, *, slice_name: str | None) -> bool:
-    """The CI straddles the non-inferiority margin: the holdout cannot decide."""
-    margin = config.slice_ndcg_ci_lower if slice_name else config.overall_ndcg_ci_lower
+    """The NDCG CI straddles the non-inferiority margin."""
     return (
-        float(metrics["ndcg_at_10_delta_ci_lower"])
-        < margin
-        <= float(metrics["ndcg_at_10_delta_ci_upper"])
+        _ci_decision(
+            metrics,
+            "ndcg_at_10_delta",
+            True,
+            _metric_threshold("ndcg_at_10_delta", config, slice_name=slice_name),
+        )
+        is GateDecision.INSUFFICIENT_EVIDENCE
     )
+
+
+def _underpowered_reasons(metrics, config, *, slice_name: str | None) -> list[str]:
+    prefix = f"slice_{slice_name}" if slice_name else "overall"
+    return [
+        f"{prefix}_{stem}_underpowered"
+        for _, stem, decision in _ci_decisions(metrics, config, slice_name=slice_name)
+        if decision is GateDecision.INSUFFICIENT_EVIDENCE
+    ]
 
 
 def _required_informative_impressions(metrics, config) -> int | None:
@@ -897,41 +1273,20 @@ def _metric_failures(metrics, config, *, slice_name: str | None) -> list[str]:
     ndcg_min = (
         config.slice_ndcg_min_delta if slice_name else config.overall_ndcg_min_delta
     )
-    ci_min = config.slice_ndcg_ci_lower if slice_name else config.overall_ndcg_ci_lower
-    error_limit = (
-        config.slice_error_max_relative_regression
-        if slice_name
-        else config.probability_error_max_relative_regression
-    )
     failures = []
     # A non-positive minimum delta is a non-inferiority requirement, which the
     # CI test below already covers; only a positive (superiority) minimum is
     # checked on the point estimate.
     if ndcg_min > 0.0 and float(metrics["ndcg_at_10_delta"]) < ndcg_min:
         failures.append(f"{prefix}_ndcg_point_delta")
-    # Only a CI wholly below the margin is a regression; a CI straddling it is
-    # reported as underpowered by _ndcg_underpowered.
-    if float(metrics["ndcg_at_10_delta_ci_upper"]) < ci_min:
-        failures.append(f"{prefix}_ndcg_regression")
-    for name in ("ctr_pr_auc_delta", "ctcvr_pr_auc_delta"):
-        if float(metrics[name]) < -config.pr_auc_max_absolute_regression:
-            failures.append(f"{prefix}_{name}")
-    for name in (
-        "ctr_log_loss_relative_regression",
-        "ctcvr_log_loss_relative_regression",
-        "ctr_brier_relative_regression",
-        "ctcvr_brier_relative_regression",
-    ):
-        if float(metrics[name]) > error_limit:
-            failures.append(f"{prefix}_{name}")
-    ece_limit = (
-        config.slice_ece_max_absolute_regression
-        if slice_name
-        else config.ece_max_absolute_regression
-    )
-    for name in ("ctr_ece_absolute_regression", "ctcvr_ece_absolute_regression"):
-        if float(metrics[name]) > ece_limit:
-            failures.append(f"{prefix}_{name}")
+    # Only a CI wholly beyond its threshold is a regression; a CI straddling it
+    # is reported by _underpowered_reasons.
+    for metric, stem, decision in _ci_decisions(metrics, config, slice_name=slice_name):
+        if decision is GateDecision.FAILED:
+            failures.append(
+                f"{prefix}_ndcg_regression" if stem == "ndcg" else f"{prefix}_{metric}"
+            )
+    # Candidate recall is external evidence with no holdout resample.
     if (
         slice_name is None
         and "candidate_recall_at_500_absolute_regression" in metrics
@@ -939,11 +1294,4 @@ def _metric_failures(metrics, config, *, slice_name: str | None) -> list[str]:
         > config.candidate_recall_max_absolute_regression
     ):
         failures.append("overall_candidate_recall_at_500_absolute_regression")
-    value_limit = (
-        config.slice_error_max_relative_regression
-        if slice_name
-        else config.value_wape_max_relative_regression
-    )
-    if float(metrics["value_wape_relative_regression"]) > value_limit:
-        failures.append(f"{prefix}_value_wape_relative_regression")
     return failures

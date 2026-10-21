@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
+import os
+import resource
+import sys
+import time
+import tracemalloc
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +20,13 @@ from video_commerce.ml.model_release_quality import (
     RankingEvaluationSpool,
     RankingPrediction,
     RankingQualityGateConfig,
-    _cluster_bootstrap_ndcg,
+    _GATED_METRICS,
+    _GateColumns,
+    _cluster_bootstrap,
+    _cluster_bootstrap_rows,
+    _comparison_metrics,
+    _gate_columns,
+    _gate_statistics,
     _informative_impression_count,
     _mean_ndcg,
     _metric_failures,
@@ -182,7 +194,7 @@ def test_quality_gate_passes_non_regressing_challenger_deterministically():
     assert first.decision is GateDecision.PASSED
     assert first.overall["ndcg_at_10_delta"] == pytest.approx(0.0)
     assert first.bootstrap == second.bootstrap
-    assert first.policy_version == "ranking_quality_gate_v5"
+    assert first.policy_version == "ranking_quality_gate_v6"
     assert first.policy_version == QUALITY_GATE_POLICY_VERSION
     assert first.overall["ndcg_informative_impressions"] == 3
 
@@ -330,7 +342,7 @@ def test_ndcg_delta_is_clearly_negative_for_random_order_challenger():
     challenger = {row.observation_id: _score(float(rng.random())) for row in rows}
 
     delta = _mean_ndcg(rows, challenger) - _mean_ndcg(rows, champion)
-    bootstrap = _cluster_bootstrap_ndcg(rows, champion, challenger, _small_config())
+    bootstrap = _cluster_bootstrap_rows(rows, champion, challenger, _small_config())
 
     assert _informative_impression_count(rows) == 40
     assert _mean_ndcg(rows, champion) == pytest.approx(1.0)
@@ -380,7 +392,7 @@ def test_long_tail_category_is_reported_without_blocking_the_gate():
     result = evaluate_quality_gate(rows, predictions, predictions, config)
 
     assert result.decision is GateDecision.PASSED
-    assert result.policy_version == "ranking_quality_gate_v5"
+    assert result.policy_version == "ranking_quality_gate_v6"
     tiny = result.slices["category_tiny"]
     assert tiny["status"] == GateDecision.INSUFFICIENT_EVIDENCE.value
     assert tiny["blocking"] is False
@@ -463,7 +475,9 @@ def test_retrain_snapshot_validates_against_retrain_defaults_only():
     assert quality_gate_snapshot_valid(legacy)
 
 
-def _equal_quality_fixture(seed: int, *, impressions: int = 240, categories: int = 30):
+def _equal_quality_fixture(
+    seed: int, *, impressions: int = 240, categories: int = 30, noise: float = 0.01
+):
     """Rows plus a factory for equal-quality predictions with independent noise."""
     rng = np.random.default_rng(seed)
     rows = []
@@ -493,10 +507,10 @@ def _equal_quality_fixture(seed: int, *, impressions: int = 240, categories: int
     }
 
     def predictions(noise_seed):
-        noise = np.random.default_rng(noise_seed)
+        generator = np.random.default_rng(noise_seed)
         out = {}
         for row in rows:
-            score = base[row.observation_id] + float(noise.normal(0.0, 0.01))
+            score = base[row.observation_id] + float(generator.normal(0.0, noise))
             probability = min(0.99, max(0.01, score / 1.5))
             out[row.observation_id] = RankingPrediction(
                 serving_score=score,
@@ -559,22 +573,25 @@ def test_equivalent_challenger_rarely_fails_across_many_category_slices():
 
 
 def _ndcg_metrics(delta: float, lower: float, upper: float) -> dict:
-    return {
-        "ndcg_at_10_delta": delta,
-        "ndcg_at_10_delta_ci_lower": lower,
-        "ndcg_at_10_delta_ci_upper": upper,
-        "ndcg_at_10_delta_ci_half_width": (upper - lower) / 2.0,
-        "ndcg_informative_impressions": 400,
-        "ctr_pr_auc_delta": 0.0,
-        "ctcvr_pr_auc_delta": 0.0,
-        "ctr_log_loss_relative_regression": 0.0,
-        "ctcvr_log_loss_relative_regression": 0.0,
-        "ctr_brier_relative_regression": 0.0,
-        "ctcvr_brier_relative_regression": 0.0,
-        "ctr_ece_absolute_regression": 0.0,
-        "ctcvr_ece_absolute_regression": 0.0,
-        "value_wape_relative_regression": 0.0,
-    }
+    metrics = {"ndcg_informative_impressions": 400}
+    for metric, _, _ in _GATED_METRICS:
+        metrics.update(
+            {
+                metric: 0.0,
+                f"{metric}_ci_lower": 0.0,
+                f"{metric}_ci_upper": 0.0,
+                f"{metric}_ci_half_width": 0.0,
+            }
+        )
+    metrics.update(
+        {
+            "ndcg_at_10_delta": delta,
+            "ndcg_at_10_delta_ci_lower": lower,
+            "ndcg_at_10_delta_ci_upper": upper,
+            "ndcg_at_10_delta_ci_half_width": (upper - lower) / 2.0,
+        }
+    )
+    return metrics
 
 
 @pytest.mark.parametrize(
@@ -615,10 +632,13 @@ def test_underpowered_holdout_is_insufficient_with_a_sample_size_estimate():
         result = evaluate_quality_gate(
             rows, predictions(1000 + seed), predictions(2000 + seed), _aa_config()
         )
-        if result.reasons == ("overall_ndcg_underpowered",):
+        if (
+            result.decision is GateDecision.INSUFFICIENT_EVIDENCE
+            and "overall_ndcg_underpowered" in result.reasons
+        ):
             break
     else:
-        pytest.fail("no seed produced an NDCG-only underpowered result")
+        pytest.fail("no seed produced an NDCG underpowered result")
 
     assert result.decision is GateDecision.INSUFFICIENT_EVIDENCE
     assert result.overall["ndcg_at_10_delta_ci_half_width"] > 0.0
@@ -653,3 +673,504 @@ def test_fixed_holdout_purges_rows_within_label_reach_of_the_holdout():
         rows, holdout_days=2, attribution_cutoff=rows[-1].as_of_ts + 86400
     )
     assert len(unpurged) > len(training)
+
+
+# --- ranking_quality_gate_v6: CI-based metrics and vectorized bootstrap -------------
+
+
+def _slow_mean_ndcg(rows, predictions) -> float:
+    """The v5 per-row implementation, kept as the equivalence reference."""
+    import math
+
+    grouped: dict[str, list[RankingEvaluationRow]] = {}
+    for row in rows:
+        grouped.setdefault(row.impression_id, []).append(row)
+
+    def gain(row):
+        return max(float(row.relevance) - 1.0, 0.0)
+
+    values = []
+    for impression_rows in grouped.values():
+        if len(impression_rows) < 2 or not any(gain(row) > 0.0 for row in impression_rows):
+            continue
+        ranked = sorted(
+            impression_rows,
+            key=lambda row: (-predictions[row.observation_id].serving_score, row.product_id),
+        )[:10]
+        ideal = sorted(impression_rows, key=lambda row: (-row.relevance, row.product_id))[:10]
+
+        def dcg(selected):
+            return sum(
+                gain(row) / math.log2(position + 2) for position, row in enumerate(selected)
+            )
+
+        values.append(dcg(ranked) / dcg(ideal))
+    return float(np.mean(values)) if values else 0.0
+
+
+def _slow_resamples(rows, config):
+    """v5 resampling: copies of each sampled user's rows with fresh impression ids."""
+    rows_by_user: dict[str, list[RankingEvaluationRow]] = {}
+    for row in rows:
+        rows_by_user.setdefault(row.user_id, []).append(row)
+    users = sorted(rows_by_user)
+    generator = np.random.default_rng(config.random_seed)
+    for _ in range(config.bootstrap_samples):
+        sampled = []
+        for index, user in enumerate(generator.choice(users, size=len(users), replace=True)):
+            sampled.extend(
+                replace(row, impression_id=f"{index}:{row.impression_id}")
+                for row in rows_by_user[str(user)]
+            )
+        yield sampled
+
+
+def _slow_metric_values(rows, predictions, bin_of) -> dict:
+    """sklearn metrics on materialized rows; ECE uses the evaluated rows' bins."""
+    from sklearn.metrics import average_precision_score, brier_score_loss, log_loss
+
+    labels = {
+        "ctr": np.array([float(row.clicked) for row in rows]),
+        "ctcvr": np.array([float(row.purchased) for row in rows]),
+    }
+    values = {"ndcg_at_10": _slow_mean_ndcg(rows, predictions)}
+    for head, y in labels.items():
+        p = np.clip([getattr(predictions[row.observation_id], head) for row in rows], 1e-7, 1 - 1e-7)
+        values[f"{head}_pr_auc"] = float(average_precision_score(y, p))
+        values[f"{head}_log_loss"] = float(log_loss(y, p, labels=[0.0, 1.0]))
+        values[f"{head}_brier"] = float(brier_score_loss(y, p))
+        gaps: dict[int, float] = {}
+        for row, probability, label in zip(rows, p, y):
+            key = bin_of[head][row.observation_id]
+            gaps[key] = gaps.get(key, 0.0) + probability - label
+        values[f"{head}_ece"] = sum(abs(gap) for gap in gaps.values()) / len(rows)
+    value_rows = [row for row in rows if row.purchased and row.value_mask]
+    errors = sum(
+        abs(row.business_value - predictions[row.observation_id].predicted_value)
+        for row in value_rows
+    )
+    values["value_wape"] = errors / max(sum(row.business_value for row in value_rows), 1e-12)
+    return values
+
+
+def _slow_bins(rows, predictions, bins: int) -> dict:
+    out = {}
+    for head in ("ctr", "ctcvr"):
+        p = np.clip([getattr(predictions[row.observation_id], head) for row in rows], 1e-7, 1 - 1e-7)
+        groups = np.array_split(np.argsort(p, kind="mergesort"), min(bins, len(rows)))
+        out[head] = {
+            rows[index].observation_id: number
+            for number, group in enumerate(groups)
+            for index in group
+        }
+    return out
+
+
+def _slow_gated(champion_values, challenger_values) -> dict:
+    def relative(name):
+        old = champion_values[name]
+        return (challenger_values[name] - old) / max(abs(old), 1e-12)
+
+    gated = {"ndcg_at_10_delta": challenger_values["ndcg_at_10"] - champion_values["ndcg_at_10"]}
+    for head in ("ctr", "ctcvr"):
+        gated[f"{head}_pr_auc_delta"] = (
+            challenger_values[f"{head}_pr_auc"] - champion_values[f"{head}_pr_auc"]
+        )
+        gated[f"{head}_log_loss_relative_regression"] = relative(f"{head}_log_loss")
+        gated[f"{head}_brier_relative_regression"] = relative(f"{head}_brier")
+        gated[f"{head}_ece_absolute_regression"] = (
+            challenger_values[f"{head}_ece"] - champion_values[f"{head}_ece"]
+        )
+    gated["value_wape_relative_regression"] = relative("value_wape")
+    return gated
+
+
+def _slow_bootstrap(rows, champion, challenger, config, *, alpha=0.05) -> dict:
+    champion_bins = _slow_bins(rows, champion, config.ece_bins)
+    challenger_bins = _slow_bins(rows, challenger, config.ece_bins)
+    draws: dict[str, list[float]] = {}
+    for sampled in _slow_resamples(rows, config):
+        gated = _slow_gated(
+            _slow_metric_values(sampled, champion, champion_bins),
+            _slow_metric_values(sampled, challenger, challenger_bins),
+        )
+        for name, value in gated.items():
+            draws.setdefault(name, []).append(value)
+    result = {}
+    for name, values in draws.items():
+        result[f"{name}_ci_lower"] = float(np.quantile(values, alpha / 2.0))
+        result[f"{name}_ci_upper"] = float(np.quantile(values, 1.0 - alpha / 2.0))
+    return result
+
+
+def _random_order_rows():
+    rng = np.random.default_rng(7)
+    rows = []
+    for index in range(60):
+        clicked_position = int(rng.integers(5)) if index % 3 == 0 else None
+        for position in range(5):
+            clicked = position == clicked_position
+            rows.append(
+                _row(
+                    impression=f"i{index}",
+                    user=f"u{index % 17}",
+                    product=f"p{position}",
+                    timestamp=1.0,
+                    relevance=(3.0 if position % 2 else 2.0) if clicked else 1.0,
+                    clicked=clicked,
+                    purchased=clicked and position % 2 == 1,
+                    value=5.0 + position,
+                )
+            )
+    champion = {row.observation_id: _score(1.0 if row.clicked else 0.0) for row in rows}
+    challenger = {
+        row.observation_id: RankingPrediction(
+            serving_score=float(rng.random()),
+            ctr=float(rng.random()),
+            ctcvr=float(rng.random()) * 0.3,
+            predicted_value=float(rng.random()) * 10.0,
+        )
+        for row in rows
+    }
+    return rows, champion, challenger
+
+
+def _equivalence_cases():
+    for seed in (0, 1):
+        rows, predictions = _equal_quality_fixture(seed, impressions=80, categories=5)
+        yield rows, predictions(1000 + seed), predictions(2000 + seed)
+    yield _random_order_rows()
+
+
+@pytest.mark.parametrize("case", range(3))
+def test_vectorized_ndcg_bootstrap_matches_the_v5_slow_implementation(case):
+    rows, champion, challenger = list(_equivalence_cases())[case]
+    config = replace(_small_config(), bootstrap_samples=60)
+
+    slow = [
+        _slow_mean_ndcg(sampled, challenger) - _slow_mean_ndcg(sampled, champion)
+        for sampled in _slow_resamples(rows, config)
+    ]
+    fast = _cluster_bootstrap_rows(rows, champion, challenger, config)
+
+    # The same seed draws the same resamples as v5's generator.choice().
+    assert fast["ndcg_at_10_delta_ci_lower"] == pytest.approx(
+        float(np.quantile(slow, 0.025)), abs=1e-12
+    )
+    assert fast["ndcg_at_10_delta_ci_upper"] == pytest.approx(
+        float(np.quantile(slow, 0.975)), abs=1e-12
+    )
+    assert _mean_ndcg(rows, champion) == pytest.approx(_slow_mean_ndcg(rows, champion), abs=1e-12)
+
+
+@pytest.mark.parametrize("case", range(3))
+def test_vectorized_point_metrics_match_the_sklearn_definitions(case):
+    from sklearn.metrics import average_precision_score, brier_score_loss, log_loss
+
+    from video_commerce.ml.probability_calibration import expected_calibration_error
+
+    rows, champion, challenger = list(_equivalence_cases())[case]
+    columns = _gate_columns(rows, champion, challenger)
+    metrics = _comparison_metrics(columns, _gate_statistics(columns, ece_bins=15))
+
+    def reference(predictions):
+        values = {"ndcg_at_10": _slow_mean_ndcg(rows, predictions)}
+        for head, attribute in (("ctr", "clicked"), ("ctcvr", "purchased")):
+            y = np.array([float(getattr(row, attribute)) for row in rows])
+            p = np.clip([getattr(predictions[row.observation_id], head) for row in rows], 1e-7, 1 - 1e-7)
+            values[f"{head}_pr_auc"] = average_precision_score(y, p)
+            values[f"{head}_log_loss"] = log_loss(y, p, labels=[0.0, 1.0])
+            values[f"{head}_brier"] = brier_score_loss(y, p)
+            values[f"{head}_ece"] = expected_calibration_error(p, y, bins=15)
+        value_rows = [row for row in rows if row.purchased and row.value_mask]
+        errors = [
+            abs(row.business_value - predictions[row.observation_id].predicted_value)
+            for row in value_rows
+        ]
+        values["value_wape"] = sum(errors) / max(sum(row.business_value for row in value_rows), 1e-12)
+        values["value_mae"] = float(np.mean(errors)) if errors else 0.0
+        return values
+
+    old, new = reference(champion), reference(challenger)
+    for name, value in _slow_gated(old, new).items():
+        assert metrics[name] == pytest.approx(value, abs=1e-12), name
+    for head in ("ctr", "ctcvr"):
+        assert metrics[f"{head}_ece_champion"] == pytest.approx(old[f"{head}_ece"], abs=1e-12)
+    assert metrics["value_mae_challenger"] == pytest.approx(new["value_mae"], abs=1e-12)
+    assert metrics["ndcg_at_10_champion"] == pytest.approx(old["ndcg_at_10"], abs=1e-12)
+
+
+@pytest.mark.parametrize("case", range(3))
+def test_vectorized_bootstrap_matches_row_resampling_for_every_metric(case):
+    rows, champion, challenger = list(_equivalence_cases())[case]
+    config = replace(_small_config(), bootstrap_samples=40)
+
+    slow = _slow_bootstrap(rows, champion, challenger, config)
+    fast = _cluster_bootstrap_rows(rows, champion, challenger, config)
+
+    assert set(slow) <= set(fast)
+    for name, value in slow.items():
+        assert fast[name] == pytest.approx(value, abs=1e-9), name
+
+
+def test_bootstrap_is_deterministic_and_independent_of_chunking(monkeypatch):
+    import video_commerce.ml.model_release_quality as quality
+
+    rows, champion, challenger = _random_order_rows()
+    config = replace(_small_config(), bootstrap_samples=50)
+    statistics = _gate_statistics(_gate_columns(rows, champion, challenger), ece_bins=15)
+
+    first = _cluster_bootstrap(statistics, config)
+    monkeypatch.setattr(quality, "_BOOTSTRAP_CHUNK_ELEMENTS", 7)
+    chunked = _cluster_bootstrap(statistics, config)
+    reseeded = _cluster_bootstrap(statistics, replace(config, random_seed=43))
+
+    assert chunked == pytest.approx(first, abs=1e-12)
+    assert _cluster_bootstrap(statistics, config) == pytest.approx(first, abs=1e-12)
+    assert reseeded != first
+
+
+def test_gate_reports_ci_bounds_for_every_gated_metric():
+    rows, predictions = _equal_quality_fixture(0)
+
+    result = evaluate_quality_gate(rows, predictions(1000), predictions(2000), _aa_config())
+
+    for metric, _, _ in _GATED_METRICS:
+        for bound in ("lower", "upper", "half_width"):
+            key = f"{metric}_ci_{bound}"
+            assert key in result.bootstrap
+            assert key in result.overall
+            assert key in result.slices["price_mid"]["metrics"]
+        assert result.overall[f"{metric}_ci_lower"] <= result.overall[f"{metric}_ci_upper"]
+
+
+def _ci_metrics(metric: str, lower: float, upper: float) -> dict:
+    metrics = _ndcg_metrics(0.0, 0.0, 0.0)
+    metrics.update(
+        {
+            metric: (lower + upper) / 2.0,
+            f"{metric}_ci_lower": lower,
+            f"{metric}_ci_upper": upper,
+            f"{metric}_ci_half_width": (upper - lower) / 2.0,
+        }
+    )
+    return metrics
+
+
+@pytest.mark.parametrize(("metric", "stem", "higher_is_better"), _GATED_METRICS)
+@pytest.mark.parametrize("slice_name", [None, "price_mid"])
+def test_every_gated_metric_is_a_three_way_ci_test(
+    metric, stem, higher_is_better, slice_name
+):
+    from video_commerce.ml.model_release_quality import (
+        _metric_threshold,
+        _underpowered_reasons,
+    )
+
+    config = RankingQualityGateConfig(experiment_kind="retrain")
+    prefix = f"slice_{slice_name}" if slice_name else "overall"
+    threshold = _metric_threshold(metric, config, slice_name=slice_name)
+    worse = -1.0 if higher_is_better else 1.0
+    failure = f"{prefix}_ndcg_regression" if stem == "ndcg" else f"{prefix}_{metric}"
+    underpowered = f"{prefix}_{stem}_underpowered"
+    beyond = sorted((threshold + worse * 0.01, threshold + worse * 0.03))
+    straddling = sorted((threshold + worse * 0.01, threshold - worse * 0.01))
+    within = sorted((threshold - worse * 0.001, threshold - worse * 0.01))
+
+    for (lower, upper), failed, insufficient in (
+        (beyond, True, False),
+        (straddling, False, True),
+        (within, False, False),
+    ):
+        metrics = _ci_metrics(metric, lower, upper)
+        failures = _metric_failures(metrics, config, slice_name=slice_name)
+        reasons = _underpowered_reasons(metrics, config, slice_name=slice_name)
+        assert (failure in failures) is failed
+        assert reasons == ([underpowered] if insufficient else [])
+
+
+@pytest.mark.parametrize("noise", [0.01, 0.05])
+def test_equal_quality_challenger_false_fail_rate_is_under_five_percent(noise):
+    """A/A: equal-quality models with independent score noise, 240 impressions.
+
+    Under v5 the point thresholds failed 2/20 runs at noise 0.01 and most runs
+    at 0.05. Under v6 no gated metric fails unless its whole CI is beyond the
+    threshold, so small holdouts are insufficient evidence instead.
+    """
+    trials = 40
+    failed = 0
+    insufficient = 0
+    config = replace(_aa_config(), bootstrap_samples=200)
+    for seed in range(trials):
+        rows, predictions = _equal_quality_fixture(seed, noise=noise)
+        result = evaluate_quality_gate(
+            rows, predictions(1000 + seed), predictions(2000 + seed), config
+        )
+        failed += result.decision is GateDecision.FAILED
+        insufficient += result.decision is GateDecision.INSUFFICIENT_EVIDENCE
+        assert all(reason.endswith("_underpowered") for reason in result.reasons)
+
+    assert failed / trials < 0.05
+    assert insufficient > 0
+
+
+def test_clear_regression_still_fails_on_ci_based_metrics():
+    rows, predictions = _equal_quality_fixture(0)
+    champion = predictions(1000)
+    rng = np.random.default_rng(5)
+    challenger = {
+        key: RankingPrediction(
+            serving_score=float(rng.random()),
+            ctr=min(0.99, value.ctr * 2.5),
+            ctcvr=min(0.99, value.ctcvr * 2.5),
+            predicted_value=20.0,
+        )
+        for key, value in champion.items()
+    }
+
+    result = evaluate_quality_gate(
+        rows, champion, challenger, replace(_aa_config(), bootstrap_samples=500)
+    )
+
+    assert result.decision is GateDecision.FAILED
+    for reason in (
+        "overall_ndcg_regression",
+        "overall_ctr_pr_auc_delta",
+        "overall_ctr_log_loss_relative_regression",
+        "overall_ctr_brier_relative_regression",
+        "overall_ctr_ece_absolute_regression",
+        "overall_value_wape_relative_regression",
+        "slice_price_mid",
+    ):
+        assert reason in result.reasons
+
+
+
+@pytest.mark.parametrize("policy", ["ranking_quality_gate_v5", "ranking_quality_gate_v6"])
+def test_v5_and_v6_evidence_both_remain_valid_for_phase_c(policy):
+    from dataclasses import asdict
+
+    from video_commerce.ml.model_release_quality import (
+        PHASE_C_QUALITY_GATE_POLICY_VERSIONS,
+        SUPPORTED_QUALITY_GATE_POLICY_VERSIONS,
+        default_gate_config,
+    )
+    from video_commerce.ml.phase_c_evidence import (
+        active_rrf_release_valid,
+        quality_gate_snapshot_valid,
+    )
+
+    assert policy in PHASE_C_QUALITY_GATE_POLICY_VERSIONS
+    assert policy in SUPPORTED_QUALITY_GATE_POLICY_VERSIONS
+    assert active_rrf_release_valid(
+        {
+            "payload": {
+                "model_release_id": "release-1",
+                "active_generation": 1,
+                "quality_gate_policy_version": policy,
+                "candidate_fusion_policy_version": "candidate_rrf_v1",
+                "candidate_rrf_k": 60,
+                "candidate_source_registry_version": "retrieval_sources_v1",
+            }
+        }
+    )
+    # v6 changes decision rules only, not the config, so a v5 snapshot of the
+    # frozen defaults still validates.
+    assert quality_gate_snapshot_valid(asdict(default_gate_config("combined")))
+
+
+# --- opt-in scale benchmark ----------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default)))
+
+
+def _peak_rss_mb() -> float:
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes, Linux reports KiB.
+    return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
+
+
+def _synthetic_columns(rows: int, users: int, slate_size: int = 10) -> _GateColumns:
+    """Slates of `slate_size` rows; each impression belongs to one user."""
+    rng = np.random.default_rng(2026)
+    impressions = rows // slate_size
+    impression = np.repeat(np.arange(impressions), slate_size)[:rows]
+    user = np.sort(rng.integers(0, users, size=impressions))[impression]
+    user = np.unique(user, return_inverse=True)[1].reshape(-1).astype(np.int64)
+    clicked = (rng.random(rows) < 0.08).astype(np.float64)
+    purchased = clicked * (rng.random(rows) < 0.2)
+    relevance = 1.0 + clicked + 2.0 * purchased
+    base = rng.random(rows) + 0.4 * clicked + 0.4 * purchased
+    noise = rng.normal(0.0, 0.05, size=(2, rows))
+    score = base + noise
+    ctr = np.clip(score / 2.0, 1e-7, 1 - 1e-7)
+    value = np.where(purchased > 0, rng.gamma(2.0, 20.0, size=rows), 0.0)
+    return _GateColumns(
+        user=user,
+        impression=impression.astype(np.int64),
+        product_rank=rng.permutation(rows).astype(np.int64),
+        relevance=relevance,
+        clicked=clicked,
+        purchased=purchased,
+        value_row=purchased > 0,
+        business_value=value,
+        serving_score=score,
+        ctr=ctr,
+        ctcvr=np.clip(ctr * 0.2, 1e-7, 1 - 1e-7),
+        predicted_value=value + rng.normal(0.0, 5.0, size=(2, rows)),
+    )
+
+
+@pytest.mark.skipif(
+    os.getenv("RANKING_GATE_BENCHMARK") != "1",
+    reason="set RANKING_GATE_BENCHMARK=1 to run the ranking gate benchmark",
+)
+def test_cluster_bootstrap_scales_to_a_million_rows():
+    """Opt-in: RANKING_GATE_BENCHMARK=1 python -m pytest -s -k scales_to_a_million.
+
+    Sizes and bounds: RANKING_GATE_BENCHMARK_{ROWS,USERS,SAMPLES,MAX_SECONDS,
+    MAX_TRACED_MB}. Traced (numpy) peak memory does not grow with SAMPLES.
+    """
+    rows = _env_int("RANKING_GATE_BENCHMARK_ROWS", 1_000_000)
+    users = _env_int("RANKING_GATE_BENCHMARK_USERS", 100_000)
+    samples = _env_int("RANKING_GATE_BENCHMARK_SAMPLES", 2000)
+    max_seconds = float(os.getenv("RANKING_GATE_BENCHMARK_MAX_SECONDS", "300"))
+    max_traced_mb = float(os.getenv("RANKING_GATE_BENCHMARK_MAX_TRACED_MB", "1536"))
+    config = RankingQualityGateConfig(bootstrap_samples=samples)
+    columns = _synthetic_columns(rows, users)
+    timings: dict[str, float] = {}
+
+    tracemalloc.start()
+    started = time.perf_counter()
+    statistics = _gate_statistics(columns, ece_bins=config.ece_bins)
+    timings["statistics_seconds"] = time.perf_counter() - started
+    point_started = time.perf_counter()
+    point = _comparison_metrics(columns, statistics, ece_bins=config.ece_bins)
+    timings["point_seconds"] = time.perf_counter() - point_started
+    bootstrap_started = time.perf_counter()
+    bootstrap = _cluster_bootstrap(statistics, config)
+    timings["bootstrap_seconds"] = time.perf_counter() - bootstrap_started
+    timings["total_seconds"] = time.perf_counter() - started
+    _, traced_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    report = {
+        "rows": rows,
+        "users": statistics.users,
+        "informative_slates": point["ndcg_informative_impressions"],
+        "samples": samples,
+        **{name: round(value, 2) for name, value in timings.items()},
+        "traced_peak_mb": round(traced_peak / (1024 * 1024), 1),
+        "peak_rss_mb": round(_peak_rss_mb(), 1),
+        "ndcg_ci": [
+            bootstrap["ndcg_at_10_delta_ci_lower"],
+            bootstrap["ndcg_at_10_delta_ci_upper"],
+        ],
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+    assert all(np.isfinite(value) for value in bootstrap.values())
+    assert timings["total_seconds"] < max_seconds
+    assert traced_peak / (1024 * 1024) < max_traced_mb

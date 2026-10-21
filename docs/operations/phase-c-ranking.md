@@ -114,8 +114,8 @@ version when evidence or an experiment changes.
   plus an `other` bucket. Missing-modality slices are also report-only. All of
   these are recorded with `"blocking": false` and never change the decision.
 
-`ranking_quality_gate_v5` NDCG decision (current policy; v2–v4 evidence stays
-valid for promotion):
+`ranking_quality_gate_v5` NDCG decision (v5 evidence stays valid for
+promotion):
 
 - NDCG@10 is a non-inferiority test on the user-cluster bootstrap CI against
   the margin (`overall_ndcg_ci_lower` = -0.005; blocking slices -0.03 with the
@@ -135,9 +135,54 @@ valid for promotion):
   check about half the time.
 - `calibration_ndcg_regression` fires only when the NDCG CI is wholly below 0.
 - Definite failures take precedence over underpowered results.
-- Other metrics (PR-AUC, log loss, Brier, ECE, value WAPE) are still
-  point-estimate thresholds. Small holdouts can still fail equal-quality
-  challengers on them.
+- Under v5, PR-AUC, log loss, Brier, ECE and value WAPE were still point
+  thresholds, so small holdouts failed equal-quality challengers on them.
+
+`ranking_quality_gate_v6` CI decision for every metric (current policy;
+v2–v5 evidence stays valid for promotion):
+
+- Every gated metric uses the v5 NDCG three-way rule on its own user-cluster
+  bootstrap CI. All metrics share the same resampled users in each sample.
+
+  | Metric | Threshold (overall / slice) | Fails when |
+  | --- | --- | --- |
+  | `ndcg_at_10_delta` | -0.005 / -0.03 | CI upper < threshold |
+  | `{ctr,ctcvr}_pr_auc_delta` | -0.005 / -0.005 | CI upper < threshold |
+  | `{ctr,ctcvr}_log_loss_relative_regression` | 0.02 / 0.05 | CI lower > threshold |
+  | `{ctr,ctcvr}_brier_relative_regression` | 0.02 / 0.05 | CI lower > threshold |
+  | `{ctr,ctcvr}_ece_absolute_regression` | 0.005 / 0.01 | CI lower > threshold |
+  | `value_wape_relative_regression` | 0.05 / 0.05 | CI lower > threshold |
+
+  A CI wholly beyond its threshold fails with the v5 reason name, for example
+  `overall_ctr_log_loss_relative_regression` or `slice_price_mid_ndcg_regression`.
+  A CI straddling it is `insufficient_evidence` with
+  `<prefix>_<metric>_underpowered`, for example `overall_ctr_ece_underpowered`
+  or `slice_price_mid_ctcvr_pr_auc_underpowered`. Otherwise the metric passes.
+- Each gated metric reports `<metric>_ci_lower`, `_ci_upper` and
+  `_ci_half_width` in `overall`, in every evaluated slice and in `bootstrap`.
+- Blocking slices use one Bonferroni-adjusted alpha for all of their metrics.
+- The superiority requirements are unchanged point checks: features and
+  fusion minimum improvement, calibration ECE improvement and no Brier
+  regression, and a positive `*_ndcg_min_delta`. Candidate recall@500 is
+  external evidence and is still a point threshold.
+- The ECE CI keeps each row in its equal-frequency bin from the evaluated
+  rows. Resamples reweight users within those bins and do not re-bin.
+- A slate is one user's rows of one impression. This matches v5 whenever every
+  impression belongs to one user.
+- Small holdouts now usually return `insufficient_evidence`. 240-impression
+  A/A simulations ran 160 equal-quality runs at score noise 0.01 and 0.05.
+  None failed, and 159 were underpowered, mostly on ECE, ctcvr PR-AUC and
+  NDCG. An underpowered result is not a regression: collect a larger holdout
+  before you decide.
+- Bootstrap cost: per-user sums are computed once. Each sample is a
+  multinomial user weight vector, and samples are processed in chunks as matrix
+  products. PR-AUC is a weighted average precision over one sort. On a laptop,
+  the overall bootstrap for 1M rows × 2000 samples takes about 26 s with a
+  300 MB traced peak, which does not grow with the sample count. With 632k
+  single-row users it takes 70 s. The full gate on 1M rows with 29 slices
+  takes about 2.2 minutes; v5 needed hours. Run the benchmark with
+  `RANKING_GATE_BENCHMARK=1 python -m pytest -s tests/test_model_release_quality.py -k million`.
+  A seed draws the same resamples as v5, so v6 NDCG CIs equal v5's.
 
 The general trainer evaluates every periodic retrain with experiment kind
 `retrain`:
