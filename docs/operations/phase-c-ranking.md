@@ -114,8 +114,8 @@ version when evidence or an experiment changes.
   plus an `other` bucket. Missing-modality slices are also report-only. All of
   these are recorded with `"blocking": false` and never change the decision.
 
-`ranking_quality_gate_v5` NDCG decision (current policy; v2–v4 evidence stays
-valid for promotion):
+`ranking_quality_gate_v5` NDCG decision (v5 evidence stays valid for
+promotion):
 
 - NDCG@10 is a non-inferiority test on the user-cluster bootstrap CI against
   the margin (`overall_ndcg_ci_lower` = -0.005; blocking slices -0.03 with the
@@ -135,9 +135,128 @@ valid for promotion):
   check about half the time.
 - `calibration_ndcg_regression` fires only when the NDCG CI is wholly below 0.
 - Definite failures take precedence over underpowered results.
-- Other metrics (PR-AUC, log loss, Brier, ECE, value WAPE) are still
-  point-estimate thresholds. Small holdouts can still fail equal-quality
-  challengers on them.
+- Under v5, PR-AUC, log loss, Brier, ECE and value WAPE were still point
+  thresholds, so small holdouts failed equal-quality challengers on them.
+
+`ranking_quality_gate_v6` CI decision for every metric (current policy;
+v2–v5 evidence stays valid for promotion):
+
+- Every gated metric uses the v5 NDCG three-way rule on its own user-cluster
+  bootstrap CI. All metrics share the same resampled users in each sample.
+
+  | Metric | Threshold (overall / slice) | Fails when |
+  | --- | --- | --- |
+  | `ndcg_at_10_delta` | -0.005 / -0.03 | CI upper < threshold |
+  | `{ctr,ctcvr}_pr_auc_delta` | -0.005 / -0.005 | CI upper < threshold |
+  | `{ctr,ctcvr}_log_loss_relative_regression` | 0.02 / 0.05 | CI lower > threshold |
+  | `{ctr,ctcvr}_brier_relative_regression` | 0.02 / 0.05 | CI lower > threshold |
+  | `{ctr,ctcvr}_ece_absolute_regression` | 0.005 / 0.01 | CI lower > threshold |
+  | `value_wape_relative_regression` | 0.05 / 0.05 | CI lower > threshold |
+
+  A CI wholly beyond its threshold fails with the v5 reason name, for example
+  `overall_ctr_log_loss_relative_regression` or `slice_price_mid_ndcg_regression`.
+  A CI straddling it is `insufficient_evidence` with
+  `<prefix>_<metric>_underpowered`, for example `overall_ctr_ece_underpowered`
+  or `slice_price_mid_ctcvr_pr_auc_underpowered`. Otherwise the metric passes.
+- Each gated metric reports `<metric>_ci_lower`, `_ci_upper` and
+  `_ci_half_width` in `overall`, in every evaluated slice and in `bootstrap`.
+  `ci_alpha` records the CI level used.
+- Per-head evidence. A metric whose head has no signal is
+  `<prefix>_<metric>_no_evidence` (insufficient), not a pass. Without signal,
+  every resample scores both models the same, for example ctcvr AP 0 with no
+  purchases, and the CI would be a falsely certain [0, 0]. Each head needs a
+  minimum number of positives and at least one negative:
+
+  | Head | Overall floor | Slice floor |
+  | --- | --- | --- |
+  | ctr | `min_clicks` | `min_slice_positives` |
+  | ctcvr | `min_purchases` | `min_slice_positives` |
+  | value | `min_purchases` value-labelled purchases | `min_slice_positives` |
+  | NDCG | 1 informative slate | 1 informative slate |
+
+  A blocking slice with clicks but too few purchases is therefore
+  insufficient on its ctcvr and value metrics.
+- Precedence: a definite failure is any of:
+  - an overall CI wholly beyond its threshold;
+  - a failed blocking slice;
+  - a failed experiment requirement;
+  - a candidate-recall regression.
+
+  Definite failures win over everything else, including missing overall or
+  slice evidence, so a tiny `cold_item` slice cannot mask an overall
+  regression. Next comes missing evidence, then underpowered metrics, then a
+  pass. The overall bootstrap therefore always runs.
+- Experiment requirements (superiority) are also three-way CI tests:
+  - Features: overall NDCG delta ≥ 0.005 or cold-user NDCG delta ≥ 0.01.
+    Either arm's CI lower bound at or above its minimum passes. Both CI upper
+    bounds below their minimums fail. A missing cold-user slice counts as
+    unknown, not as a failure.
+  - Fusion: candidate recall@500 improves by ≥ 0.005 (an external point
+    value), or the NDCG delta CI lower bound is ≥ 0.005.
+  - Calibration, per head:
+    - The ECE relative change CI must be ≤ -10%. This is the bootstrapped
+      `*_ece_relative_regression`.
+    - The Brier relative regression CI must be ≤ 0.
+    - A CI straddling either bound is `<requirement>_underpowered`.
+    - `calibration_ndcg_regression` still fires only when the NDCG CI is
+      wholly below 0.
+  - A positive `*_ndcg_min_delta` fails as `<prefix>_ndcg_minimum_improvement`
+    when the NDCG CI is wholly below it. In v5 this reason was
+    `_ndcg_point_delta`.
+  - Candidate recall@500 is external evidence and stays a point threshold.
+- Multiple comparisons: Bonferroni covers the blocking slices only. Each
+  blocking slice's CIs use `0.05 / k`, where k is the number of blocking
+  slices tested; overall CIs use 0.05.
+  - There is no adjustment across the 10 metrics within a slice or overall.
+    When every metric sits exactly on its threshold, the worst-case
+    family-wise false-failure bound is about 10 × 2.5% per family.
+  - An equal-quality challenger is well inside every threshold, so its
+    realized false-failure rate is far lower: 0 of 160 A/A runs failed.
+  - Keep `bootstrap_samples × ci_alpha / 2 ≥ 10`. The default 2000 samples
+    allow up to 5 blocking slices.
+- Underpowered metrics also report `<metric>_required_users_estimate`. This is
+  a rough user count at which the observed point estimate would clear its
+  threshold: `users × (half_width / gap)²`. It is null when the point estimate
+  is already on the failing side.
+- When v6 can pass. The evidence floors (`min_impressions` 1000,
+  `min_users` 200, `min_clicks` 50, `min_purchases` 30) only make a
+  comparison possible. At those sizes the 0.005 PR-AUC and ECE thresholds and
+  the 5% WAPE threshold are tighter than sampling noise, so nearly every
+  result is `insufficient_evidence`. Synthetic results (4-row slates,
+  2 impressions per user, 500 samples):
+
+  | Fixture | Rows / users | Clicks / purchases | Result |
+  | --- | --- | --- | --- |
+  | A/A, score noise 0.01 and 0.05 | 960 / 120 | ~290 / ~85 | 1/160 passed, 0 failed |
+  | A/A, score noise 0.01 | 16k / 2k | ~4.8k / ~1.4k | 5/6 passed |
+  | A/A, score noise 0.01 | 64k / 8k | ~19k / ~5.8k | 6/6 passed |
+  | Calibrated A/A, logit noise 0.1 | 64k / 8k | ~17k / ~5k | 3/6 passed; the rest underpowered on value WAPE |
+  | Calibrated, challenger noise 0.2 vs champion 0.5 | 16k / 2k | ~4.3k / ~1.3k | 5/6 passed |
+  | A/A, rare purchases (8% CTR, 10% of clicks buy) | 64k / 8k | ~5k / ~500 | 3/5 passed |
+  | A/A, rare purchases | 256k / 32k | ~20k / ~2k | 5/5 passed |
+
+  ctcvr PR-AUC, ECE and value WAPE bind first. Plan holdouts for thousands of
+  purchases, not the 30-purchase floor. Raising the floors or loosening those
+  thresholds is a separate policy decision. Changing the defaults would also
+  invalidate existing v2–v6 config snapshots.
+- The ECE CI keeps each row in its equal-frequency bin from the evaluated
+  rows. Resamples reweight users within those bins and do not re-bin.
+- A slate is one user's rows of one impression. This matches v5 whenever every
+  impression belongs to one user.
+- Small holdouts now usually return `insufficient_evidence`. 240-impression
+  A/A simulations ran 160 equal-quality runs at score noise 0.01 and 0.05.
+  None failed, and 159 were underpowered, mostly on ECE, ctcvr PR-AUC and
+  NDCG. An underpowered result is not a regression: collect a larger holdout
+  before you decide (see "When v6 can pass").
+- Bootstrap cost: per-user sums are computed once. Each sample is a
+  multinomial user weight vector, and samples are processed in chunks as matrix
+  products. PR-AUC is a weighted average precision over one sort. On a laptop,
+  the overall bootstrap for 1M rows × 2000 samples takes 26–36 s with a
+  300 MB traced peak, which does not grow with the sample count. With 632k
+  single-row users it takes 70 s. The full gate on 1M rows with 29 slices
+  takes about 2.2 minutes; v5 needed hours. Run the benchmark with
+  `RANKING_GATE_BENCHMARK=1 python -m pytest -s tests/test_model_release_quality.py -k million`.
+  A seed draws the same resamples as v5, so v6 NDCG CIs equal v5's.
 
 The general trainer evaluates every periodic retrain with experiment kind
 `retrain`:
