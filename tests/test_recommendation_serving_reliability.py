@@ -36,6 +36,7 @@ class RecordingObservability:
     def __init__(self):
         self.impressions = []
         self.untracked = []
+        self.write_ages = []
         self.terminal = []
         self.catalog_terminal = []
         self.outbox_stats = []
@@ -48,6 +49,9 @@ class RecordingObservability:
 
     def record_recommendation_impression_untracked(self, reason):
         self.untracked.append(reason)
+
+    def update_recommendation_impression_outbox_write_age(self, seconds):
+        self.write_ages.append(seconds)
 
     def record_recommendation_outbox_terminal(self, reason):
         self.terminal.append(reason)
@@ -78,6 +82,7 @@ class SlowOutboxStore:
         self.commit_deadlines = []
         self.publish_holds = []
         self.retire_status = "retired"
+        self.retire_calls = []
         self.retire_errors = []
         self.error = None
 
@@ -92,11 +97,20 @@ class SlowOutboxStore:
         self.enqueued.extend(event for event, _deadline in entries)
         return [self.outcome] * len(entries)
 
-    async def mark_recommendation_outbox_not_exposed(self, event_id):
-        self.not_exposed.append(event_id)
+    async def mark_recommendation_outbox_not_exposed_many(self, event_ids):
+        self.retire_calls.append(list(event_ids))
+        self.not_exposed.extend(event_ids)
         if self.retire_errors:
             raise self.retire_errors.pop(0)
-        return self.retire_status
+        return {event_id: self.retire_status for event_id in event_ids}
+
+
+@pytest.fixture(autouse=True)
+def _fresh_outbox_singletons(monkeypatch):
+    # The batcher and retirer own loop-bound tasks; never share them across
+    # tests (each test runs on its own event loop).
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
+    monkeypatch.setattr(recommendation_api, "_late_impression_retirer", None)
 
 
 def _install_runtime(monkeypatch, *, recommendation_config=None):
@@ -347,7 +361,7 @@ async def test_outbox_write_gets_serving_deadline_and_reports_lost_retire_race(
 
     assert before + 0.05 <= store.commit_deadlines[0] <= time.monotonic()
     # Held unclaimable for the budget plus a margin so the retire wins.
-    assert store.publish_holds[0] == pytest.approx(1.05)
+    assert store.publish_holds[0] == pytest.approx(2.55)
     assert ("served", "not_exposed_published") in runtime.observability.impressions
     assert runtime.observability.terminal == []
 
@@ -517,22 +531,126 @@ async def test_concurrent_impressions_share_one_outbox_transaction(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retire_retries_transient_errors(monkeypatch):
+async def test_retire_retries_transient_errors_within_the_hold(monkeypatch):
     runtime = _install_runtime(monkeypatch)
     store = SlowOutboxStore(delay_seconds=0)
     store.retire_errors = [RuntimeError("db blip"), RuntimeError("db blip")]
     monkeypatch.setattr(recommendation_api, "system_store", store)
-    monkeypatch.setattr(recommendation_api, "_RETIRE_RETRY_DELAYS_SECONDS", (0, 0, 0))
+    monkeypatch.setattr(recommendation_api, "_RETIRE_RETRY_DELAYS_SECONDS", (0.01,))
+    retirer = recommendation_api._late_impression_retirer_or_default()
 
-    await recommendation_api._retire_unexposed_impression("evt", "imp")
+    retirer.submit("evt", "imp", retire_by=time.monotonic() + 5)
+    await _drain(0.1)
 
-    assert len(store.not_exposed) == 3
+    assert store.retire_calls == [["evt"]] * 3
     assert runtime.observability.terminal == ["not_exposed"]
 
-    store.retire_errors = [RuntimeError("down")] * 4
-    await recommendation_api._retire_unexposed_impression("evt", "imp")
+    # Past its hold the row is given up instead of retried forever.
+    store.retire_errors = [RuntimeError("down")] * 100
+    retirer.submit("evt-2", "imp-2", retire_by=time.monotonic() + 0.05)
+    await _drain(0.2)
 
     assert ("served", "retire_failed") in runtime.observability.impressions
+    assert retirer.pending == 0
+    assert 2 <= len(store.retire_calls) - 3 <= 10
+
+
+@pytest.mark.asyncio
+async def test_slow_batch_commit_is_retired_with_one_update_not_one_per_row(
+    monkeypatch,
+):
+    runtime = _install_runtime(
+        monkeypatch,
+        recommendation_config=RecommendationConfig(impression_outbox_timeout_ms=50),
+    )
+    store = SlowOutboxStore(delay_seconds=0.2)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+
+    durable = await asyncio.gather(
+        *(
+            recommendation_api._stage_served_impression_event(
+                user_id=f"u{index}",
+                recommendations=["p1"],
+                response_time_ms=5,
+                request_id=None,
+                metadata={"impression_id": f"imp-late-{index}"},
+            )
+            for index in range(20)
+        )
+    )
+    await _drain(0.3)
+
+    assert durable == [False] * 20
+    assert store.batches == [16, 4]
+    # Every row committed after its budget: all are retired, by at most one
+    # UPDATE per finished write batch and never more than one at a time.
+    assert sorted(store.not_exposed) == sorted(
+        event["event_id"] for event in store.enqueued
+    )
+    assert len(store.retire_calls) <= 2
+    assert runtime.observability.terminal == ["not_exposed"] * 20
+
+
+@pytest.mark.parametrize(
+    ("pool_size", "max_overflow", "configured", "expected"),
+    [(2, 1, 2, 2), (2, 1, 5, 2), (1, 0, 2, 1), (5, 5, 3, 3)],
+)
+def test_outbox_inflight_is_clamped_below_the_pool(
+    pool_size, max_overflow, configured, expected
+):
+    from video_commerce.common.config import DatabaseConfig
+
+    batcher = recommendation_api._build_impression_outbox_batcher(
+        RecommendationConfig(impression_outbox_max_inflight=configured),
+        DatabaseConfig(pool_size=pool_size, max_overflow=max_overflow),
+    )
+
+    assert batcher.max_inflight == expected
+
+
+@pytest.mark.asyncio
+async def test_closed_batcher_skips_tracking_instead_of_building_a_new_one(
+    monkeypatch,
+):
+    runtime = _install_runtime(monkeypatch)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", SlowOutboxStore(0))
+    batcher = recommendation_api._impression_outbox_batcher_or_default()
+    await batcher.close()
+
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-after-close"},
+    )
+
+    assert durable is False
+    assert recommendation_api._impression_outbox_batcher_or_default() is batcher
+    assert runtime.observability.untracked == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_rejected_row_is_not_retired(monkeypatch):
+    _install_runtime(monkeypatch)
+    store = SlowOutboxStore(delay_seconds=0)
+    store.error = ValueError("recommendation outbox event_id payload collision")
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-collision"},
+    )
+    await _drain(0.05)
+
+    assert durable is False
+    assert store.retire_calls == []
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ import pytest
 from video_commerce.services.recommendation.impression_outbox import (
     EXPIRED,
     ImpressionOutboxBatcher,
+    LateImpressionRetirer,
 )
 
 
@@ -175,3 +176,80 @@ async def test_close_lets_inflight_write_finish_and_expires_queued_rows():
     assert await inflight == "inserted"
     assert await queued == EXPIRED
     assert writer.batches == [["e0"]]
+
+
+@pytest.mark.asyncio
+async def test_write_age_tracks_the_oldest_inflight_write_and_close_refuses():
+    writer = RecordingWriter(delay_seconds=0.1)
+    batcher = _batcher(writer)
+
+    assert batcher.oldest_write_age_seconds() == 0.0
+    future = batcher.submit(_event(0), _deadline())
+    await asyncio.sleep(0.05)
+    assert 0.03 <= batcher.oldest_write_age_seconds() < 0.1
+    await future
+    assert batcher.oldest_write_age_seconds() == 0.0
+
+    await batcher.close()
+    assert batcher.closed
+    assert batcher.submit(_event(1), _deadline()) is None
+
+
+class RecordingRetire:
+    def __init__(self, failures=0):
+        self.calls = []
+        self.failures = failures
+
+    async def __call__(self, event_ids):
+        self.calls.append(list(event_ids))
+        await asyncio.sleep(0.01)
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("db slow")
+        return {event_id: "retired" for event_id in event_ids}
+
+
+def _retirer(retire, results, errors, delays=(0.01,)):
+    return LateImpressionRetirer(
+        retire,
+        on_result=lambda entry, status: results.append((entry.event_id, status)),
+        on_error=lambda batch, attempt, exc: errors.append((len(batch), attempt)),
+        retry_delays_seconds=delays,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retirer_batches_rows_and_runs_one_update_at_a_time():
+    retire = RecordingRetire()
+    results, errors = [], []
+    retirer = _retirer(retire, results, errors)
+
+    for index in range(40):
+        retirer.submit(f"e{index}", f"i{index}", time.monotonic() + 5)
+    await asyncio.sleep(0.005)
+    # Rows arriving while an UPDATE runs wait for the next one.
+    for index in range(40, 45):
+        retirer.submit(f"e{index}", f"i{index}", time.monotonic() + 5)
+    await asyncio.sleep(0.1)
+
+    assert [len(call) for call in retire.calls] == [40, 5]
+    assert len(results) == 45 and {status for _, status in results} == {"retired"}
+
+
+@pytest.mark.asyncio
+async def test_retirer_retries_until_retire_by_then_gives_up():
+    retire = RecordingRetire(failures=2)
+    results, errors = [], []
+    retirer = _retirer(retire, results, errors)
+
+    retirer.submit("e0", "i0", time.monotonic() + 5)
+    await asyncio.sleep(0.15)
+    assert results == [("e0", "retired")]
+    assert [attempt for _, attempt in errors] == [1, 2]
+
+    retire.failures = 1000
+    retirer.submit("e1", "i1", time.monotonic() + 0.05)
+    await asyncio.sleep(0.2)
+    assert results[-1] == ("e1", None)
+    assert retirer.pending == 0
+    await retirer.close()

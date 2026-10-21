@@ -476,6 +476,17 @@ async def test_batched_enqueue_resolves_each_row_and_drops_late_rows_before_comm
         )
 
         assert outcomes[:6] == ["inserted"] * 5 + ["duplicate"]
+        async with store.session_factory() as session:
+            stored = await session.scalar(
+                text(
+                    "SELECT event_payload FROM recommendation_event_outbox "
+                    "WHERE event_id = :event_id"
+                ),
+                {"event_id": fresh[0]["event_id"]},
+            )
+        # Pre-serialized once and cast to JSON in SQL: the row reads back as
+        # the original event.
+        assert stored == fresh[0]
         assert isinstance(outcomes[6], ValueError)
         assert isinstance(outcomes[7], ValueError)
         assert isinstance(outcomes[8], OutboxCommitDeadlineExceeded)
@@ -570,6 +581,38 @@ async def test_outbox_write_without_a_free_connection_reports_pool_timeout():
                 )
         assert raised.value.reason == "pool_timeout"
         assert await _outbox_rows(store, prefix) == set()
+    finally:
+        await _delete_outbox_rows(store, prefix)
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_batched_retire_reports_each_row_with_one_update():
+    store = _store(_database_url())
+    await store.initialize()
+    prefix = f"retire-many-{uuid.uuid4().hex[:8]}"
+    late = [_event(f"{prefix}-late-{index}") for index in range(3)]
+    claimed = _event(f"{prefix}-claimed")
+    try:
+        for event in late:
+            await store.enqueue_recommendation_event(event, publish_hold_seconds=30)
+        await store.enqueue_recommendation_event(claimed)
+        assert claimed["event_id"] in await _claim_ids(store, "worker-retire")
+        await store.mark_recommendation_outbox_not_exposed(late[0]["event_id"])
+        missing = uuid.uuid4().hex
+
+        statuses = await store.mark_recommendation_outbox_not_exposed_many(
+            [event["event_id"] for event in (*late, claimed)] + [missing]
+        )
+
+        assert statuses == {
+            late[0]["event_id"]: "already_terminal",
+            late[1]["event_id"]: "retired",
+            late[2]["event_id"]: "retired",
+            claimed["event_id"]: "already_dispatched",
+            missing: "missing",
+        }
+        assert late[1]["event_id"] not in await _claim_ids(store, "worker-other")
     finally:
         await _delete_outbox_rows(store, prefix)
         await store.close()

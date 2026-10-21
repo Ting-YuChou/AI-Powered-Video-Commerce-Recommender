@@ -1,4 +1,4 @@
-"""Micro-batched served-impression outbox writes.
+"""Micro-batched served-impression outbox writes and late-commit retires.
 
 Recommendation responses tend to finish in bursts (ranking runs in batches),
 and one transaction per impression made each burst compete for a few pooled
@@ -6,6 +6,11 @@ connections: per process, at most ``max_inflight`` writes ran and the rest of
 the burst was served untracked. The batcher instead coalesces rows that arrive
 while a write is in flight into one multi-row transaction, so a burst costs
 one or two transactions and the same bounded number of connections.
+
+Rows whose COMMIT outcome the client never saw (a late COMMIT, or an error
+raised by COMMIT) are retired as ``not_exposed`` by one retirer per process,
+which also batches: one UPDATE at a time, however many rows a slow batch
+left behind.
 """
 
 from __future__ import annotations
@@ -14,11 +19,23 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 import time
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Sequence, Set
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+)
 
 # Receives (event, commit_deadline) pairs; returns one outcome or exception per
 # pair, in order, or raises to fail the whole batch.
 OutboxBatchWriter = Callable[[Sequence[tuple], float], Awaitable[List[Any]]]
+# Receives event_ids; returns {event_id: status} or raises to retry them all.
+RetireManyWriter = Callable[[List[str]], Awaitable[Dict[str, str]]]
 
 EXPIRED = "expired"
 
@@ -38,6 +55,10 @@ class ImpressionOutboxBatcher:
     ``max_pending`` rows wait; beyond that ``submit`` refuses instead of
     queueing. A queued row whose deadline passes before its batch starts is
     resolved ``"expired"`` without touching the database.
+
+    Writes are never cancelled while serving: the store bounds them server
+    side (statement timeout) and rolls back rows that missed their deadline.
+    Only ``close`` cancels, after a bounded wait at shutdown.
     """
 
     def __init__(
@@ -56,7 +77,17 @@ class ImpressionOutboxBatcher:
         self._publish_hold_seconds = float(publish_hold_seconds)
         self._pending: Deque[_PendingImpression] = deque()
         self._inflight = 0
+        self._write_started_at: Dict[int, float] = {}
         self._tasks: Set[asyncio.Task] = set()
+        self._closed = False
+
+    @property
+    def max_inflight(self) -> int:
+        return self._max_inflight
+
+    @property
+    def publish_hold_seconds(self) -> float:
+        return self._publish_hold_seconds
 
     @property
     def pending(self) -> int:
@@ -66,11 +97,21 @@ class ImpressionOutboxBatcher:
     def inflight(self) -> int:
         return self._inflight
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def oldest_write_age_seconds(self) -> float:
+        """Age of the longest-running write transaction, 0 when idle."""
+        if not self._write_started_at:
+            return 0.0
+        return max(0.0, time.monotonic() - min(self._write_started_at.values()))
+
     def submit(
         self, event: Dict[str, Any], commit_deadline: float
     ) -> Optional[asyncio.Future]:
-        """Queue one row; return None when the queue is full."""
-        if len(self._pending) >= self._max_pending:
+        """Queue one row; return None when the queue is full or closed."""
+        if self._closed or len(self._pending) >= self._max_pending:
             return None
         future = asyncio.get_running_loop().create_future()
         self._pending.append(_PendingImpression(event, commit_deadline, future))
@@ -112,6 +153,8 @@ class ImpressionOutboxBatcher:
             self._maybe_start_flush()
 
     async def _write(self, batch: List[_PendingImpression]) -> None:
+        key = id(batch)
+        self._write_started_at[key] = time.monotonic()
         try:
             outcomes = await self._writer(
                 [(entry.event, entry.commit_deadline) for entry in batch],
@@ -128,6 +171,8 @@ class ImpressionOutboxBatcher:
             raise
         except Exception as exc:
             outcomes = [exc] * len(batch)
+        finally:
+            self._write_started_at.pop(key, None)
         self._resolve(batch, outcomes)
 
     @staticmethod
@@ -141,7 +186,12 @@ class ImpressionOutboxBatcher:
                 entry.future.set_result(outcome)
 
     async def close(self, timeout_seconds: float = 2.0) -> None:
-        """Let in-flight writes finish (bounded), then cancel the rest."""
+        """Refuse new rows, let in-flight writes finish, then cancel the rest.
+
+        A write cancelled here can leave its COMMIT outcome unknown; its rows
+        resolve with an error so callers still schedule their retire.
+        """
+        self._closed = True
         while self._pending:
             entry = self._pending.popleft()
             if not entry.future.done():
@@ -154,3 +204,89 @@ class ImpressionOutboxBatcher:
             task.cancel()
         if still_running:
             await asyncio.gather(*still_running, return_exceptions=True)
+
+
+@dataclass
+class _PendingRetire:
+    event_id: str
+    impression_id: str
+    retire_by: float
+
+
+class LateImpressionRetirer:
+    """Retire late-committed impressions, one batched UPDATE at a time.
+
+    A slow COMMIT can leave a whole batch of rows whose responses went out
+    without their impression_id. Retiring them one transaction per row would
+    take more connections exactly when the database is slow, so rows are
+    queued here and retired together by a single worker. Failed attempts are
+    retried with backoff until each row's ``retire_by`` (the end of its
+    publish hold, less a margin); after that a dispatcher may already claim
+    it, so the row is reported through ``on_result(entry, None)``.
+    """
+
+    def __init__(
+        self,
+        retire_many: RetireManyWriter,
+        *,
+        on_result: Callable[[_PendingRetire, Optional[str]], None],
+        on_error: Callable[[List[_PendingRetire], int, BaseException], None],
+        retry_delays_seconds: Sequence[float] = (0.2, 0.5, 1.0),
+        max_batch_size: int = 256,
+    ) -> None:
+        self._retire_many = retire_many
+        self._on_result = on_result
+        self._on_error = on_error
+        self._retry_delays = tuple(retry_delays_seconds) or (0.5,)
+        self._max_batch_size = max(1, int(max_batch_size))
+        self._pending: Deque[_PendingRetire] = deque()
+        self._task: Optional[asyncio.Task] = None
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
+
+    def submit(self, event_id: str, impression_id: str, retire_by: float) -> None:
+        self._pending.append(_PendingRetire(event_id, impression_id, retire_by))
+        if self._task is None or self._task.done():
+            self._task = asyncio.get_running_loop().create_task(
+                self._run(), name="retire-unexposed-impressions"
+            )
+
+    async def _run(self) -> None:
+        attempt = 0
+        while self._pending:
+            now = time.monotonic()
+            batch: List[_PendingRetire] = []
+            while self._pending and len(batch) < self._max_batch_size:
+                entry = self._pending.popleft()
+                if attempt and now >= entry.retire_by:
+                    # Every attempt failed within its hold; give up on it.
+                    self._on_result(entry, None)
+                    continue
+                batch.append(entry)
+            if not batch:
+                attempt = 0
+                continue
+            try:
+                statuses = await self._retire_many([entry.event_id for entry in batch])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempt += 1
+                self._on_error(batch, attempt, exc)
+                # Retry these first; rows queued meanwhile join the retry.
+                self._pending.extendleft(reversed(batch))
+                await asyncio.sleep(
+                    self._retry_delays[min(attempt, len(self._retry_delays)) - 1]
+                )
+                continue
+            attempt = 0
+            for entry in batch:
+                self._on_result(entry, statuses.get(entry.event_id, "missing"))
+
+    async def close(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None

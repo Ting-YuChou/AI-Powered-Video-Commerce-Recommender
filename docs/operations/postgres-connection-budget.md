@@ -116,15 +116,25 @@ two or three pooled connections. Before batching, about a third of the
 impressions at concurrency 20 were skipped with a healthy database. Now:
 
 - At most `RECOMMENDATION_IMPRESSION_OUTBOX_MAX_INFLIGHT` (2) write
-  transactions run per process. Keep it below
-  `DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW` so the outbox dispatcher keeps a
-  connection.
+  transactions run per process. At startup the value is clamped to
+  `DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW - 1` (at least 1), so the outbox
+  dispatcher and the retirer keep a connection.
 - Impressions that arrive while those are busy wait and commit together in
-  the next transaction: one multi-row `INSERT ... ON CONFLICT DO NOTHING
-  RETURNING`, up to `RECOMMENDATION_IMPRESSION_OUTBOX_MAX_BATCH_SIZE` (32) rows.
+  the next transaction: one `INSERT ... ON CONFLICT DO NOTHING RETURNING`
+  executed per row set (the statement compiles once), up to
+  `RECOMMENDATION_IMPRESSION_OUTBOX_MAX_BATCH_SIZE` (16) rows. Each payload
+  is serialized once (orjson, sorted keys): the same bytes are hashed for
+  `payload_hash` and cast to JSON in SQL.
 - At most `MAX_INFLIGHT * MAX_BATCH_SIZE` rows wait. Beyond that the impression
   is skipped immediately (`status="unavailable"`) instead of queueing.
 - A row still queued when its deadline passes is dropped without a DB write.
+- Writes are not cancelled while serving; the statement timeout bounds them
+  server side. A write that hangs anyway (for example a blackholed
+  connection) shows up as a growing
+  `video_commerce_recommendation_impression_outbox_write_age_seconds`, sampled
+  each time an impression is staged, and then as `queue_full`. At shutdown,
+  in-flight writes get 2 s and are then cancelled; their rows are retired like
+  any write whose COMMIT outcome is unknown.
 
 `video_commerce_recommendation_impression_untracked_total{reason}` says why a
 slate went out without an `impression_id`:
@@ -135,7 +145,8 @@ slate went out without an `impression_id`:
 | `queue_full` | The per-process queue was full; nothing was written. |
 | `pool_timeout` | No pooled connection within `DATABASE_POOL_TIMEOUT_SECONDS`. |
 | `db_error` | The write failed before COMMIT, for example on the statement timeout. |
-| `error` | The write failed in a way that may have committed (see Retire). |
+| `error` | The write failed in a way that may have committed (see Retire), or the row was rejected (event_id collision). |
+| `closed` | The service is shutting down. |
 
 The insert is shielded, not cancelled: cancelling an asyncpg statement inside a
 transaction can return a broken connection to the pool. Instead:
@@ -144,30 +155,39 @@ transaction can return a broken connection to the pool. Instead:
    deadline has passed when the INSERT is ready to commit are deleted inside
    the transaction, or the transaction rolls back when that is every row it
    inserted.
-2. **Hold-off.** Rows are staged with `next_attempt_at = now + budget + 1 s`, so
-   no replica's dispatcher can claim them for that long. Impression events
-   therefore reach Kafka about one to two seconds after serving. A local insert
+2. **Hold-off.** Rows are staged with `next_attempt_at = now + budget + 2.5 s`,
+   so no replica's dispatcher can claim them for that long. Impression events
+   therefore reach Kafka about three seconds after serving. A local insert
    restarts the dispatcher's short polls.
 3. **Retire.** A COMMIT that lands after the deadline, or a write error raised
-   by COMMIT itself (a dropped connection can still have committed), is
-   retired as terminal `not_exposed`. A write that fails before COMMIT is sent
-   (pool timeout, statement timeout, deadline rollback) committed nothing and
-   is not retired. Before this distinction, every insert that hit the
-   statement timeout behind a table lock queued a retire, which then blocked
-   on the same lock and ended as `retire_failed`.
-   - A retired row is never published and never resolves a view slate.
-   - It counts in
+   by COMMIT itself (a dropped connection can still have committed), queues
+   the row for a `not_exposed` retire. One retirer per process retires every
+   queued row with a single conditional UPDATE, one UPDATE at a time, so a
+   slow batch of 16 rows costs one retire transaction, not 16.
+   - A write that fails before COMMIT is sent (pool timeout, statement
+     timeout, deadline rollback) committed nothing and is not retired. Before
+     this distinction, every insert that hit the statement timeout behind a
+     table lock queued a retire, which blocked on the same lock and ended as
+     `retire_failed`; that, not a stronger retire, is why the lock drill now
+     shows no `retire_failed`.
+   - Failed attempts are retried with backoff (0.2, 0.5, 1 s) until 2 s after
+     the serving deadline, which is 0.5 s before the hold ends. Each attempt is
+     bounded by the hot-path statement timeout.
+   - A retired row is never published and never resolves a view slate. It
+     counts in
      `video_commerce_recommendation_outbox_terminal_total{reason="not_exposed"}`.
-   - The retire is a conditional UPDATE that refuses rows with a live claim.
-     It is bounded by the hot-path statement timeout and retried three times
-     with backoff; a client-side cancel could abandon the statement mid-write.
+   - The UPDATE refuses rows with a live claim.
+   - **Not guaranteed:** if the database rejects every retire attempt for the
+     whole window after a late COMMIT, the row is published when the hold
+     ends (`retire_failed`). Its `impression_id` was never returned, so no
+     view can reference it; it only inflates served-funnel counts.
 
 Outcomes in `video_commerce_recommendation_impression_events_total{stage="served"}`:
 
 | Status | Meaning |
 | --- | --- |
-| `not_exposed_published` | A dispatcher still claimed or published the row first, which is only possible when the hold-off was exceeded. The event can reach Kafka with an `impression_id` no client holds. No view can reference it, and the PIT and training paths use viewed rows, so it only appears in served-funnel counts. |
-| `retire_failed` | Every retire attempt errored for a write whose COMMIT outcome was unknown. If that row did commit, it publishes normally, with the same served-funnel impact. |
+| `not_exposed_published` | A dispatcher still claimed or published the row first, which is only possible once the hold-off was exceeded. The event can reach Kafka with an `impression_id` no client holds. No view can reference it, and the PIT and training paths use viewed rows, so it only appears in served-funnel counts. |
+| `retire_failed` | Every retire attempt in the window errored for a write whose COMMIT outcome was unknown. If that row did commit, it publishes normally, with the same served-funnel impact. |
 
 ## Startup DDL lock
 

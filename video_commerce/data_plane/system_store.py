@@ -29,6 +29,7 @@ from typing import (
     Tuple,
 )
 
+import orjson
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -40,6 +41,8 @@ from sqlalchemy import (
     String,
     Text,
     and_,
+    bindparam,
+    cast,
     delete,
     desc,
     event,
@@ -782,6 +785,22 @@ class RecommendationEventOutbox(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+# Executed with one parameter set per row (insertmanyvalues): the statement
+# compiles once regardless of the batch size. Payloads arrive pre-serialized.
+_RECOMMENDATION_OUTBOX_INSERT = (
+    pg_insert(RecommendationEventOutbox)
+    .values(
+        event_id=bindparam("event_id"),
+        impression_id=bindparam("impression_id"),
+        payload_hash=bindparam("payload_hash"),
+        event_payload=cast(bindparam("payload_json", type_=Text), JSON),
+        next_attempt_at=bindparam("next_attempt_at"),
+    )
+    .on_conflict_do_nothing(index_elements=[RecommendationEventOutbox.event_id])
+    .returning(RecommendationEventOutbox.event_id)
+)
 
 
 class InteractionIdempotencyLedger(Base):
@@ -2418,16 +2437,19 @@ class SystemStore:
             if commit_deadline is not None and now > commit_deadline:
                 outcomes[index] = OutboxCommitDeadlineExceeded()
                 continue
-            payload = dict(event)
+            # Serialized once: the same bytes are hashed and stored (cast to
+            # JSON in SQL), instead of a sorted json.dumps for the hash plus
+            # another for the column, all on the serving event loop.
+            payload_json = orjson.dumps(
+                dict(event),
+                option=orjson.OPT_SORT_KEYS | orjson.OPT_NON_STR_KEYS,
+                default=str,
+            )
             rows[event_id] = {
                 "event_id": event_id,
                 "impression_id": impression_id,
-                "payload_hash": hashlib.sha256(
-                    json.dumps(
-                        payload, sort_keys=True, separators=(",", ":"), default=str
-                    ).encode("utf-8")
-                ).hexdigest(),
-                "event_payload": payload,
+                "payload_hash": hashlib.sha256(payload_json).hexdigest(),
+                "payload_json": payload_json.decode("utf-8"),
                 "next_attempt_at": next_attempt_at,
             }
             deadlines[event_id] = commit_deadline
@@ -2441,12 +2463,7 @@ class SystemStore:
         try:
             async with self._hot_path_session() as session:
                 result = await session.execute(
-                    pg_insert(RecommendationEventOutbox)
-                    .values(list(rows.values()))
-                    .on_conflict_do_nothing(
-                        index_elements=[RecommendationEventOutbox.event_id]
-                    )
-                    .returning(RecommendationEventOutbox.event_id)
+                    _RECOMMENDATION_OUTBOX_INSERT, list(rows.values())
                 )
                 inserted = set(result.scalars().all())
                 conflicted = [event_id for event_id in rows if event_id not in inserted]
@@ -2612,22 +2629,32 @@ class SystemStore:
         return terminal
 
     async def mark_recommendation_outbox_not_exposed(self, event_id: str) -> str:
-        """Retire a row whose insert committed after the serving budget expired.
+        """Retire one row; see ``mark_recommendation_outbox_not_exposed_many``."""
+        statuses = await self.mark_recommendation_outbox_not_exposed_many([event_id])
+        return statuses.get(event_id, "missing")
 
-        The response already went out without an impression_id, so the event
-        must never be published or used to resolve view slates. Returns
-        ``retired``, ``missing`` (nothing committed), ``already_terminal``, or
+    async def mark_recommendation_outbox_not_exposed_many(
+        self, event_ids: Sequence[str]
+    ) -> Dict[str, str]:
+        """Retire rows whose insert committed after the serving budget expired.
+
+        The responses already went out without these impression_ids, so the
+        events must never be published or used to resolve view slates. One
+        UPDATE covers the whole batch. Each id maps to ``retired``,
+        ``missing`` (nothing committed), ``already_terminal``, or
         ``already_dispatched`` when a dispatcher holds a live claim or has
         already published it (the race was lost).
         """
-        if not self.enabled:
-            return "missing"
+        ids = sorted({str(event_id) for event_id in event_ids if event_id})
+        if not self.enabled or not ids:
+            return {event_id: "missing" for event_id in ids}
         now = _utc_now()
+        statuses: Dict[str, str] = {}
         async with self._hot_path_session() as session:
             result = await session.execute(
                 update(RecommendationEventOutbox)
                 .where(
-                    RecommendationEventOutbox.event_id == event_id,
+                    RecommendationEventOutbox.event_id.in_(ids),
                     RecommendationEventOutbox.published_at.is_(None),
                     RecommendationEventOutbox.terminal_at.is_(None),
                     or_(
@@ -2641,19 +2668,31 @@ class SystemStore:
                     claimed_by=None,
                     claim_expires_at=None,
                 )
+                .returning(RecommendationEventOutbox.event_id)
+                .execution_options(synchronize_session=False)
             )
-            if result.rowcount:
-                status = "retired"
-            else:
-                row = await session.get(RecommendationEventOutbox, event_id)
-                if row is None:
-                    status = "missing"
-                elif row.terminal_at is not None:
-                    status = "already_terminal"
-                else:
-                    status = "already_dispatched"
+            for event_id in result.scalars().all():
+                statuses[event_id] = "retired"
+            remaining = [event_id for event_id in ids if event_id not in statuses]
+            if remaining:
+                rows = (
+                    await session.execute(
+                        select(
+                            RecommendationEventOutbox.event_id,
+                            RecommendationEventOutbox.terminal_at,
+                        ).where(RecommendationEventOutbox.event_id.in_(remaining))
+                    )
+                ).all()
+                found = {event_id: terminal_at for event_id, terminal_at in rows}
+                for event_id in remaining:
+                    if event_id not in found:
+                        statuses[event_id] = "missing"
+                    elif found[event_id] is not None:
+                        statuses[event_id] = "already_terminal"
+                    else:
+                        statuses[event_id] = "already_dispatched"
         self._update_pool_metrics()
-        return status
+        return statuses
 
     async def prune_terminal_recommendation_outbox(
         self, *, retention_days: int = 7, batch_size: int = 5000

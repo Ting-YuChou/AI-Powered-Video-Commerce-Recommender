@@ -632,13 +632,13 @@ class RecommendationConfig(BaseSettings):
         description=(
             "Per-process cap on concurrent served-impression outbox write "
             "transactions (pooled connections). Impressions that arrive while "
-            "they are busy join the next batch. Keep it below "
-            "DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW so the outbox "
-            "dispatcher keeps a connection"
+            "they are busy join the next batch. Clamped at startup to "
+            "DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW - 1 (at least 1) so the "
+            "outbox dispatcher and retirer keep a connection"
         ),
     )
     impression_outbox_max_batch_size: int = Field(
-        32,
+        16,
         ge=1,
         description=(
             "Maximum served impressions committed in one outbox transaction; "
