@@ -793,3 +793,323 @@ def test_ocr_embeddings_use_multilingual_passage_encoder():
 
     assert calls == [(["新品手機", "new phone"], "passage")]
     assert result == [[1.0, 0.0], [1.0, 0.0]]
+
+
+class _FakeClipInputs(dict):
+    def to(self, _device):
+        return self
+
+
+class _FakeClipProcessor:
+    def __call__(self, images=None, **_kwargs):
+        return _FakeClipInputs(count=len(images or []))
+
+
+class _FakeClipModel:
+    def __init__(self, *, fail=False, delay_seconds=0.0, zero=False):
+        self.fail = fail
+        self.delay_seconds = delay_seconds
+        self.zero = zero
+
+    def get_image_features(self, count):
+        import time as _time
+
+        if self.delay_seconds:
+            _time.sleep(self.delay_seconds)
+        if self.fail:
+            raise RuntimeError("CUDA out of memory")
+        if self.zero:
+            # Opposite unit vectors average to an all-zero embedding.
+            rows = [[1.0, 0.0], [-1.0, 0.0]][:count]
+            return torch.tensor(rows * (count // 2) + rows[: count % 2])
+        return torch.ones((count, 2))
+
+
+def _frames(count=2):
+    return [np.zeros((4, 4, 3), dtype=np.uint8) for _ in range(count)]
+
+
+@pytest.mark.asyncio
+async def test_clip_failure_raises_retryable_modality_error_instead_of_zeros():
+    from video_commerce.ml.content_processor import ContentModalityError
+
+    processor = _processor()
+    processor.clip_processor = _FakeClipProcessor()
+    processor.clip_model = _FakeClipModel(fail=True)
+
+    with pytest.raises(ContentModalityError) as exc:
+        await processor._extract_visual_features(_frames())
+
+    assert exc.value.modality == "clip"
+    assert not isinstance(exc.value, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_clip_without_frames_raises_instead_of_zero_embedding():
+    from video_commerce.ml.content_processor import ContentModalityError
+
+    processor = _processor()
+    processor.clip_processor = _FakeClipProcessor()
+    processor.clip_model = _FakeClipModel()
+
+    with pytest.raises(ContentModalityError):
+        await processor._extract_visual_features([])
+
+
+@pytest.mark.asyncio
+async def test_ocr_failure_is_recorded_as_status_and_processing_continues(
+    monkeypatch,
+):
+    from video_commerce.ml import content_processor as module
+
+    processor = _processor(ocr_backend="tesseract")
+
+    def failing_ocr(*_args, **_kwargs):
+        raise RuntimeError("tesseract crashed")
+
+    monkeypatch.setattr(module.pytesseract, "image_to_data", failing_ocr)
+
+    result = await processor._extract_text_features(_frames(2), [0.0, 1.0])
+
+    assert result["status"] == "failed"
+    assert result["text_blocks"] == []
+
+
+@pytest.mark.asyncio
+async def test_ocr_partial_frame_failure_is_degraded(monkeypatch):
+    from video_commerce.ml import content_processor as module
+
+    processor = _processor(ocr_backend="tesseract")
+    calls = {"count": 0}
+
+    def flaky_ocr(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("tesseract crashed")
+        return {"conf": [], "text": []}
+
+    monkeypatch.setattr(module.pytesseract, "image_to_data", flaky_ocr)
+
+    result = await processor._extract_text_features(_frames(2), [0.0, 1.0])
+
+    assert result["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_ocr_backend_error_is_failed_status_not_exception():
+    processor = _processor(ocr_backend="paddle")
+    processor.ocr_region_extractor = None
+
+    result = await processor._extract_text_features(_frames(1), [0.0])
+
+    assert result["status"] == "failed"
+
+
+def _stub_pipeline(processor, monkeypatch, *, ocr_status="failed", detection=None):
+    from video_commerce.common.models import AudioFeatures
+
+    async def keyframes(_path):
+        return _frames(2), {
+            "duration": 2.0,
+            "fps": 1.0,
+            "frame_timestamps_seconds": [0.0, 1.0],
+        }
+
+    async def text(_frames, _timestamps):
+        return {"text_blocks": [], "price_mentions": [], "status": ocr_status}
+
+    async def audio(_path, _info):
+        return AudioFeatures(transcription_status="disabled")
+
+    async def detect(_frames):
+        return detection or (["phone"], "completed")
+
+    processor.is_initialized = True
+    processor.clip_processor = _FakeClipProcessor()
+    monkeypatch.setattr(processor, "_extract_keyframes", keyframes)
+    monkeypatch.setattr(processor, "_extract_text_features", text)
+    monkeypatch.setattr(processor, "_extract_audio_features", audio)
+    monkeypatch.setattr(processor, "_detect_objects_with_status", detect)
+
+
+@pytest.mark.asyncio
+async def test_process_video_persists_modality_status(monkeypatch):
+    processor = _processor()
+    _stub_pipeline(processor, monkeypatch, detection=([], "failed"))
+    processor.clip_model = _FakeClipModel()
+
+    features = await processor.process_video("video.mp4", "content-1")
+
+    assert features.modality_status == {
+        "clip": "completed",
+        "ocr": "failed",
+        "object_detection": "failed",
+    }
+    assert features.dict()["modality_status"]["ocr"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_process_video_marks_zero_norm_clip_embedding(monkeypatch):
+    processor = _processor()
+    _stub_pipeline(processor, monkeypatch, ocr_status="completed")
+    processor.clip_model = _FakeClipModel(zero=True)
+
+    features = await processor.process_video("video.mp4", "content-1")
+
+    assert features.modality_status["clip"] == "zero_norm"
+
+
+@pytest.mark.asyncio
+async def test_process_video_propagates_clip_failure(monkeypatch):
+    from video_commerce.ml.content_processor import ContentModalityError
+
+    processor = _processor()
+    _stub_pipeline(processor, monkeypatch)
+    processor.clip_model = _FakeClipModel(fail=True)
+
+    with pytest.raises(ContentModalityError):
+        await processor.process_video("video.mp4", "content-1")
+
+
+@pytest.mark.asyncio
+async def test_process_video_without_keyframes_is_invalid_video(monkeypatch):
+    from video_commerce.ml.content_processor import InvalidVideoError
+
+    processor = _processor()
+    processor.is_initialized = True
+
+    async def no_keyframes(_path):
+        return [], {}
+
+    monkeypatch.setattr(processor, "_extract_keyframes", no_keyframes)
+
+    with pytest.raises(InvalidVideoError):
+        await processor.process_video("video.mp4", "content-1")
+
+
+@pytest.mark.asyncio
+async def test_clip_inference_does_not_block_the_event_loop():
+    import asyncio
+    import time as _time
+
+    processor = _processor()
+    processor.clip_processor = _FakeClipProcessor()
+    processor.clip_model = _FakeClipModel(delay_seconds=0.4)
+    gaps = []
+    stop = asyncio.Event()
+
+    async def ticker():
+        last = _time.perf_counter()
+        while not stop.is_set():
+            await asyncio.sleep(0.01)
+            now = _time.perf_counter()
+            gaps.append(now - last)
+            last = now
+
+    task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
+    started = _time.perf_counter()
+    await processor._extract_visual_features(_frames(2))
+    elapsed = _time.perf_counter() - started
+    stop.set()
+    await task
+
+    assert elapsed >= 0.4
+    # Lease renewal and heartbeats keep running while CLIP occupies a thread.
+    assert len(gaps) >= 10
+    assert max(gaps) < 0.2
+
+
+@pytest.mark.asyncio
+async def test_ocr_and_detection_do_not_block_the_event_loop(monkeypatch):
+    import asyncio
+    import time as _time
+
+    from video_commerce.ml import content_processor as module
+
+    processor = _processor(ocr_backend="tesseract")
+
+    def slow_ocr(*_args, **_kwargs):
+        _time.sleep(0.2)
+        return {"conf": [], "text": []}
+
+    def slow_detect(_frames):
+        _time.sleep(0.2)
+        return ["phone"]
+
+    monkeypatch.setattr(module.pytesseract, "image_to_data", slow_ocr)
+    monkeypatch.setattr(processor, "_detect_objects_sync", slow_detect)
+    gaps = []
+    stop = asyncio.Event()
+
+    async def ticker():
+        last = _time.perf_counter()
+        while not stop.is_set():
+            await asyncio.sleep(0.01)
+            now = _time.perf_counter()
+            gaps.append(now - last)
+            last = now
+
+    task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
+    text = await processor._extract_text_features(_frames(1), [0.0])
+    objects, status = await processor._detect_objects_with_status(_frames(1))
+    stop.set()
+    await task
+
+    assert text["status"] == "completed"
+    assert (objects, status) == (["phone"], "completed")
+    assert max(gaps) < 0.15
+
+
+def test_embedding_has_signal_detects_zero_and_non_finite_vectors():
+    from video_commerce.ml.content_processor import embedding_has_signal
+
+    assert embedding_has_signal([0.6, 0.8])
+    assert not embedding_has_signal([0.0, 0.0])
+    assert not embedding_has_signal([])
+    assert not embedding_has_signal([float("nan"), 1.0])
+
+
+def test_opencv_missing_file_is_not_classified_as_invalid_video(tmp_path):
+    processor = _processor()
+
+    with pytest.raises(FileNotFoundError):
+        processor._extract_keyframes_opencv_sync(str(tmp_path / "missing.mp4"))
+
+
+def test_opencv_undecodable_file_is_invalid_video(tmp_path):
+    from video_commerce.ml.content_processor import InvalidVideoError
+
+    garbage = tmp_path / "garbage.mp4"
+    garbage.write_bytes(b"this is not a video container")
+    processor = _processor()
+
+    with pytest.raises(InvalidVideoError):
+        processor._extract_keyframes_opencv_sync(str(garbage))
+
+
+def test_opencv_io_errors_stay_retryable(monkeypatch, tmp_path):
+    from video_commerce.ml import content_processor as module
+    from video_commerce.ml.content_processor import InvalidVideoError
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+
+    class Capture:
+        def isOpened(self):
+            return True
+
+        def get(self, _prop):
+            raise MemoryError("cannot allocate frame buffer")
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(module.cv2, "VideoCapture", lambda _path: Capture())
+    processor = _processor()
+
+    with pytest.raises(MemoryError) as exc:
+        processor._extract_keyframes_opencv_sync(str(source))
+
+    assert not isinstance(exc.value, InvalidVideoError)

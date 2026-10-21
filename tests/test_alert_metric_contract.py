@@ -33,23 +33,6 @@ ICEBERG_FLINK_METRICS = {
     + "IcebergFilesCommitter_table_elapsedSecondsSinceLastSuccessfulCommit",
 }
 
-# Metrics defined by Stage B PRs that are not on this branch yet. Each entry must
-# NOT be defined here: once its PR merges and this branch syncs, the test fails
-# until the entry is removed, so the list cannot silently go stale.
-PENDING_METRICS = {
-    "video_commerce_recommendation_outbox_terminal_total": "#51 (WS-2)",
-    "catalog_outbox_terminal_total": "#51 (WS-2)",
-    "video_commerce_ranking_runtime_auth_total": "#50 (WS-3)",
-    "video_commerce_content_processing_redrives_total": "#54 (WS-4)",
-    "video_commerce_content_zero_norm_embeddings_total": "#54 (WS-4)",
-}
-PENDING_ATTRIBUTES = {
-    "recommendation_outbox_terminal_total",
-    "catalog_outbox_terminal_total",
-    "ranking_runtime_auth_total",
-    "content_processing_redrives_total",
-}
-
 # Alerts on metrics nothing emits yet, kept visible instead of silently dead.
 KNOWN_UNEMITTED_METRICS: dict[str, str] = {}
 
@@ -129,7 +112,7 @@ def test_metric_name_extraction():
     ) == {"foo_seconds_bucket", "bar"}
 
 
-def test_every_rule_metric_is_emitted_or_explicitly_pending():
+def test_every_rule_metric_is_emitted():
     python_sources = _python_metric_names()
     flink_sources = _flink_sources()
     recorded = {rule["record"] for rule in _rules() if "record" in rule}
@@ -138,8 +121,6 @@ def test_every_rule_metric_is_emitted_or_explicitly_pending():
     for rule in _rules():
         for name in _metric_names(rule["expr"]) - recorded:
             referenced.add(name)
-            if name in PENDING_METRICS:
-                continue
             if name in EXTERNAL_METRICS | FLINK_BUILTIN_METRICS | ICEBERG_FLINK_METRICS:
                 continue
             if name.startswith(FLINK_OPERATOR_PREFIX):
@@ -158,11 +139,6 @@ def test_every_rule_metric_is_emitted_or_explicitly_pending():
         assert not _flink_operator_metric_defined(
             name[len(FLINK_OPERATOR_PREFIX):], flink_sources
         ), f"{name} is emitted now; drop it from KNOWN_UNEMITTED_METRICS"
-    for name, pull_request in PENDING_METRICS.items():
-        assert name in referenced, f"{name} is no longer used by any rule"
-        assert not _defined_in_python(name, python_sources), (
-            f"{name} landed with {pull_request}; drop it from PENDING_METRICS"
-        )
 
 
 def test_iceberg_metric_names_match_pinned_iceberg_version():
@@ -180,12 +156,7 @@ def test_flink_job_name_selectors_match_job_sources():
 def test_alerted_label_values_are_precreated():
     manager = ObservabilityManager()
     for attribute in ObservabilityManager.ALERTED_LABEL_VALUES:
-        if attribute in PENDING_ATTRIBUTES:
-            assert not hasattr(manager, attribute), (
-                f"{attribute} merged; drop it from PENDING_ATTRIBUTES"
-            )
-        else:
-            assert hasattr(manager, attribute), attribute
+        assert hasattr(manager, attribute), attribute
 
     payload = manager.prometheus_payload().decode("utf-8")
     assert 'video_commerce_rate_limiter_errors_total{reason="cooldown"} 0.0' in payload
@@ -194,3 +165,10 @@ def test_alerted_label_values_are_precreated():
         in payload
     )
     assert 'content_task_publish_retries_total{reason="missing_object"} 0.0' in payload
+    for sample in (
+        'video_commerce_recommendation_outbox_terminal_total{reason="max_attempts"} 0.0',
+        'catalog_outbox_terminal_total{reason="message_too_large"} 0.0',
+        'video_commerce_content_processing_redrives_total{outcome="exhausted"} 0.0',
+        'video_commerce_ranking_runtime_auth_total{result="unauthenticated",role="coordinator"} 0.0',
+    ):
+        assert sample in payload, sample

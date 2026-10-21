@@ -49,6 +49,7 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     manager.record_ranking_runner_late_write("BrokenPipeError")
     manager.observe_ranking_runner_payload_bytes(payload_version="2", size_bytes=2048)
     manager.record_ranking_coordinator_client_error("timeout")
+    manager.record_ranking_runtime_auth("coordinator", "unauthenticated")
     manager.record_best_effort_task("cache_recommendations", "dropped_queue_full")
     manager.set_best_effort_queue_depth(3)
     manager.record_interaction_ingest("click", "accepted")
@@ -137,6 +138,12 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "video_commerce_ranking_runner_late_writes_total" in payload
     assert "video_commerce_ranking_runner_payload_bytes" in payload
     assert "video_commerce_ranking_coordinator_client_errors_total" in payload
+    assert any(
+        line.startswith("video_commerce_ranking_runtime_auth_total{")
+        and 'role="coordinator"' in line
+        and 'result="unauthenticated"' in line
+        for line in payload.splitlines()
+    )
     assert "video_commerce_best_effort_tasks_total" in payload
     assert "video_commerce_best_effort_queue_depth" in payload
     assert "video_commerce_interactions_ingested_total" in payload

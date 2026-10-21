@@ -38,11 +38,6 @@ class FailingIfCalledProcessor:
         raise AssertionError("completed durable work must not be recomputed")
 
 
-class FakeVectorSearch:
-    async def add_content_embedding(self, _content_id, _embedding):
-        return None
-
-
 class FakeKafkaManager:
     def __init__(self):
         self.events = []
@@ -65,7 +60,6 @@ async def test_content_worker_publishes_speech_metadata_without_transcript(
     worker = video_processor.VideoProcessorWorker(config)
     worker.feature_store = FakeFeatureStore()
     worker.content_processor = FakeContentProcessor()
-    worker.vector_search = FakeVectorSearch()
     worker.system_store = None
     worker.object_storage = None
     kafka_manager = FakeKafkaManager()
@@ -121,7 +115,6 @@ async def test_completed_content_run_repairs_projection_without_recomputing(
     worker = video_processor.VideoProcessorWorker(config)
     worker.feature_store = FakeFeatureStore()
     worker.content_processor = FailingIfCalledProcessor()
-    worker.vector_search = FakeVectorSearch()
     worker.system_store = CompletedStore()
     worker.object_storage = None
     monkeypatch.setattr(video_processor, "get_kafka_manager", lambda **_kwargs: None)

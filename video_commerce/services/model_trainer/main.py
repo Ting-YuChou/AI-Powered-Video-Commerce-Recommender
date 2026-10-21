@@ -282,6 +282,32 @@ class ModelTrainerService:
             or ((use_pit_dataset or pit_shadow_enabled) and trimodal_enabled)
         )
 
+    async def _load_product_vector_index(self, *, prefer_visual_bundle: bool) -> None:
+        """Load product CLIP vectors for training.
+
+        The trimodal shadow needs product image embeddings in the same frozen CLIP
+        space as content: when a visual product index manifest is configured, use
+        that checksummed bundle (as recommendation-service does); otherwise fall
+        back to the legacy FAISS index.
+        """
+        model_config = self.config.model_config
+        manifest_path = str(
+            model_config.retrieval_visual_product_index_manifest_path or ""
+        ).strip()
+        if prefer_visual_bundle and manifest_path:
+            if self.artifact_manager is not None:
+                await self.artifact_manager.sync_latest_visual_product_index(
+                    expected_clip_model_id=model_config.clip_model,
+                    expected_clip_revision=model_config.clip_revision,
+                )
+            self.vector_search.activate_visual_product_index(
+                manifest_path,
+                expected_clip_model_id=model_config.clip_model,
+                expected_clip_revision=model_config.clip_revision,
+            )
+            return
+        await self.vector_search.load_index()
+
     def _build_trimodal_shadow_config(self) -> RankingConfig:
         ranking_config = self.config.ranking_config
         if hasattr(ranking_config, "dict"):
@@ -402,7 +428,9 @@ class ModelTrainerService:
 
         if not use_pit_dataset or trimodal_shadow:
             self.vector_search = VectorSearchEngine(self.config.vector_config)
-            await self.vector_search.load_index()
+            await self._load_product_vector_index(
+                prefer_visual_bundle=trimodal_shadow
+            )
 
         if not use_pit_dataset:
             self.recommendation_engine = RecommendationEngine(

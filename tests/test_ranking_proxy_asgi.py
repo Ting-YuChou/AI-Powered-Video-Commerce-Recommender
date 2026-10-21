@@ -265,3 +265,36 @@ async def test_ranking_proxy_returns_400_for_invalid_triton_payload():
 
     assert messages[0]["status"] == 400
     assert json_loads(messages[1]["body"]) == {"detail": "Invalid k"}
+
+
+def test_internal_request_check_uses_shared_constant_time_comparison(monkeypatch):
+    app = RankingProxyApp()
+    app.runtime.config = SimpleNamespace(
+        security_config=SimpleNamespace(
+            internal_service_key="secret-key",
+            internal_service_header="X-Internal-Service-Key",
+        )
+    )
+    compared = []
+    real_compare = ranking_proxy_asgi.constant_time_equals
+
+    def recording_compare(provided, expected):
+        compared.append((provided, expected))
+        return real_compare(provided, expected)
+
+    monkeypatch.setattr(ranking_proxy_asgi, "constant_time_equals", recording_compare)
+
+    def scope(value):
+        headers = [] if value is None else [(b"x-internal-service-key", value)]
+        return {"headers": headers}
+
+    assert app._is_internal_request(scope(b"secret-key")) is True
+    assert app._is_internal_request(scope(b"secret-kez")) is False
+    assert app._is_internal_request(scope(b"")) is False
+    assert app._is_internal_request(scope(None)) is False
+    assert compared == [
+        ("secret-key", "secret-key"),
+        ("secret-kez", "secret-key"),
+        ("", "secret-key"),
+        (None, "secret-key"),
+    ]
