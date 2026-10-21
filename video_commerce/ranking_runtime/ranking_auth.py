@@ -31,7 +31,7 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 
 AUTH_OPERATION = b"A"
@@ -43,7 +43,10 @@ AUTH_MODES = (AUTH_MODE_DISABLED, AUTH_MODE_PERMISSIVE, AUTH_MODE_REQUIRED)
 DEFAULT_AUTH_MODE = AUTH_MODE_PERMISSIVE
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60
 DEFAULT_NONCE_CACHE_SIZE = 65536
+DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 MAX_AUTH_BODY_BYTES = 1024
+# Operation byte plus the largest accepted handshake body.
+MAX_PRE_AUTH_FRAME_BYTES = 1 + MAX_AUTH_BODY_BYTES
 _KEY_DERIVATION_LABEL = b"ranking-runtime-v1"
 _MAC_PREFIX = "ranking-auth|v1"
 
@@ -160,6 +163,7 @@ class RankingRuntimeAuthenticator:
         observability: Any = None,
         max_clock_skew_seconds: float = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
         nonce_cache_size: int = DEFAULT_NONCE_CACHE_SIZE,
+        handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.settings = settings
@@ -167,6 +171,7 @@ class RankingRuntimeAuthenticator:
         self.observability = observability
         self.max_clock_skew_seconds = float(max_clock_skew_seconds)
         self.nonce_cache_size = max(1, int(nonce_cache_size))
+        self.handshake_timeout_seconds = max(0.1, float(handshake_timeout_seconds))
         self._clock = clock
         self._seen_nonces: "OrderedDict[str, float]" = OrderedDict()
 
@@ -176,6 +181,22 @@ class RankingRuntimeAuthenticator:
             self.settings.mode != AUTH_MODE_DISABLED
             and self.settings.runtime_key is not None
         )
+
+    def pre_auth_limits(
+        self, state: ConnectionAuthState
+    ) -> Optional[Tuple[int, float]]:
+        """``(max_frame_bytes, timeout_seconds)`` for the next read, if bounded.
+
+        In required mode an unauthenticated peer may only send a small
+        handshake, promptly; otherwise it could make the server buffer a
+        maximum-size frame, or hold the connection, before auth runs.
+        """
+        if self.settings.mode != AUTH_MODE_REQUIRED or state.authenticated:
+            return None
+        return MAX_PRE_AUTH_FRAME_BYTES, self.handshake_timeout_seconds
+
+    def record_pre_auth_violation(self) -> None:
+        self._record("rejected")
 
     def screen_frame(
         self,
@@ -225,7 +246,7 @@ class RankingRuntimeAuthenticator:
             return "malformed"
         try:
             payload = json.loads(body)
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             return "malformed"
         if not isinstance(payload, dict):
             return "malformed"

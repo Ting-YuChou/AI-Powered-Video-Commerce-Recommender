@@ -52,6 +52,11 @@ by every ranking client and server.
 - A handshake that is present but wrong (bad MAC, expired, replayed, malformed)
   is always rejected with 401 and the connection is closed, in both
   `permissive` and `required`.
+- In `required` mode, an unauthenticated connection may send only a handshake
+  of at most 1 KiB within 10 seconds. A larger declared frame or an idle peer
+  is disconnected and counted as `rejected`, before the server buffers
+  anything. `permissive` keeps the normal 32 MiB frame limit for legacy
+  clients.
 - Without `SECURITY_INTERNAL_SERVICE_KEY`, clients send nothing and servers
   cannot verify handshakes. `required` therefore refuses to start without a key.
 - With `ENVIRONMENT=production`, `disabled` is rejected at startup. The internal

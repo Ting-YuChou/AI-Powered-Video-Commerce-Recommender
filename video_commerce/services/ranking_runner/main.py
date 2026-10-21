@@ -259,8 +259,20 @@ class RankingRunner:
         auth_state = ConnectionAuthState()
         try:
             while True:
+                pre_auth_limits = self.authenticator.pre_auth_limits(auth_state)
                 try:
-                    frame = await read_frame(reader)
+                    if pre_auth_limits is None:
+                        frame = await read_frame(reader)
+                    else:
+                        max_frame_bytes, timeout_seconds = pre_auth_limits
+                        frame = await asyncio.wait_for(
+                            read_frame(reader, max_frame_bytes),
+                            timeout=timeout_seconds,
+                        )
+                except (RankingCoordinatorProtocolError, asyncio.TimeoutError):
+                    if pre_auth_limits is not None:
+                        self.authenticator.record_pre_auth_violation()
+                    break
                 except Exception:
                     break
                 if not frame:

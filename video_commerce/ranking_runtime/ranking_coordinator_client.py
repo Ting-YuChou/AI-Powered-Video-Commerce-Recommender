@@ -88,7 +88,9 @@ def decode_response(payload: bytes) -> RankingCoordinatorResponse:
     )
 
 
-async def read_frame(reader: asyncio.StreamReader) -> bytes:
+async def read_frame(
+    reader: asyncio.StreamReader, max_frame_bytes: int = MAX_FRAME_BYTES
+) -> bytes:
     try:
         header = await reader.readexactly(4)
     except asyncio.IncompleteReadError as exc:
@@ -96,7 +98,7 @@ async def read_frame(reader: asyncio.StreamReader) -> bytes:
             "ranking coordinator connection closed"
         ) from exc
     frame_length = struct.unpack("!I", header)[0]
-    if frame_length <= 0 or frame_length > MAX_FRAME_BYTES:
+    if frame_length <= 0 or frame_length > min(max_frame_bytes, MAX_FRAME_BYTES):
         raise RankingCoordinatorProtocolError(
             "invalid ranking coordinator frame length"
         )

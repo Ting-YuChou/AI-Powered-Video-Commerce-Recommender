@@ -517,6 +517,11 @@ class RankingRunnerClientPool:
                 except RankingRunnerRequestUncertain:
                     self._mark_failed(endpoint)
                     raise
+                except RankingRunnerAuthRejected as exc:
+                    # Misconfiguration, not a topology change: back off this
+                    # endpoint without forcing DNS refreshes on every retry.
+                    last_error = exc
+                    self._mark_failed(endpoint)
                 except RankingCoordinatorProtocolError as exc:
                     last_error = exc
                     self._mark_failed(endpoint)

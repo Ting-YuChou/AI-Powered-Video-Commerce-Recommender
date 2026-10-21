@@ -1,5 +1,6 @@
 import asyncio
 import json
+import struct
 import time
 
 import pytest
@@ -1106,6 +1107,72 @@ async def test_required_server_rejects_unauthenticated_frame_and_closes():
     assert responses[1:] == [None]
     assert handled == []
     assert recorder.events == [("coordinator", "rejected")]
+
+
+def test_auth_handshake_rejects_deeply_nested_json_as_malformed():
+    authenticator = RankingRuntimeAuthenticator(
+        _auth_settings("required"), role="runner"
+    )
+
+    assert authenticator.verify_handshake(b"[" * 1000) == "malformed"
+
+
+@pytest.mark.asyncio
+async def test_required_server_closes_oversized_pre_auth_frame_without_buffering():
+    server, port, handled, recorder = await _start_coordinator_server("required")
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        # Declare a 1 MiB frame but send only the header: the server must close
+        # on the length alone instead of waiting to buffer the body.
+        writer.write(struct.pack("!I", 1024 * 1024) + RANK_OPERATION)
+        await writer.drain()
+        closed = await asyncio.wait_for(reader.read(), timeout=1.0)
+    finally:
+        writer.close()
+        await _close_server(server)
+
+    assert closed == b""
+    assert handled == []
+    assert recorder.events == [("coordinator", "rejected")]
+
+
+@pytest.mark.asyncio
+async def test_required_server_closes_idle_unauthenticated_connection():
+    from video_commerce.services.ranking_coordinator.main import RankingCoordinator
+
+    coordinator = RankingCoordinator()
+    recorder = _AuthRecorder()
+    coordinator.authenticator = RankingRuntimeAuthenticator(
+        _auth_settings("required"),
+        role="coordinator",
+        observability=recorder,
+        handshake_timeout_seconds=0.1,
+    )
+    server = await asyncio.start_server(
+        coordinator._handle_client, host="127.0.0.1", port=0
+    )
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        closed = await asyncio.wait_for(reader.read(), timeout=1.0)
+    finally:
+        writer.close()
+        await _close_server(server)
+
+    assert closed == b""
+    assert recorder.events == [("coordinator", "rejected")]
+
+
+@pytest.mark.asyncio
+async def test_permissive_server_does_not_bound_unauthenticated_frames():
+    server, port, handled, recorder = await _start_coordinator_server("permissive")
+    try:
+        responses = await _raw_request(port, (RANK_OPERATION, b"x" * 4096))
+    finally:
+        await _close_server(server)
+
+    assert responses[0].status_code == 200
+    assert handled == [RANK_OPERATION]
 
 
 @pytest.mark.asyncio
