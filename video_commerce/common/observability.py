@@ -725,6 +725,12 @@ class ObservabilityManager:
             "Age of the oldest unpublished served-impression outbox row",
             registry=self.registry,
         )
+        self.recommendation_outbox_terminal_total = Counter(
+            "video_commerce_recommendation_outbox_terminal_total",
+            "Served-impression outbox rows retired without publishing, by reason",
+            ["reason"],
+            registry=self.registry,
+        )
         self.content_uploads_total = Counter(
             "video_commerce_content_uploads_total",
             "Content upload enqueue outcomes by priority and status",
@@ -757,6 +763,12 @@ class ObservabilityManager:
         self.catalog_outbox_oldest_age_seconds = Gauge(
             "catalog_outbox_oldest_age_seconds",
             "Age of the oldest unpublished catalog outbox row",
+            registry=self.registry,
+        )
+        self.catalog_outbox_terminal_total = Counter(
+            "catalog_outbox_terminal_total",
+            "Catalog outbox rows retired without publishing, by reason",
+            ["reason"],
             registry=self.registry,
         )
         self.content_task_outbox_pending = Gauge(
@@ -1225,6 +1237,9 @@ class ObservabilityManager:
                 max(0, int(count))
             )
 
+    def record_catalog_outbox_terminal(self, reason: str) -> None:
+        self.catalog_outbox_terminal_total.labels(reason=reason).inc()
+
     def update_catalog_outbox(self, *, pending: int, oldest_age_seconds: float) -> None:
         self.catalog_outbox_pending.set(max(0, int(pending)))
         self.catalog_outbox_oldest_age_seconds.set(max(0.0, float(oldest_age_seconds)))
@@ -1625,6 +1640,9 @@ class ObservabilityManager:
         self.recommendation_impression_events_total.labels(
             stage=stage, status=status
         ).inc()
+
+    def record_recommendation_outbox_terminal(self, reason: str) -> None:
+        self.recommendation_outbox_terminal_total.labels(reason=reason).inc()
 
     def update_recommendation_outbox(
         self, *, pending: int, oldest_age_seconds: float

@@ -5,6 +5,13 @@ deploying the updated interaction, recommendation, or Flink services. The
 migration is additive and introduces the interaction idempotency ledger,
 served-impression outbox, and viewed-impression table.
 
+Apply `migrations/postgres/012_recommendation_outbox_terminal.sql` before
+deploying recommendation or catalog-event-publisher builds that know about
+terminal outbox rows (startup applies the same additive columns when
+`DATABASE_AUTO_CREATE_SCHEMA=true`). It adds `terminal_at` / `terminal_reason`
+to `recommendation_event_outbox` and `catalog_feature_outbox`, plus
+`next_attempt_at` to the catalog outbox, which previously retried immediately.
+
 Apply `migrations/postgres/009_content_task_reliability.sql` before deploying
 the gateway, content-task publisher, or content workers. Uploads first persist
 the object and then atomically create the authoritative `content_jobs` row and
@@ -89,6 +96,44 @@ serving post-processing share the same Torch/NumPy policy and product-ID tie
 breaker. Keep the previous verified artifact available until shadow parity has
 passed for Python and exported inference. Both latest and exact-version
 production activation reject missing policy or value-normalization metadata.
+
+The impression outbox write is bounded by
+`RECOMMENDATION_IMPRESSION_OUTBOX_TIMEOUT_MS` (100 ms). A slower write still
+returns the slate, without `impression_id`, and records `status="timeout"`.
+See `docs/operations/postgres-connection-budget.md` for the in-flight cap and
+the `not_exposed` terminal state of inserts that commit late.
+
+The serialized `feature_context` in a served event is capped at
+`RECOMMENDATION_FEATURE_CONTEXT_MAX_BYTES` (256 KiB). Over the cap, the ranker
+history embeddings, then DIN sequences, then realtime window features are
+dropped. If that is not enough, every remaining value is cut to the
+impression-context bounds (scalars, strings of 512 characters, lists of 20).
+The event then carries `feature_context_truncated: true` and
+`feature_context_truncated_keys`. The truncation happens before the payload
+hash, so Flink's hash check still holds.
+
+Outbox rows stop retrying in two cases. A non-retryable publish error, such as
+a record over the producer `KAFKA_PRODUCER_MAX_REQUEST_SIZE` (1 MiB, explicit)
+or the broker limit, ends the row at once. Any other row ends once it has used
+`RECOMMENDATION_OUTBOX_MAX_ATTEMPTS` (20) publishes with exponential backoff
+capped at 256 s. Failures that aiokafka classifies as transient do not count
+toward the cap, such as an unreachable broker, a send timeout, or a
+leader election. Those rows keep retrying through an outage of any length. Either way the row is marked terminal:
+never claimed again, excluded from `video_commerce_recommendation_outbox_pending`,
+and counted in
+`video_commerce_recommendation_outbox_terminal_total{reason}`. The reason is
+`message_too_large`, `max_attempts`, `non_retryable` or `not_exposed`. The
+catalog outbox uses the same rules and counts in
+`catalog_outbox_terminal_total{reason}`. Terminal rows stay in the table for
+investigation. To retry one after fixing the cause, clear `terminal_at` and set
+`next_attempt_at = now()`. Impression rows become claimable one second after the serving budget (see
+the hold-off in `postgres-connection-budget.md`). The idle dispatcher backs off
+from 0.25 s to 2 s between empty claims. A local insert restarts the short
+polls, and outbox stats are read every 10 s instead of every loop. Terminal
+rows older than `RECOMMENDATION_OUTBOX_TERMINAL_RETENTION_DAYS` (7) are deleted
+hourly in batches; published rows are kept, because view ingest may still
+resolve slates from them. Catalog terminal rows are pruned with the published
+ones.
 
 Use `video_commerce_recommendation_impression_events_total` by stage and
 status together with Kafka consumer lag, Flink job state, and the durable

@@ -5,6 +5,7 @@ Durable Postgres-backed system store for operational state and training data.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -15,7 +16,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Set
 
 from sqlalchemy import (
     BigInteger,
@@ -27,6 +28,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    and_,
     delete,
     desc,
     event,
@@ -729,6 +731,10 @@ class RecommendationEventOutbox(Base):
     published_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    terminal_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    terminal_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -923,9 +929,16 @@ class CatalogFeatureOutbox(Base):
     claim_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     published_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    terminal_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    terminal_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1334,6 +1347,53 @@ Index(
 )
 
 
+# Serializes startup DDL (create_all + additive ALTERs) across every service
+# replica sharing one database. Distinct from the PIT orchestration lock.
+SCHEMA_DDL_ADVISORY_LOCK_KEY = 1_947_420_118
+
+OUTBOX_BACKOFF_MAX_SECONDS = 300
+
+
+def outbox_retry_delay_seconds(attempts: int) -> int:
+    """Exponential publish backoff shared by the Postgres outboxes."""
+    return min(OUTBOX_BACKOFF_MAX_SECONDS, 2 ** min(max(0, int(attempts)), 8))
+
+
+def _engine_options(config: DatabaseConfig) -> Dict[str, Any]:
+    """Pool and connection budget for one service's engine.
+
+    Statement timeouts are deliberately not global: latency-sensitive methods
+    opt in through ``SystemStore._hot_path_session`` so offline scans (training,
+    PIT, iceberg maintenance) keep running unbounded.
+    """
+    connect_args: Dict[str, Any] = {
+        "timeout": float(config.connect_timeout_seconds),
+    }
+    server_settings: Dict[str, str] = {}
+    if int(config.idle_in_transaction_session_timeout_ms) > 0:
+        server_settings["idle_in_transaction_session_timeout"] = str(
+            int(config.idle_in_transaction_session_timeout_ms)
+        )
+    if server_settings:
+        connect_args["server_settings"] = server_settings
+    if config.statement_cache_size is not None:
+        # PgBouncer transaction pooling cannot keep prepared statements.
+        connect_args["statement_cache_size"] = int(config.statement_cache_size)
+    return {
+        "pool_pre_ping": True,
+        "pool_size": config.pool_size,
+        "max_overflow": config.max_overflow,
+        "pool_timeout": float(config.pool_timeout_seconds),
+        "pool_recycle": int(config.pool_recycle_seconds),
+        "echo": config.echo_sql,
+        "connect_args": connect_args,
+    }
+
+
+class OutboxCommitDeadlineExceeded(RuntimeError):
+    """The serving deadline passed before COMMIT, so the insert was rolled back."""
+
+
 @dataclass
 class DatabaseHealth:
     status: str
@@ -1362,17 +1422,28 @@ class SystemStore:
             return
 
         self.engine = create_async_engine(
-            self.config.url,
-            pool_pre_ping=True,
-            pool_size=self.config.pool_size,
-            max_overflow=self.config.max_overflow,
-            echo=self.config.echo_sql,
+            self.config.url, **_engine_options(self.config)
         )
         self._install_metrics_listeners()
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
         if self.config.auto_create_schema:
             async with self.engine.begin() as conn:
+                # Replicas starting together would otherwise race create_all
+                # (duplicate pg_type / relation errors). The xact lock is
+                # released on commit; lock_timeout is set only after it is held
+                # so waiting replicas queue behind the holder instead of failing,
+                # while the holder's ALTERs cannot wedge behind a long reader.
+                await conn.execute(
+                    select(func.pg_advisory_xact_lock(SCHEMA_DDL_ADVISORY_LOCK_KEY))
+                )
+                if int(self.config.schema_lock_timeout_ms) > 0:
+                    await conn.execute(
+                        text(
+                            "SET LOCAL lock_timeout = "
+                            f"{int(self.config.schema_lock_timeout_ms)}"
+                        )
+                    )
                 if self.config.interaction_events_partitioned:
                     await conn.run_sync(
                         lambda sync_conn: Base.metadata.create_all(
@@ -1400,99 +1471,156 @@ class SystemStore:
                 name="postgres-interaction-retention-cleanup",
             )
 
+    async def _create_index_if_missing(self, conn, name: str, ddl: str) -> None:
+        """Skip CREATE INDEX when it exists: IF NOT EXISTS locks the table first."""
+        exists = await conn.scalar(
+            text("SELECT to_regclass(:name) IS NOT NULL"), {"name": name}
+        )
+        if not exists:
+            await conn.execute(text(ddl))
+
     async def _ensure_operational_indexes(self, conn) -> None:
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_interaction_events_occurred_at_desc "
-                "ON interaction_events (occurred_at DESC)"
-            )
+        # migrations/postgres/012: claims filter on both NULLs, and terminal
+        # rows keep published_at NULL, so the old pending index stops helping.
+        await self._create_index_if_missing(
+            conn,
+            "ix_recommendation_event_outbox_dispatchable",
+            "CREATE INDEX IF NOT EXISTS ix_recommendation_event_outbox_dispatchable "
+            "ON recommendation_event_outbox (next_attempt_at, created_at) "
+            "WHERE published_at IS NULL AND terminal_at IS NULL",
+        )
+        await self._create_index_if_missing(
+            conn,
+            "ix_catalog_feature_outbox_dispatchable",
+            "CREATE INDEX IF NOT EXISTS ix_catalog_feature_outbox_dispatchable "
+            "ON catalog_feature_outbox (next_attempt_at, created_at) "
+            "WHERE published_at IS NULL AND terminal_at IS NULL",
+        )
+        await self._create_index_if_missing(
+            conn,
+            "ix_interaction_events_occurred_at_desc",
+            "CREATE INDEX IF NOT EXISTS ix_interaction_events_occurred_at_desc "
+            "ON interaction_events (occurred_at DESC)",
         )
 
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_interaction_events_action_occurred_at "
-                "ON interaction_events (action, occurred_at DESC)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_interaction_events_action_occurred_at",
+            "CREATE INDEX IF NOT EXISTS ix_interaction_events_action_occurred_at "
+            "ON interaction_events (action, occurred_at DESC)",
         )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_interaction_events_user_sequence "
-                "ON interaction_events (user_id, occurred_at, event_id)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_interaction_events_user_sequence",
+            "CREATE INDEX IF NOT EXISTS ix_interaction_events_user_sequence "
+            "ON interaction_events (user_id, occurred_at, event_id)",
         )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_interaction_events_positive_user_sequence "
-                "ON interaction_events (user_id, occurred_at DESC, event_id DESC) "
-                "WHERE action IN ('view', 'click', 'add_to_cart', 'purchase')"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_interaction_events_positive_user_sequence",
+            "CREATE INDEX IF NOT EXISTS ix_interaction_events_positive_user_sequence "
+            "ON interaction_events (user_id, occurred_at DESC, event_id DESC) "
+            "WHERE action IN ('view', 'click', 'add_to_cart', 'purchase')",
         )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_model_checkpoints_latest "
-                "ON model_checkpoints (model_name, created_at DESC, id DESC)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_model_checkpoints_latest",
+            "CREATE INDEX IF NOT EXISTS ix_model_checkpoints_latest "
+            "ON model_checkpoints (model_name, created_at DESC, id DESC)",
         )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_recommendation_impressions_user_created "
-                "ON recommendation_impressions (user_id, created_at DESC)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_recommendation_impressions_user_created",
+            "CREATE INDEX IF NOT EXISTS ix_recommendation_impressions_user_created "
+            "ON recommendation_impressions (user_id, created_at DESC)",
         )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_recommendation_impressions_created_at "
-                "ON recommendation_impressions (created_at DESC)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_recommendation_impressions_created_at",
+            "CREATE INDEX IF NOT EXISTS ix_recommendation_impressions_created_at "
+            "ON recommendation_impressions (created_at DESC)",
         )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_recommendation_impression_items_impression "
-                "ON recommendation_impression_items (impression_id)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_recommendation_impression_items_impression",
+            "CREATE INDEX IF NOT EXISTS ix_recommendation_impression_items_impression "
+            "ON recommendation_impression_items (impression_id)",
         )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_recommendation_impression_items_product_created "
-                "ON recommendation_impression_items (product_id, created_at DESC)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ix_recommendation_impression_items_product_created",
+            "CREATE INDEX IF NOT EXISTS ix_recommendation_impression_items_product_created "
+            "ON recommendation_impression_items (product_id, created_at DESC)",
         )
-        await conn.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS "
-                "ux_recommendation_impression_items_impression_product "
-                "ON recommendation_impression_items (impression_id, product_id)"
-            )
+        await self._create_index_if_missing(
+            conn,
+            "ux_recommendation_impression_items_impression_product",
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "ux_recommendation_impression_items_impression_product "
+            "ON recommendation_impression_items (impression_id, product_id)",
         )
+
+    async def _add_missing_columns(
+        self, conn, table: str, columns: Dict[str, str]
+    ) -> None:
+        """ALTER only when a column is actually missing.
+
+        ``ADD COLUMN IF NOT EXISTS`` still takes an ACCESS EXCLUSIVE lock even
+        when it is a no-op, which would stall hot tables (the impression
+        outbox) on every pod restart.
+        """
+        result = await conn.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = :table"
+            ),
+            {"table": table},
+        )
+        existing = {str(row[0]) for row in result}
+        missing = [
+            f"ADD COLUMN IF NOT EXISTS {name} {ddl}"
+            for name, ddl in columns.items()
+            if name not in existing
+        ]
+        if missing:
+            await conn.execute(text(f"ALTER TABLE {table} " + ", ".join(missing)))
 
     async def _ensure_feature_lake_operational_schema(self, conn) -> None:
         """Apply additive feature-lake columns for existing operational tables."""
-        await conn.execute(
-            text(
-                "ALTER TABLE product_catalog_snapshot "
-                "ADD COLUMN IF NOT EXISTS activation_id VARCHAR(64), "
-                "ADD COLUMN IF NOT EXISTS source_version VARCHAR(255)"
-            )
+        await self._add_missing_columns(
+            conn,
+            "product_catalog_snapshot",
+            {"activation_id": "VARCHAR(64)", "source_version": "VARCHAR(255)"},
         )
-        await conn.execute(
-            text(
-                "ALTER TABLE content_jobs "
-                "ADD COLUMN IF NOT EXISTS pipeline_version VARCHAR(128), "
-                "ADD COLUMN IF NOT EXISTS task_event_id VARCHAR(64)"
-            )
+        await self._add_missing_columns(
+            conn,
+            "content_jobs",
+            {"pipeline_version": "VARCHAR(128)", "task_event_id": "VARCHAR(64)"},
         )
-        await conn.execute(
-            text(
-                "ALTER TABLE content_task_outbox "
-                "ADD COLUMN IF NOT EXISTS terminal_at TIMESTAMPTZ, "
-                "ADD COLUMN IF NOT EXISTS terminal_reason TEXT"
-            )
+        await self._add_missing_columns(
+            conn,
+            "content_task_outbox",
+            {"terminal_at": "TIMESTAMPTZ", "terminal_reason": "TEXT"},
         )
-        await conn.execute(
-            text(
-                "ALTER TABLE catalog_activations "
-                "ADD COLUMN IF NOT EXISTS manifest_hash VARCHAR(64)"
-            )
+        await self._add_missing_columns(
+            conn,
+            "catalog_activations",
+            {"manifest_hash": "VARCHAR(64)"},
+        )
+        # migrations/postgres/012_recommendation_outbox_terminal.sql
+        await self._add_missing_columns(
+            conn,
+            "recommendation_event_outbox",
+            {"terminal_at": "TIMESTAMPTZ", "terminal_reason": "TEXT"},
+        )
+        await self._add_missing_columns(
+            conn,
+            "catalog_feature_outbox",
+            {
+                "next_attempt_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+                "terminal_at": "TIMESTAMPTZ",
+                "terminal_reason": "TEXT",
+            },
         )
 
     async def _ensure_partitioned_interaction_events(self, conn) -> None:
@@ -1629,13 +1757,28 @@ class SystemStore:
         if self.observability is not None:
             self.observability.update_database_pool_metrics(self)
 
+    @asynccontextmanager
+    async def _hot_path_session(self) -> AsyncIterator[Any]:
+        """Transaction for request-path queries with a bounded statement time.
+
+        ``SET LOCAL`` scopes the timeout to this transaction, so it is safe with
+        pooled connections and PgBouncer transaction pooling.
+        """
+        async with self.session_factory.begin() as session:
+            timeout_ms = int(self.config.hot_path_statement_timeout_ms)
+            if timeout_ms > 0:
+                await session.execute(
+                    text(f"SET LOCAL statement_timeout = {timeout_ms}")
+                )
+            yield session
+
     async def health_check(self) -> DatabaseHealth:
         if not self.enabled:
             return DatabaseHealth(status="healthy", response_time_ms=0.0)
 
         started_at = time.time()
         try:
-            async with self.session_factory() as session:
+            async with self._hot_path_session() as session:
                 await session.execute(text("SELECT 1"))
             self._update_pool_metrics()
             return DatabaseHealth(
@@ -1930,7 +2073,7 @@ class SystemStore:
         """Return whether an impression is durable in the outbox or materialized tables."""
         if not self.enabled:
             return False
-        async with self.session_factory() as session:
+        async with self._hot_path_session() as session:
             materialized = await session.scalar(
                 select(RecommendationImpression.impression_id)
                 .where(RecommendationImpression.impression_id == impression_id)
@@ -1940,7 +2083,12 @@ class SystemStore:
                 return True
             staged = await session.scalar(
                 select(RecommendationEventOutbox.impression_id)
-                .where(RecommendationEventOutbox.impression_id == impression_id)
+                .where(
+                    RecommendationEventOutbox.impression_id == impression_id,
+                    # not_exposed / undeliverable rows were never returned to a
+                    # client (or never reach Kafka), so they cannot anchor views.
+                    RecommendationEventOutbox.terminal_at.is_(None),
+                )
                 .limit(1)
             )
             return staged is not None
@@ -1951,7 +2099,7 @@ class SystemStore:
         """Resolve the durable user, served time and product positions for a slate."""
         if not self.enabled:
             return None
-        async with self.session_factory() as session:
+        async with self._hot_path_session() as session:
             impression = await session.scalar(
                 select(RecommendationImpression).where(
                     RecommendationImpression.impression_id == impression_id
@@ -1977,7 +2125,8 @@ class SystemStore:
                 }
             outbox = await session.scalar(
                 select(RecommendationEventOutbox).where(
-                    RecommendationEventOutbox.impression_id == impression_id
+                    RecommendationEventOutbox.impression_id == impression_id,
+                    RecommendationEventOutbox.terminal_at.is_(None),
                 )
             )
             if outbox is None:
@@ -2029,7 +2178,7 @@ class SystemStore:
                 index_elements=[InteractionIdempotencyLedger.event_id]
             )
         )
-        async with self.session_factory.begin() as session:
+        async with self._hot_path_session() as session:
             insert_result = await session.execute(insert_stmt)
             inserted = bool(insert_result.rowcount)
             row = await session.scalar(
@@ -2059,7 +2208,7 @@ class SystemStore:
         self, event_id: str, *, claim_token: str
     ) -> bool:
         now = _utc_now()
-        async with self.session_factory.begin() as session:
+        async with self._hot_path_session() as session:
             result = await session.execute(
                 update(InteractionIdempotencyLedger)
                 .where(
@@ -2081,7 +2230,7 @@ class SystemStore:
         self, event_id: str, *, claim_token: str
     ) -> bool:
         now = _utc_now()
-        async with self.session_factory.begin() as session:
+        async with self._hot_path_session() as session:
             result = await session.execute(
                 update(InteractionIdempotencyLedger)
                 .where(
@@ -2093,8 +2242,24 @@ class SystemStore:
             )
         return bool(result.rowcount)
 
-    async def enqueue_recommendation_event(self, event: Mapping[str, Any]) -> str:
-        """Durably stage one served-impression event before returning its ID."""
+    async def enqueue_recommendation_event(
+        self,
+        event: Mapping[str, Any],
+        *,
+        commit_deadline: Optional[float] = None,
+        publish_hold_seconds: float = 0.0,
+    ) -> str:
+        """Durably stage one served-impression event before returning its ID.
+
+        ``commit_deadline`` is a ``time.monotonic()`` instant: when it has
+        passed by the time the insert is ready to commit, the transaction is
+        rolled back with ``OutboxCommitDeadlineExceeded`` because the caller
+        has already answered without the impression_id.
+
+        ``publish_hold_seconds`` delays the first claim so a COMMIT that lands
+        after the deadline can be retired as ``not_exposed`` before any
+        dispatcher can pick the row up.
+        """
         if not self.enabled:
             return False
         metadata = _safe_dict(event.get("metadata"))
@@ -2115,12 +2280,13 @@ class SystemStore:
             impression_id=impression_id,
             payload_hash=payload_hash,
             event_payload=payload,
-            next_attempt_at=_utc_now(),
+            next_attempt_at=_utc_now()
+            + timedelta(seconds=max(0.0, float(publish_hold_seconds))),
         )
         stmt = stmt.on_conflict_do_nothing(
             index_elements=[RecommendationEventOutbox.event_id]
         )
-        async with self.session_factory.begin() as session:
+        async with self._hot_path_session() as session:
             result = await session.execute(stmt)
             if result.rowcount:
                 outcome = "inserted"
@@ -2133,6 +2299,10 @@ class SystemStore:
                 if existing is None or existing.payload_hash != payload_hash:
                     raise ValueError("recommendation outbox event_id payload collision")
                 outcome = "duplicate"
+            if commit_deadline is not None and time.monotonic() > commit_deadline:
+                raise OutboxCommitDeadlineExceeded(
+                    "served impression outbox insert missed its serving deadline"
+                )
         self._update_pool_metrics()
         return outcome
 
@@ -2146,6 +2316,7 @@ class SystemStore:
             select(RecommendationEventOutbox)
             .where(
                 RecommendationEventOutbox.published_at.is_(None),
+                RecommendationEventOutbox.terminal_at.is_(None),
                 RecommendationEventOutbox.next_attempt_at <= now,
                 or_(
                     RecommendationEventOutbox.claim_expires_at.is_(None),
@@ -2188,30 +2359,135 @@ class SystemStore:
         self._update_pool_metrics()
 
     async def mark_recommendation_outbox_failed(
-        self, event_id: str, error: str, *, worker_id: str
-    ) -> None:
+        self,
+        event_id: str,
+        error: str,
+        *,
+        worker_id: str,
+        retryable: bool = True,
+        terminal_reason: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+        counts_toward_max_attempts: bool = True,
+    ) -> Optional[str]:
+        """Record a failed publish; return the terminal reason if the row stopped.
+
+        A row goes terminal (never claimed again, excluded from stats) on a
+        non-retryable error such as an oversized record, or once it has used
+        ``max_attempts`` publishes. Transient broker outages pass
+        ``counts_toward_max_attempts=False`` so a long Kafka outage cannot
+        retire every pending row; they still back off exponentially.
+        """
         if not self.enabled:
-            return
+            return None
         now = _utc_now()
+        terminal: Optional[str] = None
         async with self.session_factory.begin() as session:
-            row = await session.get(RecommendationEventOutbox, event_id)
-            attempts = int(row.attempts if row else 0) + 1
-            delay = min(300, 2 ** min(attempts, 8))
-            await session.execute(
+            row = await session.get(
+                RecommendationEventOutbox, event_id, with_for_update=True
+            )
+            if (
+                row is None
+                or row.claimed_by != worker_id
+                or row.published_at is not None
+                or row.terminal_at is not None
+            ):
+                return None
+            attempts = int(row.attempts or 0) + 1
+            row.attempts = attempts
+            row.last_error = str(error)[:2000]
+            row.claimed_by = None
+            row.claim_expires_at = None
+            if not retryable:
+                terminal = terminal_reason or "non_retryable"
+            elif (
+                counts_toward_max_attempts
+                and max_attempts is not None
+                and attempts >= int(max_attempts)
+            ):
+                terminal = "max_attempts"
+            if terminal is not None:
+                row.terminal_at = now
+                row.terminal_reason = terminal
+            else:
+                row.next_attempt_at = now + timedelta(
+                    seconds=outbox_retry_delay_seconds(attempts)
+                )
+        self._update_pool_metrics()
+        return terminal
+
+    async def mark_recommendation_outbox_not_exposed(self, event_id: str) -> str:
+        """Retire a row whose insert committed after the serving budget expired.
+
+        The response already went out without an impression_id, so the event
+        must never be published or used to resolve view slates. Returns
+        ``retired``, ``missing`` (nothing committed), ``already_terminal``, or
+        ``already_dispatched`` when a dispatcher holds a live claim or has
+        already published it (the race was lost).
+        """
+        if not self.enabled:
+            return "missing"
+        now = _utc_now()
+        async with self._hot_path_session() as session:
+            result = await session.execute(
                 update(RecommendationEventOutbox)
                 .where(
                     RecommendationEventOutbox.event_id == event_id,
-                    RecommendationEventOutbox.claimed_by == worker_id,
+                    RecommendationEventOutbox.published_at.is_(None),
+                    RecommendationEventOutbox.terminal_at.is_(None),
+                    or_(
+                        RecommendationEventOutbox.claimed_by.is_(None),
+                        RecommendationEventOutbox.claim_expires_at < now,
+                    ),
                 )
                 .values(
-                    attempts=attempts,
-                    last_error=str(error)[:2000],
-                    next_attempt_at=now + timedelta(seconds=delay),
+                    terminal_at=now,
+                    terminal_reason="not_exposed",
                     claimed_by=None,
                     claim_expires_at=None,
                 )
             )
+            if result.rowcount:
+                status = "retired"
+            else:
+                row = await session.get(RecommendationEventOutbox, event_id)
+                if row is None:
+                    status = "missing"
+                elif row.terminal_at is not None:
+                    status = "already_terminal"
+                else:
+                    status = "already_dispatched"
         self._update_pool_metrics()
+        return status
+
+    async def prune_terminal_recommendation_outbox(
+        self, *, retention_days: int = 7, batch_size: int = 5000
+    ) -> int:
+        """Delete terminal rows past retention, in bounded batches.
+
+        Published rows are kept: view ingest may still resolve slates from the
+        outbox until the impression is materialized.
+        """
+        if not self.enabled:
+            return 0
+        cutoff = _utc_now() - timedelta(days=max(1, int(retention_days)))
+        doomed = (
+            select(RecommendationEventOutbox.event_id)
+            .where(
+                RecommendationEventOutbox.terminal_at.is_not(None),
+                RecommendationEventOutbox.terminal_at < cutoff,
+            )
+            .limit(max(1, int(batch_size)))
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                delete(RecommendationEventOutbox).where(
+                    RecommendationEventOutbox.event_id.in_(doomed)
+                )
+            )
+        self._update_pool_metrics()
+        return int(result.rowcount or 0)
 
     async def get_recommendation_outbox_stats(self) -> Dict[str, Any]:
         if not self.enabled:
@@ -2222,7 +2498,10 @@ class SystemStore:
                     select(
                         func.count(RecommendationEventOutbox.event_id),
                         func.min(RecommendationEventOutbox.created_at),
-                    ).where(RecommendationEventOutbox.published_at.is_(None))
+                    ).where(
+                        RecommendationEventOutbox.published_at.is_(None),
+                        RecommendationEventOutbox.terminal_at.is_(None),
+                    )
                 )
             ).one()
         oldest_age = max(0.0, (_utc_now() - oldest).total_seconds()) if oldest else 0.0
@@ -3572,6 +3851,8 @@ class SystemStore:
             .where(
                 CatalogActivation.status == "complete",
                 CatalogFeatureOutbox.published_at.is_(None),
+                CatalogFeatureOutbox.terminal_at.is_(None),
+                CatalogFeatureOutbox.next_attempt_at <= now,
                 or_(
                     CatalogFeatureOutbox.claim_expires_at.is_(None),
                     CatalogFeatureOutbox.claim_expires_at < now,
@@ -3623,25 +3904,47 @@ class SystemStore:
         error: str,
         *,
         worker_id: str,
-    ) -> None:
+        retryable: bool = True,
+        terminal_reason: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+        counts_toward_max_attempts: bool = True,
+    ) -> Optional[str]:
+        """Back off a failed catalog publish, or stop it; return the terminal reason."""
         if not self.enabled:
-            return
+            return None
+        now = _utc_now()
+        terminal: Optional[str] = None
         async with self.session_factory.begin() as session:
-            await session.execute(
-                update(CatalogFeatureOutbox)
-                .where(
-                    CatalogFeatureOutbox.event_id == event_id,
-                    CatalogFeatureOutbox.claimed_by == worker_id,
-                    CatalogFeatureOutbox.published_at.is_(None),
+            row = await session.get(CatalogFeatureOutbox, event_id, with_for_update=True)
+            if (
+                row is None
+                or row.claimed_by != worker_id
+                or row.published_at is not None
+                or row.terminal_at is not None
+            ):
+                return None
+            attempts = int(row.attempts or 0) + 1
+            row.attempts = attempts
+            row.last_error = str(error)[:4096]
+            row.claimed_by = None
+            row.claim_expires_at = None
+            if not retryable:
+                terminal = terminal_reason or "non_retryable"
+            elif (
+                counts_toward_max_attempts
+                and max_attempts is not None
+                and attempts >= int(max_attempts)
+            ):
+                terminal = "max_attempts"
+            if terminal is not None:
+                row.terminal_at = now
+                row.terminal_reason = terminal
+            else:
+                row.next_attempt_at = now + timedelta(
+                    seconds=outbox_retry_delay_seconds(attempts)
                 )
-                .values(
-                    attempts=CatalogFeatureOutbox.attempts + 1,
-                    last_error=str(error)[:4096],
-                    claimed_by=None,
-                    claim_expires_at=None,
-                )
-            )
         self._update_pool_metrics()
+        return terminal
 
     async def prune_catalog_outbox(self, *, retention_days: int = 7) -> int:
         if not self.enabled:
@@ -3650,8 +3953,16 @@ class SystemStore:
         async with self.session_factory.begin() as session:
             result = await session.execute(
                 delete(CatalogFeatureOutbox).where(
-                    CatalogFeatureOutbox.published_at.is_not(None),
-                    CatalogFeatureOutbox.published_at < cutoff,
+                    or_(
+                        and_(
+                            CatalogFeatureOutbox.published_at.is_not(None),
+                            CatalogFeatureOutbox.published_at < cutoff,
+                        ),
+                        and_(
+                            CatalogFeatureOutbox.terminal_at.is_not(None),
+                            CatalogFeatureOutbox.terminal_at < cutoff,
+                        ),
+                    )
                 )
             )
         self._update_pool_metrics()
@@ -3674,6 +3985,7 @@ class SystemStore:
                 .where(
                     CatalogActivation.status == "complete",
                     CatalogFeatureOutbox.published_at.is_(None),
+                    CatalogFeatureOutbox.terminal_at.is_(None),
                 )
             )
             pending, oldest = result.one()
