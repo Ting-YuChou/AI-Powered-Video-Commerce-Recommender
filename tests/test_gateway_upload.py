@@ -290,7 +290,9 @@ async def test_content_status_prefers_authoritative_postgres_job(monkeypatch):
     monkeypatch.setattr(gateway_api, "system_store", Store())
     monkeypatch.setattr(gateway_api, "feature_store", FeatureStore())
 
-    response = await content_status("content-1")
+    response = await content_status(
+        "content-1", SimpleNamespace(state=SimpleNamespace())
+    )
 
     assert response["status"] == "pending_publish"
     assert response["processed_at"] == 123.0

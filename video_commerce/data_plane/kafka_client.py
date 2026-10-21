@@ -175,12 +175,23 @@ class KafkaProducerClient:
 
             except KafkaConnectionError as e:
                 logger.error(f"Failed to connect Kafka producer: {e}")
-                self.is_connected = False
+                await self._discard_unstarted_producer()
                 raise
             except Exception as e:
                 logger.error(f"Unexpected error starting Kafka producer: {e}")
-                self.is_connected = False
+                await self._discard_unstarted_producer()
                 raise
+
+    async def _discard_unstarted_producer(self) -> None:
+        """Close a producer whose start() failed so retries do not leak it."""
+        producer, self.producer = self.producer, None
+        self.is_connected = False
+        if producer is None:
+            return
+        try:
+            await producer.stop()
+        except Exception as exc:
+            logger.debug("kafka_producer_discard_failed: %s", exc)
 
     async def stop(self):
         """Stop the Kafka producer connection."""
@@ -1187,6 +1198,80 @@ async def init_kafka(config: KafkaConfig, observability=None) -> KafkaManager:
     manager = get_kafka_manager(config, observability=observability)
     await manager.start()
     return manager
+
+
+class KafkaProducerSupervisor:
+    """Start a service's Kafka manager and keep retrying in the background.
+
+    Services used to set their manager to None forever when Kafka was briefly
+    unavailable at startup, which left the pod unready (or uploads failing)
+    until someone restarted it. ``start`` returns the manager when the first
+    attempt succeeds; otherwise it returns None and keeps retrying with
+    exponential backoff, calling ``on_connected`` once a later attempt works.
+    """
+
+    def __init__(
+        self,
+        config: KafkaConfig,
+        *,
+        service_name: str,
+        observability=None,
+        on_connected: Optional[Callable[["KafkaManager"], None]] = None,
+        initial_backoff_seconds: float = 1.0,
+        max_backoff_seconds: float = 60.0,
+    ) -> None:
+        self.config = config
+        self.service_name = service_name
+        self.observability = observability
+        self.on_connected = on_connected
+        self.initial_backoff_seconds = initial_backoff_seconds
+        self.max_backoff_seconds = max_backoff_seconds
+        self.manager: Optional[KafkaManager] = None
+        self._task: Optional[asyncio.Task] = None
+
+    @property
+    def connected(self) -> bool:
+        return self.manager is not None
+
+    async def _attempt(self) -> bool:
+        try:
+            manager = await init_kafka(self.config, observability=self.observability)
+        except Exception as exc:
+            logger.warning("%s Kafka init failed: %s", self.service_name, exc)
+            return False
+        self.manager = manager
+        if self.on_connected is not None:
+            self.on_connected(manager)
+        return True
+
+    async def start(self) -> Optional["KafkaManager"]:
+        if not self.config.enable:
+            return None
+        if await self._attempt():
+            return self.manager
+        self._task = asyncio.create_task(self._retry_loop())
+        return None
+
+    async def _retry_loop(self) -> None:
+        delay = self.initial_backoff_seconds
+        while True:
+            await asyncio.sleep(delay)
+            if await self._attempt():
+                logger.info("%s Kafka producer connected after retry", self.service_name)
+                return
+            delay = min(self.max_backoff_seconds, delay * 2)
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        if self.manager is not None:
+            await close_kafka()
+            self.manager = None
 
 
 async def close_kafka():

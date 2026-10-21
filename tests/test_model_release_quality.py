@@ -17,6 +17,8 @@ from video_commerce.ml.model_release_quality import (
     _cluster_bootstrap_ndcg,
     _informative_impression_count,
     _mean_ndcg,
+    _metric_failures,
+    _ndcg_underpowered,
     evaluate_quality_gate,
     split_fixed_holdout,
     split_training_examples_fixed_holdout,
@@ -180,7 +182,7 @@ def test_quality_gate_passes_non_regressing_challenger_deterministically():
     assert first.decision is GateDecision.PASSED
     assert first.overall["ndcg_at_10_delta"] == pytest.approx(0.0)
     assert first.bootstrap == second.bootstrap
-    assert first.policy_version == "ranking_quality_gate_v4"
+    assert first.policy_version == "ranking_quality_gate_v5"
     assert first.policy_version == QUALITY_GATE_POLICY_VERSION
     assert first.overall["ndcg_informative_impressions"] == 3
 
@@ -193,7 +195,7 @@ def test_quality_gate_rejects_serving_order_regression():
     result = evaluate_quality_gate(rows, champion, challenger, _small_config())
 
     assert result.decision is GateDecision.FAILED
-    assert "overall_ndcg_point_delta" in result.reasons
+    assert "overall_ndcg_regression" in result.reasons
     assert result.overall["ndcg_at_10_delta"] < 0
 
 
@@ -378,7 +380,7 @@ def test_long_tail_category_is_reported_without_blocking_the_gate():
     result = evaluate_quality_gate(rows, predictions, predictions, config)
 
     assert result.decision is GateDecision.PASSED
-    assert result.policy_version == "ranking_quality_gate_v4"
+    assert result.policy_version == "ranking_quality_gate_v5"
     tiny = result.slices["category_tiny"]
     assert tiny["status"] == GateDecision.INSUFFICIENT_EVIDENCE.value
     assert tiny["blocking"] is False
@@ -461,79 +463,170 @@ def test_retrain_snapshot_validates_against_retrain_defaults_only():
     assert quality_gate_snapshot_valid(legacy)
 
 
-def test_equivalent_challenger_rarely_fails_across_many_category_slices():
-    """A/A-style check: equal-quality models with noisy scores, 30 categories.
+def _equal_quality_fixture(seed: int, *, impressions: int = 240, categories: int = 30):
+    """Rows plus a factory for equal-quality predictions with independent noise."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for impression in range(impressions):
+        user = f"u{impression % (impressions // 2)}"
+        category = f"c{impression % categories}"
+        for slot in range(4):
+            clicked = bool(rng.random() < 0.3)
+            rows.append(
+                replace(
+                    _row(
+                        impression=f"i{impression}",
+                        user=user,
+                        product=f"i{impression}:p{slot}",
+                        timestamp=1_700_000_000.0 + impression * 600,
+                        relevance=2.0 if clicked else 1.0,
+                        clicked=clicked,
+                        purchased=clicked and rng.random() < 0.3,
+                        value=10.0,
+                    ),
+                    category=category,
+                )
+            )
+    base = {
+        row.observation_id: float(rng.random()) + (0.3 if row.clicked else 0.0)
+        for row in rows
+    }
 
-    Only slice-driven failures are counted: the overall NDCG non-inferiority CI
-    is a power question that depends on holdout size, not on slice policy.
-    """
+    def predictions(noise_seed):
+        noise = np.random.default_rng(noise_seed)
+        out = {}
+        for row in rows:
+            score = base[row.observation_id] + float(noise.normal(0.0, 0.01))
+            probability = min(0.99, max(0.01, score / 1.5))
+            out[row.observation_id] = RankingPrediction(
+                serving_score=score,
+                ctr=probability,
+                ctcvr=probability * 0.3,
+                predicted_value=10.0,
+            )
+        return out
+
+    return rows, predictions
+
+
+def _aa_config() -> RankingQualityGateConfig:
+    return RankingQualityGateConfig(
+        bootstrap_samples=100,
+        min_impressions=50,
+        min_users=20,
+        min_clicks=10,
+        min_purchases=5,
+        min_slice_impressions=5,
+        min_slice_users=3,
+        min_slice_positives=1,
+        require_candidate_recall=False,
+        experiment_kind="retrain",
+    )
+
+
+def test_equivalent_challenger_rarely_fails_across_many_category_slices():
+    """A/A-style check: equal-quality models with noisy scores, 30 categories."""
     slice_failures = 0
     category_failures = 0
+    ndcg_failures = 0
+    underpowered = 0
     trials = 20
     for seed in range(trials):
-        rng = np.random.default_rng(seed)
-        rows = []
-        for impression in range(240):
-            user = f"u{impression % 120}"
-            category = f"c{impression % 30}"
-            for slot in range(4):
-                clicked = bool(rng.random() < 0.3)
-                rows.append(
-                    replace(
-                        _row(
-                            impression=f"i{impression}",
-                            user=user,
-                            product=f"i{impression}:p{slot}",
-                            timestamp=1_700_000_000.0 + impression * 600,
-                            relevance=2.0 if clicked else 1.0,
-                            clicked=clicked,
-                            purchased=clicked and rng.random() < 0.3,
-                            value=10.0,
-                        ),
-                        category=category,
-                    )
-                )
-        base = {
-            row.observation_id: float(rng.random()) + (0.3 if row.clicked else 0.0)
-            for row in rows
-        }
-
-        def predictions(noise_seed):
-            noise = np.random.default_rng(noise_seed)
-            out = {}
-            for row in rows:
-                score = base[row.observation_id] + float(noise.normal(0.0, 0.01))
-                probability = min(0.99, max(0.01, score / 1.5))
-                out[row.observation_id] = RankingPrediction(
-                    serving_score=score,
-                    ctr=probability,
-                    ctcvr=probability * 0.3,
-                    predicted_value=10.0,
-                )
-            return out
-
-        config = RankingQualityGateConfig(
-            bootstrap_samples=100,
-            min_impressions=50,
-            min_users=20,
-            min_clicks=10,
-            min_purchases=5,
-            min_slice_impressions=5,
-            min_slice_users=3,
-            min_slice_positives=1,
-            require_candidate_recall=False,
-            experiment_kind="retrain",
-        )
+        rows, predictions = _equal_quality_fixture(seed)
         result = evaluate_quality_gate(
-            rows, predictions(1000 + seed), predictions(2000 + seed), config
+            rows, predictions(1000 + seed), predictions(2000 + seed), _aa_config()
         )
-        slice_reasons = [reason for reason in result.reasons if reason.startswith("slice_")]
+        slice_reasons = [
+            reason
+            for reason in result.reasons
+            if reason.startswith("slice_") and not reason.endswith("_underpowered")
+        ]
         slice_failures += bool(slice_reasons)
         category_failures += any("category_" in reason for reason in result.reasons)
+        ndcg_failures += any(
+            reason.endswith(("_ndcg_regression", "_ndcg_point_delta"))
+            for reason in result.reasons
+        )
+        underpowered += "overall_ndcg_underpowered" in result.reasons
 
     # 30 per-category point thresholds no longer multiply false failures.
     assert category_failures == 0
     assert slice_failures / trials <= 0.05
+    # v5: an equal-quality challenger never fails on NDCG; a holdout this small
+    # often cannot resolve the -0.005 margin and is reported as underpowered.
+    assert ndcg_failures == 0
+    assert underpowered > 0
+
+
+def _ndcg_metrics(delta: float, lower: float, upper: float) -> dict:
+    return {
+        "ndcg_at_10_delta": delta,
+        "ndcg_at_10_delta_ci_lower": lower,
+        "ndcg_at_10_delta_ci_upper": upper,
+        "ndcg_at_10_delta_ci_half_width": (upper - lower) / 2.0,
+        "ndcg_informative_impressions": 400,
+        "ctr_pr_auc_delta": 0.0,
+        "ctcvr_pr_auc_delta": 0.0,
+        "ctr_log_loss_relative_regression": 0.0,
+        "ctcvr_log_loss_relative_regression": 0.0,
+        "ctr_brier_relative_regression": 0.0,
+        "ctcvr_brier_relative_regression": 0.0,
+        "ctr_ece_absolute_regression": 0.0,
+        "ctcvr_ece_absolute_regression": 0.0,
+        "value_wape_relative_regression": 0.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("delta", "lower", "upper", "failed", "underpowered"),
+    [
+        (0.001, -0.002, 0.004, False, False),  # CI clears the margin
+        (-0.001, -0.009, 0.007, False, True),  # straddles the margin
+        (-0.02, -0.03, -0.01, True, False),  # wholly below the margin
+        (-0.003, -0.004, -0.002, False, False),  # worse, but within the margin
+    ],
+)
+def test_ndcg_is_a_three_way_non_inferiority_test(
+    delta, lower, upper, failed, underpowered
+):
+    config = RankingQualityGateConfig(experiment_kind="retrain")
+    metrics = _ndcg_metrics(delta, lower, upper)
+
+    failures = _metric_failures(metrics, config, slice_name=None)
+
+    assert ("overall_ndcg_regression" in failures) is failed
+    assert "overall_ndcg_point_delta" not in failures
+    assert _ndcg_underpowered(metrics, config, slice_name=None) is underpowered
+
+
+def test_positive_minimum_delta_is_still_a_superiority_requirement():
+    config = RankingQualityGateConfig(overall_ndcg_min_delta=0.005)
+
+    failures = _metric_failures(
+        _ndcg_metrics(0.001, -0.002, 0.004), config, slice_name=None
+    )
+
+    assert "overall_ndcg_point_delta" in failures
+
+
+def test_underpowered_holdout_is_insufficient_with_a_sample_size_estimate():
+    for seed in range(20):
+        rows, predictions = _equal_quality_fixture(seed)
+        result = evaluate_quality_gate(
+            rows, predictions(1000 + seed), predictions(2000 + seed), _aa_config()
+        )
+        if result.reasons == ("overall_ndcg_underpowered",):
+            break
+    else:
+        pytest.fail("no seed produced an NDCG-only underpowered result")
+
+    assert result.decision is GateDecision.INSUFFICIENT_EVIDENCE
+    assert result.overall["ndcg_at_10_delta_ci_half_width"] > 0.0
+    estimate = result.overall["ndcg_informative_impressions_required_estimate"]
+    if result.overall["ndcg_at_10_delta"] > -0.005:
+        assert estimate > result.overall["ndcg_informative_impressions"]
+    else:
+        assert estimate is None
 
 
 def test_fixed_holdout_purges_rows_within_label_reach_of_the_holdout():

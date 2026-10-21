@@ -41,6 +41,7 @@ data:
   API_CORS_ORIGINS: {{ .Values.appConfig.apiCorsOrigins | quote }}
   API_CORS_CREDENTIALS: {{ .Values.appConfig.apiCorsCredentials | quote }}
   API_RATE_LIMIT_REQUESTS: {{ .Values.appConfig.apiRateLimitRequests | quote }}
+  API_TRUSTED_PROXY_CIDRS: {{ .Values.appConfig.apiTrustedProxyCidrs | quote }}
   REDIS_HOST: {{ .Values.external.redis.host | quote }}
   REDIS_PORT: {{ .Values.external.redis.port | quote }}
   REDIS_DB: {{ .Values.external.redis.db | quote }}
@@ -61,6 +62,7 @@ data:
   KAFKA_DEAD_LETTER_ENABLE: {{ .Values.external.kafka.deadLetterEnable | quote }}
   KAFKA_DEAD_LETTER_TOPIC: {{ .Values.external.kafka.deadLetterTopic | quote }}
   FEATURE_PIPELINE_MODE: {{ .Values.appConfig.featurePipelineMode | quote }}
+  FEATURE_PIPELINE_FLINK_REST_URL: {{ .Values.appConfig.flinkRestUrl | quote }}
   FLINK_FEATURE_OUTPUT_NAMESPACE: {{ .Values.appConfig.flinkFeatureOutputNamespace | quote }}
   FEATURE_LAKE_ENABLED: {{ .Values.external.featureLake.enabled | quote }}
   FEATURE_LAKE_CATALOG_NAME: {{ .Values.external.featureLake.catalogName | quote }}

@@ -14,9 +14,47 @@ except ImportError:
     from pydantic import BaseModel, Field, root_validator, validator
 from typing import List, Dict, Optional, Any, Union, TYPE_CHECKING
 from enum import Enum
+import json
 import time
 import math
 from uuid import UUID
+
+
+# Public identifiers flow into Redis keys and SCAN patterns ("rc:{user_id}:*"),
+# Postgres VARCHAR columns and Kafka keys. User IDs exclude ":" so one user's
+# key prefix cannot cover another's; no ID may carry glob metacharacters,
+# whitespace or control characters. \Z, not $, so a trailing newline is rejected.
+USER_ID_PATTERN = r"^[A-Za-z0-9._@-]{1,255}\Z"
+CATALOG_ID_PATTERN = r"^[A-Za-z0-9._:@/+-]{1,255}\Z"
+
+# Client-supplied context is copied into the outbox, Kafka and feature
+# snapshots; bound it so one request cannot produce a multi-megabyte event.
+CONTEXT_MAX_BYTES = 8192
+CONTEXT_MAX_KEYS = 64
+CONTEXT_MAX_DEPTH = 3
+
+
+def _context_shape(value: Any, depth: int) -> int:
+    """Return the number of mapping keys, enforcing the nesting limit."""
+    if isinstance(value, dict):
+        if depth > CONTEXT_MAX_DEPTH:
+            raise ValueError(f"context nesting exceeds {CONTEXT_MAX_DEPTH} levels")
+        return len(value) + sum(_context_shape(item, depth + 1) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        if depth > CONTEXT_MAX_DEPTH:
+            raise ValueError(f"context nesting exceeds {CONTEXT_MAX_DEPTH} levels")
+        return sum(_context_shape(item, depth + 1) for item in value)
+    return 0
+
+
+def validate_bounded_context(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Reject (not truncate) oversized context, so idempotency hashes stay stable."""
+    if _context_shape(value, 1) > CONTEXT_MAX_KEYS:
+        raise ValueError(f"context has more than {CONTEXT_MAX_KEYS} keys")
+    encoded = json.dumps(value, separators=(",", ":"), default=str)
+    if len(encoded.encode("utf-8")) > CONTEXT_MAX_BYTES:
+        raise ValueError(f"context exceeds {CONTEXT_MAX_BYTES} bytes")
+    return value
 
 
 # Enums for categorical fields
@@ -54,15 +92,25 @@ class RecommendationRequest(BaseModel):
     """Request model for product recommendations."""
 
     user_id: str = Field(
-        ..., min_length=1, max_length=255, description="Unique user identifier"
+        ...,
+        min_length=1,
+        max_length=255,
+        regex=USER_ID_PATTERN,
+        description="Unique user identifier",
     )
     content_id: Optional[str] = Field(
-        None, min_length=1, max_length=255, description="Video content identifier"
+        None,
+        min_length=1,
+        max_length=255,
+        regex=CATALOG_ID_PATTERN,
+        description="Video content identifier",
     )
     context: Dict[str, Any] = Field(
         default_factory=dict, description="Additional context"
     )
     k: int = Field(10, ge=1, le=100, description="Number of recommendations to return")
+
+    _bounded_context = validator("context", allow_reuse=True)(validate_bounded_context)
 
     # Context field examples
     class Config:
@@ -88,15 +136,25 @@ class UserInteractionRequest(BaseModel):
         None, description="Stable client event identifier reused across retries"
     )
     user_id: str = Field(
-        ..., min_length=1, max_length=255, description="Unique user identifier"
+        ...,
+        min_length=1,
+        max_length=255,
+        regex=USER_ID_PATTERN,
+        description="Unique user identifier",
     )
     product_id: str = Field(
-        ..., min_length=1, max_length=255, description="Product identifier"
+        ...,
+        min_length=1,
+        max_length=255,
+        regex=CATALOG_ID_PATTERN,
+        description="Product identifier",
     )
     action: InteractionType = Field(..., description="Type of interaction")
     context: Dict[str, Any] = Field(
         default_factory=dict, description="Interaction context"
     )
+
+    _bounded_context = validator("context", allow_reuse=True)(validate_bounded_context)
     event_time: Optional[float] = Field(
         None,
         description="Client event time as a Unix timestamp; bounded by the ingest service",
@@ -141,7 +199,9 @@ class UserInteractionRequest(BaseModel):
 
 class ViewedImpressionItem(BaseModel):
     event_id: UUID = Field(..., description="Stable per-item viewport event ID")
-    product_id: str = Field(..., min_length=1, max_length=255)
+    product_id: str = Field(
+        ..., min_length=1, max_length=255, regex=CATALOG_ID_PATTERN
+    )
     position: int = Field(..., ge=1, le=1000)
 
 
@@ -150,6 +210,8 @@ class ViewedImpressionRequest(BaseModel):
     viewed_at: float
     items: List[ViewedImpressionItem] = Field(..., min_items=1, max_items=100)
     context: Dict[str, Any] = Field(default_factory=dict)
+
+    _bounded_context = validator("context", allow_reuse=True)(validate_bounded_context)
 
     @validator("items")
     def reject_duplicate_item_event_ids(cls, items):
