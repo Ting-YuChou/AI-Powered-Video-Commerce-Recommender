@@ -1959,27 +1959,43 @@ class FeatureStore:
             "updated_at": time.time(),
             "metadata": metadata or {},
         }
+        payload["expires_at"] = payload["updated_at"] + ttl_seconds
         key = f"{self.prefixes['health']}heartbeat:{service_name}:{instance_id}"
-        await self._client_for_key_type("health").setex(
-            key, ttl_seconds, json_dumps(payload)
-        )
+        client = self._client_for_key_type("health")
+        await client.setex(key, ttl_seconds, json_dumps(payload))
+        # One hash per service lets readers fetch every instance with a single
+        # HGETALL instead of a keyspace SCAN on each /metrics or /readyz call.
+        index_key = self._service_heartbeat_index_key(service_name)
+        pipe = client.pipeline(transaction=False)
+        pipe.hset(index_key, instance_id, json_dumps(payload))
+        pipe.expire(index_key, ttl_seconds)
+        await pipe.execute()
+
+    def _service_heartbeat_index_key(self, service_name: str) -> str:
+        return f"{self.prefixes['health']}heartbeats:{service_name}"
 
     async def get_service_heartbeat_status(
         self,
         service_name: str,
     ) -> Dict[str, Any]:
-        """Get readiness summary for all live heartbeat keys of a service."""
-        pattern = f"{self.prefixes['health']}heartbeat:{service_name}:*"
+        """Get readiness summary for all live heartbeat entries of a service."""
         heartbeats: List[Dict[str, Any]] = []
         client = self._client_for_key_type("health")
-        async for key in client.scan_iter(match=pattern, count=100):
-            raw = await client.get(key)
-            if not raw:
-                continue
+        index_key = self._service_heartbeat_index_key(service_name)
+        now = time.time()
+        stale_instances = []
+        for instance_id, raw in (await client.hgetall(index_key) or {}).items():
             try:
-                heartbeats.append(json_loads(raw))
+                heartbeat = json_loads(raw)
             except Exception:
+                stale_instances.append(instance_id)
                 continue
+            if float(heartbeat.get("expires_at") or 0.0) < now:
+                stale_instances.append(instance_id)
+                continue
+            heartbeats.append(heartbeat)
+        if stale_instances:
+            await client.hdel(index_key, *stale_instances)
 
         if not heartbeats:
             return {

@@ -1718,12 +1718,12 @@ class APIConfig(BaseSettings):
     debug: bool = Field(False, description="Debug mode")
     reload: bool = Field(False, description="Auto-reload on code changes")
 
-    # Request limits
+    # Request limits. Uploads are bounded by DATA_MAX_FILE_SIZE instead.
     max_request_size: int = Field(
-        100 * 1024 * 1024, description="Max request size (100MB)"
+        1024 * 1024,
+        ge=1024,
+        description="Max non-upload request body in bytes, checked before parsing",
     )
-    request_timeout: int = Field(30, description="Request timeout in seconds")
-    max_concurrent_requests: int = Field(100, description="Max concurrent requests")
 
     # CORS settings
     cors_origins: List[str] = Field(["*"], description="CORS allowed origins")
@@ -1734,6 +1734,25 @@ class APIConfig(BaseSettings):
     rate_limit_requests: int = Field(
         120000,
         description="Rate limit per minute; default sized for 1000 QPS public-edge validation",
+    )
+    rate_limit_timeout_ms: int = Field(
+        50,
+        ge=1,
+        description="Redis budget per rate-limit decision; slower calls fail open",
+    )
+    unauthenticated_rate_limit_requests: int = Field(
+        600,
+        ge=1,
+        description="Failed-auth attempts allowed per client IP per minute before 429",
+    )
+    trusted_proxy_cidrs: str = Field(
+        "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+        description="Peers whose X-Forwarded-For is trusted for client-IP rate limiting",
+    )
+    readiness_cache_seconds: float = Field(
+        2.0,
+        ge=0.0,
+        description="Per-worker cache for the public /readyz and /health responses",
     )
 
     class Config:
@@ -2018,6 +2037,15 @@ class FeaturePipelineConfig(BaseSettings):
         if normalized not in {"python", "flink_shadow", "flink"}:
             raise ValueError("mode must be one of: python, flink_shadow, flink")
         return normalized
+
+    flink_rest_url: str = Field(
+        "",
+        description="Flink REST URL for the informational job check in gateway /readyz/full",
+    )
+    flink_job_name: str = Field(
+        "video-commerce-interaction-features",
+        description="Name of the official Flink interaction feature job",
+    )
 
     @validator("flink_feature_output_namespace")
     def validate_namespace(cls, value: str) -> str:
@@ -2304,6 +2332,24 @@ class SecurityConfig(BaseSettings):
     jwt_algorithms: List[str] = Field(
         ["RS256"],
         description="Allowed bearer token algorithms",
+    )
+    oidc_user_id_claim: str = Field(
+        "sub",
+        description="Bearer claim that must match the request user_id",
+    )
+    admin_scope: str = Field(
+        "video-commerce:admin",
+        description="Bearer scope required for global endpoints such as /api/analytics",
+    )
+    jwks_timeout_seconds: float = Field(
+        2.0,
+        gt=0.0,
+        description="Timeout for fetching the JWKS document",
+    )
+    jwks_min_refresh_interval_seconds: float = Field(
+        30.0,
+        ge=0.0,
+        description="Minimum interval between JWKS refreshes forced by unknown key IDs",
     )
 
     class Config:
@@ -3168,6 +3214,23 @@ class Config:
                 errors.append(
                     "API_API_KEY or API_API_KEY_FILE is required in production"
                 )
+            if self.security_config.auth_mode in {"bearer", "api_key_or_bearer"} and (
+                self.security_config.oidc_enabled
+            ):
+                if not self.security_config.oidc_issuer:
+                    errors.append("SECURITY_OIDC_ISSUER is required for bearer auth in production")
+                if not self.security_config.oidc_audience:
+                    errors.append(
+                        "SECURITY_OIDC_AUDIENCE is required for bearer auth in production"
+                    )
+                if not self.security_config.oidc_jwks_url:
+                    errors.append(
+                        "SECURITY_OIDC_JWKS_URL is required for bearer auth in production"
+                    )
+                if self.security_config.jwt_shared_secret:
+                    errors.append(
+                        "SECURITY_JWT_SHARED_SECRET is for local/test only; use JWKS in production"
+                    )
             if not self.security_config.internal_service_key:
                 errors.append(
                     "SECURITY_INTERNAL_SERVICE_KEY or SECURITY_INTERNAL_SERVICE_KEY_FILE is required in production"

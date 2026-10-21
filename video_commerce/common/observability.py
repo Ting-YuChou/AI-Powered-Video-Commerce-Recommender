@@ -658,6 +658,26 @@ class ObservabilityManager:
             ["target"],
             registry=self.registry,
         )
+        self.rate_limiter_errors_total = Counter(
+            "video_commerce_rate_limiter_errors_total",
+            "Rate-limit decisions that failed open because Redis was slow or unavailable",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.dependency_status = Gauge(
+            "video_commerce_dependency_status",
+            "Last readiness probe result per dependency: 1 healthy, 0.5 degraded, 0 unhealthy",
+            ["service", "dependency"],
+            registry=self.registry,
+            multiprocess_mode="min",
+        )
+        self.feature_pipeline_mode = Gauge(
+            "video_commerce_feature_pipeline_mode",
+            "Configured interaction feature pipeline mode (1 for the active mode)",
+            ["mode"],
+            registry=self.registry,
+            multiprocess_mode="max",
+        )
         self.best_effort_tasks_total = Counter(
             "video_commerce_best_effort_tasks_total",
             "Best-effort background tasks by task name and outcome",
@@ -1565,6 +1585,22 @@ class ObservabilityManager:
 
     def set_ranking_triton_model_ready(self, ready: bool) -> None:
         self.ranking_triton_model_ready.set(1 if ready else 0)
+
+    def record_rate_limiter_error(self, reason: str) -> None:
+        self.rate_limiter_errors_total.labels(reason=reason).inc()
+
+    _DEPENDENCY_STATUS_VALUES = {"healthy": 1.0, "degraded": 0.5}
+
+    def set_dependency_status(self, service: str, dependency: str, status: str) -> None:
+        self.dependency_status.labels(service=service, dependency=dependency).set(
+            self._DEPENDENCY_STATUS_VALUES.get(str(status), 0.0)
+        )
+
+    def set_feature_pipeline_mode(self, mode: str) -> None:
+        for candidate in ("python", "flink_shadow", "flink"):
+            self.feature_pipeline_mode.labels(mode=candidate).set(
+                1.0 if candidate == mode else 0.0
+            )
 
     def inc_upstream_inflight(self, target: str) -> None:
         self.upstream_inflight.labels(target=target).inc()
