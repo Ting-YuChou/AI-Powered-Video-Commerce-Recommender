@@ -238,6 +238,8 @@ site/
 
 # Documentation files (exclude all .md except README.md)
 # --------------------------------------------------------
+# PROGRESS.md and AGENTS.md are local working logs and stay untracked;
+# parallel PRs that each added an entry kept conflicting on PROGRESS.md.
 *.md
 !README.md
 !LICENSE

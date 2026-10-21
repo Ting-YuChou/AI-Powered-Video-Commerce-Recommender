@@ -67,7 +67,7 @@ read legacy events, but they do not provide pipeline-version lease fencing, so
 do not run old and new content workers concurrently.
 
 ## Release Gates
-- `backend-tests` passes.
+- The `docker-backend-tests` CI check passes.
 - `integration-tests` passes before major release or infrastructure change.
 - Gateway `/readyz` is healthy.
 - `content-task-publisher` is running and content outbox backlog is draining.
