@@ -75,8 +75,10 @@ class FakeStore:
     async def mark_catalog_outbox_published(self, event_id, *, worker_id):
         self.published.append((event_id, worker_id))
 
-    async def mark_catalog_outbox_failed(self, event_id, error, *, worker_id):
+    async def mark_catalog_outbox_failed(self, event_id, error, *, worker_id, **kwargs):
         self.failed.append((event_id, error, worker_id))
+        self.failed_kwargs = kwargs
+        return None
 
 
 class FakeKafka:
@@ -196,9 +198,27 @@ async def test_catalog_activation_outbox_is_idempotent_and_lease_safe():
             == []
         )
 
-        await store.mark_catalog_outbox_failed(
-            first_claim[0]["event_id"], "retry", worker_id="worker-1"
+        assert (
+            await store.mark_catalog_outbox_failed(
+                first_claim[0]["event_id"], "retry", worker_id="worker-1"
+            )
+            is None
         )
+        # Failed rows back off instead of being re-claimed immediately.
+        assert (
+            await store.claim_catalog_outbox(
+                worker_id="worker-2", batch_size=10, lease_seconds=60
+            )
+            == []
+        )
+        async with store.session_factory.begin() as session:
+            await session.execute(
+                text(
+                    "UPDATE catalog_feature_outbox SET next_attempt_at = now() "
+                    "WHERE event_id = :event_id"
+                ),
+                {"event_id": first_claim[0]["event_id"]},
+            )
         retry_claim = await store.claim_catalog_outbox(
             worker_id="worker-2", batch_size=10, lease_seconds=60
         )
@@ -207,6 +227,32 @@ async def test_catalog_activation_outbox_is_idempotent_and_lease_safe():
         ]
         await store.mark_catalog_outbox_published(
             retry_claim[0]["event_id"], worker_id="worker-2"
+        )
+        # worker-1 still holds the second row; an oversized record goes
+        # terminal and is never claimed again, even once due.
+        assert (
+            await store.mark_catalog_outbox_failed(
+                first_claim[1]["event_id"],
+                "too large",
+                worker_id="worker-1",
+                retryable=False,
+                terminal_reason="message_too_large",
+            )
+            == "message_too_large"
+        )
+        async with store.session_factory.begin() as session:
+            await session.execute(
+                text(
+                    "UPDATE catalog_feature_outbox SET next_attempt_at = now() "
+                    "WHERE activation_id = :activation_id"
+                ),
+                {"activation_id": activation_id},
+            )
+        assert (
+            await store.claim_catalog_outbox(
+                worker_id="worker-3", batch_size=10, lease_seconds=60
+            )
+            == []
         )
 
         async with store.session_factory() as session:

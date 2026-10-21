@@ -325,10 +325,15 @@ def test_recommendation_impression_tables_are_declared_in_migration():
 
 
 class RecordingConnection:
+    """Fresh database: every existence probe reports the index as missing."""
+
     def __init__(self):
         self.statements = []
 
-    async def execute(self, statement):
+    async def scalar(self, statement, params=None):
+        return False
+
+    async def execute(self, statement, params=None):
         self.statements.append(str(statement))
 
 
@@ -364,6 +369,20 @@ def test_positive_sequence_index_is_ensured_on_startup():
     assert "ix_interaction_events_positive_user_sequence" in combined_sql
     assert "ON interaction_events (user_id, occurred_at DESC, event_id DESC)" in combined_sql
     assert "WHERE action IN ('view', 'click', 'add_to_cart', 'purchase')" in combined_sql
+
+
+def test_existing_indexes_are_not_recreated_on_startup():
+    class ExistingIndexConnection(RecordingConnection):
+        async def scalar(self, statement, params=None):
+            return True
+
+    conn = ExistingIndexConnection()
+    store = SystemStore(DatabaseConfig(enable=True))
+
+    asyncio.run(store._ensure_operational_indexes(conn))
+
+    # CREATE INDEX IF NOT EXISTS locks the table before its name check.
+    assert conn.statements == []
 
 
 def test_recommendation_impression_indexes_are_ensured_on_startup():

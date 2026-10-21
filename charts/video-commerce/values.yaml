@@ -139,8 +139,20 @@ external:
     deadLetterTopic: dead-letter-events
   database:
     enable: true
-    poolSize: 5
-    maxOverflow: 5
+    # Per-process pool (every uvicorn worker owns one). Kept small so the
+    # HPA-max fleet fits postgres.maxConnectionsBudget; workloads that need
+    # more or less override DATABASE_POOL_SIZE / DATABASE_MAX_OVERFLOW in env.
+    # tests/test_connection_budget.py enforces the total.
+    poolSize: 2
+    maxOverflow: 1
+    poolTimeoutSeconds: 2
+    poolRecycleSeconds: 1800
+    connectTimeoutSeconds: 5
+    idleInTransactionSessionTimeoutMs: 60000
+    hotPathStatementTimeoutMs: 1000
+    schemaLockTimeoutMs: 5000
+    # Set "0" behind PgBouncer transaction pooling (no prepared statements).
+    statementCacheSize: ""
     analyticsSummaryCacheTtlSeconds: 15
     trainingSequenceLookbackDays: 90
     ltrImpressionLookbackDays: 30
@@ -215,6 +227,13 @@ external:
     icebergMaintenanceDeleteBatchSize: 1000
     icebergMaintenanceRunSeconds: 300
 
+# Budget for the external Postgres this chart connects to (the chart does not
+# install Postgres). Must stay <= the server's max_connections (or PgBouncer's
+# max_db_connections) minus superuser/maintenance slots.
+postgres:
+  maxConnectionsBudget: 500
+  reservedConnections: 25
+
 pitOrchestrator:
   enabled: false
   schedule: "0 2 * * *"
@@ -225,6 +244,8 @@ pitOrchestrator:
   activeDeadlineSeconds: 7200
   env:
     MONITORING_WORKER_METRICS_PORT: "9105"
+    # Offline scans may wait for a pooled connection; no hot-path budget here.
+    DATABASE_POOL_TIMEOUT_SECONDS: "30"
   resources:
     requests:
       cpu: 250m
@@ -240,7 +261,8 @@ icebergMaintenance:
   failedJobsHistoryLimit: 1
   backoffLimit: 1
   activeDeadlineSeconds: 3600
-  env: {}
+  env:
+    DATABASE_POOL_TIMEOUT_SECONDS: "30"
   resources:
     requests:
       cpu: 250m
@@ -642,6 +664,9 @@ backend:
         API_PORT: "8003"
         SERVICE_RANKING_PORT: "8003"
         SERVICE_RANKING_WORKERS: "2"
+        # Only polls the active release pointer.
+        DATABASE_POOL_SIZE: "1"
+        DATABASE_MAX_OVERFLOW: "0"
       service:
         enabled: true
         port: 8003
@@ -684,6 +709,8 @@ backend:
         SERVICE_RANKING_COORDINATOR_HOST: ""
         SERVICE_RANKING_COORDINATOR_BIND_HOST: "0.0.0.0"
         SERVICE_RANKING_COORDINATOR_PORT: "8013"
+        DATABASE_POOL_SIZE: "1"
+        DATABASE_MAX_OVERFLOW: "0"
       service:
         enabled: true
         port: 8013
@@ -734,6 +761,9 @@ backend:
         API_PORT: "8014"
         SERVICE_RANKING_RUNNER_BIND_HOST: "0.0.0.0"
         SERVICE_RANKING_RUNNER_PORT: "8014"
+        # Release pointer sync and instance observations only; 32 replicas.
+        DATABASE_POOL_SIZE: "1"
+        DATABASE_MAX_OVERFLOW: "0"
       service:
         enabled: true
         headless: true
@@ -1025,6 +1055,9 @@ backend:
         SERVICE_TRAINER_INTERVAL_SECONDS: "3600"
         MONITORING_WORKER_METRICS_PORT: "9103"
         FEATURE_LAKE_PIT_STAGING_DIR: /var/lib/video-commerce/pit
+        DATABASE_POOL_SIZE: "3"
+        DATABASE_MAX_OVERFLOW: "2"
+        DATABASE_POOL_TIMEOUT_SECONDS: "30"
       service:
         enabled: true
         port: 9103

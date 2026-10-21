@@ -515,7 +515,7 @@ async def test_impression_slate_reports_materialized_served_at():
         [SimpleNamespace(user_id="u1", created_at=created_at)],
         [SimpleNamespace(product_id="p1", position=1)],
     )
-    store.session_factory = lambda: session
+    store.session_factory = SimpleNamespace(begin=lambda: session)
 
     slate = await store.get_recommendation_impression_slate("imp-1")
 
@@ -534,7 +534,7 @@ async def test_impression_slate_reports_outbox_served_at():
         created_at=None,
     )
     session = _SlateSession([None, outbox])
-    store.session_factory = lambda: session
+    store.session_factory = SimpleNamespace(begin=lambda: session)
 
     slate = await store.get_recommendation_impression_slate("imp-1")
 
