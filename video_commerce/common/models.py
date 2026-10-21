@@ -478,6 +478,13 @@ class ContentFeatures(BaseModel):
     ocr_tracks: List[Dict[str, Any]] = Field(
         default_factory=list, description="Temporally deduplicated OCR regions"
     )
+    modality_status: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Per-modality extraction outcome (clip, ocr, object_detection): "
+            "completed, degraded, failed, zero_norm, or skipped"
+        ),
+    )
     multimodal_schema_version: str = Field(
         "temporal_multimodal_v2", description="Content feature contract version"
     )

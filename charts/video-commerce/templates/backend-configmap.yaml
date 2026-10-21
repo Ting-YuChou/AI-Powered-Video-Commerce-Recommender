@@ -57,6 +57,7 @@ data:
   KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS: {{ .Values.external.kafka.consumerMaxPollIntervalMs | quote }}
   KAFKA_CONSUMER_HANDLER_RETRIES: {{ .Values.external.kafka.consumerHandlerRetries | quote }}
   KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS: {{ .Values.external.kafka.consumerHandlerRetryBackoffMs | quote }}
+  KAFKA_CONSUMER_HANDLER_RETRY_MAX_BACKOFF_MS: {{ .Values.external.kafka.consumerHandlerRetryMaxBackoffMs | quote }}
   KAFKA_DEAD_LETTER_ENABLE: {{ .Values.external.kafka.deadLetterEnable | quote }}
   KAFKA_DEAD_LETTER_TOPIC: {{ .Values.external.kafka.deadLetterTopic | quote }}
   FEATURE_PIPELINE_MODE: {{ .Values.appConfig.featurePipelineMode | quote }}
@@ -132,6 +133,9 @@ data:
   SERVICE_CONTENT_OUTBOX_RETENTION_DAYS: {{ .Values.appConfig.contentOutboxRetentionDays | quote }}
   SERVICE_CONTENT_ORPHAN_GRACE_SECONDS: {{ .Values.appConfig.contentOrphanGraceSeconds | quote }}
   SERVICE_CONTENT_PROCESSING_LEASE_SECONDS: {{ .Values.appConfig.contentProcessingLeaseSeconds | quote }}
+  SERVICE_CONTENT_PROCESSING_MAX_REDRIVES: {{ .Values.appConfig.contentProcessingMaxRedrives | quote }}
+  SERVICE_CONTENT_PROCESSING_REDRIVE_GRACE_SECONDS: {{ .Values.appConfig.contentProcessingRedriveGraceSeconds | quote }}
+  SERVICE_CONTENT_PROCESSING_REAPER_INTERVAL_SECONDS: {{ .Values.appConfig.contentProcessingReaperIntervalSeconds | quote }}
   VECTOR_INDEX_PATH: {{ .Values.appConfig.vectorIndexPath | quote }}
   VECTOR_BOOTSTRAP_MODE: {{ .Values.appConfig.vectorBootstrapMode | quote }}
   VECTOR_MODEL_VERSION: {{ .Values.appConfig.vectorModelVersion | quote }}

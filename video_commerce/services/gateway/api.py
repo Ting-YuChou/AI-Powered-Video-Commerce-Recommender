@@ -4,13 +4,15 @@ Gateway API for validation, auth, routing, and upload orchestration.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 import uuid
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from fastapi import Body, File, HTTPException, Request, UploadFile
@@ -40,6 +42,7 @@ from video_commerce.common.service_common import (
     RoundRobinAsyncClientPool,
 )
 from video_commerce.data_plane.system_store import (
+    ContentIdempotencyKeyInUse,
     PreparedContentTask,
     SystemStore,
     prepare_content_task,
@@ -47,6 +50,9 @@ from video_commerce.data_plane.system_store import (
 from video_commerce.common.telemetry import inject_http_headers
 
 logger = logging.getLogger(__name__)
+
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+_IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:~-]{1,128}$")
 
 app = create_service_app(
     title="Gateway API",
@@ -413,6 +419,9 @@ async def upload_content(
     runtime = app.state.runtime
     if priority not in {"low", "normal", "high"}:
         raise HTTPException(status_code=400, detail="Invalid priority")
+    idempotency_key = parse_idempotency_key(
+        request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    )
     if (
         not kafka_manager
         or not runtime.config.kafka_config.enable
@@ -428,14 +437,39 @@ async def upload_content(
         raise HTTPException(status_code=503, detail=dependency_error)
 
     suffix = validate_upload_file(file, runtime.config)
-    content_id = str(uuid.uuid4())
+    hasher = hashlib.sha256() if idempotency_key else None
     file_path, size_bytes = await stream_upload_to_temp_file(
         file=file,
         upload_dir=runtime.config.data_config.upload_dir,
         suffix=suffix,
         max_size=runtime.config.data_config.max_file_size,
         chunk_size=runtime.config.data_config.upload_chunk_size_bytes,
+        hasher=hasher,
     )
+    request_fingerprint = (
+        f"sha256:{hasher.hexdigest()}:{size_bytes}" if hasher is not None else None
+    )
+    lease_seconds = runtime.config.service_topology_config.content_outbox_lease_seconds
+    if idempotency_key:
+        try:
+            existing = await system_store.get_content_job_by_idempotency_key(
+                user_id=user_id, idempotency_key=idempotency_key
+            )
+        except Exception:
+            _remove_staged_file(file_path)
+            raise
+        if existing is not None:
+            _remove_staged_file(file_path)
+            return await _idempotent_upload_response(
+                existing,
+                request_fingerprint=request_fingerprint,
+                request=request,
+                priority=priority,
+                size_bytes=size_bytes,
+                lease_seconds=lease_seconds,
+            )
+
+    content_id = str(uuid.uuid4())
     storage_path = file_path
     try:
         if object_storage:
@@ -449,8 +483,7 @@ async def upload_content(
             if storage_path != file_path and os.path.exists(file_path):
                 os.remove(file_path)
     except Exception:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        _remove_staged_file(file_path)
         raise
 
     try:
@@ -465,30 +498,39 @@ async def upload_content(
             priority=priority,
             request_id=request.state.request_id,
             occurred_at=time.time(),
-            lease_seconds=runtime.config.service_topology_config.content_outbox_lease_seconds,
+            lease_seconds=lease_seconds,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+        )
+    except ContentIdempotencyKeyInUse:
+        # A concurrent request with the same key committed first. Our staging
+        # transaction rolled back, so this object is definitely unreferenced.
+        await _delete_uploaded_object_quietly(storage_path)
+        existing = await system_store.get_content_job_by_idempotency_key(
+            user_id=user_id, idempotency_key=idempotency_key
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=409, detail="Idempotency-Key is already in use"
+            )
+        return await _idempotent_upload_response(
+            existing,
+            request_fingerprint=request_fingerprint,
+            request=request,
+            priority=priority,
+            size_bytes=size_bytes,
+            lease_seconds=lease_seconds,
         )
     except Exception:
-        try:
-            await object_storage.delete_uploaded_object(storage_path)
-        except Exception as cleanup_error:
-            logger.warning("content_upload_cleanup_failed: %s", cleanup_error)
-        raise
+        staged_job = await _resolve_unknown_stage_outcome(content_id, storage_path)
+        if staged_job is None:
+            raise
+        # The staging COMMIT succeeded even though the call raised: the job and
+        # its outbox row are durable and the publisher will enqueue them.
+        success = False
     if not success:
         runtime.observability.record_content_upload(priority, "enqueue_failed")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": {
-                    "code": "CONTENT_ENQUEUE_PENDING",
-                    "message": "Content is durable and pending Kafka acknowledgement",
-                    "request_id": request.state.request_id,
-                    "retryable": True,
-                },
-                "content_id": content_id,
-                "status": "pending_publish",
-            },
-            headers={"Retry-After": "1"},
-        )
+        return _content_enqueue_pending_response(request, content_id)
     await feature_store.update_content_status(content_id, "queued")
     runtime.observability.record_content_upload(priority, "queued")
 
@@ -498,6 +540,137 @@ async def upload_content(
         "size_bytes": size_bytes,
         "status": "queued",
         "message": f"Content uploaded and queued for processing (priority: {priority}).",
+    }
+
+
+def parse_idempotency_key(value: Optional[str]) -> Optional[str]:
+    """Validate an optional Idempotency-Key header (1-128 URL-safe characters)."""
+    if value is None:
+        return None
+    key = value.strip()
+    if not _IDEMPOTENCY_KEY_PATTERN.fullmatch(key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Idempotency-Key must be 1-128 characters of "
+                "A-Z a-z 0-9 _ . : ~ -"
+            ),
+        )
+    return key
+
+
+def _remove_staged_file(file_path: str) -> None:
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError as exc:
+        logger.warning("content_upload_staged_file_cleanup_failed: %s", exc)
+
+
+async def _delete_uploaded_object_quietly(storage_path: str) -> None:
+    try:
+        await object_storage.delete_uploaded_object(storage_path)
+    except Exception as cleanup_error:
+        logger.warning("content_upload_cleanup_failed: %s", cleanup_error)
+
+
+async def _resolve_unknown_stage_outcome(
+    content_id: str, storage_path: str
+) -> Optional[Dict[str, Any]]:
+    """Decide whether an object is safe to delete after staging raised.
+
+    The staging transaction may have committed even if the call raised (for
+    example the connection dropped during COMMIT). Delete the object only when
+    the job is definitely absent; if the lookup also fails, keep the object and
+    let the orphan reconciler delete it after the grace period if unreferenced.
+    """
+    try:
+        job = await system_store.get_content_job(content_id)
+    except Exception as lookup_error:
+        logger.warning(
+            "content_upload_stage_outcome_unknown: content_id=%s keeping object "
+            "for reconciliation: %s",
+            content_id,
+            lookup_error,
+        )
+        return None
+    if job is None:
+        await _delete_uploaded_object_quietly(storage_path)
+        return None
+    logger.warning(
+        "content_upload_staged_despite_error: content_id=%s status=%s",
+        content_id,
+        job.get("status"),
+    )
+    return job
+
+
+def _content_enqueue_pending_response(request: Request, content_id: str) -> Response:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "code": "CONTENT_ENQUEUE_PENDING",
+                "message": "Content is durable and pending Kafka acknowledgement",
+                "request_id": request.state.request_id,
+                "retryable": True,
+            },
+            "content_id": content_id,
+            "status": "pending_publish",
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+async def _idempotent_upload_response(
+    existing: Dict[str, Any],
+    *,
+    request_fingerprint: Optional[str],
+    request: Request,
+    priority: str,
+    size_bytes: int,
+    lease_seconds: int,
+):
+    """Replay the original upload result, or reject a reused key with new bytes."""
+    runtime = app.state.runtime
+    content_id = str(existing["content_id"])
+    if existing.get("request_fingerprint") != request_fingerprint:
+        runtime.observability.record_content_upload(priority, "idempotency_conflict")
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "IDEMPOTENCY_KEY_REUSED",
+                    "message": (
+                        "Idempotency-Key was already used for a different upload"
+                    ),
+                    "request_id": request.state.request_id,
+                    "retryable": False,
+                },
+                "content_id": content_id,
+            },
+        )
+    status = str(existing.get("status") or "")
+    if status == "pending_publish" and existing.get("task_event_id"):
+        published = await _publish_staged_content_task(
+            system_store=system_store,
+            kafka_manager=kafka_manager,
+            event_id=str(existing["task_event_id"]),
+            lease_seconds=lease_seconds,
+        )
+        if not published:
+            runtime.observability.record_content_upload(priority, "enqueue_failed")
+            return _content_enqueue_pending_response(request, content_id)
+        await feature_store.update_content_status(content_id, "queued")
+        status = "queued"
+    runtime.observability.record_content_upload(priority, "idempotent_replay")
+    return {
+        "content_id": content_id,
+        "filename": existing.get("filename"),
+        "size_bytes": size_bytes,
+        "status": status,
+        "idempotent_replay": True,
+        "message": "Upload already accepted for this Idempotency-Key.",
     }
 
 
@@ -529,6 +702,8 @@ async def _stage_and_publish_content_task(
     request_id: Optional[str],
     occurred_at: float,
     lease_seconds: int,
+    idempotency_key: Optional[str] = None,
+    request_fingerprint: Optional[str] = None,
 ) -> Tuple[PreparedContentTask, bool]:
     task = prepare_content_task(
         content_id=content_id,
@@ -540,6 +715,12 @@ async def _stage_and_publish_content_task(
         request_id=request_id,
         timestamp=occurred_at,
     )
+    stage_kwargs = {}
+    if idempotency_key is not None:
+        stage_kwargs = {
+            "idempotency_key": idempotency_key,
+            "request_fingerprint": request_fingerprint,
+        }
     await system_store.stage_content_task(
         task,
         filename=filename,
@@ -547,35 +728,53 @@ async def _stage_and_publish_content_task(
         user_id=user_id,
         priority=priority,
         request_id=request_id,
+        **stage_kwargs,
     )
+    published = await _publish_staged_content_task(
+        system_store=system_store,
+        kafka_manager=kafka_manager,
+        event_id=task.event_id,
+        lease_seconds=lease_seconds,
+    )
+    return task, published
+
+
+async def _publish_staged_content_task(
+    *,
+    system_store,
+    kafka_manager,
+    event_id: str,
+    lease_seconds: int,
+) -> bool:
+    """Publish a durable outbox row inline; the publisher retries on failure."""
     worker_id = f"gateway-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     try:
         event = await system_store.claim_content_task_outbox_event(
-            task.event_id,
+            event_id,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
         )
         if event is None:
-            return task, False
+            return False
         acknowledged = await kafka_manager.publish_video_processing_task_payload(event)
         if not acknowledged:
             raise RuntimeError("Kafka broker did not acknowledge content task")
         marked = await system_store.mark_content_task_outbox_published(
-            task.event_id, worker_id=worker_id
+            event_id, worker_id=worker_id
         )
-        return task, bool(marked)
+        return bool(marked)
     except Exception as exc:
         try:
             await system_store.mark_content_task_outbox_failed(
-                task.event_id, str(exc), worker_id=worker_id
+                event_id, str(exc), worker_id=worker_id
             )
         except Exception as bookkeeping_error:
             logger.error(
                 "content_outbox_failure_record_failed: event_id=%s error=%s",
-                task.event_id,
+                event_id,
                 bookkeeping_error,
             )
-        return task, False
+        return False
 
 
 @app.get("/api/content/{content_id}/status")
@@ -733,8 +932,13 @@ async def stream_upload_to_temp_file(
     suffix: str,
     max_size: int,
     chunk_size: int,
+    hasher: Optional[Any] = None,
 ) -> Tuple[str, int]:
-    """Stream an incoming upload to disk while enforcing a size limit."""
+    """Stream an incoming upload to disk while enforcing a size limit.
+
+    When ``hasher`` (e.g. ``hashlib.sha256()``) is given it is updated with every
+    chunk, so the request fingerprint costs no second pass over the file.
+    """
     os.makedirs(upload_dir, exist_ok=True)
     bytes_written = 0
     with tempfile.NamedTemporaryFile(
@@ -754,6 +958,8 @@ async def stream_upload_to_temp_file(
                         status_code=413, detail="Uploaded file exceeds size limit"
                     )
                 tmp_file.write(chunk)
+                if hasher is not None:
+                    hasher.update(chunk)
         except Exception:
             tmp_file.close()
             if os.path.exists(file_path):

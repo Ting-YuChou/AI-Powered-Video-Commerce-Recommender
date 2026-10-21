@@ -1911,7 +1911,11 @@ class KafkaConfig(BaseSettings):
         3, description="Handler retry attempts before DLQ/fail"
     )
     consumer_handler_retry_backoff_ms: int = Field(
-        250, description="Handler retry backoff in milliseconds"
+        250, description="Base handler retry backoff in milliseconds"
+    )
+    consumer_handler_retry_max_backoff_ms: int = Field(
+        10000,
+        description="Cap for exponential handler retry backoff (jittered)",
     )
     dead_letter_enable: bool = Field(
         True, description="Publish poison messages to a dead-letter topic"
@@ -2460,6 +2464,22 @@ class ServiceTopologyConfig(BaseSettings):
     content_outbox_retention_days: int = Field(7, ge=1)
     content_orphan_grace_seconds: int = Field(86400, ge=60)
     content_processing_lease_seconds: int = Field(300, ge=30)
+    content_processing_max_redrives: int = Field(
+        3,
+        ge=0,
+        description="Expired-lease redrives before a content run is terminal failed",
+    )
+    content_processing_redrive_grace_seconds: int = Field(
+        60,
+        ge=0,
+        description="Seconds past lease expiry before the reaper redrives a run",
+    )
+    content_processing_reaper_interval_seconds: float = Field(
+        15.0, gt=0.0, description="Content processing reaper cadence"
+    )
+    content_reconcile_page_size: int = Field(
+        1000, ge=1, le=1000, description="Objects per orphan-reconcile page"
+    )
 
     class Config:
         env_prefix = "SERVICE_"

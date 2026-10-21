@@ -26,10 +26,16 @@ from typing import Dict, Any, Optional, List
 from video_commerce.data_plane.kafka_client import (
     KafkaConsumerClient,
     KafkaManager,
+    NonRetryableProcessingError,
     get_kafka_manager,
 )
 from video_commerce.common.config import Config, KafkaConfig
-from video_commerce.ml.content_processor import ContentProcessor
+from video_commerce.ml.content_processor import (
+    ContentModalityError,
+    ContentProcessor,
+    InvalidVideoError,
+    embedding_has_signal,
+)
 from video_commerce.ml.content_artifacts import (
     persist_content_features,
     publish_content_feature_artifact,
@@ -38,7 +44,6 @@ from video_commerce.common.models import ContentFeatures
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.object_storage import ObjectStorage
 from video_commerce.data_plane.system_store import SystemStore
-from video_commerce.ml.vector_search import VectorSearchEngine
 from video_commerce.common.observability import (
     ObservabilityManager,
     configure_logging,
@@ -53,13 +58,53 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class ContentPipelineMismatchError(NonRetryableProcessingError, ValueError):
+    """The task targets a pipeline version this worker does not run."""
+
+
+class ContentSourceMissingError(NonRetryableProcessingError, FileNotFoundError):
+    """The uploaded source object no longer exists."""
+
+
+class ContentInvalidVideoError(NonRetryableProcessingError, ValueError):
+    """The uploaded source cannot be decoded into frames."""
+
+
+def _is_missing_object_error(exc: BaseException) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    response = getattr(exc, "response", None) or {}
+    if not isinstance(response, dict):
+        return False
+    status = (response.get("ResponseMetadata", {}) or {}).get("HTTPStatusCode")
+    code = str((response.get("Error", {}) or {}).get("Code") or "")
+    return status == 404 or code in {"404", "NoSuchKey", "NotFound"}
+
+
+def classify_content_failure(exc: BaseException) -> BaseException:
+    """Map failures retrying cannot fix onto NonRetryableProcessingError.
+
+    The Kafka consumer sends non-retryable failures straight to the DLQ; all
+    other failures (including ContentModalityError) use the bounded retry path.
+    """
+    if isinstance(exc, NonRetryableProcessingError):
+        return exc
+    if isinstance(exc, InvalidVideoError):
+        return ContentInvalidVideoError(str(exc))
+    if _is_missing_object_error(exc):
+        return ContentSourceMissingError(str(exc))
+    return exc
+
+
 class VideoProcessorWorker:
     """
     Kafka worker for processing video content.
 
     Consumes video processing tasks from Kafka and extracts features
-    using the ContentProcessor. Results are stored in the FeatureStore
-    and vector search index.
+    using the ContentProcessor. Results are stored durably in Postgres/object
+    storage and projected into the FeatureStore. The worker does not load the
+    product vector index: content embeddings are consumed from the durable
+    artifacts by recommendation and training.
     """
 
     def __init__(self, config: Config):
@@ -70,7 +115,6 @@ class VideoProcessorWorker:
         # Initialize components
         self.content_processor: Optional[ContentProcessor] = None
         self.feature_store: Optional[FeatureStore] = None
-        self.vector_search: Optional[VectorSearchEngine] = None
         self.system_store: Optional[SystemStore] = None
         self.object_storage: Optional[ObjectStorage] = None
         self.consumer: Optional[KafkaConsumerClient] = None
@@ -117,10 +161,6 @@ class VideoProcessorWorker:
         # Initialize content processor
         self.content_processor = ContentProcessor(self.config.model_config)
         await self.content_processor.load_models()
-
-        # Initialize vector search
-        self.vector_search = VectorSearchEngine(self.config.vector_config)
-        await self.vector_search.load_index()
 
         # Initialize Kafka consumer
         self.consumer = KafkaConsumerClient(
@@ -200,7 +240,7 @@ class VideoProcessorWorker:
         lease_lost = asyncio.Event()
         try:
             if pipeline_mismatch:
-                raise ValueError(
+                raise ContentPipelineMismatchError(
                     f"content pipeline version mismatch: task={pipeline_version} "
                     f"worker={configured_pipeline_version}"
                 )
@@ -213,6 +253,9 @@ class VideoProcessorWorker:
                     lease_seconds=lease_seconds,
                 )
                 if claim["outcome"] == "lease_held":
+                    # Ack (commit the offset) instead of retrying: the holder is
+                    # alive and renewing, and if it dies the publisher's reaper
+                    # redrives the run once the lease expires.
                     self.observability.record_content_processing(
                         "duplicate_in_progress"
                     )
@@ -281,7 +324,7 @@ class VideoProcessorWorker:
 
             # Check if file exists
             if not processing_path or not os.path.exists(processing_path):
-                raise FileNotFoundError(
+                raise ContentSourceMissingError(
                     f"Uploaded file missing before processing: {file_path}"
                 )
 
@@ -323,10 +366,8 @@ class VideoProcessorWorker:
                     system_store=self.system_store,
                     feature_store=self.feature_store,
                 )
-                if features.visual_embedding:
-                    await self.vector_search.add_content_embedding(
-                        content_id, features.visual_embedding
-                    )
+
+            has_visual_embedding = self._record_modality_outcomes(features)
 
             audio_features = features.audio_features
             transcription_status = (
@@ -373,7 +414,7 @@ class VideoProcessorWorker:
                     entity_id=content_id,
                     feature_updates={
                         "status": "completed",
-                        "has_visual_embedding": features.visual_embedding is not None,
+                        "has_visual_embedding": has_visual_embedding,
                         "detected_objects": features.detected_objects,
                         "has_transcript": bool(
                             audio_features and audio_features.audio_transcript
@@ -389,7 +430,20 @@ class VideoProcessorWorker:
 
         except Exception as e:
             status = "error"
-            logger.error(f"Error processing video {content_id}: {e}")
+            classified = classify_content_failure(e)
+            if isinstance(e, ContentModalityError):
+                self.observability.record_content_modality_status(
+                    e.modality, "failed"
+                )
+            logger.error(
+                f"Error processing video {content_id}: {e}",
+                extra={
+                    "content_id": content_id,
+                    "retryable": not isinstance(
+                        classified, NonRetryableProcessingError
+                    ),
+                },
+            )
             try:
                 await self.feature_store.update_content_status(content_id, "failed")
             except Exception as status_error:
@@ -436,6 +490,8 @@ class VideoProcessorWorker:
                             "bookkeeping_error": str(status_error),
                         },
                     )
+            if classified is not e:
+                raise classified from e
             raise
 
         finally:
@@ -451,35 +507,38 @@ class VideoProcessorWorker:
                 status,
                 time.perf_counter() - started_at,
             )
-            # Cleanup temporary file
+            # Delete only the temporary copy this worker materialized (S3 mode).
+            # A local-mode storage_path is the durable upload referenced by
+            # content_jobs: retries, redrives, backfills, and duplicate deliveries
+            # being processed by another worker all still need it.
             try:
                 if (
                     cleanup_processing_path
                     and processing_path
+                    and processing_path != file_path
                     and os.path.exists(processing_path)
                 ):
                     os.remove(processing_path)
                     logger.debug(f"Cleaned up materialized file: {processing_path}")
-                elif (
-                    self.config.data_config.cleanup_temp_files
-                    and file_path
-                    and file_path == processing_path
-                    and os.path.exists(file_path)
-                ):
-                    os.remove(file_path)
-                    logger.debug(f"Cleaned up temporary file: {file_path}")
             except Exception as e:
-                logger.warning(
-                    f"Failed to cleanup file {processing_path or file_path}: {e}"
-                )
+                logger.warning(f"Failed to cleanup file {processing_path}: {e}")
+
+    def _record_modality_outcomes(self, features: ContentFeatures) -> bool:
+        """Count per-modality outcomes; return whether the visual vector is real."""
+        has_visual_embedding = embedding_has_signal(features.visual_embedding)
+        statuses = dict(features.modality_status or {})
+        if not has_visual_embedding:
+            statuses["clip"] = "zero_norm"
+            self.observability.record_content_zero_norm_embedding()
+        for modality, modality_status in sorted(statuses.items()):
+            self.observability.record_content_modality_status(
+                modality, modality_status
+            )
+        return has_visual_embedding
 
     async def _project_completed_features(self, features: ContentFeatures) -> None:
         """Repair online projections from the durable content artifact."""
         await self.feature_store.store_content_features(features.content_id, features)
-        if features.visual_embedding:
-            await self.vector_search.add_content_embedding(
-                features.content_id, features.visual_embedding
-            )
         await self.feature_store.update_content_status(features.content_id, "completed")
 
     async def _renew_processing_lease(

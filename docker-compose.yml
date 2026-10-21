@@ -46,6 +46,7 @@ x-common-service: &common-service
     KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS: ${KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS:-600000}
     KAFKA_CONSUMER_HANDLER_RETRIES: ${KAFKA_CONSUMER_HANDLER_RETRIES:-3}
     KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS: ${KAFKA_CONSUMER_HANDLER_RETRY_BACKOFF_MS:-250}
+    KAFKA_CONSUMER_HANDLER_RETRY_MAX_BACKOFF_MS: ${KAFKA_CONSUMER_HANDLER_RETRY_MAX_BACKOFF_MS:-10000}
     KAFKA_DEAD_LETTER_ENABLE: ${KAFKA_DEAD_LETTER_ENABLE:-true}
     KAFKA_DEAD_LETTER_TOPIC: ${KAFKA_DEAD_LETTER_TOPIC:-dead-letter-events}
     FEATURE_PIPELINE_MODE: ${FEATURE_PIPELINE_MODE:-flink}
@@ -270,6 +271,9 @@ x-common-service: &common-service
     SERVICE_CONTENT_OUTBOX_RETENTION_DAYS: ${SERVICE_CONTENT_OUTBOX_RETENTION_DAYS:-7}
     SERVICE_CONTENT_ORPHAN_GRACE_SECONDS: ${SERVICE_CONTENT_ORPHAN_GRACE_SECONDS:-86400}
     SERVICE_CONTENT_PROCESSING_LEASE_SECONDS: ${SERVICE_CONTENT_PROCESSING_LEASE_SECONDS:-300}
+    SERVICE_CONTENT_PROCESSING_MAX_REDRIVES: ${SERVICE_CONTENT_PROCESSING_MAX_REDRIVES:-3}
+    SERVICE_CONTENT_PROCESSING_REDRIVE_GRACE_SECONDS: ${SERVICE_CONTENT_PROCESSING_REDRIVE_GRACE_SECONDS:-60}
+    SERVICE_CONTENT_PROCESSING_REAPER_INTERVAL_SECONDS: ${SERVICE_CONTENT_PROCESSING_REAPER_INTERVAL_SECONDS:-15}
     SECURITY_AUTH_MODE: ${SECURITY_AUTH_MODE:-disabled}
     SECURITY_INTERNAL_SERVICE_KEY: ${SECURITY_INTERNAL_SERVICE_KEY:-}
     SECURITY_INTERNAL_SERVICE_KEY_FILE: ${SECURITY_INTERNAL_SERVICE_KEY_FILE:-}
@@ -1026,7 +1030,7 @@ services:
       - -ec
       - |
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic user-interactions --partitions 6 --replication-factor 1
-        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic video-processing-tasks --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic video-processing-tasks --partitions 12 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic recommendation-events --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-updates --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic feature-history-snapshots --partitions 3 --replication-factor 1

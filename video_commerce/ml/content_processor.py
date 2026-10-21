@@ -38,6 +38,32 @@ from video_commerce.ml.visual_retrieval import load_visual_retrieval_checkpoint
 logger = logging.getLogger(__name__)
 
 
+ZERO_NORM_EPSILON = 1e-6
+
+
+class ContentModalityError(RuntimeError):
+    """A required modality failed; the task is retryable (never silently zeroed)."""
+
+    def __init__(self, modality: str, message: str):
+        super().__init__(f"{modality} extraction failed: {message}")
+        self.modality = modality
+
+
+class InvalidVideoError(ValueError):
+    """The source media cannot be decoded into frames; retrying will not help."""
+
+
+def embedding_has_signal(embedding: Any) -> bool:
+    """True when an embedding has a non-trivial L2 norm."""
+    try:
+        values = np.asarray(embedding, dtype=np.float32)
+    except (TypeError, ValueError):
+        return False
+    if values.size == 0 or not np.all(np.isfinite(values)):
+        return False
+    return float(np.linalg.norm(values)) > ZERO_NORM_EPSILON
+
+
 class ContentProcessor:
     """
     Multi-modal content processor for video commerce recommendations.
@@ -323,22 +349,35 @@ class ContentProcessor:
             keyframes, video_info = await self._extract_keyframes(video_path)
 
             if not keyframes:
-                raise ValueError("No keyframes could be extracted from video")
+                raise InvalidVideoError("No keyframes could be extracted from video")
 
-            # Process visual features with CLIP
+            # Model inference runs in worker threads, one stage at a time, so the
+            # event loop keeps renewing the processing lease and heartbeats.
+            # CLIP is required: a failure raises ContentModalityError (retryable).
             visual_features = await self._extract_visual_features(keyframes)
+            modality_status = {
+                "clip": (
+                    "completed"
+                    if embedding_has_signal(visual_features["embedding"])
+                    else "zero_norm"
+                )
+            }
 
-            # Extract text using OCR
+            # OCR is optional: failures are recorded and processing continues.
             frame_timestamps = self._frame_timestamps(keyframes, video_info)
             text_features = await self._extract_text_features(
                 keyframes, frame_timestamps
             )
+            modality_status["ocr"] = str(text_features.get("status") or "completed")
 
             # Extract audio speech without making it a hard dependency for the job.
             audio_features = await self._extract_audio_features(video_path, video_info)
 
             # Basic object detection using CLIP
-            detected_objects = await self._detect_objects(keyframes)
+            detected_objects, detection_status = await self._detect_objects_with_status(
+                keyframes
+            )
+            modality_status["object_detection"] = detection_status
 
             # Analyze commerce-related content
             commerce_features = self._analyze_commerce_content(
@@ -353,7 +392,8 @@ class ContentProcessor:
             processing_time = time.time() - start_time
 
             # Create ContentFeatures object
-            retrieval_fields = self._retrieval_visual_fields(
+            retrieval_fields = await asyncio.to_thread(
+                self._retrieval_visual_fields,
                 visual_features.get("individual_embeddings", []),
                 frame_timestamps,
             )
@@ -363,6 +403,7 @@ class ContentProcessor:
                 frame_embeddings=visual_features.get("individual_embeddings", []),
                 frame_timestamps_seconds=frame_timestamps,
                 ocr_tracks=text_features.get("ocr_tracks", []),
+                modality_status=modality_status,
                 text_embedding_model=self.config.multilingual_text_model,
                 text_embedding_revision=self.config.multilingual_text_revision,
                 duration_seconds=video_info.get("duration", 0),
@@ -938,7 +979,8 @@ class ContentProcessor:
                         }
                     )
                     previous_start = start
-                segment_embeddings = self._encode_multilingual_texts(
+                segment_embeddings = await asyncio.to_thread(
+                    self._encode_multilingual_texts,
                     [segment["text"] for segment in normalized_segments],
                     prefix="passage",
                 )
@@ -1153,6 +1195,12 @@ class ContentProcessor:
     async def _extract_keyframes_opencv(
         self, video_path: str
     ) -> Tuple[List[np.ndarray], Dict]:
+        """Extract keyframes with OpenCV off the event loop."""
+        return await asyncio.to_thread(self._extract_keyframes_opencv_sync, video_path)
+
+    def _extract_keyframes_opencv_sync(
+        self, video_path: str
+    ) -> Tuple[List[np.ndarray], Dict]:
         """Extract keyframes from video file using OpenCV."""
         keyframes = []
         video_info = {}
@@ -1213,57 +1261,55 @@ class ContentProcessor:
     async def _extract_visual_features(
         self, keyframes: List[np.ndarray]
     ) -> Dict[str, Any]:
-        """Extract visual features using CLIP."""
+        """Extract visual features using CLIP; failures raise, never zero-fill."""
         try:
-            # Convert numpy arrays to PIL Images
-            pil_images = []
-            for frame in keyframes:
-                # Enhance image quality
-                img = Image.fromarray(frame)
-                enhancer = ImageEnhance.Sharpness(img)
-                img = enhancer.enhance(1.2)  # Slight sharpness increase
-                pil_images.append(img)
+            features = await asyncio.to_thread(self._clip_visual_features, keyframes)
+        except Exception as exc:
+            logger.error(f"Error extracting visual features: {exc}")
+            raise ContentModalityError("clip", type(exc).__name__) from exc
+        if features["frame_count"] == 0:
+            raise ContentModalityError("clip", "no frame embeddings were produced")
+        return features
 
-            # Process images in batches
-            all_embeddings = []
+    def _clip_visual_features(self, keyframes: List[np.ndarray]) -> Dict[str, Any]:
+        # Convert numpy arrays to PIL Images
+        pil_images = []
+        for frame in keyframes:
+            # Enhance image quality
+            img = Image.fromarray(frame)
+            enhancer = ImageEnhance.Sharpness(img)
+            img = enhancer.enhance(1.2)  # Slight sharpness increase
+            pil_images.append(img)
 
-            for i in range(0, len(pil_images), self.batch_size):
-                batch_images = pil_images[i : i + self.batch_size]
+        # Process images in batches
+        all_embeddings = []
 
-                # Preprocess images
-                inputs = self.clip_processor(
-                    images=batch_images, return_tensors="pt", padding=True
-                ).to(self.device)
+        for i in range(0, len(pil_images), self.batch_size):
+            batch_images = pil_images[i : i + self.batch_size]
 
-                # Extract features
-                with torch.no_grad():
-                    image_features = self.clip_model.get_image_features(**inputs)
-                    # Normalize embeddings
-                    image_features = image_features / image_features.norm(
-                        dim=1, keepdim=True
-                    )
-                    all_embeddings.append(image_features.cpu())
+            # Preprocess images
+            inputs = self.clip_processor(
+                images=batch_images, return_tensors="pt", padding=True
+            ).to(self.device)
 
-            # Combine all embeddings
-            if all_embeddings:
-                all_embeddings = torch.cat(all_embeddings, dim=0)
-                # Average pool across frames
-                video_embedding = all_embeddings.mean(dim=0)
-            else:
-                video_embedding = torch.zeros(self.config.embedding_dim)
+            # Extract features
+            with torch.no_grad():
+                image_features = self.clip_model.get_image_features(**inputs)
+                # Normalize embeddings
+                image_features = image_features / image_features.norm(
+                    dim=1, keepdim=True
+                )
+                all_embeddings.append(image_features.cpu())
 
-            return {
-                "embedding": video_embedding,
-                "frame_count": len(keyframes),
-                "individual_embeddings": all_embeddings.numpy().tolist(),
-            }
-
-        except Exception as e:
-            logger.error(f"Error extracting visual features: {e}")
-            return {
-                "embedding": torch.zeros(self.config.embedding_dim),
-                "frame_count": 0,
-            }
+        if not all_embeddings:
+            return {"embedding": None, "frame_count": 0, "individual_embeddings": []}
+        # Combine all embeddings and average pool across frames
+        stacked = torch.cat(all_embeddings, dim=0)
+        return {
+            "embedding": stacked.mean(dim=0),
+            "frame_count": len(keyframes),
+            "individual_embeddings": stacked.numpy().tolist(),
+        }
 
     @staticmethod
     def _frame_timestamps(keyframes: List[np.ndarray], video_info: Dict) -> List[float]:
@@ -1288,100 +1334,24 @@ class ContentProcessor:
         keyframes: List[np.ndarray],
         frame_timestamps: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
-        """Extract text using OCR from keyframes."""
-        from video_commerce.ml.video_ocr import OCRRegion, TemporalOCRTracker
+        """Extract text using OCR from keyframes.
 
-        all_text_blocks = []
-        regions = []
-        price_mentions = []
+        OCR is optional for the job: an OCR failure is reported through
+        ``status`` ("failed", or "degraded" when only some frames failed) and the
+        remaining modalities still complete.
+        """
+        from video_commerce.ml.video_ocr import TemporalOCRTracker
+
         frame_timestamps = frame_timestamps or [float(i) for i in range(len(keyframes))]
 
         try:
-            for i, frame in enumerate(keyframes):
-                if self.config.ocr_backend == "paddle":
-                    if self.ocr_region_extractor is None:
-                        raise RuntimeError(
-                            "PaddleOCR region extractor is not initialized"
-                        )
-                    frame_regions = self.ocr_region_extractor.extract(
-                        frame,
-                        frame_index=i,
-                        timestamp_seconds=float(frame_timestamps[i]),
-                    )
-                    regions.extend(frame_regions)
-                    all_text_blocks.extend(region.text for region in frame_regions)
-                    for region in frame_regions:
-                        if self._is_price_mention(region.text):
-                            price_mentions.append(
-                                {
-                                    "text": region.text,
-                                    "frame": i,
-                                    "confidence": region.recognition_confidence,
-                                }
-                            )
-                    continue
-                # Convert to PIL Image for OCR
-                pil_image = Image.fromarray(frame)
-
-                # Enhance image for better OCR
-                enhancer = ImageEnhance.Contrast(pil_image)
-                enhanced_image = enhancer.enhance(1.5)
-
-                # Perform OCR
-                try:
-                    ocr_data = pytesseract.image_to_data(
-                        enhanced_image, config=self.ocr_config, output_type=Output.DICT
-                    )
-
-                    # Extract text blocks with confidence > 30
-                    frame_text = []
-                    for j, confidence in enumerate(ocr_data["conf"]):
-                        if int(confidence) > 30:
-                            text = ocr_data["text"][j].strip()
-                            if text and len(text) > 1:
-                                frame_text.append(text)
-                                width = max(1, int(enhanced_image.width))
-                                height = max(1, int(enhanced_image.height))
-                                left = int(ocr_data.get("left", [0])[j]) / width
-                                top = int(ocr_data.get("top", [0])[j]) / height
-                                right = (
-                                    left + int(ocr_data.get("width", [0])[j]) / width
-                                )
-                                bottom = (
-                                    top + int(ocr_data.get("height", [0])[j]) / height
-                                )
-                                score = max(0.0, min(1.0, float(confidence) / 100.0))
-                                regions.append(
-                                    OCRRegion(
-                                        text=text,
-                                        polygon=[
-                                            (left, top),
-                                            (right, top),
-                                            (right, bottom),
-                                            (left, bottom),
-                                        ],
-                                        detection_confidence=score,
-                                        recognition_confidence=score,
-                                        frame_index=i,
-                                        timestamp_seconds=float(frame_timestamps[i]),
-                                    )
-                                )
-
-                                # Check for price patterns
-                                if self._is_price_mention(text):
-                                    price_mentions.append(
-                                        {
-                                            "text": text,
-                                            "frame": i,
-                                            "confidence": confidence,
-                                        }
-                                    )
-
-                    if frame_text:
-                        all_text_blocks.extend(frame_text)
-
-                except Exception as ocr_error:
-                    logger.warning(f"OCR failed for frame {i}: {ocr_error}")
+            (
+                regions,
+                price_mentions,
+                failed_frames,
+            ) = await asyncio.to_thread(
+                self._ocr_regions_sync, keyframes, frame_timestamps
+            )
 
             tracker = TemporalOCRTracker(
                 text_similarity_threshold=float(
@@ -1393,7 +1363,9 @@ class ContentProcessor:
             )
             tracks = tracker.track(regions)
             unique_text_blocks = [track.text for track in tracks if len(track.text) > 2]
-            text_embeddings = self._encode_ocr_texts([track.text for track in tracks])
+            text_embeddings = await asyncio.to_thread(
+                self._encode_ocr_texts, [track.text for track in tracks]
+            )
             track_payloads = [
                 {
                     "text": track.text,
@@ -1406,17 +1378,114 @@ class ContentProcessor:
                 }
                 for index, track in enumerate(tracks)
             ]
+            if keyframes and failed_frames >= len(keyframes):
+                status = "failed"
+            elif failed_frames:
+                status = "degraded"
+            else:
+                status = "completed"
 
             return {
                 "text_blocks": unique_text_blocks,
                 "price_mentions": price_mentions,
                 "total_text_regions": len(regions),
                 "ocr_tracks": track_payloads,
+                "status": status,
             }
 
         except Exception as e:
             logger.error(f"Error extracting text features: {e}")
-            return {"text_blocks": [], "price_mentions": [], "total_text_regions": 0}
+            return {
+                "text_blocks": [],
+                "price_mentions": [],
+                "total_text_regions": 0,
+                "status": "failed",
+            }
+
+    def _ocr_regions_sync(
+        self, keyframes: List[np.ndarray], frame_timestamps: List[float]
+    ) -> Tuple[List[Any], List[Dict[str, Any]], int]:
+        """Run PaddleOCR or pytesseract over every keyframe (blocking)."""
+        from video_commerce.ml.video_ocr import OCRRegion
+
+        regions = []
+        price_mentions = []
+        failed_frames = 0
+        for i, frame in enumerate(keyframes):
+            if self.config.ocr_backend == "paddle":
+                if self.ocr_region_extractor is None:
+                    raise RuntimeError("PaddleOCR region extractor is not initialized")
+                frame_regions = self.ocr_region_extractor.extract(
+                    frame,
+                    frame_index=i,
+                    timestamp_seconds=float(frame_timestamps[i]),
+                )
+                regions.extend(frame_regions)
+                for region in frame_regions:
+                    if self._is_price_mention(region.text):
+                        price_mentions.append(
+                            {
+                                "text": region.text,
+                                "frame": i,
+                                "confidence": region.recognition_confidence,
+                            }
+                        )
+                continue
+            # Convert to PIL Image for OCR
+            pil_image = Image.fromarray(frame)
+
+            # Enhance image for better OCR
+            enhancer = ImageEnhance.Contrast(pil_image)
+            enhanced_image = enhancer.enhance(1.5)
+
+            # Perform OCR
+            try:
+                ocr_data = pytesseract.image_to_data(
+                    enhanced_image, config=self.ocr_config, output_type=Output.DICT
+                )
+
+                # Extract text blocks with confidence > 30
+                for j, confidence in enumerate(ocr_data["conf"]):
+                    if int(confidence) > 30:
+                        text = ocr_data["text"][j].strip()
+                        if text and len(text) > 1:
+                            width = max(1, int(enhanced_image.width))
+                            height = max(1, int(enhanced_image.height))
+                            left = int(ocr_data.get("left", [0])[j]) / width
+                            top = int(ocr_data.get("top", [0])[j]) / height
+                            right = left + int(ocr_data.get("width", [0])[j]) / width
+                            bottom = top + int(ocr_data.get("height", [0])[j]) / height
+                            score = max(0.0, min(1.0, float(confidence) / 100.0))
+                            regions.append(
+                                OCRRegion(
+                                    text=text,
+                                    polygon=[
+                                        (left, top),
+                                        (right, top),
+                                        (right, bottom),
+                                        (left, bottom),
+                                    ],
+                                    detection_confidence=score,
+                                    recognition_confidence=score,
+                                    frame_index=i,
+                                    timestamp_seconds=float(frame_timestamps[i]),
+                                )
+                            )
+
+                            # Check for price patterns
+                            if self._is_price_mention(text):
+                                price_mentions.append(
+                                    {
+                                        "text": text,
+                                        "frame": i,
+                                        "confidence": confidence,
+                                    }
+                                )
+
+            except Exception as ocr_error:
+                failed_frames += 1
+                logger.warning(f"OCR failed for frame {i}: {ocr_error}")
+        return regions, price_mentions, failed_frames
 
     def _encode_ocr_texts(self, texts: List[str]) -> List[List[float]]:
         """Embed OCR strings in the frozen multilingual passage space."""
@@ -1449,79 +1518,89 @@ class ContentProcessor:
 
         return False
 
-    async def _detect_objects(self, keyframes: List[np.ndarray]) -> List[str]:
-        """Detect objects in keyframes using CLIP zero-shot classification."""
+    async def _detect_objects_with_status(
+        self, keyframes: List[np.ndarray]
+    ) -> Tuple[List[str], str]:
+        """CLIP zero-shot object detection off the event loop.
+
+        Detection is optional: a failure returns no objects with status
+        "failed" instead of aborting the job.
+        """
         try:
-            # Common product categories for e-commerce
-            candidate_objects = [
-                "clothing",
-                "shoes",
-                "electronics",
-                "phone",
-                "laptop",
-                "headphones",
-                "watch",
-                "jewelry",
-                "bag",
-                "furniture",
-                "book",
-                "toy",
-                "food",
-                "cosmetics",
-                "skincare",
-                "perfume",
-                "glasses",
-                "hat",
-                "shirt",
-                "dress",
-                "jacket",
-                "pants",
-                "sneakers",
-                "boots",
-                "camera",
-                "tablet",
-                "speaker",
-                "gaming",
-                "kitchen",
-                "home decor",
-            ]
-
-            detected_objects = set()
-
-            # Sample a few representative frames
-            sample_frames = keyframes[:: max(1, len(keyframes) // 3)][:3]
-
-            for frame in sample_frames:
-                pil_image = Image.fromarray(frame)
-
-                # Prepare text queries for zero-shot classification
-                text_queries = [f"a photo of {obj}" for obj in candidate_objects]
-
-                # Process with CLIP
-                inputs = self.clip_processor(
-                    images=[pil_image],
-                    text=text_queries,
-                    return_tensors="pt",
-                    padding=True,
-                ).to(self.device)
-
-                with torch.no_grad():
-                    outputs = self.clip_model(**inputs)
-                    logits_per_image = outputs.logits_per_image
-                    probs = logits_per_image.softmax(dim=1)
-
-                # Get top predictions above threshold
-                top_probs, top_indices = torch.topk(probs[0], k=5)
-
-                for prob, idx in zip(top_probs, top_indices):
-                    if prob.item() > 0.1:  # Threshold for object detection
-                        detected_objects.add(candidate_objects[idx.item()])
-
-            return list(detected_objects)
-
+            return await asyncio.to_thread(self._detect_objects_sync, keyframes), (
+                "completed"
+            )
         except Exception as e:
             logger.error(f"Error detecting objects: {e}")
-            return []
+            return [], "failed"
+
+    def _detect_objects_sync(self, keyframes: List[np.ndarray]) -> List[str]:
+        # Common product categories for e-commerce
+        candidate_objects = [
+            "clothing",
+            "shoes",
+            "electronics",
+            "phone",
+            "laptop",
+            "headphones",
+            "watch",
+            "jewelry",
+            "bag",
+            "furniture",
+            "book",
+            "toy",
+            "food",
+            "cosmetics",
+            "skincare",
+            "perfume",
+            "glasses",
+            "hat",
+            "shirt",
+            "dress",
+            "jacket",
+            "pants",
+            "sneakers",
+            "boots",
+            "camera",
+            "tablet",
+            "speaker",
+            "gaming",
+            "kitchen",
+            "home decor",
+        ]
+
+        detected_objects = set()
+
+        # Sample a few representative frames
+        sample_frames = keyframes[:: max(1, len(keyframes) // 3)][:3]
+
+        for frame in sample_frames:
+            pil_image = Image.fromarray(frame)
+
+            # Prepare text queries for zero-shot classification
+            text_queries = [f"a photo of {obj}" for obj in candidate_objects]
+
+            # Process with CLIP
+            inputs = self.clip_processor(
+                images=[pil_image],
+                text=text_queries,
+                return_tensors="pt",
+                padding=True,
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.clip_model(**inputs)
+                logits_per_image = outputs.logits_per_image
+                probs = logits_per_image.softmax(dim=1)
+
+            # Get top predictions above threshold
+            top_probs, top_indices = torch.topk(probs[0], k=5)
+
+            for prob, idx in zip(top_probs, top_indices):
+                if prob.item() > 0.1:  # Threshold for object detection
+                    detected_objects.add(candidate_objects[idx.item()])
+
+        return list(detected_objects)
 
     def _categories_from_text(self, text_values: List[str]) -> Dict[str, float]:
         """Map bilingual commerce words to canonical catalog categories."""

@@ -16,6 +16,7 @@ Features:
 import json
 import asyncio
 import logging
+import random
 from typing import Dict, Any, Optional, Callable, List
 from datetime import datetime
 import time
@@ -335,6 +336,28 @@ class KafkaProducerClient:
             self.observability.record_kafka_produce(topic, status)
 
 
+class NonRetryableProcessingError(Exception):
+    """A handler failure that retrying cannot fix; the message goes to the DLQ.
+
+    Examples: a task for another pipeline version, a source object that no longer
+    exists, or a video that cannot be decoded.
+    """
+
+
+def handler_retry_backoff_seconds(
+    attempt: int,
+    *,
+    base_ms: int,
+    max_ms: int,
+    jitter: Callable[[], float] = random.random,
+) -> float:
+    """Exponential backoff with equal jitter: delay/2 + U(0, delay/2)."""
+    exponent = min(max(0, int(attempt) - 1), 16)
+    delay_ms = min(max(0, int(max_ms)), max(0, int(base_ms)) * (2**exponent))
+    half = delay_ms / 2.0
+    return (half + half * float(jitter())) / 1000.0
+
+
 class KafkaConsumerClient:
     """
     Async Kafka consumer for processing messages from topics.
@@ -488,8 +511,7 @@ class KafkaConsumerClient:
                 return True
             except Exception as exc:
                 last_error = exc
-                if self.observability is not None:
-                    self.observability.record_kafka_retry(message.topic, self.group_id)
+                retryable = not isinstance(exc, NonRetryableProcessingError)
                 logger.error(
                     "Error processing Kafka message",
                     extra={
@@ -498,14 +520,28 @@ class KafkaConsumerClient:
                         "offset": message.offset,
                         "attempt": attempt,
                         "max_attempts": max_attempts,
+                        "retryable": retryable,
                         "error": str(exc),
                     },
                 )
+                if not retryable:
+                    break
                 if attempt < max_attempts:
-                    backoff_seconds = (
-                        max(0, self.config.consumer_handler_retry_backoff_ms) / 1000.0
-                    ) * attempt
-                    await asyncio.sleep(backoff_seconds)
+                    if self.observability is not None:
+                        self.observability.record_kafka_retry(
+                            message.topic, self.group_id
+                        )
+                    await asyncio.sleep(
+                        handler_retry_backoff_seconds(
+                            attempt,
+                            base_ms=self.config.consumer_handler_retry_backoff_ms,
+                            max_ms=getattr(
+                                self.config,
+                                "consumer_handler_retry_max_backoff_ms",
+                                10000,
+                            ),
+                        )
+                    )
 
         if last_error and self.config.dead_letter_enable:
             return await self._publish_dead_letter(message, last_error)

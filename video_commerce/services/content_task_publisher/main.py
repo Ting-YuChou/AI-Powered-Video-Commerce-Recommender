@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import socket
 import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ContentTaskPublisher:
@@ -77,26 +80,132 @@ class ContentTaskPublisher:
                     )
         return published
 
+    async def reap_expired_processing_runs(self) -> dict[str, int]:
+        """Redrive runs whose worker died while holding the processing lease."""
+        counts = await self.system_store.redrive_expired_content_processing_runs(
+            grace_seconds=int(self.config.content_processing_redrive_grace_seconds),
+            max_redrives=int(self.config.content_processing_max_redrives),
+            batch_size=int(self.config.content_outbox_batch_size),
+        )
+        if self.observability is not None:
+            for outcome, count in counts.items():
+                if count:
+                    self.observability.record_content_processing_redrives(
+                        outcome, count
+                    )
+        return counts
+
     async def reconcile_objects(self, *, now: float | None = None) -> dict[str, int]:
+        """Delete old upload objects no content job references, one page at a time."""
         if self.object_storage is None or not self.upload_prefix:
             return {"orphan_objects": 0, "deleted_objects": 0}
         current_time = time.time() if now is None else float(now)
         grace = int(self.config.content_orphan_grace_seconds)
-        referenced = await self.system_store.list_content_job_storage_paths()
-        objects = await self.object_storage.list_storage_objects(self.upload_prefix)
+        page_size = int(getattr(self.config, "content_reconcile_page_size", 1000))
         orphan_objects = 0
         deleted_objects = 0
-        for item in objects:
-            if item.uri in referenced:
-                continue
-            orphan_objects += 1
-            if current_time - float(item.last_modified) >= grace:
-                await self.object_storage.delete_uploaded_object(item.uri)
-                deleted_objects += 1
+        async for page in self.object_storage.iter_upload_object_pages(
+            self.upload_prefix, page_size=page_size
+        ):
+            referenced = await self.system_store.filter_referenced_storage_paths(
+                [item.uri for item in page]
+            )
+            for item in page:
+                if item.uri in referenced:
+                    continue
+                orphan_objects += 1
+                if current_time - float(item.last_modified) >= grace:
+                    await self.object_storage.delete_uploaded_object(item.uri)
+                    deleted_objects += 1
         return {
             "orphan_objects": orphan_objects,
             "deleted_objects": deleted_objects,
         }
+
+    async def run_iteration(self, state: "_LoopState") -> int:
+        """One publisher pass; maintenance runs on its own cadence."""
+        state.stage = "publish"
+        published = await self.publish_once()
+        if self.observability is not None:
+            state.stage = "outbox_stats"
+            self.observability.update_content_task_outbox(
+                **(await self.system_store.get_content_task_outbox_stats())
+            )
+        now = time.monotonic()
+        if now - state.last_reaped_at >= float(
+            self.config.content_processing_reaper_interval_seconds
+        ):
+            state.stage = "reaper"
+            await self.reap_expired_processing_runs()
+            state.last_reaped_at = now
+        if now - state.last_reconciled_at >= 300.0:
+            state.stage = "reconcile"
+            counts = await self.reconcile_objects()
+            if self.observability is not None:
+                self.observability.update_content_orphans(**counts)
+            state.last_reconciled_at = now
+        if now - state.last_pruned_at >= 3600.0:
+            state.stage = "prune"
+            await self.system_store.prune_content_task_outbox(
+                retention_days=self.config.content_outbox_retention_days
+            )
+            state.last_pruned_at = now
+        return published
+
+
+class _LoopState:
+    def __init__(self) -> None:
+        self.stage = "publish"
+        self.last_reaped_at = float("-inf")
+        self.last_reconciled_at = float("-inf")
+        self.last_pruned_at = float("-inf")
+        self.consecutive_failures = 0
+
+
+def failure_backoff_seconds(
+    consecutive_failures: int, *, base_seconds: float, max_seconds: float = 30.0
+) -> float:
+    """Exponential backoff for a failing publisher loop, capped at max_seconds."""
+    exponent = min(max(0, int(consecutive_failures) - 1), 16)
+    return min(float(max_seconds), max(0.05, float(base_seconds)) * (2**exponent))
+
+
+async def run_publisher_loop(
+    publisher: ContentTaskPublisher,
+    stop_event: asyncio.Event,
+    *,
+    poll_seconds: float,
+    observability: Any = None,
+) -> None:
+    """Keep publishing until stopped; one failing iteration never ends the loop."""
+    state = _LoopState()
+    while not stop_event.is_set():
+        try:
+            published = await publisher.run_iteration(state)
+            state.consecutive_failures = 0
+            delay = 0.0 if published else float(poll_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            state.consecutive_failures += 1
+            delay = failure_backoff_seconds(
+                state.consecutive_failures, base_seconds=poll_seconds
+            )
+            logger.exception(
+                "content_task_publisher_iteration_failed",
+                extra={
+                    "stage": state.stage,
+                    "consecutive_failures": state.consecutive_failures,
+                    "backoff_seconds": delay,
+                },
+            )
+            if observability is not None:
+                observability.record_content_task_publisher_error(state.stage)
+        if delay > 0:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
 
 
 async def main() -> None:
@@ -142,37 +251,13 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
-    last_reconciled_at = 0.0
-    last_pruned_at = 0.0
     try:
-        while not stop_event.is_set():
-            published = await publisher.publish_once()
-            observability.update_content_task_outbox(
-                **(await store.get_content_task_outbox_stats())
-            )
-            now = time.monotonic()
-            if now - last_reconciled_at >= 300.0:
-                observability.update_content_orphans(
-                    **(await publisher.reconcile_objects())
-                )
-                last_reconciled_at = now
-            if now - last_pruned_at >= 3600.0:
-                await store.prune_content_task_outbox(
-                    retention_days=(
-                        config.service_topology_config.content_outbox_retention_days
-                    )
-                )
-                last_pruned_at = now
-            if published == 0:
-                try:
-                    await asyncio.wait_for(
-                        stop_event.wait(),
-                        timeout=(
-                            config.service_topology_config.content_outbox_poll_seconds
-                        ),
-                    )
-                except asyncio.TimeoutError:
-                    pass
+        await run_publisher_loop(
+            publisher,
+            stop_event,
+            poll_seconds=config.service_topology_config.content_outbox_poll_seconds,
+            observability=observability,
+        )
     finally:
         await close_kafka()
         await store.close()
