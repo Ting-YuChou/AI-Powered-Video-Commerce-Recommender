@@ -13,12 +13,17 @@ coordinator, coordinator to runners, `runner_healthcheck` probes) may start with
 an `A` frame:
 
 ```json
-{"v": 1, "ts": 1800000000, "nonce": "<32 hex chars>", "mac": "<hex>"}
+{"v": 1, "role": "runner", "ts": 1800000000, "nonce": "<32 hex chars>", "mac": "<hex>"}
 ```
 
 - `K = HMAC-SHA256(SECURITY_INTERNAL_SERVICE_KEY, "ranking-runtime-v1")`
-- `mac = HMAC-SHA256(K, "ranking-auth|v1|<ts>|<nonce>")`, compared with
+- `mac = HMAC-SHA256(K, "ranking-auth|v1|<role>|<ts>|<nonce>")`, compared with
   `hmac.compare_digest`.
+- `role` is the role of the server being dialled: `coordinator` or `runner`.
+  A server rejects a handshake for another role (`wrong_role`), so a frame
+  captured on the coordinator path cannot be replayed against a runner, or the
+  other way round. `runner_healthcheck` defaults to `--role runner`; the
+  coordinator readiness probes pass `--role coordinator`.
 - The server accepts `ts` within ±60 seconds of its clock and rejects nonces it
   has already seen (bounded in-memory LRU, 65,536 entries per process).
 - After a successful handshake the rest of the connection is trusted; frames are
@@ -28,13 +33,15 @@ What this does and does not protect:
 
 - It stops pods without the internal key from ranking, reading metrics, or
   probing health over the protocol.
-- It does not encrypt traffic or bind the handshake to later frames. An on-path
-  attacker could still observe or hijack an authenticated connection. Use the
-  NetworkPolicies below (and a mesh/mTLS if your threat model needs it).
-- The replay cache is per process. A captured handshake replayed to a different
-  runner within the 60 second window is accepted by that runner. Under a flood
-  of valid handshakes, older nonces can also be evicted while still inside the
-  window. Both cases need the internal key or a captured handshake first.
+- It does not encrypt traffic or bind the handshake to later frames. Frames
+  after the handshake are unauthenticated, so an on-path attacker could still
+  observe or hijack an authenticated connection. Use the NetworkPolicies
+  below. mTLS (or a mesh that provides it) is future work.
+- The replay cache is per process. A captured handshake replayed to another
+  replica of the same role, or to the same pod after a restart, within the
+  60 second window is accepted. Under a flood of valid handshakes, older
+  nonces can also be evicted while still inside the window. Both cases need
+  the internal key or a captured handshake first.
 - Keep node clocks synchronized (NTP). Skew beyond 60 seconds rejects
   otherwise valid handshakes with reason `expired`.
 
@@ -61,6 +68,15 @@ by every ranking client and server.
   cannot verify handshakes. `required` therefore refuses to start without a key.
 - With `ENVIRONMENT=production`, `disabled` is rejected at startup. The internal
   key is already mandatory there.
+- With `ENVIRONMENT=production` and any mode other than `required` with a key,
+  coordinator and runner log `ranking_runtime_auth_not_enforced` at startup.
+  `permissive` is meant only for the rolling upgrade; follow
+  [Flipping To `required`](#flipping-to-required) once
+  `result="unauthenticated"` stays at zero.
+- `SECURITY_INTERNAL_SERVICE_KEY` must be identical on every ranking client and
+  server and must rotate in lockstep. A *wrong* key gets 401 and a closed
+  connection even in `permissive` mode; only a *missing* handshake is
+  tolerated. See key rotation below.
 
 ### Metric
 
@@ -71,8 +87,8 @@ servers. `role` is `coordinator` or `runner`. `result` is one of:
 - `unauthenticated`: connection used without `A` and accepted in permissive
   mode. Counted once per connection.
 - `rejected`: connection used without `A` in required mode.
-- `invalid_mac`, `expired`, `replayed`, `malformed`, `unsupported_version`:
-  a failed handshake.
+- `invalid_mac`, `expired`, `replayed`, `malformed`, `unsupported_version`,
+  `wrong_role`: a failed handshake.
 
 Coordinator metrics are exported through ranking-service `/metrics`, which
 proxies the coordinator's `M` frame. Runners have no scrape target by default,
@@ -123,6 +139,12 @@ workload, then return to `required`. Note that permissive mode still rejects a
 - `D` (drain) and `U` (undrain) are accepted only from loopback peers
   (`127.0.0.0/8`, `::1`, IPv4-mapped loopback). A remote peer gets 403
   `ranking_runner_lifecycle_loopback_only`, even when it is authenticated.
+- The loopback gate trusts the pod's network namespace. Anything else in the
+  pod is trusted too, and a sidecar or service mesh that terminates inbound
+  traffic and re-originates it from `127.0.0.x` (for example Istio or Linkerd
+  with inbound capture) would make every remote peer look local. Re-check
+  this gate before adopting a mesh, e.g. by excluding port 8014 from inbound
+  capture.
 - The Helm `preStop` hook already runs
   `runner_healthcheck --host 127.0.0.1 --operation drain` inside the pod.
 - To return a drained runner to service without restarting it, exec into the
@@ -135,9 +157,10 @@ workload, then return to `required`. Note that permissive mode still rejects a
 - The coordinator marks a runner protocol-drained when the runner answers a
   batch with `ranking_runner_draining`. The coordinator clears that state only
   after the runner returns an explicit HTTP-200 health response with status
-  `ready` or `degraded`. The coordinator health check (its readiness probe
-  every 10 seconds) issues these. Seeing the runner in DNS again does not clear
-  the drain.
+  `ready` or `degraded`, from a health probe that started after the drain was
+  observed (an older in-flight probe may carry a pre-drain answer). The
+  coordinator health check (its readiness probe every 10 seconds) issues
+  these. Seeing the runner in DNS again does not clear the drain.
 
 ## NetworkPolicy
 

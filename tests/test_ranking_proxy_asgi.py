@@ -289,9 +289,12 @@ def test_internal_request_check_uses_constant_time_key_comparison(monkeypatch):
         return {"headers": headers}
 
     assert app._is_internal_request(scope(b"secret-key")) is True
+    # Non-ASCII header bytes round-trip through latin-1 unchanged.
+    assert app._is_internal_request(scope("sécret".encode("utf-8"))) is False
     assert app._is_internal_request(scope(b"secret-kez")) is False
     assert app._is_internal_request(scope(None)) is False
     assert compared == [
         (b"secret-key", b"secret-key"),
+        ("sécret".encode("utf-8"), b"secret-key"),
         (b"secret-kez", b"secret-key"),
     ]

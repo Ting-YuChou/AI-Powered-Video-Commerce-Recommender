@@ -690,6 +690,8 @@ backend:
           - health
           - --timeout-seconds
           - "5"
+          - --role
+          - coordinator
         initialDelaySeconds: 30
         periodSeconds: 10
         timeoutSeconds: 5

@@ -1,14 +1,20 @@
 """Connection-level authentication for the internal ranking TCP protocol.
 
 Every coordinator/runner connection may open with an ``A`` frame whose JSON
-body is ``{"v": 1, "ts": <unix seconds>, "nonce": <hex>, "mac": <hex>}``.
-``mac = HMAC-SHA256(K, "ranking-auth|v1|<ts>|<nonce>")`` where
-``K = HMAC-SHA256(SECURITY_INTERNAL_SERVICE_KEY, "ranking-runtime-v1")``.
+body is ``{"v": 1, "role": <server role>, "ts": <unix seconds>,
+"nonce": <hex>, "mac": <hex>}``.
+``mac = HMAC-SHA256(K, "ranking-auth|v1|<role>|<ts>|<nonce>")`` where
+``K = HMAC-SHA256(SECURITY_INTERNAL_SERVICE_KEY, "ranking-runtime-v1")`` and
+``role`` is the role of the server being dialled (``coordinator`` or
+``runner``), so a handshake captured for one role is useless against the other.
 Servers accept timestamps within the clock-skew window, reject nonces they
 have already seen, and treat the rest of the connection as authenticated.
 
 This authenticates peers; it does not encrypt or integrity-protect later
-frames. Network policy remains the boundary against on-path attackers.
+frames, and the nonce cache is per process (a captured handshake replays
+against another replica of the same role, or after a restart, within the
+skew window). Network policy remains the boundary against on-path attackers;
+mTLS is future work.
 
 ``RANKING_RUNTIME_AUTH_MODE`` controls rollout:
 
@@ -26,6 +32,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import secrets
 import time
@@ -40,6 +47,9 @@ AUTH_MODE_DISABLED = "disabled"
 AUTH_MODE_PERMISSIVE = "permissive"
 AUTH_MODE_REQUIRED = "required"
 AUTH_MODES = (AUTH_MODE_DISABLED, AUTH_MODE_PERMISSIVE, AUTH_MODE_REQUIRED)
+ROLE_COORDINATOR = "coordinator"
+ROLE_RUNNER = "runner"
+SERVER_ROLES = (ROLE_COORDINATOR, ROLE_RUNNER)
 DEFAULT_AUTH_MODE = AUTH_MODE_PERMISSIVE
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60
 DEFAULT_NONCE_CACHE_SIZE = 65536
@@ -68,8 +78,8 @@ def derive_runtime_key(internal_service_key: str) -> bytes:
     ).digest()
 
 
-def compute_auth_mac(runtime_key: bytes, ts: int, nonce: str) -> str:
-    message = f"{_MAC_PREFIX}|{int(ts)}|{nonce}".encode("utf-8")
+def compute_auth_mac(runtime_key: bytes, role: str, ts: int, nonce: str) -> str:
+    message = f"{_MAC_PREFIX}|{role}|{int(ts)}|{nonce}".encode("utf-8")
     return hmac.new(runtime_key, message, hashlib.sha256).hexdigest()
 
 
@@ -118,20 +128,24 @@ class RankingRuntimeAuthSettings:
 
     def build_handshake_body(
         self,
+        server_role: str,
         *,
         now: Optional[float] = None,
         nonce: Optional[str] = None,
     ) -> bytes:
         if self.runtime_key is None:
             raise ValueError("ranking runtime auth key is not configured")
+        if server_role not in SERVER_ROLES:
+            raise ValueError(f"unknown ranking runtime server role: {server_role}")
         ts = int(time.time() if now is None else now)
         nonce = nonce or secrets.token_hex(16)
         return json.dumps(
             {
                 "v": AUTH_PROTOCOL_VERSION,
+                "role": server_role,
                 "ts": ts,
                 "nonce": nonce,
-                "mac": compute_auth_mac(self.runtime_key, ts, nonce),
+                "mac": compute_auth_mac(self.runtime_key, server_role, ts, nonce),
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -251,18 +265,23 @@ class RankingRuntimeAuthenticator:
         if not isinstance(payload, dict):
             return "malformed"
         version = payload.get("v")
+        role = payload.get("role")
         ts = payload.get("ts")
         nonce = payload.get("nonce")
         mac = payload.get("mac")
         if version != AUTH_PROTOCOL_VERSION or isinstance(version, bool):
             return "unsupported_version"
+        if not isinstance(role, str):
+            return "malformed"
+        if role != self.role:
+            return "wrong_role"
         if not isinstance(ts, int) or isinstance(ts, bool):
             return "malformed"
         if not isinstance(nonce, str) or not 16 <= len(nonce) <= 128:
             return "malformed"
         if not isinstance(mac, str) or len(mac) > 128:
             return "malformed"
-        expected = compute_auth_mac(runtime_key, ts, nonce)
+        expected = compute_auth_mac(runtime_key, self.role, ts, nonce)
         if not hmac.compare_digest(
             expected.encode("ascii"), mac.encode("utf-8", errors="replace")
         ):
@@ -294,6 +313,33 @@ class RankingRuntimeAuthenticator:
             self.observability, "record_ranking_runtime_auth"
         ):
             self.observability.record_ranking_runtime_auth(self.role, result)
+
+
+def warn_if_weak_production_auth(
+    settings: RankingRuntimeAuthSettings, *, role: str, logger: logging.Logger
+) -> bool:
+    """Log a startup warning when production still accepts unauthenticated peers.
+
+    Returns True when the warning was emitted. Config validation already
+    rejects ``disabled`` in production; ``permissive`` is allowed for rolling
+    upgrades but should be flipped to ``required`` once
+    ``video_commerce_ranking_runtime_auth_total{result="unauthenticated"}``
+    stays at zero (docs/operations/ranking-runtime-auth.md).
+    """
+    if os.getenv("ENVIRONMENT", "").lower() != "production":
+        return False
+    if settings.mode == AUTH_MODE_REQUIRED and settings.runtime_key is not None:
+        return False
+    logger.warning(
+        "ranking_runtime_auth_not_enforced",
+        extra={
+            "role": role,
+            "runtime_auth_mode": settings.mode,
+            "runtime_auth_key_configured": settings.runtime_key is not None,
+            "runbook": "docs/operations/ranking-runtime-auth.md",
+        },
+    )
+    return True
 
 
 def is_loopback_peer(peername: Any) -> bool:

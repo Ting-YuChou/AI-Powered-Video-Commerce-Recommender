@@ -29,6 +29,7 @@ from video_commerce.ranking_runtime.ranking_auth import (
     RankingRuntimeAuthenticator,
     RankingRuntimeAuthSettings,
     is_loopback_peer,
+    warn_if_weak_production_auth,
 )
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     DRAIN_OPERATION,
@@ -94,6 +95,9 @@ class RankingRunner:
             RankingRuntimeAuthSettings.from_config(self.config),
             role="runner",
             observability=self.runtime.observability,
+        )
+        warn_if_weak_production_auth(
+            self.authenticator.settings, role="runner", logger=logger
         )
 
         if self.config.database_config.enable:

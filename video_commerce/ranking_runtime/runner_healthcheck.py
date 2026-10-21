@@ -11,7 +11,11 @@ import asyncio
 import json
 from typing import Any, Dict, Optional
 
-from video_commerce.ranking_runtime.ranking_auth import RankingRuntimeAuthSettings
+from video_commerce.ranking_runtime.ranking_auth import (
+    ROLE_RUNNER,
+    SERVER_ROLES,
+    RankingRuntimeAuthSettings,
+)
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     DRAIN_OPERATION,
     HEALTH_OPERATION,
@@ -38,6 +42,7 @@ async def probe_runner(
     timeout_seconds: float = 2.0,
     allow_degraded: bool = False,
     auth_settings: Optional[RankingRuntimeAuthSettings] = None,
+    role: str = ROLE_RUNNER,
 ) -> Dict[str, Any]:
     if operation not in OPERATIONS:
         raise ValueError(f"unsupported ranking runner operation: {operation}")
@@ -54,6 +59,7 @@ async def probe_runner(
                 reader,
                 writer,
                 auth_settings,
+                server_role=role,
                 timeout_seconds=timeout_seconds,
                 peer_label=f"{host}:{port}",
             )
@@ -95,6 +101,12 @@ def main() -> int:
     parser.add_argument("--operation", choices=tuple(OPERATIONS), default="health")
     parser.add_argument("--timeout-seconds", type=float, default=2.0)
     parser.add_argument("--allow-degraded", action="store_true")
+    parser.add_argument(
+        "--role",
+        choices=SERVER_ROLES,
+        default=ROLE_RUNNER,
+        help="Role of the probed server; bound into the auth handshake",
+    )
     args = parser.parse_args()
     try:
         asyncio.run(
@@ -104,6 +116,7 @@ def main() -> int:
                 operation=args.operation,
                 timeout_seconds=args.timeout_seconds,
                 allow_degraded=args.allow_degraded,
+                role=args.role,
             )
         )
     except Exception as exc:

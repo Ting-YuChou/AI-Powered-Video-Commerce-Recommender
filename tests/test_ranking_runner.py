@@ -468,3 +468,24 @@ async def test_required_runner_rejects_unauthenticated_probe_and_frames():
         await _close_server(server)
 
     assert runner._draining is False
+
+
+@pytest.mark.asyncio
+async def test_healthcheck_role_must_match_probed_server():
+    runner = RankingRunner()
+    runner.ranking_model = HealthyRankingModel()
+    settings = RankingRuntimeAuthSettings.build("required", "runner-test-key")
+    runner.authenticator = RankingRuntimeAuthenticator(settings, role="runner")
+    server, port = await _serve_runner(runner)
+    try:
+        with pytest.raises(RankingRuntimeAuthRejected, match="wrong_role"):
+            await probe_runner(
+                host="127.0.0.1",
+                port=port,
+                operation="health",
+                timeout_seconds=1.0,
+                auth_settings=settings,
+                role="coordinator",
+            )
+    finally:
+        await _close_server(server)

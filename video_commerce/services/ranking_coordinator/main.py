@@ -34,6 +34,7 @@ from video_commerce.ranking_runtime.ranking_auth import (
     ConnectionAuthState,
     RankingRuntimeAuthenticator,
     RankingRuntimeAuthSettings,
+    warn_if_weak_production_auth,
 )
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     HEALTH_OPERATION,
@@ -87,6 +88,7 @@ class RankingCoordinator:
             role="coordinator",
             observability=self.runtime.observability,
         )
+        warn_if_weak_production_auth(auth_settings, role="coordinator", logger=logger)
 
         if self.config.database_config.enable:
             self.system_store = SystemStore(

@@ -517,8 +517,10 @@ class RankingProxyApp:
         provided_key = headers.get(header_name)
         if provided_key is None:
             return False
+        # _headers() decoded the raw header bytes as latin-1; re-encode the
+        # same way so the comparison sees exactly the bytes on the wire.
         return hmac.compare_digest(
-            provided_key.encode("utf-8"), expected_key.encode("utf-8")
+            provided_key.encode("latin-1"), expected_key.encode("utf-8")
         )
 
     def _request_id(self, scope) -> str:

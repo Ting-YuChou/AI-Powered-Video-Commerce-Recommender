@@ -10,6 +10,7 @@ from typing import Optional
 
 from video_commerce.ranking_runtime.ranking_auth import (
     AUTH_OPERATION,
+    ROLE_COORDINATOR,
     RankingRuntimeAuthSettings,
 )
 
@@ -115,6 +116,7 @@ async def perform_client_handshake(
     writer: asyncio.StreamWriter,
     auth_settings: RankingRuntimeAuthSettings,
     *,
+    server_role: str,
     timeout_seconds: float,
     peer_label: str,
 ) -> bool:
@@ -124,7 +126,9 @@ async def perform_client_handshake(
     permissive client keeps using a legacy server that rejected ``A`` as an
     unknown operation. Raises ``RankingRuntimeAuthRejected`` otherwise.
     """
-    writer.write(encode_request(AUTH_OPERATION, auth_settings.build_handshake_body()))
+    writer.write(
+        encode_request(AUTH_OPERATION, auth_settings.build_handshake_body(server_role))
+    )
     await asyncio.wait_for(writer.drain(), timeout=timeout_seconds)
     response = decode_response(
         await asyncio.wait_for(read_frame(reader), timeout=timeout_seconds)
@@ -164,13 +168,55 @@ def auth_rejection_detail(response: RankingCoordinatorResponse) -> Optional[str]
 
 
 def abort_writer(writer: Optional[asyncio.StreamWriter]) -> None:
-    """Close a transport without awaiting, safe while a task is being cancelled."""
+    """Drop a transport immediately, safe while a task is being cancelled.
+
+    ``abort()`` discards any unflushed buffer, so a stalled peer cannot keep
+    the socket (and a half-written frame) alive the way ``close()`` would.
+    """
     if writer is None:
         return
+    transport = getattr(writer, "transport", None)
     try:
-        writer.close()
+        if transport is not None:
+            transport.abort()
+        else:
+            writer.close()
     except Exception:
         pass
+
+
+async def acquire_from_queue(queue: "asyncio.Queue", timeout_seconds: float):
+    """``queue.get()`` with a timeout that never loses a dequeued item.
+
+    ``asyncio.wait_for(queue.get(), ...)`` can drop an item that was dequeued
+    just as the waiter is cancelled or times out (Python 3.12+), or swallow
+    the cancellation (3.10). Either way a fixed-size pool can shrink or a
+    cancelled request keeps running. Here a getter that completes after we
+    stop waiting puts its item straight back.
+    """
+    getter = asyncio.ensure_future(queue.get())
+    try:
+        done, _pending = await asyncio.wait({getter}, timeout=timeout_seconds)
+    except BaseException:
+        _reclaim_getter(queue, getter)
+        raise
+    if not done:
+        _reclaim_getter(queue, getter)
+        raise asyncio.TimeoutError()
+    return getter.result()
+
+
+def _reclaim_getter(queue: "asyncio.Queue", getter: "asyncio.Future") -> None:
+    def put_back(task: "asyncio.Future") -> None:
+        if task.cancelled() or task.exception() is not None:
+            return
+        queue.put_nowait(task.result())
+
+    if getter.done():
+        put_back(getter)
+        return
+    getter.cancel()
+    getter.add_done_callback(put_back)
 
 
 class _CoordinatorConnection:
@@ -195,11 +241,16 @@ class _CoordinatorConnection:
         # connection left in this state has an unread (or partially read)
         # response on the wire and must never serve another request.
         self.in_flight = False
+        # Terminal: set once this connection was torn down after a failure or
+        # cancellation. Pools replace closed connections instead of reusing.
+        self.closed = False
 
     @property
     def reusable(self) -> bool:
-        return not self.in_flight and (
-            self.writer is None or not self.writer.is_closing()
+        return (
+            not self.closed
+            and not self.in_flight
+            and (self.writer is None or not self.writer.is_closing())
         )
 
     async def request(
@@ -242,9 +293,12 @@ class _CoordinatorConnection:
         return response
 
     async def _ensure_connected(self) -> None:
+        if self.closed:
+            raise RankingCoordinatorUnavailable("ranking coordinator connection closed")
         if self.writer is not None and not self.writer.is_closing():
             return
-        self.close_nowait()
+        # The peer closed an idle connection; drop it and dial again.
+        self._reset_transport()
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
@@ -265,6 +319,7 @@ class _CoordinatorConnection:
                     reader,
                     writer,
                     self.auth_settings,
+                    server_role=ROLE_COORDINATOR,
                     timeout_seconds=self.connect_timeout_seconds,
                     peer_label=f"{self.host}:{self.port}",
                 )
@@ -287,7 +342,7 @@ class _CoordinatorConnection:
         self.authenticated = authenticated
         self.in_flight = False
 
-    def close_nowait(self) -> None:
+    def _reset_transport(self) -> None:
         writer = self.writer
         self.reader = None
         self.writer = None
@@ -295,12 +350,20 @@ class _CoordinatorConnection:
         self.in_flight = False
         abort_writer(writer)
 
+    def close_nowait(self) -> None:
+        self.closed = True
+        self._reset_transport()
+
     async def close(self) -> None:
+        """Graceful shutdown for idle connections (pool close)."""
         writer = self.writer
-        self.close_nowait()
+        self.closed = True
+        self.reader = None
+        self.writer = None
         if writer is None:
             return
         try:
+            writer.close()
             await writer.wait_closed()
         except Exception:
             pass
@@ -329,16 +392,28 @@ class RankingCoordinatorClientPool:
             maxsize=self.pool_size
         )
         for _ in range(self.pool_size):
-            self._queue.put_nowait(
-                _CoordinatorConnection(
-                    self.host,
-                    self.port,
-                    connect_timeout_seconds=self.connect_timeout_seconds,
-                    request_timeout_seconds=self.request_timeout_seconds,
-                    auth_settings=self.auth_settings,
-                )
-            )
+            self._queue.put_nowait(self._new_connection())
         self._closed = False
+
+    def _new_connection(self) -> _CoordinatorConnection:
+        return _CoordinatorConnection(
+            self.host,
+            self.port,
+            connect_timeout_seconds=self.connect_timeout_seconds,
+            request_timeout_seconds=self.request_timeout_seconds,
+            auth_settings=self.auth_settings,
+        )
+
+    def _release(self, connection: _CoordinatorConnection) -> None:
+        if self._closed:
+            connection.close_nowait()
+            return
+        if not connection.reusable:
+            # Never hand a closed or interrupted connection to the next
+            # borrower; keep the pool size by slotting in a fresh one.
+            connection.close_nowait()
+            connection = self._new_connection()
+        self._queue.put_nowait(connection)
 
     async def rank(self, raw_body: bytes) -> RankingCoordinatorResponse:
         return await self.request(RANK_OPERATION, raw_body)
@@ -355,9 +430,8 @@ class RankingCoordinatorClientPool:
         if self._closed:
             raise RankingCoordinatorUnavailable("ranking coordinator client is closed")
         try:
-            connection = await asyncio.wait_for(
-                self._queue.get(),
-                timeout=self.request_timeout_seconds,
+            connection = await acquire_from_queue(
+                self._queue, self.request_timeout_seconds
             )
         except asyncio.TimeoutError as exc:
             raise RankingCoordinatorTimeout(
@@ -369,14 +443,15 @@ class RankingCoordinatorClientPool:
             except (RankingCoordinatorTimeout, RankingRuntimeAuthRejected):
                 raise
             except RankingCoordinatorUnavailable:
+                # Typically a pooled connection the coordinator closed while
+                # idle, or a refused connect. Retry once, on a fresh
+                # connection when the failed one was torn down.
+                if not connection.reusable:
+                    connection.close_nowait()
+                    connection = self._new_connection()
                 return await connection.request(operation, body)
         finally:
-            # Never hand a connection with an interrupted request back to the
-            # pool; reset it so the next borrower reconnects cleanly.
-            if self._closed or not connection.reusable:
-                connection.close_nowait()
-            if not self._closed:
-                self._queue.put_nowait(connection)
+            self._release(connection)
 
     async def aclose(self) -> None:
         self._closed = True

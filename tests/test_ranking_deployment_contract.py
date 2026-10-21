@@ -128,6 +128,22 @@ def test_ranking_runtime_auth_mode_is_wired_with_permissive_default():
     assert "RANKING_RUNTIME_AUTH_MODE:" in configmap
 
 
+def test_coordinator_probes_bind_coordinator_role_into_auth():
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+    values = yaml.safe_load((CHART / "values.yaml").read_text())
+    workloads = values["backend"]["workloads"]
+
+    coordinator_probe = compose["services"]["ranking-coordinator"]["healthcheck"]["test"]
+    runner_probe = compose["services"]["ranking-runner"]["healthcheck"]["test"]
+    readiness = workloads["rankingCoordinator"]["probes"]["readinessCommand"]
+
+    assert coordinator_probe[coordinator_probe.index("--role") + 1] == "coordinator"
+    assert readiness[readiness.index("--role") + 1] == "coordinator"
+    # Runner probes rely on the runner default.
+    assert "--role" not in runner_probe
+    assert "--role" not in workloads["rankingRunner"]["probes"]["readinessCommand"]
+
+
 def test_ranking_runner_prestop_drains_over_loopback():
     runner = yaml.safe_load((CHART / "values.yaml").read_text())["backend"][
         "workloads"

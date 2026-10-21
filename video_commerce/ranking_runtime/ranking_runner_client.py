@@ -9,7 +9,10 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
-from video_commerce.ranking_runtime.ranking_auth import RankingRuntimeAuthSettings
+from video_commerce.ranking_runtime.ranking_auth import (
+    ROLE_RUNNER,
+    RankingRuntimeAuthSettings,
+)
 from video_commerce.ranking_runtime.ranking_coordinator_client import (
     HEALTH_OPERATION,
     RankingCoordinatorProtocolError,
@@ -72,6 +75,9 @@ class RankingRunnerEndpoint:
     missing_refresh_count: int = 0
     draining: bool = False
     drain_reason: str = ""
+    # Monotonic time of the latest protocol drain; health probes started
+    # before it cannot clear it.
+    drained_at: float = 0.0
     batch_payload_versions: Tuple[int, ...] = (1,)
     connections: Optional[asyncio.Queue["_RunnerConnection"]] = field(
         default=None, init=False, repr=False
@@ -98,13 +104,16 @@ class _RunnerConnection:
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.authenticated = False
-        # See _CoordinatorConnection.in_flight.
+        # See _CoordinatorConnection.in_flight / .closed.
         self.in_flight = False
+        self.closed = False
 
     @property
     def reusable(self) -> bool:
-        return not self.in_flight and (
-            self.writer is None or not self.writer.is_closing()
+        return (
+            not self.closed
+            and not self.in_flight
+            and (self.writer is None or not self.writer.is_closing())
         )
 
     async def request(
@@ -164,9 +173,13 @@ class _RunnerConnection:
         return response
 
     async def _ensure_connected(self) -> None:
+        if self.closed:
+            raise RankingRunnerUnavailable(
+                f"ranking runner connection closed: {self.endpoint.label}"
+            )
         if self.writer is not None and not self.writer.is_closing():
             return
-        self.close_nowait()
+        self._reset_transport()
         last_error: Optional[BaseException] = None
         for _ in range(2):
             try:
@@ -184,6 +197,7 @@ class _RunnerConnection:
                         reader,
                         writer,
                         self.auth_settings,
+                        server_role=ROLE_RUNNER,
                         timeout_seconds=self.connect_timeout_seconds,
                         peer_label=self.endpoint.label,
                     )
@@ -205,7 +219,7 @@ class _RunnerConnection:
             f"ranking runner unavailable: {self.endpoint.label}"
         ) from last_error
 
-    def close_nowait(self) -> None:
+    def _reset_transport(self) -> None:
         writer = self.writer
         self.reader = None
         self.writer = None
@@ -213,12 +227,20 @@ class _RunnerConnection:
         self.in_flight = False
         abort_writer(writer)
 
+    def close_nowait(self) -> None:
+        self.closed = True
+        self._reset_transport()
+
     async def close(self) -> None:
+        """Graceful shutdown for idle connections (pool close)."""
         writer = self.writer
-        self.close_nowait()
+        self.closed = True
+        self.reader = None
+        self.writer = None
         if writer is None:
             return
         try:
+            writer.close()
             await writer.wait_closed()
         except Exception:
             pass
@@ -542,6 +564,7 @@ class RankingRunnerClientPool:
 
     async def health_check(self) -> dict:
         await self._refresh_endpoints_if_needed()
+        probe_started_at = time.monotonic()
         checks = await asyncio.gather(
             *(self._health_endpoint(endpoint) for endpoint in self.endpoints),
             return_exceptions=True,
@@ -567,7 +590,7 @@ class RankingRunnerClientPool:
                 health_payload = self._response_payload(check)
                 endpoint_status = str(health_payload.get("status") or "ready")
                 if endpoint_status in UNDRAINED_HEALTH_STATUSES:
-                    self._clear_protocol_drain(endpoint)
+                    self._clear_protocol_drain(endpoint, probe_started_at)
                 if endpoint_status == "degraded":
                     degraded += 1
                 else:
@@ -648,15 +671,16 @@ class RankingRunnerClientPool:
             endpoint.last_seen_at = now
         endpoint.connections = asyncio.Queue(maxsize=endpoint.max_inflight_batches)
         for _ in range(endpoint.max_inflight_batches):
-            endpoint.connections.put_nowait(
-                _RunnerConnection(
-                    endpoint,
-                    connect_timeout_seconds=self.connect_timeout_seconds,
-                    request_timeout_seconds=self.request_timeout_seconds,
-                    auth_settings=self.auth_settings,
-                )
-            )
+            endpoint.connections.put_nowait(self._new_connection(endpoint))
         self._record_endpoint_capacity(endpoint)
+
+    def _new_connection(self, endpoint: RankingRunnerEndpoint) -> _RunnerConnection:
+        return _RunnerConnection(
+            endpoint,
+            connect_timeout_seconds=self.connect_timeout_seconds,
+            request_timeout_seconds=self.request_timeout_seconds,
+            auth_settings=self.auth_settings,
+        )
 
     def _endpoint_has_capacity(
         self,
@@ -702,9 +726,11 @@ class RankingRunnerClientPool:
         connection: _RunnerConnection,
     ) -> None:
         if not connection.reusable:
-            # An interrupted request leaves an unread response on the stream;
-            # reset so the next borrower opens a clean connection.
+            # Never return a closed or interrupted connection (an interrupted
+            # request leaves an unread response on the stream); keep the
+            # endpoint's capacity by slotting in a fresh one.
             connection.close_nowait()
+            connection = self._new_connection(endpoint)
         if endpoint.connections is not None:
             try:
                 endpoint.connections.put_nowait(connection)
@@ -727,16 +753,22 @@ class RankingRunnerClientPool:
     def _mark_draining(self, endpoint: RankingRunnerEndpoint) -> None:
         endpoint.draining = True
         endpoint.drain_reason = "protocol"
+        endpoint.drained_at = time.monotonic()
         self._record_endpoint_event(endpoint, "draining")
         self._record_endpoint_capacity(endpoint)
 
-    def _clear_protocol_drain(self, endpoint: RankingRunnerEndpoint) -> None:
+    def _clear_protocol_drain(
+        self, endpoint: RankingRunnerEndpoint, probe_started_at: float
+    ) -> None:
         """Undo a protocol drain once the runner itself reports non-draining.
 
         Only an explicit health response may clear it: DNS presence alone does
-        not prove the runner was undrained.
+        not prove the runner was undrained. A probe that started before the
+        drain was observed may carry a pre-drain answer, so it is ignored.
         """
         if not endpoint.draining or endpoint.drain_reason != "protocol":
+            return
+        if probe_started_at <= endpoint.drained_at:
             return
         endpoint.draining = False
         endpoint.drain_reason = ""
@@ -795,12 +827,7 @@ class RankingRunnerClientPool:
         self,
         endpoint: RankingRunnerEndpoint,
     ) -> RankingCoordinatorResponse:
-        connection = _RunnerConnection(
-            endpoint,
-            connect_timeout_seconds=self.connect_timeout_seconds,
-            request_timeout_seconds=self.request_timeout_seconds,
-            auth_settings=self.auth_settings,
-        )
+        connection = self._new_connection(endpoint)
         try:
             return await connection.request(HEALTH_OPERATION)
         finally:
