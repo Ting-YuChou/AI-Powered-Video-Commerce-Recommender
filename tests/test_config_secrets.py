@@ -497,9 +497,7 @@ def test_production_config_requires_explicit_pit_staging_limit(monkeypatch, tmp_
 
 
 def _production_secret_env(monkeypatch, tmp_path):
-    internal_key_file = tmp_path / "internal_key.txt"
-    internal_key_file.write_text("internal-key\n", encoding="utf-8")
-    for env_name in ("API_API_KEY", "SECURITY_INTERNAL_SERVICE_KEY", "OBJECT_STORAGE_BACKEND"):
+    for env_name in ("OBJECT_STORAGE_BACKEND", "SECURITY_INTERNAL_SERVICE_KEY_FILE"):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("RANKING_VALUE_CURRENCY", "USD")
     monkeypatch.setenv("ENVIRONMENT", "production")
@@ -513,7 +511,7 @@ def _production_secret_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MODEL_ARTIFACT_GENERATION_ROOT", str(tmp_path / "generations"))
     monkeypatch.setenv("SECURITY_AUTH_MODE", "api_key")
     monkeypatch.setenv("API_API_KEY", "api-key")
-    monkeypatch.setenv("SECURITY_INTERNAL_SERVICE_KEY_FILE", str(internal_key_file))
+    monkeypatch.setenv("SECURITY_INTERNAL_SERVICE_KEY", "internal-key")
     monkeypatch.setenv("REDIS_PASSWORD", "redis-password")
     monkeypatch.setenv(
         "DATABASE_URL",

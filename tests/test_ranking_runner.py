@@ -316,6 +316,9 @@ async def test_protocol_healthcheck_validates_ready_payload():
             port=port,
             operation="health",
             timeout_seconds=1.0,
+            # Explicit: other tests can leak SECURITY_INTERNAL_SERVICE_KEY into
+            # os.environ via *_FILE resolution, and this stub reads one frame.
+            auth_settings=RankingRuntimeAuthSettings(),
         )
     finally:
         server.close()
