@@ -2523,6 +2523,37 @@ class ServiceTopologyConfig(BaseSettings):
         10.0,
         description="HTTP write timeout from gateway to internal services",
     )
+    interaction_ingest_publish_timeout_ms: int = Field(
+        3000,
+        ge=1,
+        description=(
+            "How long interaction ingest waits for a Kafka publish before "
+            "answering 503; keep it well below proxy_read_timeout_seconds so "
+            "the client sees the 503 instead of a gateway 504"
+        ),
+    )
+    interaction_ingest_max_outstanding_publishes: int = Field(
+        1000,
+        ge=1,
+        description=(
+            "Kafka publishes one ingest worker may have unresolved, including "
+            "ones that outlived the publish timeout; above it ingest answers "
+            "503 at once"
+        ),
+    )
+    interaction_ingest_breaker_failure_threshold: int = Field(
+        5,
+        ge=1,
+        description=(
+            "Consecutive Kafka publish timeouts or failures that make ingest "
+            "answer 503 at once until a probe publish succeeds"
+        ),
+    )
+    interaction_ingest_breaker_cooldown_seconds: float = Field(
+        5.0,
+        gt=0.0,
+        description="How long ingest fails fast before letting one probe publish through",
+    )
     proxy_pool_timeout_seconds: float = Field(
         5.0,
         description="HTTP connection-pool acquisition timeout in the gateway",
@@ -3085,6 +3116,16 @@ class Config:
             errors.append("Speech-to-text maximum transcript length must be positive")
         if self.kafka_config.consumer_max_poll_interval_ms <= 0:
             errors.append("Kafka consumer maximum poll interval must be positive")
+        topology = self.service_topology_config
+        if (
+            topology.interaction_ingest_publish_timeout_ms
+            >= topology.proxy_read_timeout_seconds * 1000
+        ):
+            errors.append(
+                "SERVICE_INTERACTION_INGEST_PUBLISH_TIMEOUT_MS must be below "
+                "SERVICE_PROXY_READ_TIMEOUT_SECONDS, or the gateway times out "
+                "before ingest can answer 503"
+            )
         if os.getenv("ENVIRONMENT", "").lower() == "production":
             if not (
                 os.getenv("RANKING_VALUE_CURRENCY")

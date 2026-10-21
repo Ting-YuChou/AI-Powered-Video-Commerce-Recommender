@@ -170,6 +170,10 @@ class KafkaProducerClient:
         self.producer: Optional[AIOKafkaProducer] = None
         self.is_connected = False
         self._lock = asyncio.Lock()
+        # Set by an owner that reconnects in the background (the supervisor).
+        # Without it an unreachable broker never marks the producer down.
+        self.on_unreachable: Optional[Callable[[], None]] = None
+        self._retiring: set = set()
 
         logger.info(
             f"KafkaProducerClient initialized with servers: {config.bootstrap_servers}"
@@ -223,6 +227,38 @@ class KafkaProducerClient:
         except Exception as exc:
             logger.debug("kafka_producer_discard_failed: %s", exc)
 
+    def _note_send_failure(self, producer, exc: BaseException) -> None:
+        """Mark the producer down once aiokafka gave up reaching the broker.
+
+        aiokafka keeps a started producer through a broker outage and fails
+        each buffered send only after its batch expires, so ``is_connected``
+        would otherwise stay True for the whole outage. With a reconnecting
+        owner, drop the producer (stopping it flushes or fails its other
+        buffered sends) and let the owner start a fresh one.
+        """
+        if self.on_unreachable is None or producer is None:
+            return
+        if self.producer is not producer:
+            return
+        if not (
+            isinstance(exc, (KafkaConnectionError, KafkaTimeoutError))
+            or getattr(exc, "retriable", False)
+        ):
+            return
+        logger.warning("Kafka broker unreachable, dropping producer: %r", exc)
+        self.producer = None
+        self.is_connected = False
+        task = asyncio.create_task(self._stop_retired(producer))
+        self._retiring.add(task)
+        task.add_done_callback(self._retiring.discard)
+        self.on_unreachable()
+
+    async def _stop_retired(self, producer) -> None:
+        try:
+            await producer.stop()
+        except Exception as exc:
+            logger.debug("kafka_retired_producer_stop_failed: %s", exc)
+
     async def stop(self):
         """Stop the Kafka producer connection."""
         async with self._lock:
@@ -269,13 +305,14 @@ class KafkaProducerClient:
                 self._record_produce(topic, "error")
                 return False
 
+        producer = self.producer
         try:
             # Add timestamp to message
             value["_kafka_timestamp"] = datetime.utcnow().isoformat()
             value["_kafka_topic"] = topic
 
             # Send message
-            await self.producer.send_and_wait(
+            await producer.send_and_wait(
                 topic=topic, value=value, key=key, headers=headers
             )
 
@@ -286,6 +323,7 @@ class KafkaProducerClient:
         except KafkaError as e:
             logger.error(f"Failed to send message to topic '{topic}': {e}")
             self._record_produce(topic, "error")
+            self._note_send_failure(producer, e)
             return False
         except Exception as e:
             logger.error(f"Unexpected error sending message: {e}")
@@ -318,8 +356,9 @@ class KafkaProducerClient:
 
         value["_kafka_timestamp"] = datetime.utcnow().isoformat()
         value["_kafka_topic"] = topic
+        producer = self.producer
         try:
-            await self.producer.send_and_wait(
+            await producer.send_and_wait(
                 topic=topic, value=value, key=key, headers=headers
             )
         except MessageSizeTooLargeError as exc:
@@ -333,6 +372,7 @@ class KafkaProducerClient:
             transient = isinstance(
                 exc, (KafkaConnectionError, KafkaTimeoutError, asyncio.TimeoutError)
             ) or bool(getattr(exc, "retriable", False))
+            self._note_send_failure(producer, exc)
             raise KafkaPublishError(
                 f"Failed to send message to topic '{topic}': {exc}",
                 transient=transient,
@@ -1317,6 +1357,11 @@ async def init_kafka(config: KafkaConfig, observability=None) -> KafkaManager:
     return manager
 
 
+# A dropped producer means the broker was up a moment ago, so poll for it more
+# often than the startup retry does; failed attempts are cheap.
+RECONNECT_MAX_BACKOFF_SECONDS = 5.0
+
+
 class KafkaProducerSupervisor:
     """Start a service's Kafka manager and keep retrying in the background.
 
@@ -1357,6 +1402,7 @@ class KafkaProducerSupervisor:
             logger.warning("%s Kafka init failed: %s", self.service_name, exc)
             return False
         self.manager = manager
+        manager.producer.on_unreachable = self.reconnect_in_background
         if self.on_connected is not None:
             self.on_connected(manager)
         return True
@@ -1377,6 +1423,37 @@ class KafkaProducerSupervisor:
                 logger.info("%s Kafka producer connected after retry", self.service_name)
                 return
             delay = min(self.max_backoff_seconds, delay * 2)
+
+    def reconnect_in_background(self) -> None:
+        """Restart a started manager's dropped producer off the request path.
+
+        The producer calls this when it drops itself after the broker became
+        unreachable, and callers that fail fast on ``producer.is_connected``
+        call it too, since they never reach the inline reconnect in
+        ``KafkaProducerClient.send``. Repeated calls share one loop.
+        """
+        if not self.config.enable or self.manager is None:
+            return
+        if self.manager.producer.is_connected:
+            return
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._reconnect_loop(self.manager))
+
+    async def _reconnect_loop(self, manager: "KafkaManager") -> None:
+        delay = self.initial_backoff_seconds
+        while not manager.producer.is_connected:
+            try:
+                await manager.producer.start()
+            except Exception as exc:
+                logger.warning(
+                    "%s Kafka producer reconnect failed: %s", self.service_name, exc
+                )
+                await asyncio.sleep(delay)
+                delay = min(
+                    self.max_backoff_seconds, RECONNECT_MAX_BACKOFF_SECONDS, delay * 2
+                )
+        logger.info("%s Kafka producer reconnected", self.service_name)
 
     async def stop(self) -> None:
         if self._task is not None:
