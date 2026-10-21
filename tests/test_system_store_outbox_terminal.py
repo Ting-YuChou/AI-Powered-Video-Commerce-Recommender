@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from video_commerce.common.config import DatabaseConfig
 from video_commerce.data_plane.system_store import (
     OutboxCommitDeadlineExceeded,
+    OutboxWriteRolledBack,
     SystemStore,
     _engine_options,
     outbox_retry_delay_seconds,
@@ -392,4 +394,225 @@ async def test_late_commit_hold_lets_retire_win_and_lost_race_is_reported():
                 ),
                 {"prefix": f"{prefix}%"},
             )
+        await store.close()
+
+
+async def _outbox_rows(store: SystemStore, prefix: str) -> set:
+    async with store.session_factory() as session:
+        return set(
+            (
+                await session.execute(
+                    text(
+                        "SELECT impression_id FROM recommendation_event_outbox "
+                        "WHERE impression_id LIKE :prefix"
+                    ),
+                    {"prefix": f"{prefix}%"},
+                )
+            ).scalars()
+        )
+
+
+async def _delete_outbox_rows(store: SystemStore, prefix: str) -> None:
+    async with store.session_factory.begin() as session:
+        await session.execute(
+            text(
+                "DELETE FROM recommendation_event_outbox "
+                "WHERE impression_id LIKE :prefix"
+            ),
+            {"prefix": f"{prefix}%"},
+        )
+
+
+async def _enqueue_while_key_is_held(
+    store: SystemStore, held: dict, entries: list, hold_seconds: float = 0.6
+) -> list:
+    """Run a batch while another transaction holds ``held``'s key uncommitted."""
+    blocker = create_async_engine(store.config.url)
+    try:
+        async with blocker.connect() as connection:
+            transaction = await connection.begin()
+            await connection.execute(
+                text(
+                    "INSERT INTO recommendation_event_outbox "
+                    "(event_id, impression_id, payload_hash, event_payload, attempts) "
+                    "VALUES (:event_id, :impression_id, 'blocker', '{}', 0)"
+                ),
+                {
+                    "event_id": held["event_id"],
+                    "impression_id": held["metadata"]["impression_id"],
+                },
+            )
+            write = asyncio.create_task(store.enqueue_recommendation_events(entries))
+            await asyncio.sleep(hold_seconds)
+            assert not write.done()
+            await transaction.rollback()
+            return await write
+    finally:
+        await blocker.dispose()
+
+
+@pytest.mark.asyncio
+async def test_batched_enqueue_resolves_each_row_and_drops_late_rows_before_commit():
+    store = _store(_database_url())
+    await store.initialize()
+    prefix = f"batch-{uuid.uuid4().hex[:8]}"
+    existing = _event(f"{prefix}-existing")
+    collided = _event(f"{prefix}-collided")
+    try:
+        await store.enqueue_recommendation_event(existing)
+        await store.enqueue_recommendation_event(collided)
+        fresh = [_event(f"{prefix}-fresh-{index}") for index in range(5)]
+        changed = {**collided, "user_id": "someone-else"}
+        far = time.monotonic() + 30
+        outcomes = await store.enqueue_recommendation_events(
+            [(event, far) for event in fresh]
+            + [
+                (existing, far),
+                (changed, far),
+                ({"event_id": "", "metadata": {}}, far),
+                (_event(f"{prefix}-expired"), 0.0),
+            ],
+            publish_hold_seconds=30,
+        )
+
+        assert outcomes[:6] == ["inserted"] * 5 + ["duplicate"]
+        async with store.session_factory() as session:
+            stored = await session.scalar(
+                text(
+                    "SELECT event_payload FROM recommendation_event_outbox "
+                    "WHERE event_id = :event_id"
+                ),
+                {"event_id": fresh[0]["event_id"]},
+            )
+        # Pre-serialized once and cast to JSON in SQL: the row reads back as
+        # the original event.
+        assert stored == fresh[0]
+        assert isinstance(outcomes[6], ValueError)
+        assert isinstance(outcomes[7], ValueError)
+        assert isinstance(outcomes[8], OutboxCommitDeadlineExceeded)
+        assert await _outbox_rows(store, prefix) == {
+            f"{prefix}-existing",
+            f"{prefix}-collided",
+            *(f"{prefix}-fresh-{index}" for index in range(5)),
+        }
+        # Held for the publish hold like single-row inserts.
+        assert not await _claim_ids(store, "worker-batch") & {
+            event["event_id"] for event in fresh
+        }
+
+        # A deadline that passes during the INSERT drops only that row; the
+        # transaction still commits the rows that are on time. The INSERT is
+        # held up by another transaction's uncommitted row with the same key.
+        on_time = _event(f"{prefix}-on-time")
+        missed = _event(f"{prefix}-missed")
+        contended = _event(f"{prefix}-contended")
+        outcomes = await _enqueue_while_key_is_held(
+            store,
+            contended,
+            [
+                (on_time, time.monotonic() + 30),
+                (missed, time.monotonic() + 0.2),
+                (contended, time.monotonic() + 30),
+            ],
+        )
+        assert outcomes[0] == "inserted"
+        assert isinstance(outcomes[1], OutboxCommitDeadlineExceeded)
+        assert outcomes[2] == "inserted"
+        rows = await _outbox_rows(store, prefix)
+        assert {f"{prefix}-on-time", f"{prefix}-contended"} <= rows
+        assert f"{prefix}-missed" not in rows
+
+        # Every inserted row late: the whole transaction rolls back.
+        all_late = _event(f"{prefix}-all-late")
+        outcomes = await _enqueue_while_key_is_held(
+            store, all_late, [(all_late, time.monotonic() + 0.2)]
+        )
+        assert isinstance(outcomes[0], OutboxCommitDeadlineExceeded)
+        assert f"{prefix}-all-late" not in await _outbox_rows(store, prefix)
+    finally:
+        await _delete_outbox_rows(store, prefix)
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_outbox_write_blocked_by_table_lock_rolls_back_without_commit():
+    """The lock drill: the insert hits the hot-path statement timeout.
+
+    It fails before COMMIT, so the caller must not schedule a retire (the
+    retire would block on the same lock and end as retire_failed).
+    """
+    database_url = _database_url()
+    store = _store(database_url, hot_path_statement_timeout_ms=200)
+    await store.initialize()
+    prefix = f"locked-{uuid.uuid4().hex[:8]}"
+    locker = create_async_engine(database_url)
+    try:
+        async with locker.connect() as connection:
+            transaction = await connection.begin()
+            await connection.execute(
+                text("LOCK TABLE recommendation_event_outbox IN ACCESS EXCLUSIVE MODE")
+            )
+            with pytest.raises(OutboxWriteRolledBack) as raised:
+                await store.enqueue_recommendation_events(
+                    [(_event(f"{prefix}-blocked"), time.monotonic() + 30)]
+                )
+            await transaction.rollback()
+        assert raised.value.reason == "db_error"
+        assert "statement timeout" in str(raised.value)
+        assert await _outbox_rows(store, prefix) == set()
+    finally:
+        await locker.dispose()
+        await _delete_outbox_rows(store, prefix)
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_outbox_write_without_a_free_connection_reports_pool_timeout():
+    store = _store(
+        _database_url(), pool_size=1, max_overflow=0, pool_timeout_seconds=0.2
+    )
+    await store.initialize()
+    prefix = f"pool-{uuid.uuid4().hex[:8]}"
+    try:
+        async with store.engine.connect():
+            with pytest.raises(OutboxWriteRolledBack) as raised:
+                await store.enqueue_recommendation_events(
+                    [(_event(f"{prefix}-starved"), time.monotonic() + 30)]
+                )
+        assert raised.value.reason == "pool_timeout"
+        assert await _outbox_rows(store, prefix) == set()
+    finally:
+        await _delete_outbox_rows(store, prefix)
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_batched_retire_reports_each_row_with_one_update():
+    store = _store(_database_url())
+    await store.initialize()
+    prefix = f"retire-many-{uuid.uuid4().hex[:8]}"
+    late = [_event(f"{prefix}-late-{index}") for index in range(3)]
+    claimed = _event(f"{prefix}-claimed")
+    try:
+        for event in late:
+            await store.enqueue_recommendation_event(event, publish_hold_seconds=30)
+        await store.enqueue_recommendation_event(claimed)
+        assert claimed["event_id"] in await _claim_ids(store, "worker-retire")
+        await store.mark_recommendation_outbox_not_exposed(late[0]["event_id"])
+        missing = uuid.uuid4().hex
+
+        statuses = await store.mark_recommendation_outbox_not_exposed_many(
+            [event["event_id"] for event in (*late, claimed)] + [missing]
+        )
+
+        assert statuses == {
+            late[0]["event_id"]: "already_terminal",
+            late[1]["event_id"]: "retired",
+            late[2]["event_id"]: "retired",
+            claimed["event_id"]: "already_dispatched",
+            missing: "missing",
+        }
+        assert late[1]["event_id"] not in await _claim_ids(store, "worker-other")
+    finally:
+        await _delete_outbox_rows(store, prefix)
         await store.close()

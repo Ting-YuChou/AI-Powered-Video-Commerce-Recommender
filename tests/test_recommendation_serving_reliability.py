@@ -21,13 +21,22 @@ from video_commerce.data_plane.kafka_client import (
 )
 from video_commerce.ml.din import DIN_SEQUENCE_CONTEXT_KEY
 from video_commerce.ml.ranking_history import RANKING_HISTORY_CONTEXT_KEY
+from video_commerce.data_plane.system_store import (
+    OutboxCommitDeadlineExceeded,
+    OutboxWriteRolledBack,
+)
 from video_commerce.services.catalog_event_publisher.main import CatalogEventPublisher
 from video_commerce.services.recommendation import api as recommendation_api
+from video_commerce.services.recommendation.impression_outbox import (
+    ImpressionOutboxBatcher,
+)
 
 
 class RecordingObservability:
     def __init__(self):
         self.impressions = []
+        self.untracked = []
+        self.write_ages = []
         self.terminal = []
         self.catalog_terminal = []
         self.outbox_stats = []
@@ -37,6 +46,12 @@ class RecordingObservability:
 
     def record_recommendation_impression(self, stage, status):
         self.impressions.append((stage, status))
+
+    def record_recommendation_impression_untracked(self, reason):
+        self.untracked.append(reason)
+
+    def update_recommendation_impression_outbox_write_age(self, seconds):
+        self.write_ages.append(seconds)
 
     def record_recommendation_outbox_terminal(self, reason):
         self.terminal.append(reason)
@@ -62,29 +77,40 @@ class SlowOutboxStore:
         self.delay_seconds = delay_seconds
         self.outcome = outcome
         self.enqueued = []
+        self.batches = []
         self.not_exposed = []
         self.commit_deadlines = []
         self.publish_holds = []
         self.retire_status = "retired"
+        self.retire_calls = []
         self.retire_errors = []
         self.error = None
 
-    async def enqueue_recommendation_event(
-        self, event, *, commit_deadline=None, publish_hold_seconds=0.0
-    ):
-        self.commit_deadlines.append(commit_deadline)
-        self.publish_holds.append(publish_hold_seconds)
+    async def enqueue_recommendation_events(self, entries, *, publish_hold_seconds=0.0):
+        self.batches.append(len(entries))
+        for _event, commit_deadline in entries:
+            self.commit_deadlines.append(commit_deadline)
+            self.publish_holds.append(publish_hold_seconds)
         await asyncio.sleep(self.delay_seconds)
         if self.error is not None:
             raise self.error
-        self.enqueued.append(event)
-        return self.outcome
+        self.enqueued.extend(event for event, _deadline in entries)
+        return [self.outcome] * len(entries)
 
-    async def mark_recommendation_outbox_not_exposed(self, event_id):
-        self.not_exposed.append(event_id)
+    async def mark_recommendation_outbox_not_exposed_many(self, event_ids):
+        self.retire_calls.append(list(event_ids))
+        self.not_exposed.extend(event_ids)
         if self.retire_errors:
             raise self.retire_errors.pop(0)
-        return self.retire_status
+        return {event_id: self.retire_status for event_id in event_ids}
+
+
+@pytest.fixture(autouse=True)
+def _fresh_outbox_singletons(monkeypatch):
+    # The batcher and retirer own loop-bound tasks; never share them across
+    # tests (each test runs on its own event loop).
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
+    monkeypatch.setattr(recommendation_api, "_late_impression_retirer", None)
 
 
 def _install_runtime(monkeypatch, *, recommendation_config=None):
@@ -280,9 +306,7 @@ async def test_slow_outbox_write_times_out_and_late_insert_is_retired(monkeypatc
     store = SlowOutboxStore(delay_seconds=0.5)
     monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
     monkeypatch.setattr(recommendation_api, "system_store", store)
-    monkeypatch.setattr(
-        recommendation_api, "_impression_outbox_semaphore", asyncio.Semaphore(32)
-    )
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
 
     started = time.perf_counter()
     durable = await recommendation_api._stage_served_impression_event(
@@ -304,8 +328,9 @@ async def test_slow_outbox_write_times_out_and_late_insert_is_retired(monkeypatc
     assert len(store.enqueued) == 1
     assert store.not_exposed == [store.enqueued[0]["event_id"]]
     assert runtime.observability.terminal == ["not_exposed"]
-    # The permit is released once the shielded write finishes.
-    assert recommendation_api._impression_outbox_semaphore._value == 32
+    # The batcher is idle again once the shielded write finishes.
+    assert recommendation_api._impression_outbox_batcher.inflight == 0
+    assert recommendation_api._impression_outbox_batcher.pending == 0
 
 
 @pytest.mark.asyncio
@@ -320,7 +345,7 @@ async def test_outbox_write_gets_serving_deadline_and_reports_lost_retire_race(
     store.retire_status = "already_dispatched"
     monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
     monkeypatch.setattr(recommendation_api, "system_store", store)
-    monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", None)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
 
     before = time.monotonic()
     await recommendation_api._stage_served_impression_event(
@@ -336,7 +361,7 @@ async def test_outbox_write_gets_serving_deadline_and_reports_lost_retire_race(
 
     assert before + 0.05 <= store.commit_deadlines[0] <= time.monotonic()
     # Held unclaimable for the budget plus a margin so the retire wins.
-    assert store.publish_holds[0] == pytest.approx(1.05)
+    assert store.publish_holds[0] == pytest.approx(2.55)
     assert ("served", "not_exposed_published") in runtime.observability.impressions
     assert runtime.observability.terminal == []
 
@@ -358,8 +383,7 @@ async def test_client_disconnect_during_pending_write_still_retires_late_insert(
     store = SlowOutboxStore(delay_seconds=0.1)
     monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
     monkeypatch.setattr(recommendation_api, "system_store", store)
-    semaphore = asyncio.Semaphore(3)
-    monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", semaphore)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
 
     staging = asyncio.create_task(
         recommendation_api._stage_served_impression_event(
@@ -379,7 +403,7 @@ async def test_client_disconnect_during_pending_write_still_retires_late_insert(
     assert len(store.enqueued) == 1
     assert store.not_exposed == [store.enqueued[0]["event_id"]]
     assert runtime.observability.terminal == ["not_exposed"]
-    assert semaphore._value == 3
+    assert recommendation_api._impression_outbox_batcher.inflight == 0
 
 
 @pytest.mark.asyncio
@@ -392,7 +416,7 @@ async def test_ambiguous_write_error_triggers_retire_but_deadline_rollback_does_
     store.retire_status = "missing"
     monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
     monkeypatch.setattr(recommendation_api, "system_store", store)
-    monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", None)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
 
     durable = await recommendation_api._stage_served_impression_event(
         user_id="u1",
@@ -407,7 +431,7 @@ async def test_ambiguous_write_error_triggers_retire_but_deadline_rollback_does_
     assert len(store.not_exposed) == 1
     assert runtime.observability.terminal == []
 
-    store.error = recommendation_api.OutboxCommitDeadlineExceeded("late")
+    store.error = OutboxCommitDeadlineExceeded("late")
     await recommendation_api._stage_served_impression_event(
         user_id="u1",
         recommendations=["p1"],
@@ -421,33 +445,274 @@ async def test_ambiguous_write_error_triggers_retire_but_deadline_rollback_does_
 
 
 @pytest.mark.asyncio
-async def test_retire_retries_transient_errors(monkeypatch):
+async def test_write_that_fails_before_commit_after_the_budget_is_not_retired(
+    monkeypatch,
+):
+    """Lock drill: the caller times out, then the insert hits its statement
+    timeout. Nothing committed, so no retire runs (it used to block on the
+    same lock and end as retire_failed)."""
+    runtime = _install_runtime(
+        monkeypatch,
+        recommendation_config=RecommendationConfig(impression_outbox_timeout_ms=50),
+    )
+    store = SlowOutboxStore(delay_seconds=0.15)
+    store.error = OutboxWriteRolledBack("canceling statement due to statement timeout")
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
+
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-locked"},
+    )
+    await _drain(0.25)
+
+    assert durable is False
+    assert store.not_exposed == []
+    assert runtime.observability.impressions == [("served", "timeout")]
+    assert runtime.observability.untracked == ["timeout"]
+
+
+@pytest.mark.asyncio
+async def test_pool_timeout_is_reported_as_its_own_cause_without_retire(monkeypatch):
+    runtime = _install_runtime(monkeypatch)
+    store = SlowOutboxStore(delay_seconds=0)
+    store.error = OutboxWriteRolledBack("no connection", reason="pool_timeout")
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
+
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-pool"},
+    )
+    await _drain(0)
+
+    assert durable is False
+    assert store.not_exposed == []
+    assert runtime.observability.impressions == [("served", "unavailable")]
+    assert runtime.observability.untracked == ["pool_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_impressions_share_one_outbox_transaction(monkeypatch):
+    runtime = _install_runtime(
+        monkeypatch,
+        recommendation_config=RecommendationConfig(impression_outbox_max_inflight=1),
+    )
+    store = SlowOutboxStore(delay_seconds=0.01)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
+
+    durable = await asyncio.gather(
+        *(
+            recommendation_api._stage_served_impression_event(
+                user_id=f"u{index}",
+                recommendations=["p1"],
+                response_time_ms=5,
+                request_id=None,
+                metadata={"impression_id": f"imp-burst-{index}"},
+            )
+            for index in range(8)
+        )
+    )
+
+    assert durable == [True] * 8
+    assert store.batches == [8]
+    assert runtime.observability.impressions == [("served", "inserted")] * 8
+    assert runtime.observability.untracked == []
+
+
+@pytest.mark.asyncio
+async def test_retire_retries_transient_errors_within_the_hold(monkeypatch):
     runtime = _install_runtime(monkeypatch)
     store = SlowOutboxStore(delay_seconds=0)
     store.retire_errors = [RuntimeError("db blip"), RuntimeError("db blip")]
     monkeypatch.setattr(recommendation_api, "system_store", store)
-    monkeypatch.setattr(recommendation_api, "_RETIRE_RETRY_DELAYS_SECONDS", (0, 0, 0))
+    monkeypatch.setattr(recommendation_api, "_RETIRE_RETRY_DELAYS_SECONDS", (0.01,))
+    retirer = recommendation_api._late_impression_retirer_or_default()
 
-    await recommendation_api._retire_unexposed_impression("evt", "imp")
+    retirer.submit("evt", "imp", retire_by=time.monotonic() + 5)
+    await _drain(0.1)
 
-    assert len(store.not_exposed) == 3
+    assert store.retire_calls == [["evt"]] * 3
     assert runtime.observability.terminal == ["not_exposed"]
 
-    store.retire_errors = [RuntimeError("down")] * 4
-    await recommendation_api._retire_unexposed_impression("evt", "imp")
+    # Past its hold the row is given up instead of retried forever.
+    store.retire_errors = [RuntimeError("down")] * 100
+    retirer.submit("evt-2", "imp-2", retire_by=time.monotonic() + 0.05)
+    await _drain(0.2)
 
     assert ("served", "retire_failed") in runtime.observability.impressions
+    assert retirer.pending == 0
+    assert 2 <= len(store.retire_calls) - 3 <= 10
 
 
 @pytest.mark.asyncio
-async def test_full_outbox_semaphore_skips_impression_without_queueing(monkeypatch):
-    runtime = _install_runtime(monkeypatch)
-    store = SlowOutboxStore(delay_seconds=0)
-    semaphore = asyncio.Semaphore(1)
-    await semaphore.acquire()
+async def test_slow_batch_commit_is_retired_with_one_update_not_one_per_row(
+    monkeypatch,
+):
+    runtime = _install_runtime(
+        monkeypatch,
+        recommendation_config=RecommendationConfig(impression_outbox_timeout_ms=50),
+    )
+    store = SlowOutboxStore(delay_seconds=0.2)
     monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
     monkeypatch.setattr(recommendation_api, "system_store", store)
-    monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", semaphore)
+
+    durable = await asyncio.gather(
+        *(
+            recommendation_api._stage_served_impression_event(
+                user_id=f"u{index}",
+                recommendations=["p1"],
+                response_time_ms=5,
+                request_id=None,
+                metadata={"impression_id": f"imp-late-{index}"},
+            )
+            for index in range(20)
+        )
+    )
+    await _drain(0.3)
+
+    assert durable == [False] * 20
+    assert store.batches == [16, 4]
+    # Every row committed after its budget: all are retired, by at most one
+    # UPDATE per finished write batch and never more than one at a time.
+    assert sorted(store.not_exposed) == sorted(
+        event["event_id"] for event in store.enqueued
+    )
+    assert len(store.retire_calls) <= 2
+    assert runtime.observability.terminal == ["not_exposed"] * 20
+
+
+@pytest.mark.parametrize(
+    ("pool_size", "max_overflow", "configured", "expected"),
+    [(2, 1, 2, 2), (2, 1, 5, 2), (1, 0, 2, 1), (5, 5, 3, 3)],
+)
+def test_outbox_inflight_is_clamped_below_the_pool(
+    pool_size, max_overflow, configured, expected
+):
+    from video_commerce.common.config import DatabaseConfig
+
+    batcher = recommendation_api._build_impression_outbox_batcher(
+        RecommendationConfig(impression_outbox_max_inflight=configured),
+        DatabaseConfig(pool_size=pool_size, max_overflow=max_overflow),
+    )
+
+    assert batcher.max_inflight == expected
+
+
+@pytest.mark.asyncio
+async def test_closed_batcher_skips_tracking_instead_of_building_a_new_one(
+    monkeypatch,
+):
+    runtime = _install_runtime(monkeypatch)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", SlowOutboxStore(0))
+    batcher = recommendation_api._impression_outbox_batcher_or_default()
+    await batcher.close()
+
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-after-close"},
+    )
+
+    assert durable is False
+    assert recommendation_api._impression_outbox_batcher_or_default() is batcher
+    assert runtime.observability.untracked == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_admission_refusal_skips_tracking_without_waiting(monkeypatch):
+    runtime = _install_runtime(
+        monkeypatch,
+        recommendation_config=RecommendationConfig(impression_outbox_timeout_ms=100),
+    )
+    store = SlowOutboxStore(delay_seconds=0.15)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    batcher = ImpressionOutboxBatcher(
+        recommendation_api._write_impression_outbox_batch,
+        max_inflight=1,
+        max_batch_size=16,
+        max_pending=16,
+        publish_hold_seconds=2.6,
+    )
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", batcher)
+    # Learn a 150 ms write time, then occupy the only slot.
+    await batcher.submit(
+        {"event_id": "w", "metadata": {"impression_id": "w"}}, time.monotonic() + 1
+    )
+    busy = batcher.submit(
+        {"event_id": "b", "metadata": {"impression_id": "b"}}, time.monotonic() + 1
+    )
+
+    started = time.perf_counter()
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-admission"},
+    )
+    elapsed = time.perf_counter() - started
+    await busy
+
+    assert durable is False
+    assert elapsed < 0.05
+    assert runtime.observability.impressions == [("served", "unavailable")]
+    assert runtime.observability.untracked == ["admission"]
+
+
+@pytest.mark.asyncio
+async def test_rejected_row_is_not_retired(monkeypatch):
+    _install_runtime(monkeypatch)
+    store = SlowOutboxStore(delay_seconds=0)
+    store.error = ValueError("recommendation outbox event_id payload collision")
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+
+    durable = await recommendation_api._stage_served_impression_event(
+        user_id="u1",
+        recommendations=["p1"],
+        response_time_ms=5,
+        request_id=None,
+        metadata={"impression_id": "imp-collision"},
+    )
+    await _drain(0.05)
+
+    assert durable is False
+    assert store.retire_calls == []
+
+
+@pytest.mark.asyncio
+async def test_full_outbox_queue_skips_impression_without_queueing(monkeypatch):
+    runtime = _install_runtime(monkeypatch)
+    store = SlowOutboxStore(delay_seconds=0.05)
+    monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
+    monkeypatch.setattr(recommendation_api, "system_store", store)
+    batcher = ImpressionOutboxBatcher(
+        recommendation_api._write_impression_outbox_batch,
+        max_inflight=1,
+        max_batch_size=1,
+        max_pending=1,
+        publish_hold_seconds=1.0,
+    )
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", batcher)
+    queued = batcher.submit(
+        {"event_id": "e0", "metadata": {"impression_id": "imp-0"}},
+        time.monotonic() + 1.0,
+    )
 
     durable = await recommendation_api._stage_served_impression_event(
         user_id="u1",
@@ -458,8 +723,10 @@ async def test_full_outbox_semaphore_skips_impression_without_queueing(monkeypat
     )
 
     assert durable is False
-    assert store.enqueued == []
     assert runtime.observability.impressions == [("served", "unavailable")]
+    assert runtime.observability.untracked == ["queue_full"]
+    assert await queued == "inserted"
+    assert [event["event_id"] for event in store.enqueued] == ["e0"]
 
 
 @pytest.mark.asyncio
@@ -470,9 +737,7 @@ async def test_fast_outbox_write_stays_durable_and_wakes_dispatcher(monkeypatch)
     monkeypatch.setattr(
         recommendation_api, "system_store", SlowOutboxStore(delay_seconds=0)
     )
-    monkeypatch.setattr(
-        recommendation_api, "_impression_outbox_semaphore", asyncio.Semaphore(2)
-    )
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
     monkeypatch.setattr(recommendation_api, "_recommendation_outbox_wakeup", wakeup)
 
     durable = await recommendation_api._stage_served_impression_event(
@@ -546,9 +811,7 @@ async def test_cache_hit_response_is_not_held_by_slow_outbox(monkeypatch):
     monkeypatch.setattr(recommendation_api, "_remote_ranking_release", None)
     monkeypatch.setattr(recommendation_api, "kafka_manager", EventBuildingKafka())
     monkeypatch.setattr(recommendation_api, "system_store", store)
-    monkeypatch.setattr(
-        recommendation_api, "_impression_outbox_semaphore", asyncio.Semaphore(32)
-    )
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
     recommendation_api._refresh_serving_version_context(runtime)
     request = SimpleNamespace(
         state=SimpleNamespace(
@@ -632,7 +895,7 @@ async def test_staged_impression_marks_feature_context_truncated(monkeypatch):
     monkeypatch.setattr(
         recommendation_api, "system_store", SlowOutboxStore(delay_seconds=0)
     )
-    monkeypatch.setattr(recommendation_api, "_impression_outbox_semaphore", None)
+    monkeypatch.setattr(recommendation_api, "_impression_outbox_batcher", None)
 
     await recommendation_api._stage_served_impression_event(
         user_id="u1",
