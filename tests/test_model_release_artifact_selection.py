@@ -124,7 +124,7 @@ def test_persisted_ranking_checkpoint_is_registered_without_becoming_active(tmp_
 
     assert store.release["model_version"] == "ranking-v2"
     assert store.release["bundle_manifest"]["quality_gate_policy_version"] == (
-        "ranking_quality_gate_v4"
+        "ranking_quality_gate_v5"
     )
     assert (
         store.release["bundle_manifest"]["artifact_manifest"]

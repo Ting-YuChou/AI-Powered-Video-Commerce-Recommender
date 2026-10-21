@@ -114,6 +114,31 @@ version when evidence or an experiment changes.
   plus an `other` bucket. Missing-modality slices are also report-only. All of
   these are recorded with `"blocking": false` and never change the decision.
 
+`ranking_quality_gate_v5` NDCG decision (current policy; v2–v4 evidence stays
+valid for promotion):
+
+- NDCG@10 is a non-inferiority test on the user-cluster bootstrap CI against
+  the margin (`overall_ndcg_ci_lower` = -0.005; blocking slices -0.03 with the
+  Bonferroni-adjusted CI):
+  - The CI lower bound is at or above the margin: the NDCG check passes.
+  - The whole CI is below the margin: `overall_ndcg_regression` (or
+    `slice_<name>_ndcg_regression`) and the gate fails.
+  - The CI straddles the margin: `overall_ndcg_underpowered` (or
+    `slice_<name>_ndcg_underpowered`) and the gate is `insufficient_evidence`.
+    The holdout is too small to decide. `ndcg_informative_impressions_required_estimate`
+    gives a rough holdout size (`n × (half_width / (delta − margin))²`) at
+    which the observed delta would clear the margin. It is null when the point
+    delta is already below the margin.
+- The point-delta check applies only to a positive `*_ndcg_min_delta`
+  (superiority). The default minimum of 0 is a non-inferiority requirement,
+  which the CI test covers. Under v4, an equal-quality challenger failed that
+  check about half the time.
+- `calibration_ndcg_regression` fires only when the NDCG CI is wholly below 0.
+- Definite failures take precedence over underpowered results.
+- Other metrics (PR-AUC, log loss, Brier, ECE, value WAPE) are still
+  point-estimate thresholds. Small holdouts can still fail equal-quality
+  challengers on them.
+
 The general trainer evaluates every periodic retrain with experiment kind
 `retrain`:
 
