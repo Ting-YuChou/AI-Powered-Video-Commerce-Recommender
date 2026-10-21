@@ -5,10 +5,12 @@ Observability utilities for request tracing, structured logging, and metrics.
 from __future__ import annotations
 
 import contextvars
+import fcntl
 import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import psutil
@@ -19,6 +21,7 @@ from prometheus_client import (
     Gauge,
     Histogram,
     generate_latest,
+    multiprocess,
     start_http_server,
 )
 
@@ -121,6 +124,45 @@ def get_current_trace_context() -> Optional[Dict[str, str]]:
     }
 
 
+def prometheus_multiprocess_dir() -> Optional[str]:
+    """Return the prometheus_client multiprocess directory, if enabled.
+
+    prometheus_client picks mmap-backed values at import time from the same
+    variables, so this must already be set in the environment of every worker.
+    """
+    return (
+        os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+        or os.environ.get("prometheus_multiproc_dir")
+        or None
+    )
+
+
+def prepare_prometheus_multiprocess_dir(path: Optional[str] = None) -> int:
+    """Create the multiprocess directory and remove stale ``*.db`` files.
+
+    Run once per container start, before uvicorn forks its workers: the
+    directory (a tmpfs or Memory emptyDir) survives in-pod container restarts,
+    and files left by a previous container would otherwise be merged into the
+    new process' counters. The flock keeps two concurrent invocations from
+    racing; it is never held while workers run. Returns the removed file count.
+    """
+    directory = path or prometheus_multiprocess_dir()
+    if not directory:
+        return 0
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    with open(root / ".prepare.lock", "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            for stale in root.glob("*.db"):
+                stale.unlink(missing_ok=True)
+                removed += 1
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    return removed
+
+
 def configure_logging(monitoring_config) -> None:
     """Configure root logging according to monitoring settings."""
     root_logger = logging.getLogger()
@@ -163,10 +205,22 @@ def configure_logging(monitoring_config) -> None:
 
 
 class ObservabilityManager:
-    """Prometheus metrics collector and request instrumentation."""
+    """Prometheus metrics collector and request instrumentation.
+
+    Every Gauge declares ``multiprocess_mode`` so ``/metrics`` stays correct when
+    uvicorn runs several workers with ``PROMETHEUS_MULTIPROC_DIR`` set:
+    per-process counts use ``livesum``, per-process health flags ``livemin`` or
+    ``livemax``, observations of shared external state ``mostrecent``, and
+    versions, peaks and timestamps ``max``. Single-process exporters ignore it.
+    """
+
+    _PROCESS_METRICS_REFRESH_SECONDS = 15.0
 
     def __init__(self) -> None:
         self.registry = CollectorRegistry(auto_describe=True)
+        self.multiprocess_dir = prometheus_multiprocess_dir()
+        self._multiprocess_registry: Optional[CollectorRegistry] = None
+        self._process_metrics_refreshed_at = 0.0
         self.http_requests_total = Counter(
             "video_commerce_http_requests_total",
             "HTTP requests processed by the API",
@@ -184,6 +238,7 @@ class ObservabilityManager:
             "video_commerce_http_requests_in_progress",
             "HTTP requests currently being processed",
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.http_request_exceptions_total = Counter(
             "video_commerce_http_request_exceptions_total",
@@ -195,46 +250,54 @@ class ObservabilityManager:
             "video_commerce_process_cpu_percent",
             "Process CPU utilization percentage",
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.process_resident_memory_bytes = Gauge(
             "video_commerce_process_resident_memory_bytes",
             "Resident memory size in bytes",
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.redis_ops_per_sec = Gauge(
             "video_commerce_redis_ops_per_sec",
             "Redis instantaneous operations per second",
             ["role"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.redis_connected_clients = Gauge(
             "video_commerce_redis_connected_clients",
             "Redis connected clients",
             ["role"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.redis_used_memory_bytes = Gauge(
             "video_commerce_redis_used_memory_bytes",
             "Redis used memory in bytes",
             ["role"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.redis_maxmemory_bytes = Gauge(
             "video_commerce_redis_maxmemory_bytes",
             "Redis configured max memory in bytes",
             ["role"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.redis_memory_fragmentation_ratio = Gauge(
             "video_commerce_redis_memory_fragmentation_ratio",
             "Redis memory fragmentation ratio",
             ["role"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.kafka_producer_connected = Gauge(
             "video_commerce_kafka_producer_connected",
             "Kafka producer connection status",
             registry=self.registry,
+            multiprocess_mode="livemax",
         )
         self.kafka_messages_produced_total = Counter(
             "video_commerce_kafka_messages_produced_total",
@@ -272,24 +335,28 @@ class ObservabilityManager:
             "Kafka consumer lag by consumer group (-1 when unavailable)",
             ["group_id"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.worker_live_instances = Gauge(
             "video_commerce_worker_live_instances",
             "Number of live worker instances observed via Redis heartbeats",
             ["service"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.worker_status = Gauge(
             "video_commerce_worker_status",
             "Worker health status observed via Redis heartbeats (1=healthy, 0=unhealthy)",
             ["service"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.worker_heartbeat_timestamp_seconds = Gauge(
             "video_commerce_worker_heartbeat_timestamp_seconds",
             "Unix timestamp of the latest worker heartbeat observed by the worker itself",
             ["service", "instance_id"],
             registry=self.registry,
+            multiprocess_mode="max",
         )
         self.worker_messages_processed_total = Counter(
             "video_commerce_worker_messages_processed_total",
@@ -367,6 +434,7 @@ class ObservabilityManager:
             "SQLAlchemy pool connection counts",
             ["state"],
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.recommendation_requests_total = Counter(
             "video_commerce_recommendation_requests_total",
@@ -385,6 +453,7 @@ class ObservabilityManager:
             "video_commerce_ranking_batch_queue_depth",
             "Queued ranking requests in the local micro-batcher",
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.ranking_batch_size = Histogram(
             "video_commerce_ranking_batch_size",
@@ -458,21 +527,25 @@ class ObservabilityManager:
             "video_commerce_ranking_active_batches",
             "Ranking batches currently executing",
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.ranking_effective_runner_capacity = Gauge(
             "video_commerce_ranking_effective_runner_capacity",
             "Dispatchable ranking runner batch slots known to the coordinator",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.ranking_healthy_runners = Gauge(
             "video_commerce_ranking_healthy_runners",
             "Protocol-ready ranking runners with verified trained models",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.ranking_draining_runners = Gauge(
             "video_commerce_ranking_draining_runners",
             "Ranking runners draining and excluded from new dispatch",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.ranking_admission_rejections_total = Counter(
             "video_commerce_ranking_admission_rejections_total",
@@ -496,6 +569,7 @@ class ObservabilityManager:
             "video_commerce_ranking_runner_queue_depth",
             "Queued ranking micro-batches inside each ranking runner",
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.ranking_runner_batches_total = Counter(
             "video_commerce_ranking_runner_batches_total",
@@ -508,12 +582,14 @@ class ObservabilityManager:
             "Coordinator in-flight ranking batches by runner endpoint",
             ["endpoint"],
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.ranking_runner_endpoint_available_connections = Gauge(
             "video_commerce_ranking_runner_endpoint_available_connections",
             "Coordinator available ranking-runner persistent connections by endpoint",
             ["endpoint"],
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.ranking_runner_endpoint_events_total = Counter(
             "video_commerce_ranking_runner_endpoint_events_total",
@@ -526,12 +602,14 @@ class ObservabilityManager:
             "Coordinator runner endpoint state as a one-hot gauge",
             ["endpoint", "state"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.ranking_runner_endpoint_missing_refreshes = Gauge(
             "video_commerce_ranking_runner_endpoint_missing_refreshes",
             "Consecutive DNS refreshes missing a known runner endpoint",
             ["endpoint"],
             registry=self.registry,
+            multiprocess_mode="livemax",
         )
         self.ranking_runner_endpoint_removed_total = Counter(
             "video_commerce_ranking_runner_endpoint_removed_total",
@@ -640,11 +718,13 @@ class ObservabilityManager:
             "video_commerce_ranking_adapter_inflight",
             "Ranking adapter requests currently admitted",
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.ranking_triton_model_ready = Gauge(
             "video_commerce_ranking_triton_model_ready",
             "Whether the exact required Triton model version is ready",
             registry=self.registry,
+            multiprocess_mode="livemin",
         )
         self.upstream_requests_total = Counter(
             "video_commerce_upstream_requests_total",
@@ -657,6 +737,7 @@ class ObservabilityManager:
             "Internal upstream HTTP requests currently in flight",
             ["target"],
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.best_effort_tasks_total = Counter(
             "video_commerce_best_effort_tasks_total",
@@ -668,6 +749,7 @@ class ObservabilityManager:
             "video_commerce_best_effort_queue_depth",
             "Queued best-effort background tasks in this worker",
             registry=self.registry,
+            multiprocess_mode="livesum",
         )
         self.interactions_ingested_total = Counter(
             "video_commerce_interactions_ingested_total",
@@ -699,11 +781,13 @@ class ObservabilityManager:
             "video_commerce_recommendation_outbox_pending",
             "Unpublished served-impression outbox rows",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.recommendation_outbox_oldest_age_seconds = Gauge(
             "video_commerce_recommendation_outbox_oldest_age_seconds",
             "Age of the oldest unpublished served-impression outbox row",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.content_uploads_total = Counter(
             "video_commerce_content_uploads_total",
@@ -716,6 +800,7 @@ class ObservabilityManager:
             "Latest observed feature-lake materialization lag",
             ["record_type"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.feature_lake_records_total = Counter(
             "feature_lake_records_total",
@@ -733,21 +818,25 @@ class ObservabilityManager:
             "catalog_outbox_pending",
             "Unpublished catalog outbox rows from completed activations",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.catalog_outbox_oldest_age_seconds = Gauge(
             "catalog_outbox_oldest_age_seconds",
             "Age of the oldest unpublished catalog outbox row",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.content_task_outbox_pending = Gauge(
             "content_task_outbox_pending",
             "Unpublished durable content processing tasks",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.content_task_outbox_oldest_age_seconds = Gauge(
             "content_task_outbox_oldest_age_seconds",
             "Age of the oldest unpublished content processing task",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.content_task_publish_retries_total = Counter(
             "content_task_publish_retries_total",
@@ -759,6 +848,7 @@ class ObservabilityManager:
             "content_orphan_objects",
             "Managed upload objects without a durable content job",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.content_orphan_objects_deleted_total = Counter(
             "content_orphan_objects_deleted_total",
@@ -775,6 +865,7 @@ class ObservabilityManager:
             "pit_export_rows",
             "Rows in the latest PIT Parquet export",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_manifest_validation_failures_total = Counter(
             "pit_manifest_validation_failures_total",
@@ -786,36 +877,43 @@ class ObservabilityManager:
             "pit_online_offline_parity_ratio",
             "Finalized online/offline feature bundle parity ratio",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_leakage_rows = Gauge(
             "pit_leakage_rows",
             "Rows violating PIT event-time or availability constraints",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_assembler_vector_parity_ratio = Gauge(
             "pit_assembler_vector_parity_ratio",
             "Exact shared-assembler vector parity for identical bundles",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_label_reconciliation_ratio = Gauge(
             "pit_label_reconciliation_ratio",
             "Typed labels reconciled with finalized attribution facts",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_current_state_calls = Gauge(
             "pit_current_state_calls",
             "Forbidden current Redis/catalog calls observed during PIT training",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_invalid_feature_or_label_rows = Gauge(
             "pit_invalid_feature_or_label_rows",
             "PIT rows containing invalid feature or label tensors",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_value_mask_coverage_ratio = Gauge(
             "pit_value_mask_coverage_ratio",
             "Purchase rows containing an actual attributed business value",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_stream_validation_seconds = Histogram(
             "pit_stream_validation_seconds",
@@ -828,12 +926,14 @@ class ObservabilityManager:
             "Verified PIT rows processed per second",
             ["kind"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_stream_staging_bytes = Gauge(
             "pit_stream_staging_bytes",
             "Bytes occupied by the active verified PIT generation",
             ["kind"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_stream_batch_rows = Histogram(
             "pit_stream_batch_rows",
@@ -846,12 +946,14 @@ class ObservabilityManager:
             "Largest verified PIT group in rows",
             ["kind"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_stream_peak_rss_bytes = Gauge(
             "pit_stream_peak_rss_bytes",
             "Peak resident bytes observed during PIT validation or training",
             ["kind"],
             registry=self.registry,
+            multiprocess_mode="max",
         )
         self.pit_stream_content_cache_total = Counter(
             "pit_stream_content_cache_total",
@@ -869,21 +971,25 @@ class ObservabilityManager:
             "din_sequence_coverage_ratio",
             "Training rows containing at least one DIN event",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.din_embedding_coverage_ratio = Gauge(
             "din_embedding_coverage_ratio",
             "DIN sequence item references found in the frozen sidecar",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.din_unknown_item_ratio = Gauge(
             "din_unknown_item_ratio",
             "DIN candidate and history item references missing from the sidecar",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.din_attention_entropy = Gauge(
             "din_attention_entropy",
             "Mean masked DIN attention entropy from the latest training pass",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_orchestrator_runs_total = Counter(
             "pit_orchestrator_runs_total",
@@ -895,32 +1001,44 @@ class ObservabilityManager:
             "pit_orchestrator_last_success_timestamp",
             "Unix timestamp of the latest completed PIT orchestration run",
             registry=self.registry,
+            multiprocess_mode="max",
         )
         self.pit_orchestrator_start_timestamp = Gauge(
             "pit_orchestrator_start_timestamp",
             "Unix timestamp when this PIT orchestrator process started",
             registry=self.registry,
+            multiprocess_mode="max",
         )
         self.pit_orchestrator_start_timestamp.set(time.time())
         self.pit_orchestrator_run_in_progress = Gauge(
             "pit_orchestrator_run_in_progress",
             "Whether a PIT run currently holds the orchestration lease",
             registry=self.registry,
+            multiprocess_mode="livemax",
         )
         self.pit_orchestrator_lease_expired = Gauge(
             "pit_orchestrator_lease_expired",
             "Whether a durable PIT run has an expired active lease",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_orchestrator_waiting_for_rows = Gauge(
             "pit_orchestrator_waiting_for_rows",
             "Whether the PIT orchestrator is waiting for eligible observations",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
+        )
+        self.pit_orchestrator_waiting_for_materializer_age_seconds = Gauge(
+            "pit_orchestrator_waiting_for_materializer_age_seconds",
+            "Seconds since the cutoff of the oldest PIT run parked in waiting_for_materializer (0 when none)",
+            registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_trainer_waiting_for_manifest = Gauge(
             "pit_trainer_waiting_for_manifest",
             "Whether the PIT trainer is waiting for the first complete manifest",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.pit_training_duplicate_manifest_skips_total = Counter(
             "pit_training_duplicate_manifest_skips_total",
@@ -948,21 +1066,25 @@ class ObservabilityManager:
             "model_release_active_generation",
             "Active ranking release pointer generation observed by this process",
             registry=self.registry,
+            multiprocess_mode="max",
         )
         self.model_release_registered_backlog = Gauge(
             "model_release_registered_backlog",
             "Ranking releases still waiting for a conclusive quality evaluation",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.model_release_staging_age_seconds = Gauge(
             "model_release_staging_age_seconds",
             "Age of the oldest ranking release still in staging",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.model_release_runner_generation_mismatch = Gauge(
             "model_release_runner_generation_mismatch",
             "Whether desired and locally observed ranking generations differ",
             registry=self.registry,
+            multiprocess_mode="livemax",
         )
         self.model_release_transition_failures_total = Counter(
             "model_release_transition_failures_total",
@@ -987,12 +1109,14 @@ class ObservabilityManager:
             "Verified local artifact generations",
             ["model_name"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.model_artifact_local_generation_bytes = Gauge(
             "model_artifact_local_generation_bytes",
             "Bytes occupied by verified local artifact generations",
             ["model_name"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.model_artifact_generation_cleanup_failures_total = Counter(
             "model_artifact_generation_cleanup_failures_total",
@@ -1011,27 +1135,32 @@ class ObservabilityManager:
             "Planned Iceberg maintenance candidates",
             ["table", "kind"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.iceberg_maintenance_failed_runs = Gauge(
             "iceberg_maintenance_failed_runs",
             "Failed Iceberg maintenance runs during the operational lookback",
             ["table"],
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.retrieval_release_active_generation = Gauge(
             "retrieval_release_active_generation",
             "Active Two-Tower retrieval release pointer generation",
             registry=self.registry,
+            multiprocess_mode="max",
         )
         self.retrieval_release_registered_backlog = Gauge(
             "retrieval_release_registered_backlog",
             "Two-Tower releases waiting for a conclusive quality evaluation",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self.retrieval_release_staging_age_seconds = Gauge(
             "retrieval_release_staging_age_seconds",
             "Age of the oldest Two-Tower release still in staging",
             registry=self.registry,
+            multiprocess_mode="mostrecent",
         )
         self._process = psutil.Process()
 
@@ -1080,6 +1209,20 @@ class ObservabilityManager:
         self.http_request_duration_seconds.labels(method=method, path=path).observe(
             duration
         )
+        if self.multiprocess_dir:
+            # Prometheus keeps one keep-alive connection, so a single worker
+            # tends to serve every scrape; let each worker refresh its own
+            # process gauges from the request path instead.
+            now = time.monotonic()
+            if now - self._process_metrics_refreshed_at >= (
+                self._PROCESS_METRICS_REFRESH_SECONDS
+            ):
+                self._process_metrics_refreshed_at = now
+                self.refresh_process_metrics()
+
+    def refresh_process_metrics(self) -> None:
+        self.process_cpu_percent.set(self._process.cpu_percent())
+        self.process_resident_memory_bytes.set(self._process.memory_info().rss)
 
     def record_exception(self, method: str, path: str, exception_type: str) -> None:
         self.http_request_exceptions_total.labels(
@@ -1252,6 +1395,7 @@ class ObservabilityManager:
         waiting_for_rows: bool,
         run_in_progress: bool,
         lease_expired: bool,
+        waiting_for_materializer_age_seconds: float = 0.0,
     ) -> None:
         self.pit_orchestrator_last_success_timestamp.set(
             max(0.0, float(last_success_timestamp))
@@ -1259,6 +1403,9 @@ class ObservabilityManager:
         self.pit_orchestrator_waiting_for_rows.set(1 if waiting_for_rows else 0)
         self.pit_orchestrator_run_in_progress.set(1 if run_in_progress else 0)
         self.pit_orchestrator_lease_expired.set(1 if lease_expired else 0)
+        self.pit_orchestrator_waiting_for_materializer_age_seconds.set(
+            max(0.0, float(waiting_for_materializer_age_seconds))
+        )
 
     def set_pit_trainer_waiting_for_manifest(self, waiting: bool) -> None:
         self.pit_trainer_waiting_for_manifest.set(1 if waiting else 0)
@@ -1609,8 +1756,7 @@ class ObservabilityManager:
         worker_statuses: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         """Refresh gauges from the current process and backing services."""
-        self.process_cpu_percent.set(self._process.cpu_percent())
-        self.process_resident_memory_bytes.set(self._process.memory_info().rss)
+        self.refresh_process_metrics()
 
         if feature_store and getattr(feature_store, "redis_client", None):
             await self._collect_redis_metrics("state", feature_store.redis_client)
@@ -1707,7 +1853,32 @@ class ObservabilityManager:
             self.kafka_consumer_lag.labels(group_id=group_id).set(lag_value)
 
     def prometheus_payload(self) -> bytes:
+        if self.multiprocess_dir:
+            if self._multiprocess_registry is None:
+                registry = CollectorRegistry()
+                multiprocess.MultiProcessCollector(
+                    registry, path=self.multiprocess_dir
+                )
+                self._multiprocess_registry = registry
+            return generate_latest(self._multiprocess_registry)
         return generate_latest(self.registry)
+
+    def mark_process_dead(self, pid: Optional[int] = None) -> None:
+        """Drop this worker's ``live*`` gauge files on clean shutdown.
+
+        uvicorn has no child-exit hook, so a worker that crashes keeps its live
+        gauges in the aggregate until the container restarts.
+        """
+        if not self.multiprocess_dir:
+            return
+        try:
+            multiprocess.mark_process_dead(
+                os.getpid() if pid is None else pid, path=self.multiprocess_dir
+            )
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "prometheus_multiprocess_cleanup_failed", exc_info=True
+            )
 
     @property
     def prometheus_content_type(self) -> str:

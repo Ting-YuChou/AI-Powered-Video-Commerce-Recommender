@@ -1,9 +1,43 @@
+# Alert routing. Every rule in monitoring/prometheus-rules.yml sets severity
+# (critical or warning) and a runbook_url annotation that webhook payloads carry.
 route:
   receiver: default
   group_by: ["alertname", "severity"]
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h
+  routes:
+    # Pages on-call. The receiver URL is a secret read from a mounted file.
+    - receiver: oncall-webhook
+      matchers:
+        - severity="critical"
+      group_wait: 10s
+      repeat_interval: 1h
+    # Ticket-level: visible in the Alertmanager UI/API, not paged.
+    - receiver: default
+      matchers:
+        - severity="warning"
+
+inhibit_rules:
+  # A critical alert silences the warning of the same name (tiered thresholds).
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: ["alertname"]
+  # With the Flink job missing or duplicated, checkpoint and watermark alerts are
+  # symptoms of the same outage.
+  - source_matchers:
+      - alertname="FlinkInteractionFeatureJobMissing"
+    target_matchers:
+      - alertname=~"FlinkCheckpointUnavailable|FlinkInteractionWatermarkLag"
 
 receivers:
   - name: default
+  - name: oncall-webhook
+    webhook_configs:
+      # Compose mounts monitoring/secrets/oncall-webhook-url.example here by
+      # default; production mounts the real secret (see
+      # docs/operations/slo-and-alerting.md). Requires Alertmanager >= 0.26.
+      - url_file: /etc/alertmanager/secrets/oncall-webhook-url
+        send_resolved: true

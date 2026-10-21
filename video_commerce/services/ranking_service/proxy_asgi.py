@@ -90,6 +90,7 @@ class RankingProxyApp:
                     await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 await self.shutdown()
+                self.runtime.observability.mark_process_dead()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 

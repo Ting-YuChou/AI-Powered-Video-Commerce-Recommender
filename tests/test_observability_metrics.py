@@ -88,6 +88,7 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
         waiting_for_rows=False,
         run_in_progress=True,
         lease_expired=False,
+        waiting_for_materializer_age_seconds=7200.0,
     )
     manager.update_content_task_outbox(pending=2, oldest_age_seconds=12.5)
     manager.record_content_task_publish_retry("kafka_error")
@@ -175,6 +176,7 @@ def test_observability_manager_exposes_app_worker_and_dependency_metrics():
     assert "pit_orchestrator_last_success_timestamp 123.0" in payload
     assert "pit_orchestrator_run_in_progress 1.0" in payload
     assert "pit_orchestrator_lease_expired 0.0" in payload
+    assert "pit_orchestrator_waiting_for_materializer_age_seconds 7200.0" in payload
     assert "content_task_outbox_pending 2.0" in payload
     assert "content_task_outbox_oldest_age_seconds 12.5" in payload
     assert 'content_task_publish_retries_total{reason="kafka_error"} 1.0' in payload

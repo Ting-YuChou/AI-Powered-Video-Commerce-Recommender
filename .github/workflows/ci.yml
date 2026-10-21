@@ -64,8 +64,22 @@ jobs:
         run: docker run --rm -v "$PWD:/work" -w /work alpine/helm:3.14.0 template video-commerce charts/video-commerce > /tmp/video-commerce.yaml
       - name: Validate Kubernetes manifests
         run: docker run --rm -v /tmp:/work ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary /work/video-commerce.yaml
+      - name: Render Helm chart with ServiceMonitor and PrometheusRule
+        run: docker run --rm -v "$PWD:/work" -w /work alpine/helm:3.14.0 template video-commerce charts/video-commerce --set monitoring.serviceMonitor.enabled=true --set monitoring.prometheusRule.enabled=true > /tmp/video-commerce-monitoring.yaml
+      - name: Validate monitoring manifests against CRD schemas
+        run: >-
+          docker run --rm -v /tmp:/work ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary
+          -schema-location default
+          -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          /work/video-commerce-monitoring.yaml
       - name: Test Prometheus rules
         run: docker run --rm --entrypoint /bin/promtool -v "$PWD:/work" -w /work prom/prometheus:v2.54.1 test rules tests/monitoring/prometheus-rules.test.yml
+      - name: Check Alertmanager config
+        run: >-
+          docker run --rm --entrypoint /bin/amtool
+          -v "$PWD/monitoring:/m:ro"
+          -v "$PWD/monitoring/secrets/oncall-webhook-url.example:/etc/alertmanager/secrets/oncall-webhook-url:ro"
+          prom/alertmanager:v0.27.0 check-config /m/alertmanager.yml
 
   docker-build:
     runs-on: ubuntu-latest

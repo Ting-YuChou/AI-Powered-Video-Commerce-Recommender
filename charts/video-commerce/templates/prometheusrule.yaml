@@ -1,0 +1,17 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "video-commerce.fullname" . }}
+  labels:
+    {{- include "video-commerce.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # files/prometheus-rules.yml is a verbatim copy of monitoring/prometheus-rules.yml
+  # (tests/test_alert_runbooks.py enforces parity). .Files.Get inserts it raw, so
+  # the alert annotation templates reach Prometheus unrendered.
+  {{- .Files.Get "files/prometheus-rules.yml" | nindent 2 }}
+{{- end }}

@@ -80,6 +80,10 @@ spec:
               value: {{ $workload.name | quote }}
             {{- include "video-commerce.secretEnv" $ | nindent 12 }}
             {{- include "video-commerce.mapEnv" $workload.env | nindent 12 }}
+            {{- if $workload.prometheusMultiproc }}
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /run/prometheus-multiproc
+            {{- end }}
           resources:
             {{- toYaml $workload.resources | nindent 12 }}
           securityContext:
@@ -102,6 +106,10 @@ spec:
             {{- if eq $workload.name "model-trainer" }}
             - name: pit-staging
               mountPath: /var/lib/video-commerce/pit
+            {{- end }}
+            {{- if $workload.prometheusMultiproc }}
+            - name: prometheus-multiproc
+              mountPath: /run/prometheus-multiproc
             {{- end }}
           {{- if hasKey $workload.probes "livenessType" }}
           livenessProbe:
@@ -196,6 +204,11 @@ spec:
         - name: pit-staging
           emptyDir:
             {{- toYaml $.Values.backend.emptyDirs.pitStaging | nindent 12 }}
+        {{- end }}
+        {{- if $workload.prometheusMultiproc }}
+        - name: prometheus-multiproc
+          emptyDir:
+            {{- toYaml $.Values.backend.emptyDirs.prometheusMultiproc | nindent 12 }}
         {{- end }}
 {{- end }}
 {{- end }}

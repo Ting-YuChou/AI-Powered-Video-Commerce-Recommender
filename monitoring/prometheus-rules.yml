@@ -16,6 +16,7 @@ groups:
         annotations:
           summary: "{{ $labels.job }} 5xx rate is above the 5% error budget burn threshold"
           description: "{{ $labels.job }} has exceeded the 5xx error budget for at least 10 minutes."
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#serviceerrorbudgetburn
 
       - alert: ServiceP95LatencyHigh
         expr: |
@@ -32,6 +33,7 @@ groups:
         annotations:
           summary: "{{ $labels.job }} p95 latency is above 1 second"
           description: "{{ $labels.job }} p95 latency has stayed above 1 second for 10 minutes."
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#servicep95latencyhigh
 
       - alert: ServiceP99LatencyHigh
         expr: |
@@ -48,6 +50,7 @@ groups:
         annotations:
           summary: "{{ $labels.job }} p99 latency is above 2.5 seconds"
           description: "{{ $labels.job }} p99 latency has stayed above 2.5 seconds for 10 minutes."
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#servicep99latencyhigh
 
   - name: video-commerce-dependencies
     rules:
@@ -59,6 +62,7 @@ groups:
         annotations:
           summary: Gateway API is unavailable
           description: Prometheus has failed to scrape the gateway for more than 2 minutes.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#gatewayunavailable
 
       - alert: RecommendationServiceUnavailable
         expr: up{job="recommendation-service"} == 0
@@ -68,6 +72,7 @@ groups:
         annotations:
           summary: Recommendation service is unavailable
           description: The recommendation service scrape target is down.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#recommendationserviceunavailable
 
       - alert: InteractionIngestServiceUnavailable
         expr: up{job="interaction-ingest-service"} == 0
@@ -77,24 +82,41 @@ groups:
         annotations:
           summary: Interaction ingest service is unavailable
           description: The interaction ingest service scrape target is down.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#interactioningestserviceunavailable
 
+      # feature-worker only runs (and heartbeats) when the Python feature pipeline
+      # is active; in the default Flink mode it is not deployed at all.
       - alert: WorkerHeartbeatMissing
-        expr: video_commerce_worker_live_instances{job="gateway-api"} < 1
+        expr: |
+          video_commerce_worker_live_instances{job="gateway-api",service!="feature-worker"} < 1
+          or
+          (
+            video_commerce_worker_live_instances{job="gateway-api",service="feature-worker"} < 1
+            and on() max(video_commerce_feature_pipeline_mode{job="gateway-api",mode!="flink"}) == 1
+          )
         for: 2m
         labels:
           severity: critical
         annotations:
           summary: Background worker heartbeat missing
           description: "{{ $labels.service }} has reported zero live instances for more than 2 minutes."
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#workerheartbeatmissing
 
       - alert: WorkerMetricsTargetDown
-        expr: up{job=~"content-worker|content-task-publisher|feature-worker|model-trainer"} == 0
+        expr: |
+          up{job=~"content-worker|content-task-publisher|model-trainer"} == 0
+          or
+          (
+            up{job="feature-worker"} == 0
+            and on() max(video_commerce_feature_pipeline_mode{job="gateway-api",mode!="flink"}) == 1
+          )
         for: 2m
         labels:
           severity: critical
         annotations:
           summary: "{{ $labels.job }} metrics endpoint is unavailable"
           description: Prometheus cannot scrape the worker metrics endpoint.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#workermetricstargetdown
 
       - alert: WorkerProcessingFailures
         expr: |
@@ -107,15 +129,32 @@ groups:
         annotations:
           summary: "{{ $labels.service }} is failing message processing"
           description: "{{ $labels.service }} has message processing errors on {{ $labels.topic }}."
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#workerprocessingfailures
 
+      # Every exporter carries the gauge (0 when it has no producer), so only
+      # the services that own a producer are evaluated, each on its own.
       - alert: KafkaProducerDisconnected
-        expr: max(video_commerce_kafka_producer_connected) < 1
+        expr: |
+          min by (job) (
+            video_commerce_kafka_producer_connected{job=~"gateway-api|interaction-ingest-service|recommendation-service"}
+          ) < 1
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: Kafka producer is disconnected
-          description: The gateway Kafka producer has not been connected for at least 5 minutes.
+          summary: "{{ $labels.job }} Kafka producer is disconnected"
+          description: "{{ $labels.job }} has not had a connected Kafka producer for at least 5 minutes; uploads, interactions or impression publishing fail until it reconnects."
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#kafkaproducerdisconnected
+
+      - alert: RateLimiterFailingOpen
+        expr: sum by (job, reason) (rate(video_commerce_rate_limiter_errors_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} rate limiter is failing open ({{ $labels.reason }})"
+          description: Rate-limit checks against Redis are erroring or timing out, so requests are admitted without a limit.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#ratelimiterfailingopen
 
       - alert: KafkaConsumerLagHigh
         expr: |
@@ -126,6 +165,7 @@ groups:
         annotations:
           summary: Kafka consumer lag is high for {{ $labels.consumergroup }}
           description: Consumer group {{ $labels.consumergroup }} has more than 1000 pending messages on {{ $labels.topic }}.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#kafkaconsumerlaghigh
 
       - alert: KafkaDeadLetterTraffic
         expr: rate(video_commerce_kafka_dead_letter_messages_total[5m]) > 0
@@ -135,6 +175,7 @@ groups:
         annotations:
           summary: Kafka dead-letter traffic detected
           description: Messages are being published to the dead-letter topic.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#kafkadeadlettertraffic
 
       - alert: RedisMemoryHigh
         expr: |
@@ -149,6 +190,7 @@ groups:
         annotations:
           summary: Redis memory usage is above 80%
           description: "{{ $labels.job }} role={{ $labels.role }} has exceeded 80% of configured maxmemory."
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#redismemoryhigh
 
       - alert: PostgresExporterDown
         expr: up{job="postgres"} == 0 or pg_up == 0
@@ -158,6 +200,7 @@ groups:
         annotations:
           summary: Postgres exporter or database is unavailable
           description: Prometheus cannot scrape Postgres metrics or the database is not accepting connections.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#postgresexporterdown
 
       - alert: DatabaseErrors
         expr: rate(video_commerce_database_queries_total{status="error"}[5m]) > 0
@@ -167,6 +210,7 @@ groups:
         annotations:
           summary: Application database errors detected
           description: Application-level Postgres operations are failing.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#databaseerrors
 
       - alert: DatabaseP95LatencyHigh
         expr: |
@@ -182,6 +226,7 @@ groups:
         annotations:
           summary: Database p95 latency is high
           description: Application-observed Postgres p95 latency is above 500ms.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#databasep95latencyhigh
 
   - name: video-commerce-ranking-serving
     rules:
@@ -193,6 +238,7 @@ groups:
         annotations:
           summary: No verified trained ranking model is serving
           description: All ranking runners failed model, checksum, or feature-schema readiness.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingverifiedmodelmissing
 
       - alert: RankingHealthyRunnersLow
         expr: max(video_commerce_ranking_healthy_runners{job="ranking-service"}) < 2
@@ -202,6 +248,7 @@ groups:
         annotations:
           summary: Fewer than two ranking runners are healthy
           description: Coordinator readiness is closed until at least two verified runners recover.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankinghealthyrunnerslow
 
       - alert: RankingQueueWaitP95High
         expr: |
@@ -217,6 +264,7 @@ groups:
         annotations:
           summary: Ranking queue wait p95 is above 75ms
           description: Admission or runner capacity is lagging the current request rate.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingqueuewaitp95high
 
       - alert: RankingRunnerSlotP95High
         expr: |
@@ -232,6 +280,7 @@ groups:
         annotations:
           summary: Ranking runner slot wait p95 is above 50ms
           description: Dispatch demand is persistently above effective runner capacity.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingrunnerslotp95high
 
       - alert: RankingOverloadSustained
         expr: sum(rate(video_commerce_ranking_admission_rejections_total[5m])) > 1
@@ -241,6 +290,7 @@ groups:
         annotations:
           summary: Ranking overload responses are sustained
           description: Capacity-excess traffic is being rejected with HTTP 429.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingoverloadsustained
 
       - alert: RankingCoordinatorPoolTimeout
         expr: sum(increase(video_commerce_ranking_coordinator_client_errors_total{reason="timeout"}[5m])) > 0
@@ -250,6 +300,7 @@ groups:
         annotations:
           summary: Ranking coordinator client pool or request timeout detected
           description: Inspect coordinator CPU, connection pool saturation, and runner dispatch latency.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingcoordinatorpooltimeout
 
       - alert: Ranking5xxDetected
         expr: sum(rate(video_commerce_http_requests_total{job=~"ranking-service|recommendation-service",status=~"5.."}[5m])) > 0
@@ -259,6 +310,7 @@ groups:
         annotations:
           summary: Ranking serving is returning 5xx responses
           description: Capacity overload must return 429; investigate model, protocol, or dependency availability.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#ranking5xxdetected
 
       - alert: RankingTritonModelUnavailable
         expr: max(video_commerce_ranking_triton_model_ready{job="ranking-service"}) < 1
@@ -268,6 +320,27 @@ groups:
         annotations:
           summary: Required Triton ranking model is unavailable
           description: Verify the exact business/numeric model version, ONNX checksum, and Triton readiness.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingtritonmodelunavailable
+
+      - alert: RankingRuntimeUnauthenticatedConnections
+        expr: sum by (job, role) (increase(video_commerce_ranking_runtime_auth_total{result="unauthenticated"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ranking {{ $labels.role }} is accepting unauthenticated runtime connections"
+          description: RANKING_RUNTIME_AUTH_MODE=permissive is admitting connections without the HMAC handshake; configure SECURITY_INTERNAL_SERVICE_KEY on every peer before switching to required.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingruntimeunauthenticatedconnections
+
+      - alert: RankingRuntimeAuthFailures
+        expr: sum by (job, role, result) (increase(video_commerce_ranking_runtime_auth_total{result=~"invalid_mac|expired|replayed|malformed|unsupported_version|rejected"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ranking {{ $labels.role }} is rejecting runtime handshakes ({{ $labels.result }})"
+          description: Peers are failing ranking runtime authentication; check for key mismatch during rotation, clock skew, or an unexpected client.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingruntimeauthfailures
 
       - alert: RankingTritonOverloadSustained
         expr: sum(rate(video_commerce_ranking_adapter_requests_total{outcome=~"overloaded|rejected_inflight"}[5m])) > 1
@@ -277,6 +350,7 @@ groups:
         annotations:
           summary: Triton ranking overload responses are sustained
           description: Inspect adapter inflight, Triton queue, dynamic batch distribution, and CPU saturation.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingtritonoverloadsustained
 
   - name: video-commerce-feature-lake
     rules:
@@ -288,6 +362,7 @@ groups:
         annotations:
           summary: Flink interaction feature job is missing or duplicated
           description: Restore exactly one running video-commerce-interaction-features job before trusting official online features.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkinteractionfeaturejobmissing
 
       - alert: FlinkRedisSnapshotConflict
         expr: increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_conflict[5m]) > 0
@@ -296,6 +371,7 @@ groups:
         annotations:
           summary: Flink Redis snapshot version conflict detected
           description: Stop cutover and inspect state epoch, generation, digest, and concurrent official writers.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkredissnapshotconflict
 
       - alert: FlinkRedisSnapshotStaleWrites
         expr: |
@@ -311,6 +387,7 @@ groups:
         annotations:
           summary: Most Flink Redis snapshot writes are rejected as stale
           description: The job is likely running from empty state under an epoch that already wrote Redis; restore from the latest checkpoint or bump FLINK_FEATURE_STATE_EPOCH.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkredissnapshotstalewrites
 
       - alert: FlinkRedisSnapshotWriteFailure
         expr: increase(flink_taskmanager_job_task_operator_redis_snapshot_sink_failure[10m]) > 3
@@ -320,6 +397,7 @@ groups:
         annotations:
           summary: Flink Redis snapshot writes are repeatedly failing
           description: Inspect Redis availability, Lua errors, and Flink restart/checkpoint state.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkredissnapshotwritefailure
 
       - alert: FlinkInteractionWatermarkLag
         expr: (time() * 1000) - max(flink_taskmanager_job_task_operator_currentInputWatermark{job_name="video-commerce-interaction-features"}) > 900000
@@ -329,6 +407,7 @@ groups:
         annotations:
           summary: Flink interaction watermark is over 15 minutes behind
           description: Inspect Kafka partition activity, idleness detection, consumer lag, and late-event volume.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkinteractionwatermarklag
 
       - alert: FlinkCheckpointUnavailable
         expr: time() - max(flink_jobmanager_job_lastCheckpointCompletionTimestamp{job_name="video-commerce-interaction-features"}) / 1000 > 300
@@ -338,6 +417,7 @@ groups:
         annotations:
           summary: Flink interaction job has no recent successful checkpoint
           description: Pause replay and cutover until checkpoint storage and job health recover.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkcheckpointunavailable
 
       - alert: FlinkLatePurchaseSustained
         expr: sum(increase(flink_taskmanager_job_task_operator_late_interactions_5m_purchase_total[15m])) > 0
@@ -347,6 +427,7 @@ groups:
         annotations:
           summary: Late purchase events are continuously missing realtime windows
           description: Reconcile the quarantine topic and inspect producer clocks, Kafka lag, and watermark policy.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinklatepurchasesustained
 
       - alert: RecommendationOutboxBacklog
         expr: video_commerce_recommendation_outbox_oldest_age_seconds > 300 or video_commerce_recommendation_outbox_pending > 10000
@@ -356,6 +437,41 @@ groups:
         annotations:
           summary: Served-impression outbox is backlogged
           description: Attribution coverage is falling behind; inspect Kafka publish retries and database health.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#recommendationoutboxbacklog
+
+      - alert: RecommendationOutboxTerminal
+        expr: sum by (job, reason) (increase(video_commerce_recommendation_outbox_terminal_total{reason!="not_exposed"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Served-impression outbox rows are being retired unpublished ({{ $labels.reason }})"
+          description: These impressions will never reach Kafka, so their attribution and training labels are lost.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#recommendationoutboxterminal
+
+      - alert: RecommendationImpressionAttributionDegraded
+        expr: |
+          sum(rate(video_commerce_recommendation_impression_events_total{stage="served",status=~"timeout|unavailable"}[10m]))
+            /
+          clamp_min(sum(rate(video_commerce_recommendation_impression_events_total{stage="served"}[10m])), 0.001)
+            > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 5% of served recommendations carry no impression_id
+          description: The impression outbox write is timing out or saturated, so responses are served without attribution; inspect Postgres latency and outbox in-flight limits.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#recommendationimpressionattributiondegraded
+
+      - alert: CatalogOutboxTerminal
+        expr: sum by (job, reason) (increase(catalog_outbox_terminal_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Catalog outbox rows are being retired unpublished ({{ $labels.reason }})"
+          description: Catalog activation events were abandoned and downstream catalog consumers will not see them.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#catalogoutboxterminal
 
       - alert: ContentTaskOutboxBacklog
         expr: content_task_outbox_oldest_age_seconds > 300 or content_task_outbox_pending > 1000
@@ -365,6 +481,7 @@ groups:
         annotations:
           summary: Content task outbox is not draining
           description: Durable uploads are waiting for Kafka publication; inspect the publisher and broker.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contenttaskoutboxbacklog
 
       - alert: ContentUploadObjectMissing
         expr: increase(content_task_publish_retries_total{reason="missing_object"}[10m]) > 0
@@ -374,6 +491,7 @@ groups:
         annotations:
           summary: A durable content job references a missing object
           description: The task was terminalized before Kafka publish to avoid an unprocessable job.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contentuploadobjectmissing
 
       - alert: ContentProcessingLeaseLost
         expr: increase(content_processing_events_total{outcome="lease_lost"}[10m]) > 0
@@ -383,6 +501,29 @@ groups:
         annotations:
           summary: A content worker lost its processing lease
           description: Check worker stalls, Postgres latency, and processing duration before retry takeover.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contentprocessingleaselost
+
+      # The reaper labels a run that ran out of redrives "exhausted"; "terminal"
+      # is accepted too so the rule survives a rename in either direction.
+      - alert: ContentProcessingRedrivesExhausted
+        expr: sum by (job) (increase(video_commerce_content_processing_redrives_total{outcome=~"exhausted|terminal"}[30m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: A content job exhausted its processing redrives and was failed
+          description: The job's lease kept expiring until CONTENT_PROCESSING_MAX_REDRIVES; the upload will not be processed without operator action.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contentprocessingredrivesexhausted
+
+      - alert: ContentZeroNormEmbeddings
+        expr: sum by (job) (increase(video_commerce_content_zero_norm_embeddings_total[30m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Content worker produced zero-norm visual embeddings
+          description: CLIP returned (near) zero vectors; affected content is excluded from visual retrieval until reprocessed.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contentzeronormembeddings
 
       - alert: FeatureLakeMaterializationLagHigh
         expr: max by (record_type) ({__name__=~"(.+_)?feature_lake_materialization_lag_seconds",record_type!="window_feature"}) > 120
@@ -392,6 +533,7 @@ groups:
         annotations:
           summary: Feature lake raw materialization lag is above two minutes
           description: Kafka to Iceberg history materialization is outside the shadow gate.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#featurelakematerializationlaghigh
 
       - alert: FeatureLakeWindowLagHigh
         expr: max by (record_type) ({__name__=~"(.+_)?feature_lake_materialization_lag_seconds",record_type="window_feature"}) > 900
@@ -401,6 +543,7 @@ groups:
         annotations:
           summary: Feature lake window snapshot lag is above fifteen minutes
           description: Window history materialization is outside the shadow gate.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#featurelakewindowlaghigh
 
       - alert: FeatureLakeDlqTraffic
         expr: sum(rate({__name__=~"(.+_)?feature_lake_dlq_total"}[5m])) > 0
@@ -410,6 +553,7 @@ groups:
         annotations:
           summary: Feature lake events are being rejected to DLQ
           description: Inspect contract validation failures before allowing PIT cutover.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#featurelakedlqtraffic
 
       - alert: CatalogOutboxBacklog
         expr: catalog_outbox_oldest_age_seconds > 300 or catalog_outbox_pending > 10000
@@ -419,6 +563,7 @@ groups:
         annotations:
           summary: Catalog transactional outbox is backlogged
           description: The oldest completed-activation event has not reached Kafka within five minutes.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#catalogoutboxbacklog
 
       - alert: FeatureLakeIcebergCommitFailure
         expr: increase(flink_taskmanager_job_task_operator_iceberg_commit_failed_total[10m]) > 0
@@ -428,6 +573,7 @@ groups:
         annotations:
           summary: Iceberg atomic commit failed
           description: Pause materialization cutover and inspect the Flink checkpoint/commit failure.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#featurelakeicebergcommitfailure
 
       - alert: PitManifestValidationFailure
         expr: increase(pit_manifest_validation_failures_total[10m]) > 0
@@ -437,6 +583,7 @@ groups:
         annotations:
           summary: PIT manifest or Parquet shard validation failed
           description: Trainer has failed closed and will not fall back to legacy data.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitmanifestvalidationfailure
 
       - alert: PitOnlineOfflineParityLow
         expr: pit_online_offline_parity_ratio < 0.999
@@ -446,6 +593,7 @@ groups:
         annotations:
           summary: Online/offline feature bundle parity is below 99.9 percent
           description: Training source must remain legacy until parity recovers.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitonlineofflineparitylow
 
       - alert: PitLeakageDetected
         expr: pit_leakage_rows > 0
@@ -455,6 +603,7 @@ groups:
         annotations:
           summary: Point-in-time leakage rows detected
           description: One or more training rows used a future or unavailable feature.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitleakagedetected
 
       - alert: PitDailyRunMissing
         expr: |
@@ -469,6 +618,7 @@ groups:
         annotations:
           summary: No successful PIT dataset run for more than 26 hours
           description: Inspect the durable run state, Flink submission, and manifest publication stages.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitdailyrunmissing
 
       - alert: PitTrainerManifestFailure
         expr: |
@@ -480,6 +630,7 @@ groups:
         annotations:
           summary: PIT manifest exists but typed training continues to fail
           description: The trainer has failed closed; inspect manifest, shard hash, schema, and version errors.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pittrainermanifestfailure
 
       - alert: PitOrchestratorRunStuck
         expr: pit_orchestrator_run_in_progress{job="pit-state-exporter"} == 1
@@ -489,6 +640,32 @@ groups:
         annotations:
           summary: PIT orchestrator run exceeded its lease duration
           description: The durable run remains active beyond the two-hour lease and requires takeover or investigation.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitorchestratorrunstuck
+
+      - alert: PitRunWaitingForMaterializer
+        expr: pit_orchestrator_waiting_for_materializer_age_seconds{job="pit-state-exporter"} > 21600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A PIT run has waited over 6 hours for the history materializer
+          description: The feature-history materializer has not passed the oldest parked run's cutoff, so no new PIT dataset can be exported.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitrunwaitingformaterializer
+
+      - alert: KnownUserFeaturesMissing
+        expr: |
+          sum(rate(video_commerce_user_features_missing_known_user_total[10m]))
+            /
+          clamp_min(sum(rate(video_commerce_recommendation_requests_total{cache_hit="false"}[10m])), 0.001)
+            > 0.05
+          and sum(rate(video_commerce_user_features_missing_known_user_total[10m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Known users are being served without online features
+          description: More than 5% of uncached recommendation requests read no uf feature key for a known user; check the Flink feature job and the official feature namespace.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#knownuserfeaturesmissing
 
       - alert: PitOrchestratorLeaseExpired
         expr: pit_orchestrator_lease_expired{job="pit-state-exporter"} == 1
@@ -498,6 +675,7 @@ groups:
         annotations:
           summary: PIT orchestrator lease expired
           description: A durable running PIT job has stopped renewing its lease and requires takeover.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitorchestratorleaseexpired
 
       - alert: RankingArtifactFallbackPersisting
         expr: |
@@ -509,6 +687,7 @@ groups:
         annotations:
           summary: Serving still uses untrained fallback after PIT artifact creation
           description: Check artifact activation, checksum sync, and ranking runner reload state.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingartifactfallbackpersisting
 
       - alert: ModelReleaseRegisteredBacklog
         expr: model_release_registered_backlog > 0
@@ -518,6 +697,7 @@ groups:
         annotations:
           summary: Ranking releases have waited more than 24 hours for evaluation
           description: Inspect PIT evidence, evaluator failures, and slice sample thresholds.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#modelreleaseregisteredbacklog
 
       - alert: ModelReleaseStagingTooOld
         expr: model_release_staging_age_seconds > 86400
@@ -527,6 +707,7 @@ groups:
         annotations:
           summary: A validated ranking release remains in staging
           description: Review the offline gate evidence and either promote or retire the release.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#modelreleasestagingtooold
 
       - alert: ModelReleaseRunnerGenerationMismatch
         expr: model_release_runner_generation_mismatch > 0
@@ -536,6 +717,7 @@ groups:
         annotations:
           summary: Ranking runner has not converged to the active generation
           description: Inspect artifact download, checksum validation, and runner reload failures.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#modelreleaserunnergenerationmismatch
 
       - alert: RetrievalReleaseRegisteredBacklog
         expr: retrieval_release_registered_backlog > 0
@@ -545,6 +727,7 @@ groups:
         annotations:
           summary: Two-Tower releases have waited more than 24 hours for evaluation
           description: Inspect retrieval PIT evidence, catalog coverage, and slice thresholds.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#retrievalreleaseregisteredbacklog
 
       - alert: RetrievalReleaseStagingTooOld
         expr: retrieval_release_staging_age_seconds > 86400
@@ -554,6 +737,7 @@ groups:
         annotations:
           summary: A validated Two-Tower release remains in staging
           description: Review retrieval gate evidence and either promote or retire the release.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#retrievalreleasestagingtooold
 
       - alert: ModelArtifactActivationFailures
         expr: increase(model_artifact_activation_failures_total[10m]) > 0
@@ -563,6 +747,7 @@ groups:
         annotations:
           summary: Model artifact generation activation failed
           description: The previous verified generation remains active; inspect checksum, schema, policy, and smoke validation errors.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#modelartifactactivationfailures
 
       - alert: ModelArtifactGenerationCleanupFailure
         expr: increase(model_artifact_generation_cleanup_failures_total[1h]) > 0
@@ -572,6 +757,7 @@ groups:
         annotations:
           summary: Local model generation cleanup failed
           description: Inspect filesystem capacity and protected generation references before manual cleanup.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#modelartifactgenerationcleanupfailure
 
       - alert: IcebergMaintenanceFailure
         expr: iceberg_maintenance_failed_runs > 0
@@ -581,3 +767,4 @@ groups:
         annotations:
           summary: Iceberg maintenance failed
           description: Keep execute mode disabled until plan hash, table head, protected lineage, and post-cleanup reads are reconciled.
+          runbook_url: https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#icebergmaintenancefailure
