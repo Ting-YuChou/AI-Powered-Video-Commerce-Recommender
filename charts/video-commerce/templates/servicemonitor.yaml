@@ -26,6 +26,21 @@ spec:
       path: {{ default "/metrics" $workload.serviceMonitor.path }}
       interval: {{ $.Values.monitoring.serviceMonitor.interval }}
       scrapeTimeout: {{ $.Values.monitoring.serviceMonitor.scrapeTimeout }}
+      # Alert rules match job="<workload>" (as in Compose), not the Service name.
+      relabelings:
+        - action: replace
+          targetLabel: job
+          replacement: {{ $workload.name }}
+    {{- range $workload.serviceMonitor.extraEndpoints }}
+    - port: {{ default "http" $workload.service.portName }}
+      path: {{ .path }}
+      interval: {{ $.Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ $.Values.monitoring.serviceMonitor.scrapeTimeout }}
+      relabelings:
+        - action: replace
+          targetLabel: job
+          replacement: {{ .job }}
+    {{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

@@ -19,6 +19,7 @@ tests:
             exp_annotations:
               summary: "Most Flink Redis snapshot writes are rejected as stale"
               description: "The job is likely running from empty state under an epoch that already wrote Redis; restore from the latest checkpoint or bump FLINK_FEATURE_STATE_EPOCH."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#flinkredissnapshotstalewrites"
 
   - interval: 1m
     input_series:
@@ -37,6 +38,7 @@ tests:
             exp_annotations:
               summary: "gateway-api 5xx rate is above the 5% error budget burn threshold"
               description: "gateway-api has exceeded the 5xx error budget for at least 10 minutes."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#serviceerrorbudgetburn"
 
   - interval: 1m
     input_series:
@@ -52,6 +54,7 @@ tests:
             exp_annotations:
               summary: "PIT orchestrator run exceeded its lease duration"
               description: "The durable run remains active beyond the two-hour lease and requires takeover or investigation."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitorchestratorrunstuck"
 
   - interval: 1m
     input_series:
@@ -71,6 +74,7 @@ tests:
             exp_annotations:
               summary: "PIT manifest exists but typed training continues to fail"
               description: "The trainer has failed closed; inspect manifest, shard hash, schema, and version errors."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pittrainermanifestfailure"
 
   - interval: 1m
     input_series:
@@ -88,6 +92,7 @@ tests:
             exp_annotations:
               summary: "Content task outbox is not draining"
               description: "Durable uploads are waiting for Kafka publication; inspect the publisher and broker."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contenttaskoutboxbacklog"
 
   - interval: 1m
     input_series:
@@ -104,6 +109,7 @@ tests:
             exp_annotations:
               summary: "A durable content job references a missing object"
               description: "The task was terminalized before Kafka publish to avoid an unprocessable job."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contentuploadobjectmissing"
 
   - interval: 1m
     input_series:
@@ -119,3 +125,312 @@ tests:
             exp_annotations:
               summary: "Ranking runner has not converged to the active generation"
               description: "Inspect artifact download, checksum validation, and runner reload failures."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#modelreleaserunnergenerationmismatch"
+
+  # feature-worker is gated on the Python feature pipeline (Flink is default).
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_worker_live_instances{job="gateway-api",service="content-worker"}'
+        values: '0x10'
+      - series: 'video_commerce_worker_live_instances{job="gateway-api",service="feature-worker"}'
+        values: '0x10'
+      - series: 'video_commerce_feature_pipeline_mode{job="gateway-api",mode="flink"}'
+        values: '1x10'
+      - series: 'video_commerce_feature_pipeline_mode{job="gateway-api",mode="python"}'
+        values: '0x10'
+      - series: 'up{job="feature-worker",instance="feature-worker:9102"}'
+        values: '0x10'
+      - series: 'up{job="model-trainer",instance="model-trainer:9103"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WorkerHeartbeatMissing
+        exp_alerts:
+          - exp_labels:
+              job: gateway-api
+              service: content-worker
+              severity: critical
+            exp_annotations:
+              summary: "Background worker heartbeat missing"
+              description: "content-worker has reported zero live instances for more than 2 minutes."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#workerheartbeatmissing"
+      - eval_time: 5m
+        alertname: WorkerMetricsTargetDown
+        exp_alerts:
+          - exp_labels:
+              job: model-trainer
+              instance: model-trainer:9103
+              severity: critical
+            exp_annotations:
+              summary: "model-trainer metrics endpoint is unavailable"
+              description: "Prometheus cannot scrape the worker metrics endpoint."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#workermetricstargetdown"
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_worker_live_instances{job="gateway-api",service="feature-worker"}'
+        values: '0x10'
+      - series: 'video_commerce_feature_pipeline_mode{job="gateway-api",mode="flink"}'
+        values: '0x10'
+      - series: 'video_commerce_feature_pipeline_mode{job="gateway-api",mode="python"}'
+        values: '1x10'
+      - series: 'up{job="feature-worker",instance="feature-worker:9102"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WorkerHeartbeatMissing
+        exp_alerts:
+          - exp_labels:
+              job: gateway-api
+              service: feature-worker
+              severity: critical
+            exp_annotations:
+              summary: "Background worker heartbeat missing"
+              description: "feature-worker has reported zero live instances for more than 2 minutes."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#workerheartbeatmissing"
+      - eval_time: 5m
+        alertname: WorkerMetricsTargetDown
+        exp_alerts:
+          - exp_labels:
+              job: feature-worker
+              instance: feature-worker:9102
+              severity: critical
+            exp_annotations:
+              summary: "feature-worker metrics endpoint is unavailable"
+              description: "Prometheus cannot scrape the worker metrics endpoint."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#workermetricstargetdown"
+
+  # Only producer-owning services alert, each on its own.
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_kafka_producer_connected{job="gateway-api",instance="gateway-api:8000"}'
+        values: '1x10'
+      - series: 'video_commerce_kafka_producer_connected{job="interaction-ingest-service",instance="interaction-ingest-service:8002"}'
+        values: '0x10'
+      - series: 'video_commerce_kafka_producer_connected{job="content-worker",instance="content-worker:9101"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: KafkaProducerDisconnected
+        exp_alerts:
+          - exp_labels:
+              job: interaction-ingest-service
+              severity: critical
+            exp_annotations:
+              summary: "interaction-ingest-service Kafka producer is disconnected"
+              description: "interaction-ingest-service has not had a connected Kafka producer for at least 5 minutes; uploads, interactions or impression publishing fail until it reconnects."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#kafkaproducerdisconnected"
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_rate_limiter_errors_total{job="gateway-api",reason="timeout"}'
+        values: '0+5x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: RateLimiterFailingOpen
+        exp_alerts:
+          - exp_labels:
+              job: gateway-api
+              reason: timeout
+              severity: warning
+            exp_annotations:
+              summary: "gateway-api rate limiter is failing open (timeout)"
+              description: "Rate-limit checks against Redis are erroring or timing out, so requests are admitted without a limit."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#ratelimiterfailingopen"
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_ranking_runtime_auth_total{job="ranking-service",role="coordinator",result="unauthenticated"}'
+        values: '0+1x40'
+      - series: 'video_commerce_ranking_runtime_auth_total{job="ranking-service",role="coordinator",result="authenticated"}'
+        values: '0+10x40'
+      - series: 'video_commerce_ranking_runtime_auth_total{job="ranking-service",role="coordinator",result="invalid_mac"}'
+        values: '0+1x40'
+      - series: 'video_commerce_ranking_runtime_auth_total{job="ranking-service",role="coordinator",result="replayed"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: RankingRuntimeUnauthenticatedConnections
+        exp_alerts:
+          - exp_labels:
+              job: ranking-service
+              role: coordinator
+              severity: warning
+            exp_annotations:
+              summary: "Ranking coordinator is accepting unauthenticated runtime connections"
+              description: "RANKING_RUNTIME_AUTH_MODE=permissive is admitting connections without the HMAC handshake; configure SECURITY_INTERNAL_SERVICE_KEY on every peer before switching to required."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingruntimeunauthenticatedconnections"
+      - eval_time: 30m
+        alertname: RankingRuntimeAuthFailures
+        exp_alerts:
+          - exp_labels:
+              job: ranking-service
+              role: coordinator
+              result: invalid_mac
+              severity: warning
+            exp_annotations:
+              summary: "Ranking coordinator is rejecting runtime handshakes (invalid_mac)"
+              description: "Peers are failing ranking runtime authentication; check for key mismatch during rotation, clock skew, or an unexpected client."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#rankingruntimeauthfailures"
+
+  # not_exposed retirements are expected under DB slowness and do not alert here.
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_recommendation_outbox_terminal_total{job="recommendation-service",reason="max_attempts"}'
+        values: '0+1x20'
+      - series: 'video_commerce_recommendation_outbox_terminal_total{job="recommendation-service",reason="not_exposed"}'
+        values: '0+5x20'
+      - series: 'catalog_outbox_terminal_total{job="catalog-event-publisher",reason="message_too_large"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: RecommendationOutboxTerminal
+        exp_alerts:
+          - exp_labels:
+              job: recommendation-service
+              reason: max_attempts
+              severity: warning
+            exp_annotations:
+              summary: "Served-impression outbox rows are being retired unpublished (max_attempts)"
+              description: "These impressions will never reach Kafka, so their attribution and training labels are lost."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#recommendationoutboxterminal"
+      - eval_time: 10m
+        alertname: CatalogOutboxTerminal
+        exp_alerts:
+          - exp_labels:
+              job: catalog-event-publisher
+              reason: message_too_large
+              severity: warning
+            exp_annotations:
+              summary: "Catalog outbox rows are being retired unpublished (message_too_large)"
+              description: "Catalog activation events were abandoned and downstream catalog consumers will not see them."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#catalogoutboxterminal"
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_recommendation_impression_events_total{job="recommendation-service",stage="served",status="inserted"}'
+        values: '0+90x40'
+      - series: 'video_commerce_recommendation_impression_events_total{job="recommendation-service",stage="served",status="timeout"}'
+        values: '0+10x40'
+      # Dispatcher events share stage="served" but must not dilute the ratio.
+      - series: 'video_commerce_recommendation_impression_events_total{job="recommendation-service",stage="served",status="published"}'
+        values: '0+200x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: RecommendationImpressionAttributionDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "More than 5% of served recommendations carry no impression_id"
+              description: "The impression outbox write is timing out or saturated, so responses are served without attribution; inspect Postgres latency and outbox in-flight limits."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#recommendationimpressionattributiondegraded"
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_content_processing_redrives_total{job="content-task-publisher",outcome="exhausted"}'
+        values: '0 0 1 1 1 1 1 1 1 1'
+      - series: 'video_commerce_content_processing_redrives_total{job="content-task-publisher",outcome="redriven"}'
+        values: '0+1x10'
+      - series: 'video_commerce_content_zero_norm_embeddings_total{job="content-worker"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ContentProcessingRedrivesExhausted
+        exp_alerts:
+          - exp_labels:
+              job: content-task-publisher
+              severity: warning
+            exp_annotations:
+              summary: "A content job exhausted its processing redrives and was failed"
+              description: "The job's lease kept expiring until CONTENT_PROCESSING_MAX_REDRIVES; the upload will not be processed without operator action."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contentprocessingredrivesexhausted"
+      - eval_time: 10m
+        alertname: ContentZeroNormEmbeddings
+        exp_alerts:
+          - exp_labels:
+              job: content-worker
+              severity: warning
+            exp_annotations:
+              summary: "Content worker produced zero-norm visual embeddings"
+              description: "CLIP returned (near) zero vectors; affected content is excluded from visual retrieval until reprocessed."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#contentzeronormembeddings"
+
+  - interval: 1m
+    input_series:
+      - series: 'pit_orchestrator_waiting_for_materializer_age_seconds{job="pit-state-exporter"}'
+        values: '30000x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PitRunWaitingForMaterializer
+        exp_alerts:
+          - exp_labels:
+              job: pit-state-exporter
+              severity: warning
+            exp_annotations:
+              summary: "A PIT run has waited over 6 hours for the history materializer"
+              description: "The feature-history materializer has not passed the oldest parked run's cutoff, so no new PIT dataset can be exported."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#pitrunwaitingformaterializer"
+
+  - interval: 1m
+    input_series:
+      - series: 'pit_orchestrator_waiting_for_materializer_age_seconds{job="pit-state-exporter"}'
+        values: '3600x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PitRunWaitingForMaterializer
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_user_features_missing_known_user_total{job="recommendation-service"}'
+        values: '0+60x40'
+      - series: 'video_commerce_recommendation_requests_total{job="recommendation-service",result="success",cache_hit="false",serving_path="ranked"}'
+        values: '0+600x40'
+      - series: 'video_commerce_recommendation_requests_total{job="recommendation-service",result="success",cache_hit="true",serving_path="cache"}'
+        values: '0+6000x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KnownUserFeaturesMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Known users are being served without online features"
+              description: "More than 5% of uncached recommendation requests read no uf feature key for a known user; check the Flink feature job and the official feature namespace."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#knownuserfeaturesmissing"
+
+  # A trickle of misses on a quiet service stays below the absolute floor.
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_user_features_missing_known_user_total{job="recommendation-service"}'
+        values: '0+1x40'
+      - series: 'video_commerce_recommendation_requests_total{job="recommendation-service",result="success",cache_hit="false",serving_path="ranked"}'
+        values: '0+2x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KnownUserFeaturesMissing
+        exp_alerts: []
+
+  # Only a dependency that stays unhealthy alerts; degraded (0.5) does not.
+  - interval: 1m
+    input_series:
+      - series: 'video_commerce_dependency_status{job="gateway-api",service="gateway-api",dependency="recommendation"}'
+        values: '0x20'
+      - series: 'video_commerce_dependency_status{job="gateway-api",service="gateway-api",dependency="kafka"}'
+        values: '0.5x20'
+      - series: 'video_commerce_dependency_status{job="gateway-api",service="gateway-api",dependency="redis"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DependencyUnhealthy
+        exp_alerts:
+          - exp_labels:
+              job: gateway-api
+              service: gateway-api
+              dependency: recommendation
+              severity: warning
+            exp_annotations:
+              summary: "gateway-api reports recommendation unhealthy"
+              description: "gateway-api readiness has seen recommendation unhealthy for 10 minutes; features that need it are failing or degraded."
+              runbook_url: "https://github.com/Ting-YuChou/AI-Powered-Video-Commerce-Recommender/blob/main/docs/operations/alert-runbooks.md#dependencyunhealthy"

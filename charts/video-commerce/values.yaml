@@ -569,6 +569,12 @@ backend:
       sizeLimit: 10Gi
     pitStaging:
       sizeLimit: 20Gi
+    # Memory-backed dir for prometheus_client multiprocess files, mounted only
+    # into workloads with prometheusMultiproc: true. Counts against the pod's
+    # memory limit; a few MB per worker is typical.
+    prometheusMultiproc:
+      medium: Memory
+      sizeLimit: 64Mi
   workloads:
     gatewayApi:
       enabled: true
@@ -576,7 +582,9 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn video_commerce.services.gateway.api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log'
+        - 'python -m video_commerce.common.prometheus_multiproc && exec python -m uvicorn video_commerce.services.gateway.api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log'
+      # Aggregate metrics across uvicorn workers via PROMETHEUS_MULTIPROC_DIR.
+      prometheusMultiproc: true
       env:
         API_PORT: "8000"
         SERVICE_GATEWAY_PORT: "8000"
@@ -621,7 +629,9 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn video_commerce.services.recommendation.api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-4} --no-access-log'
+        - 'python -m video_commerce.common.prometheus_multiproc && exec python -m uvicorn video_commerce.services.recommendation.api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-4} --no-access-log'
+      # Aggregate metrics across uvicorn workers via PROMETHEUS_MULTIPROC_DIR.
+      prometheusMultiproc: true
       env:
         API_PORT: "8001"
         SERVICE_RECOMMENDATION_PORT: "8001"
@@ -663,7 +673,9 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-2} --no-access-log'
+        - 'python -m video_commerce.common.prometheus_multiproc && exec python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-2} --no-access-log'
+      # Aggregate metrics across uvicorn workers via PROMETHEUS_MULTIPROC_DIR.
+      prometheusMultiproc: true
       env:
         API_PORT: "8003"
         SERVICE_RANKING_PORT: "8003"
@@ -703,6 +715,11 @@ backend:
       serviceMonitor:
         enabled: true
         path: /metrics
+        # /metrics forwards the coordinator's payload; the proxy workers' own
+        # metrics are scraped separately under job=ranking-service-proxy.
+        extraEndpoints:
+          - path: /metrics/proxy
+            job: ranking-service-proxy
     rankingCoordinator:
       enabled: true
       name: ranking-coordinator
@@ -838,7 +855,9 @@ backend:
       replicaCount: 2
       command: ["sh", "-lc"]
       args:
-        - 'python -m uvicorn video_commerce.services.interaction_ingest.api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log'
+        - 'python -m video_commerce.common.prometheus_multiproc && exec python -m uvicorn video_commerce.services.interaction_ingest.api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log'
+      # Aggregate metrics across uvicorn workers via PROMETHEUS_MULTIPROC_DIR.
+      prometheusMultiproc: true
       env:
         API_PORT: "8002"
         SERVICE_INTERACTION_PORT: "8002"
@@ -1145,6 +1164,12 @@ monitoring:
     scrapeTimeout: 10s
     labels: {}
     namespace: ""
+  # Installs files/prometheus-rules.yml (a copy of monitoring/prometheus-rules.yml)
+  # as a prometheus-operator PrometheusRule. labels must match the Prometheus
+  # ruleSelector, e.g. {release: kube-prometheus-stack}.
+  prometheusRule:
+    enabled: false
+    labels: {}
 
 kafkaTopicInitJob:
   enabled: false

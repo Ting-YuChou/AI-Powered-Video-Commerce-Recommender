@@ -438,6 +438,7 @@ def create_service_app(
     )
     app.state.runtime = ServiceRuntime(service_name)
     app.state.runtime.app = app
+    app.add_event_handler("shutdown", app.state.runtime.observability.mark_process_dead)
     configure_tracing(service_name, app=app)
     app.add_middleware(
         CORSMiddleware,

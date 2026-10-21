@@ -91,6 +91,7 @@ class RankingProxyApp:
                     await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 await self.shutdown()
+                self.runtime.observability.mark_process_dead()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -307,6 +308,19 @@ class RankingProxyApp:
                     status_code,
                     response.content_type,
                     response.body,
+                    request_id,
+                )
+                return
+            if path == "/metrics/proxy" and method == "GET":
+                # The proxy workers' own metrics (HTTP, coordinator client
+                # errors), aggregated across uvicorn workers. /metrics forwards
+                # the coordinator's payload instead, except with Triton.
+                status_code = 200
+                await self._send_response(
+                    send,
+                    status_code,
+                    self.runtime.observability.prometheus_content_type,
+                    self.runtime.observability.prometheus_payload(),
                     request_id,
                 )
                 return

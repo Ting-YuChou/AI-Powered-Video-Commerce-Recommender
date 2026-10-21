@@ -4644,9 +4644,20 @@ class SystemStore:
                 )
             )
             last_success = success_result.scalar_one_or_none()
+            waiting_cutoff = await session.scalar(
+                select(func.min(PitMaterializationRun.cutoff_at)).where(
+                    PitMaterializationRun.status == "waiting_for_materializer"
+                )
+            )
+        waiting_cutoff = _coerce_datetime(waiting_cutoff)
         return {
             "last_success_timestamp": (
                 last_success.timestamp() if last_success is not None else 0.0
+            ),
+            "waiting_for_materializer_age_seconds": (
+                max(0.0, (now - waiting_cutoff).total_seconds())
+                if waiting_cutoff is not None
+                else 0.0
             ),
             "waiting_for_rows": bool(
                 latest is not None and latest.status == "waiting_for_eligible_rows"

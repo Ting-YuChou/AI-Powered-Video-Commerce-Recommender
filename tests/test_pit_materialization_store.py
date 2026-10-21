@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import time
 import uuid
 
 import pytest
@@ -277,6 +278,11 @@ async def test_run_waiting_for_materializer_is_resumed_before_a_newer_cutoff():
             parked_run_id,
             worker_id="worker-1",
             reason="consumer_lag:user-interactions:0:5",
+        )
+        metrics = await store.get_pit_operational_metrics()
+        # Other parked rows in a shared database can only make the oldest older.
+        assert metrics["waiting_for_materializer_age_seconds"] >= (
+            time.time() - 1_600_000_000.0 - 5
         )
 
         resumed = await store.claim_pit_materialization_run(

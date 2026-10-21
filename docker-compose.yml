@@ -387,14 +387,17 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn video_commerce.services.gateway.api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log
+      - python -m video_commerce.common.prometheus_multiproc && exec python -m uvicorn video_commerce.services.gateway.api:app --host 0.0.0.0 --port 8000 --workers ${SERVICE_GATEWAY_WORKERS:-4} --no-access-log
     environment:
       <<: *common-env
+      PROMETHEUS_MULTIPROC_DIR: /run/prometheus-multiproc
       API_PORT: 8000
       SERVICE_GATEWAY_PORT: 8000
       SERVICE_GATEWAY_WORKERS: ${SERVICE_GATEWAY_WORKERS:-4}
       # Informational Flink job check in /readyz/full (flink profile).
       FEATURE_PIPELINE_FLINK_REST_URL: ${FEATURE_PIPELINE_FLINK_REST_URL:-http://flink-jobmanager:8081}
+    tmpfs:
+      - /run/prometheus-multiproc:uid=10001,gid=10001,mode=0700,size=64m
     expose:
       - "8000"
     depends_on:
@@ -429,13 +432,16 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn video_commerce.services.recommendation.api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-8} --no-access-log
+      - python -m video_commerce.common.prometheus_multiproc && exec python -m uvicorn video_commerce.services.recommendation.api:app --host 0.0.0.0 --port 8001 --workers ${SERVICE_RECOMMENDATION_WORKERS:-8} --no-access-log
     environment:
       <<: *common-env
+      PROMETHEUS_MULTIPROC_DIR: /run/prometheus-multiproc
       API_PORT: 8001
       SERVICE_RECOMMENDATION_PORT: 8001
       SERVICE_RECOMMENDATION_WORKERS: ${SERVICE_RECOMMENDATION_WORKERS:-8}
       MODEL_ARTIFACT_SERVICE_NAME: recommendation-service
+    tmpfs:
+      - /run/prometheus-multiproc:uid=10001,gid=10001,mode=0700,size=64m
     expose:
       - "8001"
     depends_on:
@@ -580,15 +586,18 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-2} --no-access-log
+      - python -m video_commerce.common.prometheus_multiproc && exec python -m uvicorn video_commerce.services.ranking_service.proxy_asgi:app --host 0.0.0.0 --port 8003 --workers ${SERVICE_RANKING_WORKERS:-2} --no-access-log
     environment:
       <<: *common-env
+      PROMETHEUS_MULTIPROC_DIR: /run/prometheus-multiproc
       API_PORT: 8003
       SERVICE_RANKING_PORT: 8003
       SERVICE_RANKING_WORKERS: ${SERVICE_RANKING_WORKERS:-2}
       MODEL_ARTIFACT_SERVICE_NAME: ranking-service
       DATABASE_POOL_SIZE: 1
       DATABASE_MAX_OVERFLOW: 0
+    tmpfs:
+      - /run/prometheus-multiproc:uid=10001,gid=10001,mode=0700,size=64m
     expose:
       - "8003"
     depends_on:
@@ -609,12 +618,15 @@ services:
     command:
       - sh
       - -lc
-      - python -m uvicorn video_commerce.services.interaction_ingest.api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log
+      - python -m video_commerce.common.prometheus_multiproc && exec python -m uvicorn video_commerce.services.interaction_ingest.api:app --host 0.0.0.0 --port 8002 --workers ${SERVICE_INTERACTION_WORKERS:-2} --no-access-log
     environment:
       <<: *common-env
+      PROMETHEUS_MULTIPROC_DIR: /run/prometheus-multiproc
       API_PORT: 8002
       SERVICE_INTERACTION_PORT: 8002
       SERVICE_INTERACTION_WORKERS: ${SERVICE_INTERACTION_WORKERS:-2}
+    tmpfs:
+      - /run/prometheus-multiproc:uid=10001,gid=10001,mode=0700,size=64m
     expose:
       - "8002"
     depends_on:
@@ -736,6 +748,10 @@ services:
 
   feature-worker:
     <<: *common-service
+    # Flink is the default feature pipeline (FEATURE_PIPELINE_MODE=flink), where
+    # this worker exits at startup. Start it only for the Python pipeline:
+    # FEATURE_PIPELINE_MODE=python docker compose --profile python-features up -d
+    profiles: ["python-features"]
     command: python -m video_commerce.services.feature_worker.feature_updater
     environment:
       <<: *common-env
@@ -1369,7 +1385,7 @@ services:
     restart: "no"
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.54.1
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -1468,7 +1484,7 @@ services:
     restart: unless-stopped
 
   alertmanager:
-    image: prom/alertmanager:latest
+    image: prom/alertmanager:v0.27.0
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
@@ -1476,13 +1492,29 @@ services:
       - "127.0.0.1:9093:9093"
     volumes:
       - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # The on-call webhook URL is a secret read through url_file. The example
+      # points at a local sink; mount the real secret file here in production
+      # (see docs/operations/slo-and-alerting.md).
+      - ${ALERTMANAGER_ONCALL_WEBHOOK_URL_FILE:-./monitoring/secrets/oncall-webhook-url.example}:/etc/alertmanager/secrets/oncall-webhook-url:ro
       - alertmanager_data:/alertmanager
     networks:
       - video-commerce-network
     restart: unless-stopped
 
+  alert-webhook-sink:
+    image: python:3.12-alpine
+    profiles: ["alert-sink"]
+    command: ["python", "/sink/alert_webhook_sink.py", "9095"]
+    volumes:
+      - ./monitoring/alert_webhook_sink.py:/sink/alert_webhook_sink.py:ro
+    expose:
+      - "9095"
+    networks:
+      - video-commerce-network
+    restart: unless-stopped
+
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.2.0
     ports:
       - "127.0.0.1:3000:3000"
     environment:
