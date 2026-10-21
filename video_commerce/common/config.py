@@ -2523,6 +2523,15 @@ class ServiceTopologyConfig(BaseSettings):
         10.0,
         description="HTTP write timeout from gateway to internal services",
     )
+    interaction_ingest_publish_timeout_ms: int = Field(
+        3000,
+        ge=1,
+        description=(
+            "How long interaction ingest waits for a Kafka publish before "
+            "answering 503; keep it well below proxy_read_timeout_seconds so "
+            "the client sees the 503 instead of a gateway 504"
+        ),
+    )
     proxy_pool_timeout_seconds: float = Field(
         5.0,
         description="HTTP connection-pool acquisition timeout in the gateway",

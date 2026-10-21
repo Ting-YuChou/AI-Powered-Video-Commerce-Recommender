@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 import hashlib
 import json
-from typing import Optional
+from typing import Awaitable, Callable, Optional, Set
 
 from fastapi import Body, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -39,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 IDEMPOTENCY_PENDING_TTL_SECONDS = 30
 IDEMPOTENCY_PUBLISHED_TTL_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_PUBLISH_TIMEOUT_SECONDS = 3.0
+LATE_PUBLISH_DRAIN_SECONDS = 5.0
 
 app = create_service_app(
     title="Interaction Ingest Service",
@@ -50,6 +53,11 @@ feature_store: Optional[FeatureStore] = None
 kafka_manager = None
 kafka_supervisor: Optional[KafkaProducerSupervisor] = None
 system_store: Optional[SystemStore] = None
+# Startup replaces both from config.
+publish_timeout_seconds = DEFAULT_PUBLISH_TIMEOUT_SECONDS
+pending_lease_seconds = IDEMPOTENCY_PENDING_TTL_SECONDS
+# Sends that outlived the publish budget; aiokafka still delivers or fails them.
+_late_publishes: Set[asyncio.Task] = set()
 
 
 @app.middleware("http")
@@ -63,10 +71,18 @@ async def internal_auth(request: Request, call_next):
 @app.on_event("startup")
 async def startup_event():
     global feature_store, kafka_manager, kafka_supervisor, system_store
+    global publish_timeout_seconds, pending_lease_seconds
 
     runtime = app.state.runtime
     runtime.config = Config()
     configure_service_logging(runtime)
+    publish_timeout_seconds = (
+        runtime.config.service_topology_config.interaction_ingest_publish_timeout_ms
+        / 1000
+    )
+    pending_lease_seconds = _pending_lease_seconds(
+        runtime.config.kafka_config.request_timeout_ms
+    )
 
     feature_store = FeatureStore(runtime.config.redis_config, runtime.config.cache_config)
     await feature_store.initialize()
@@ -92,8 +108,24 @@ def _set_kafka_manager(manager) -> None:
     kafka_manager = manager
 
 
+def _pending_lease_seconds(kafka_request_timeout_ms: int) -> int:
+    """Lease long enough to outlive a send that missed the publish budget.
+
+    aiokafka can hold a send for up to twice its request timeout, and the claim
+    stays pending until that send resolves. A shorter lease would let a retry
+    reclaim the event_id and publish it a second time.
+    """
+    return max(
+        IDEMPOTENCY_PENDING_TTL_SECONDS,
+        math.ceil(2 * kafka_request_timeout_ms / 1000) + 5,
+    )
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
+    if _late_publishes:
+        # Let late sends settle their ledger claims while the stores are open.
+        await asyncio.wait(set(_late_publishes), timeout=LATE_PUBLISH_DRAIN_SECONDS)
     if feature_store:
         await feature_store.close()
     if system_store:
@@ -183,9 +215,11 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         client_event_time, upper_bound=server_received_at
     )
 
-    if not kafka_manager or not app.state.runtime.config.kafka_config.enable:
+    request_id = http_request.state.request_id
+    unavailable = _kafka_unavailable_reason()
+    if unavailable is not None:
         app.state.runtime.observability.record_interaction_ingest(action, "kafka_unavailable")
-        raise HTTPException(status_code=503, detail="Interaction ingest requires Kafka to be available")
+        raise _kafka_error("KAFKA_UNAVAILABLE", unavailable, request_id)
 
     event_id = str(request.event_id or uuid.uuid4())
     hashed_fields = {
@@ -217,7 +251,7 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
         "event_time": event_time,
         "client_event_time": client_event_time if client_supplied_time else None,
         "server_received_at": server_received_at,
-        "request_id": http_request.state.request_id,
+        "request_id": request_id,
     }
     ledger_key = f"interaction:idempotency:{event_id}"
     if uses_postgres_ledger:
@@ -225,7 +259,7 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
             event_id=event_id,
             payload_hash=payload_hash,
             event_payload=event_payload,
-            lease_seconds=IDEMPOTENCY_PENDING_TTL_SECONDS,
+            lease_seconds=pending_lease_seconds,
         )
         if claim["status"] == "collision":
             raise HTTPException(
@@ -251,7 +285,7 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
                 ledger_key,
                 pending,
                 nx=True,
-                ex=IDEMPOTENCY_PENDING_TTL_SECONDS,
+                ex=pending_lease_seconds,
             )
         )
         if not owns_claim:
@@ -263,7 +297,7 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
                             ledger_key,
                             pending,
                             nx=True,
-                            ex=IDEMPOTENCY_PENDING_TTL_SECONDS,
+                            ex=pending_lease_seconds,
                         )
                     )
                     if owns_claim:
@@ -286,40 +320,82 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
                     headers={"Retry-After": "1"},
                 )
 
-    success = duplicate or await kafka_manager.send_user_interaction(
-        event_id=event_id,
-        user_id=event_payload["user_id"],
-        product_id=event_payload["product_id"],
-        action=event_payload["action"],
-        context=event_payload["context"],
-        event_time=event_payload["event_time"],
-        server_received_at=event_payload["server_received_at"],
-        request_id=event_payload["request_id"],
-        client_event_time=event_payload.get("client_event_time"),
-    )
-    if not success:
+    async def release_claim() -> None:
         if owns_claim and uses_postgres_ledger:
             await system_store.release_interaction_event_claim(
                 event_id, claim_token=claim_token
             )
         elif owns_claim and feature_store and feature_store.redis_client:
             await feature_store.redis_client.delete(ledger_key)
-        app.state.runtime.observability.record_interaction_ingest(action, "publish_failed")
-        raise HTTPException(status_code=503, detail="Failed to publish interaction event to Kafka")
-    if owns_claim and uses_postgres_ledger:
-        marked = await system_store.mark_interaction_event_published(
-            event_id, claim_token=claim_token
-        )
-        if not marked:
-            raise HTTPException(
-                status_code=503,
-                detail="Interaction publish lease expired before acknowledgement",
+
+    async def mark_published() -> bool:
+        if owns_claim and uses_postgres_ledger:
+            return await system_store.mark_interaction_event_published(
+                event_id, claim_token=claim_token
             )
-    elif owns_claim and feature_store and feature_store.redis_client:
-        await feature_store.redis_client.set(
-            ledger_key,
-            json.dumps({"payload_hash": payload_hash, "status": "published"}),
-            ex=IDEMPOTENCY_PUBLISHED_TTL_SECONDS,
+        if owns_claim and feature_store and feature_store.redis_client:
+            await feature_store.redis_client.set(
+                ledger_key,
+                json.dumps({"payload_hash": payload_hash, "status": "published"}),
+                ex=IDEMPOTENCY_PUBLISHED_TTL_SECONDS,
+            )
+        return True
+
+    success = True
+    if not duplicate:
+        publish = asyncio.ensure_future(
+            kafka_manager.send_user_interaction(
+                event_id=event_id,
+                user_id=event_payload["user_id"],
+                product_id=event_payload["product_id"],
+                action=event_payload["action"],
+                context=event_payload["context"],
+                event_time=event_payload["event_time"],
+                server_received_at=event_payload["server_received_at"],
+                request_id=event_payload["request_id"],
+                client_event_time=event_payload.get("client_event_time"),
+            )
+        )
+        try:
+            success = await asyncio.wait_for(
+                asyncio.shield(publish), timeout=publish_timeout_seconds
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            # aiokafka keeps delivering a send it has buffered, so the claim
+            # stays pending and follows the send's real outcome. Releasing it
+            # now would let a retry publish the same event_id twice.
+            _track_late_publish(
+                _settle_late_interaction(
+                    publish,
+                    action=action,
+                    user_id=request.user_id,
+                    mark_published=mark_published,
+                    release_claim=release_claim,
+                )
+            )
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            app.state.runtime.observability.record_interaction_ingest(
+                action, "publish_timeout"
+            )
+            raise _kafka_error(
+                "KAFKA_PUBLISH_TIMEOUT",
+                "Kafka did not acknowledge the interaction in time; retry with "
+                "the same event_id",
+                request_id,
+            )
+    if not success:
+        await release_claim()
+        app.state.runtime.observability.record_interaction_ingest(action, "publish_failed")
+        raise _kafka_error(
+            "KAFKA_PUBLISH_FAILED",
+            "Failed to publish interaction event to Kafka",
+            request_id,
+        )
+    if not await mark_published():
+        raise HTTPException(
+            status_code=503,
+            detail="Interaction publish lease expired before acknowledgement",
         )
     app.state.runtime.observability.record_interaction_ingest(action, "accepted")
 
@@ -347,6 +423,71 @@ async def ingest_interaction(http_request: Request, request: UserInteractionRequ
             "duplicate": duplicate,
         },
     )
+
+
+def _kafka_unavailable_reason() -> Optional[str]:
+    """Why a publish cannot start now, or None when the producer is usable."""
+    if not app.state.runtime.config.kafka_config.enable or kafka_manager is None:
+        return "Kafka producer is not started"
+    if not kafka_manager.producer.is_connected:
+        # send() would reconnect inline and hold the request for up to the
+        # Kafka request timeout; answer now and reconnect in the background.
+        if kafka_supervisor is not None:
+            kafka_supervisor.reconnect_in_background()
+        return "Kafka producer is disconnected"
+    return None
+
+
+def _kafka_error(code: str, message: str, request_id: Optional[str]) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": {
+                "code": code,
+                "message": message,
+                "request_id": request_id,
+                "retryable": True,
+            }
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+def _track_late_publish(coro: Awaitable[None]) -> None:
+    task = asyncio.ensure_future(coro)
+    _late_publishes.add(task)
+    task.add_done_callback(_late_publishes.discard)
+
+
+async def _settle_late_interaction(
+    publish: Awaitable[bool],
+    *,
+    action: str,
+    user_id: str,
+    mark_published: Callable[[], Awaitable[bool]],
+    release_claim: Callable[[], Awaitable[None]],
+) -> None:
+    """Finish the ledger claim of a send that outlived the publish budget."""
+    observability = app.state.runtime.observability
+    try:
+        published = await publish
+    except Exception:
+        logger.exception("late_interaction_publish_failed")
+        published = False
+    try:
+        if not published:
+            await release_claim()
+            observability.record_interaction_ingest(action, "late_publish_failed")
+            return
+        if not await mark_published():
+            # The lease ran out first, so a retry may have published again.
+            logger.warning("late_interaction_publish_lost_lease", extra={"action": action})
+        observability.record_interaction_ingest(action, "published_late")
+    except Exception:
+        # The lease still expires, so a retry recovers the event_id.
+        logger.exception("late_interaction_ledger_update_failed")
+        return
+    await _invalidate_user_serving_cache(user_id)
 
 
 def _clamped_bound(client_time: float, server_time: float) -> Optional[str]:
@@ -381,8 +522,10 @@ async def ingest_viewed_impression(
         client_viewed_at = validate_public_event_time(request.viewed_at, received_at)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if not kafka_manager or not app.state.runtime.config.kafka_config.enable:
-        raise HTTPException(status_code=503, detail="Viewed impressions require Kafka")
+    request_id = http_request.state.request_id
+    unavailable = _kafka_unavailable_reason()
+    if unavailable is not None:
+        raise _kafka_error("KAFKA_UNAVAILABLE", unavailable, request_id)
 
     slate = None
     if system_store is not None:
@@ -413,23 +556,39 @@ async def ingest_viewed_impression(
     viewed_at = clamp_public_event_time(
         client_viewed_at, upper_bound=received_at, lower_bound=served_at
     )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + publish_timeout_seconds
     for item in request.items:
-        success = await kafka_manager.send_recommendation_view(
-            event_id=str(item.event_id),
-            impression_id=str(request.impression_id),
-            user_id=user_id,
-            product_id=item.product_id,
-            position=item.position,
-            viewed_at=viewed_at,
-            context=request.context,
-            request_id=http_request.state.request_id,
-            client_viewed_at=client_viewed_at,
-            served_at=served_at,
-            server_received_at=received_at,
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise _view_publish_timeout(request_id)
+        publish = asyncio.ensure_future(
+            kafka_manager.send_recommendation_view(
+                event_id=str(item.event_id),
+                impression_id=str(request.impression_id),
+                user_id=user_id,
+                product_id=item.product_id,
+                position=item.position,
+                viewed_at=viewed_at,
+                context=request.context,
+                request_id=request_id,
+                client_viewed_at=client_viewed_at,
+                served_at=served_at,
+                server_received_at=received_at,
+            )
         )
+        try:
+            success = await asyncio.wait_for(asyncio.shield(publish), timeout=remaining)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            # Views carry per-item event_ids and have no ledger, so a retry
+            # only re-sends them; keep the buffered send alive until it ends.
+            _track_late_publish(publish)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise _view_publish_timeout(request_id)
         if not success:
-            raise HTTPException(
-                status_code=503, detail="Failed to publish viewed impression"
+            raise _kafka_error(
+                "KAFKA_PUBLISH_FAILED", "Failed to publish viewed impression", request_id
             )
 
     if system_store is not None:
@@ -455,6 +614,17 @@ async def ingest_viewed_impression(
             "impression_id": str(request.impression_id),
             "accepted_items": len(request.items),
         },
+    )
+
+
+def _view_publish_timeout(request_id: Optional[str]) -> HTTPException:
+    app.state.runtime.observability.record_recommendation_impression(
+        "viewed", "publish_timeout"
+    )
+    return _kafka_error(
+        "KAFKA_PUBLISH_TIMEOUT",
+        "Kafka did not acknowledge the viewed impression in time; retry",
+        request_id,
     )
 
 

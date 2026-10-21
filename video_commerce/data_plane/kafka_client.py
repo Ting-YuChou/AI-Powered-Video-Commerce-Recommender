@@ -1378,6 +1378,34 @@ class KafkaProducerSupervisor:
                 return
             delay = min(self.max_backoff_seconds, delay * 2)
 
+    def reconnect_in_background(self) -> None:
+        """Restart a started manager's dropped producer off the request path.
+
+        Callers that fail fast on ``producer.is_connected`` never reach the
+        inline reconnect in ``KafkaProducerClient.send``, so the supervisor
+        brings the producer back instead. Repeated calls share one loop.
+        """
+        if not self.config.enable or self.manager is None:
+            return
+        if self.manager.producer.is_connected:
+            return
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._reconnect_loop(self.manager))
+
+    async def _reconnect_loop(self, manager: "KafkaManager") -> None:
+        delay = self.initial_backoff_seconds
+        while not manager.producer.is_connected:
+            try:
+                await manager.producer.start()
+            except Exception as exc:
+                logger.warning(
+                    "%s Kafka producer reconnect failed: %s", self.service_name, exc
+                )
+                await asyncio.sleep(delay)
+                delay = min(self.max_backoff_seconds, delay * 2)
+        logger.info("%s Kafka producer reconnected", self.service_name)
+
     async def stop(self) -> None:
         if self._task is not None:
             self._task.cancel()
