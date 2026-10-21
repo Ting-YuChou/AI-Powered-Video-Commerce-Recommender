@@ -289,7 +289,7 @@ async def test_existing_matching_served_event_remains_durable(monkeypatch):
             }
 
     class Store:
-        async def enqueue_recommendation_event(self, event):
+        async def enqueue_recommendation_event(self, event, **kwargs):
             return "duplicate"
 
     monkeypatch.setattr(recommendation_api, "kafka_manager", Kafka())

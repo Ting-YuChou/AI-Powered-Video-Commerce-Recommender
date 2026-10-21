@@ -58,6 +58,26 @@ rankingTriton:
   networkPolicy:
     enabled: true
 
+networkPolicy:
+  # Ingress isolation for the internal ranking TCP protocol (coordinator 8013,
+  # runner 8014): coordinator <- recommendation-service, ranking-service;
+  # runner <- coordinator. Requires a CNI that enforces NetworkPolicy.
+  rankingRuntime:
+    enabled: true
+    # Optional extra peer for the protocol port, e.g. a scraper using the `M`
+    # frame (coordinator/runner have no HTTP /metrics port; ranking-service
+    # /metrics already proxies coordinator metrics). Empty selectors add no
+    # rule. Example:
+    #   namespaceSelector:
+    #     matchLabels:
+    #       kubernetes.io/metadata.name: monitoring
+    #   podSelector:
+    #     matchLabels:
+    #       app.kubernetes.io/name: prometheus
+    metricsFrom:
+      namespaceSelector: {}
+      podSelector: {}
+
 securityContext:
   pod:
     runAsNonRoot: true
@@ -115,12 +135,25 @@ external:
     consumerMaxPollIntervalMs: 600000
     consumerHandlerRetries: 3
     consumerHandlerRetryBackoffMs: 250
+    consumerHandlerRetryMaxBackoffMs: 10000
     deadLetterEnable: true
     deadLetterTopic: dead-letter-events
   database:
     enable: true
-    poolSize: 5
-    maxOverflow: 5
+    # Per-process pool (every uvicorn worker owns one). Kept small so the
+    # HPA-max fleet fits postgres.maxConnectionsBudget; workloads that need
+    # more or less override DATABASE_POOL_SIZE / DATABASE_MAX_OVERFLOW in env.
+    # tests/test_connection_budget.py enforces the total.
+    poolSize: 2
+    maxOverflow: 1
+    poolTimeoutSeconds: 2
+    poolRecycleSeconds: 1800
+    connectTimeoutSeconds: 5
+    idleInTransactionSessionTimeoutMs: 60000
+    hotPathStatementTimeoutMs: 1000
+    schemaLockTimeoutMs: 5000
+    # Set "0" behind PgBouncer transaction pooling (no prepared statements).
+    statementCacheSize: ""
     analyticsSummaryCacheTtlSeconds: 15
     trainingSequenceLookbackDays: 90
     ltrImpressionLookbackDays: 30
@@ -195,6 +228,13 @@ external:
     icebergMaintenanceDeleteBatchSize: 1000
     icebergMaintenanceRunSeconds: 300
 
+# Budget for the external Postgres this chart connects to (the chart does not
+# install Postgres). Must stay <= the server's max_connections (or PgBouncer's
+# max_db_connections) minus superuser/maintenance slots.
+postgres:
+  maxConnectionsBudget: 500
+  reservedConnections: 25
+
 pitOrchestrator:
   enabled: false
   schedule: "0 2 * * *"
@@ -205,6 +245,8 @@ pitOrchestrator:
   activeDeadlineSeconds: 7200
   env:
     MONITORING_WORKER_METRICS_PORT: "9105"
+    # Offline scans may wait for a pooled connection; no hot-path budget here.
+    DATABASE_POOL_TIMEOUT_SECONDS: "30"
   resources:
     requests:
       cpu: 250m
@@ -220,7 +262,8 @@ icebergMaintenance:
   failedJobsHistoryLimit: 1
   backoffLimit: 1
   activeDeadlineSeconds: 3600
-  env: {}
+  env:
+    DATABASE_POOL_TIMEOUT_SECONDS: "30"
   resources:
     requests:
       cpu: 250m
@@ -269,6 +312,9 @@ appConfig:
   contentOutboxRetentionDays: 7
   contentOrphanGraceSeconds: 86400
   contentProcessingLeaseSeconds: 300
+  contentProcessingMaxRedrives: 3
+  contentProcessingRedriveGraceSeconds: 60
+  contentProcessingReaperIntervalSeconds: 15
   vectorIndexPath: /app/models/vector_index.faiss
   vectorBootstrapMode: required
   vectorModelVersion: clip-vit-base-patch16
@@ -383,6 +429,9 @@ appConfig:
     tritonOrtInterOpThreads: 1
     onnxExportEnabled: false
     allowUntrainedFallback: false
+    # Ranking TCP protocol connection auth: disabled | permissive | required.
+    # Production must stay >= permissive; see docs/operations/ranking-runtime-auth.md.
+    runtimeAuthMode: permissive
     requireVerifiedArtifact: true
     trimodalEnabled: false
     trimodalShadow: true
@@ -631,6 +680,9 @@ backend:
         API_PORT: "8003"
         SERVICE_RANKING_PORT: "8003"
         SERVICE_RANKING_WORKERS: "2"
+        # Only polls the active release pointer.
+        DATABASE_POOL_SIZE: "1"
+        DATABASE_MAX_OVERFLOW: "0"
       service:
         enabled: true
         port: 8003
@@ -678,6 +730,8 @@ backend:
         SERVICE_RANKING_COORDINATOR_HOST: ""
         SERVICE_RANKING_COORDINATOR_BIND_HOST: "0.0.0.0"
         SERVICE_RANKING_COORDINATOR_PORT: "8013"
+        DATABASE_POOL_SIZE: "1"
+        DATABASE_MAX_OVERFLOW: "0"
       service:
         enabled: true
         port: 8013
@@ -700,6 +754,8 @@ backend:
           - health
           - --timeout-seconds
           - "5"
+          - --role
+          - coordinator
         initialDelaySeconds: 30
         periodSeconds: 10
         timeoutSeconds: 5
@@ -726,6 +782,9 @@ backend:
         API_PORT: "8014"
         SERVICE_RANKING_RUNNER_BIND_HOST: "0.0.0.0"
         SERVICE_RANKING_RUNNER_PORT: "8014"
+        # Release pointer sync and instance observations only; 32 replicas.
+        DATABASE_POOL_SIZE: "1"
+        DATABASE_MAX_OVERFLOW: "0"
       service:
         enabled: true
         headless: true
@@ -1019,6 +1078,9 @@ backend:
         SERVICE_TRAINER_INTERVAL_SECONDS: "3600"
         MONITORING_WORKER_METRICS_PORT: "9103"
         FEATURE_LAKE_PIT_STAGING_DIR: /var/lib/video-commerce/pit
+        DATABASE_POOL_SIZE: "3"
+        DATABASE_MAX_OVERFLOW: "2"
+        DATABASE_POOL_TIMEOUT_SECONDS: "30"
       service:
         enabled: true
         port: 9103
@@ -1119,9 +1181,13 @@ kafkaTopicInitJob:
     user-interactions:
       partitions: 6
       replicationFactor: 3
+    # Partitions bound content-worker parallelism. alterPartitions grows an
+    # existing topic (never shrinks it; a lower count is ignored). See
+    # docs/operations/event-and-artifact-reliability.md before raising it.
     video-processing-tasks:
-      partitions: 3
+      partitions: 12
       replicationFactor: 3
+      alterPartitions: true
     recommendation-events:
       partitions: 3
       replicationFactor: 3

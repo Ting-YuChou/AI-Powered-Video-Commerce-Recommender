@@ -618,6 +618,44 @@ class RecommendationConfig(BaseSettings):
         100,
         description="Maximum displayed top-k items to include in one impression event",
     )
+    impression_outbox_timeout_ms: int = Field(
+        100,
+        ge=1,
+        description=(
+            "Hot-path budget for durably staging one served impression; on expiry "
+            "the response omits impression_id and the outcome is recorded as timeout"
+        ),
+    )
+    impression_outbox_max_inflight: int = Field(
+        3,
+        ge=1,
+        description=(
+            "Per-process cap on concurrent served-impression outbox writes; when "
+            "full the impression is skipped instead of queueing on the DB pool. "
+            "Keep it near DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW"
+        ),
+    )
+    outbox_terminal_retention_days: int = Field(
+        7,
+        ge=1,
+        description="Days terminal outbox rows are kept for investigation",
+    )
+    feature_context_max_bytes: int = Field(
+        262144,
+        ge=1024,
+        description=(
+            "Serialized size cap for the impression feature_context; history "
+            "embeddings and DIN sequences are dropped first when exceeded"
+        ),
+    )
+    outbox_max_attempts: int = Field(
+        20,
+        ge=1,
+        description=(
+            "Publish attempts before a recommendation or catalog outbox row is "
+            "marked terminal instead of retried"
+        ),
+    )
 
     # Ranking weights
     cf_weight: float = Field(0.4, description="Collaborative filtering weight")
@@ -1163,6 +1201,10 @@ class RankingConfig(BaseSettings):
         True,
         description="Enable micro-batching queue for ranking inference",
     )
+    runtime_auth_mode: str = Field(
+        "permissive",
+        description="Ranking TCP protocol connection auth: disabled, permissive (send auth, accept and count unauthenticated peers), or required",
+    )
     allow_untrained_fallback: bool = Field(
         False,
         description="Allow deterministic candidate-score fallback when no trained ranking checkpoint is active; local/test only",
@@ -1662,6 +1704,15 @@ class RankingConfig(BaseSettings):
                 )
         return values
 
+    @validator("runtime_auth_mode")
+    def validate_runtime_auth_mode(cls, value: str) -> str:
+        mode = (value or "").strip().lower()
+        if mode not in {"disabled", "permissive", "required"}:
+            raise ValueError(
+                "RANKING_RUNTIME_AUTH_MODE must be disabled, permissive, or required"
+            )
+        return mode
+
     @validator("runner_payload_max_bytes")
     def validate_runner_payload_max_bytes(cls, value: int) -> int:
         if value < 1024:
@@ -1909,6 +1960,14 @@ class KafkaConfig(BaseSettings):
     producer_compression_type: str = Field(
         "gzip", description="Producer compression type"
     )
+    producer_max_request_size: int = Field(
+        1048576,
+        ge=1024,
+        description=(
+            "Producer max_request_size in bytes; must not exceed the broker or "
+            "topic max.message.bytes"
+        ),
+    )
 
     # Consumer settings
     consumer_group_id: str = Field(
@@ -1930,7 +1989,11 @@ class KafkaConfig(BaseSettings):
         3, description="Handler retry attempts before DLQ/fail"
     )
     consumer_handler_retry_backoff_ms: int = Field(
-        250, description="Handler retry backoff in milliseconds"
+        250, description="Base handler retry backoff in milliseconds"
+    )
+    consumer_handler_retry_max_backoff_ms: int = Field(
+        10000,
+        description="Cap for exponential handler retry backoff (jittered)",
     )
     dead_letter_enable: bool = Field(
         True, description="Publish poison messages to a dead-letter topic"
@@ -2506,6 +2569,22 @@ class ServiceTopologyConfig(BaseSettings):
     content_outbox_retention_days: int = Field(7, ge=1)
     content_orphan_grace_seconds: int = Field(86400, ge=60)
     content_processing_lease_seconds: int = Field(300, ge=30)
+    content_processing_max_redrives: int = Field(
+        3,
+        ge=0,
+        description="Expired-lease redrives before a content run is terminal failed",
+    )
+    content_processing_redrive_grace_seconds: int = Field(
+        60,
+        ge=0,
+        description="Seconds past lease expiry before the reaper redrives a run",
+    )
+    content_processing_reaper_interval_seconds: float = Field(
+        15.0, gt=0.0, description="Content processing reaper cadence"
+    )
+    content_reconcile_page_size: int = Field(
+        1000, ge=1, le=1000, description="Objects per orphan-reconcile page"
+    )
 
     class Config:
         env_prefix = "SERVICE_"
@@ -2706,6 +2785,62 @@ class DatabaseConfig(BaseSettings):
         description="How often to run interaction_events retention cleanup",
     )
     echo_sql: bool = Field(False, description="Enable SQLAlchemy SQL logging")
+    pool_timeout_seconds: float = Field(
+        2.0,
+        gt=0,
+        description=(
+            "Seconds to wait for a pooled connection before failing; offline "
+            "services (trainer, PIT orchestrator, iceberg maintenance) override it"
+        ),
+    )
+    pool_recycle_seconds: int = Field(
+        1800,
+        ge=-1,
+        description="Recycle pooled connections older than this; -1 disables",
+    )
+    connect_timeout_seconds: float = Field(
+        5.0,
+        gt=0,
+        description="asyncpg connection establishment timeout",
+    )
+    idle_in_transaction_session_timeout_ms: int = Field(
+        60000,
+        ge=0,
+        description=(
+            "Server-side idle_in_transaction_session_timeout for every session; "
+            "0 leaves the server default"
+        ),
+    )
+    hot_path_statement_timeout_ms: int = Field(
+        1000,
+        ge=0,
+        description=(
+            "SET LOCAL statement_timeout for latency-sensitive methods (outbox "
+            "enqueue, ingest ledger, slate lookup, health); 0 disables"
+        ),
+    )
+    schema_lock_timeout_ms: int = Field(
+        5000,
+        ge=0,
+        description=(
+            "SET LOCAL lock_timeout for startup DDL after the schema advisory "
+            "lock is held; 0 disables"
+        ),
+    )
+    statement_cache_size: Optional[int] = Field(
+        None,
+        ge=0,
+        description=(
+            "asyncpg prepared statement cache size; set 0 behind PgBouncer "
+            "transaction pooling"
+        ),
+    )
+
+    @validator("statement_cache_size", pre=True)
+    def blank_statement_cache_size_is_unset(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @validator(
         "training_sequence_lookback_days",
@@ -3099,6 +3234,13 @@ class Config:
                 errors.append(
                     "FEATURE_LAKE_FLINK_JOBMANAGER is required when Iceberg maintenance is enabled"
                 )
+        if (
+            self.ranking_config.runtime_auth_mode == "required"
+            and not self.security_config.internal_service_key
+        ):
+            errors.append(
+                "SECURITY_INTERNAL_SERVICE_KEY or SECURITY_INTERNAL_SERVICE_KEY_FILE is required when RANKING_RUNTIME_AUTH_MODE=required"
+            )
 
         if os.getenv("ENVIRONMENT", "").lower() == "production":
             if self.security_config.auth_mode == "disabled":
@@ -3136,6 +3278,10 @@ class Config:
             if self.security_config.internal_service_key == "change-me-in-production":
                 errors.append(
                     "Default internal service key is not allowed in production"
+                )
+            if self.ranking_config.runtime_auth_mode == "disabled":
+                errors.append(
+                    "RANKING_RUNTIME_AUTH_MODE=disabled is not allowed in production; use permissive or required"
                 )
             if not self.redis_config.password:
                 errors.append(

@@ -140,3 +140,77 @@ async def test_visual_retrieval_shadow_retries_until_its_own_run_succeeds(
 
     assert attempts == ["run-42", "run-42"]
     assert service.last_trained_visual_pit_run_id == "run-42"
+
+
+class _IndexVectorSearch:
+    def __init__(self):
+        self.calls = []
+
+    async def load_index(self):
+        self.calls.append(("load_index",))
+
+    def activate_visual_product_index(self, manifest_path, **kwargs):
+        self.calls.append(("visual", manifest_path, kwargs))
+
+
+class _VisualArtifactManager:
+    def __init__(self):
+        self.synced = []
+
+    async def sync_latest_visual_product_index(self, **kwargs):
+        self.synced.append(kwargs)
+
+
+def _index_trainer(manifest_path):
+    from types import SimpleNamespace
+
+    from video_commerce.services.model_trainer.main import ModelTrainerService
+
+    trainer = object.__new__(ModelTrainerService)
+    trainer.config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            retrieval_visual_product_index_manifest_path=manifest_path,
+            clip_model="openai/clip-vit-base-patch32",
+            clip_revision="rev-1",
+        )
+    )
+    trainer.vector_search = _IndexVectorSearch()
+    trainer.artifact_manager = _VisualArtifactManager()
+    return trainer
+
+
+@pytest.mark.asyncio
+async def test_trimodal_shadow_uses_visual_bundle_when_manifest_configured():
+    trainer = _index_trainer("/models/visual/manifest.json")
+
+    await trainer._load_product_vector_index(prefer_visual_bundle=True)
+
+    assert trainer.vector_search.calls == [
+        (
+            "visual",
+            "/models/visual/manifest.json",
+            {
+                "expected_clip_model_id": "openai/clip-vit-base-patch32",
+                "expected_clip_revision": "rev-1",
+            },
+        )
+    ]
+    assert trainer.artifact_manager.synced == [
+        {
+            "expected_clip_model_id": "openai/clip-vit-base-patch32",
+            "expected_clip_revision": "rev-1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manifest,prefer", [("", True), ("/models/visual/manifest.json", False)]
+)
+async def test_product_index_falls_back_to_faiss_load(manifest, prefer):
+    trainer = _index_trainer(manifest)
+
+    await trainer._load_product_vector_index(prefer_visual_bundle=prefer)
+
+    assert trainer.vector_search.calls == [("load_index",)]
+    assert trainer.artifact_manager.synced == []

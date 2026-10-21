@@ -597,6 +597,12 @@ class ObservabilityManager:
             ["endpoint", "event"],
             registry=self.registry,
         )
+        self.ranking_runtime_auth_total = Counter(
+            "video_commerce_ranking_runtime_auth_total",
+            "Ranking TCP protocol connection auth outcomes by server role",
+            ["role", "result"],
+            registry=self.registry,
+        )
         self.ranking_runner_endpoint_state = Gauge(
             "video_commerce_ranking_runner_endpoint_state",
             "Coordinator runner endpoint state as a one-hot gauge",
@@ -809,6 +815,12 @@ class ObservabilityManager:
             registry=self.registry,
             multiprocess_mode="mostrecent",
         )
+        self.recommendation_outbox_terminal_total = Counter(
+            "video_commerce_recommendation_outbox_terminal_total",
+            "Served-impression outbox rows retired without publishing, by reason",
+            ["reason"],
+            registry=self.registry,
+        )
         self.content_uploads_total = Counter(
             "video_commerce_content_uploads_total",
             "Content upload enqueue outcomes by priority and status",
@@ -846,6 +858,12 @@ class ObservabilityManager:
             registry=self.registry,
             multiprocess_mode="mostrecent",
         )
+        self.catalog_outbox_terminal_total = Counter(
+            "catalog_outbox_terminal_total",
+            "Catalog outbox rows retired without publishing, by reason",
+            ["reason"],
+            registry=self.registry,
+        )
         self.content_task_outbox_pending = Gauge(
             "content_task_outbox_pending",
             "Unpublished durable content processing tasks",
@@ -879,6 +897,30 @@ class ObservabilityManager:
             "content_processing_events_total",
             "Content processing lease and projection outcomes",
             ["outcome"],
+            registry=self.registry,
+        )
+        self.content_processing_redrives_total = Counter(
+            "video_commerce_content_processing_redrives_total",
+            "Expired content processing leases handled by the reaper "
+            "(redriven, exhausted, superseded)",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.content_modality_status_total = Counter(
+            "video_commerce_content_modality_status_total",
+            "Per-modality content extraction outcomes",
+            ["modality", "status"],
+            registry=self.registry,
+        )
+        self.content_zero_norm_embeddings_total = Counter(
+            "video_commerce_content_zero_norm_embeddings_total",
+            "Content visual embeddings with (near) zero L2 norm",
+            registry=self.registry,
+        )
+        self.content_task_publisher_errors_total = Counter(
+            "video_commerce_content_task_publisher_errors_total",
+            "Content task publisher loop iterations that raised, by stage",
+            ["stage"],
             registry=self.registry,
         )
         self.pit_export_rows = Gauge(
@@ -1189,8 +1231,6 @@ class ObservabilityManager:
     # counter series only appears with its first event, and increase() needs a
     # prior sample, so that first event would never alert. tests/
     # test_alert_metric_contract.py keeps this table in step with the rules.
-    # Attributes still missing here belong to open Stage B PRs (WS-2/3/4) and
-    # are skipped until they merge; the contract test lists them explicitly.
     ALERTED_LABEL_VALUES: Dict[str, tuple] = {
         "rate_limiter_errors_total": tuple(
             {"reason": reason} for reason in ("timeout", "error", "cooldown")
@@ -1241,9 +1281,7 @@ class ObservabilityManager:
 
     def _precreate_alerted_series(self) -> None:
         for attribute, label_sets in self.ALERTED_LABEL_VALUES.items():
-            metric = getattr(self, attribute, None)
-            if metric is None:
-                continue
+            metric = getattr(self, attribute)
             for labels in label_sets:
                 metric.labels(**labels)
 
@@ -1432,6 +1470,9 @@ class ObservabilityManager:
                 max(0, int(count))
             )
 
+    def record_catalog_outbox_terminal(self, reason: str) -> None:
+        self.catalog_outbox_terminal_total.labels(reason=reason).inc()
+
     def update_catalog_outbox(self, *, pending: int, oldest_age_seconds: float) -> None:
         self.catalog_outbox_pending.set(max(0, int(pending)))
         self.catalog_outbox_oldest_age_seconds.set(max(0.0, float(oldest_age_seconds)))
@@ -1456,6 +1497,23 @@ class ObservabilityManager:
 
     def record_content_processing(self, outcome: str) -> None:
         self.content_processing_events_total.labels(outcome=str(outcome)).inc()
+
+    def record_content_processing_redrives(self, outcome: str, count: int = 1) -> None:
+        if int(count) > 0:
+            self.content_processing_redrives_total.labels(outcome=str(outcome)).inc(
+                int(count)
+            )
+
+    def record_content_modality_status(self, modality: str, status: str) -> None:
+        self.content_modality_status_total.labels(
+            modality=str(modality), status=str(status)
+        ).inc()
+
+    def record_content_zero_norm_embedding(self) -> None:
+        self.content_zero_norm_embeddings_total.inc()
+
+    def record_content_task_publisher_error(self, stage: str) -> None:
+        self.content_task_publisher_errors_total.labels(stage=str(stage)).inc()
 
     def record_pit_manifest_validation_failure(self, reason: str) -> None:
         self.pit_manifest_validation_failures_total.labels(reason=reason).inc()
@@ -1719,6 +1777,9 @@ class ObservabilityManager:
             endpoint=endpoint
         ).set(max(0, int(available_connections)))
 
+    def record_ranking_runtime_auth(self, role: str, result: str) -> None:
+        self.ranking_runtime_auth_total.labels(role=role, result=result).inc()
+
     def record_ranking_runner_endpoint_event(self, endpoint: str, event: str) -> None:
         self.ranking_runner_endpoint_events_total.labels(
             endpoint=endpoint, event=event
@@ -1836,6 +1897,9 @@ class ObservabilityManager:
         self.recommendation_impression_events_total.labels(
             stage=stage, status=status
         ).inc()
+
+    def record_recommendation_outbox_terminal(self, reason: str) -> None:
+        self.recommendation_outbox_terminal_total.labels(reason=reason).inc()
 
     def update_recommendation_outbox(
         self, *, pending: int, oldest_age_seconds: float
