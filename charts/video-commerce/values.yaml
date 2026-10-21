@@ -266,8 +266,14 @@ appConfig:
   apiCorsOrigins: "https://localhost,http://localhost,https://127.0.0.1,http://127.0.0.1"
   apiCorsCredentials: "false"
   apiRateLimitRequests: 120000
+  # Peers whose X-Forwarded-For the gateway trusts for per-client rate limits
+  # (Caddy pods). Narrow this to the pod CIDR when it is known.
+  apiTrustedProxyCidrs: "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
   featurePipelineMode: flink
   flinkFeatureOutputNamespace: official
+  # Flink is an external dependency of this chart. Set its REST URL to report
+  # the interaction feature job in the gateway's /readyz/full.
+  flinkRestUrl: ""
   modelCacheDir: /app/models
   modelArtifactGenerationRoot: /app/models/generations
   modelArtifactLocalGenerationsToKeep: 3
@@ -522,12 +528,19 @@ backend:
   tolerations: []
   affinity: {}
   terminationGracePeriodSeconds: 60
+  # Bound scratch volumes so a burst of large uploads (FastAPI spools each
+  # multipart body to /tmp before the handler runs) evicts one pod instead of
+  # filling the node. Uploads are capped at 500MiB each by the gateway and Caddy.
   emptyDirs:
     models: {}
-    uploads: {}
-    objectStorage: {}
-    logs: {}
-    tmp: {}
+    uploads:
+      sizeLimit: 10Gi
+    objectStorage:
+      sizeLimit: 10Gi
+    logs:
+      sizeLimit: 1Gi
+    tmp:
+      sizeLimit: 10Gi
     pitStaging:
       sizeLimit: 20Gi
   workloads:
@@ -560,8 +573,11 @@ backend:
         requests:
           cpu: 500m
           memory: 1Gi
+          ephemeral-storage: 1Gi
         limits:
           memory: 2Gi
+          # tmp + uploads emptyDirs plus container writes.
+          ephemeral-storage: 22Gi
       hpa:
         enabled: true
         minReplicas: 2
@@ -1134,6 +1150,10 @@ kafkaTopicInitJob:
       partitions: 3
       replicationFactor: 3
     dead-letter-events:
+      partitions: 3
+      replicationFactor: 3
+    # Side output of the Flink interaction job for events past allowed lateness.
+    late-interaction-events:
       partitions: 3
       replicationFactor: 3
   backoffLimit: 3

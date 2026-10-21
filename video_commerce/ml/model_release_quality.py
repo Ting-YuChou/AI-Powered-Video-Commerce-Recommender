@@ -32,19 +32,30 @@ QUALITY_GATE_POLICY_V3 = "ranking_quality_gate_v3"
 # slices are capped to the top-N by impressions plus "other" and are reported
 # without blocking; blocking-slice NDCG CIs are Bonferroni-adjusted; adds the
 # "retrain" experiment kind (ranking-only change, candidates unchanged).
-QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v4"
+QUALITY_GATE_POLICY_V4 = "ranking_quality_gate_v4"
+# v5: NDCG is a three-way non-inferiority test on the bootstrap CI. A CI wholly
+# below the margin fails, a CI straddling it is insufficient evidence
+# (underpowered holdout), and the "point delta >= 0" check is dropped because
+# an equal-quality challenger misses it half the time.
+QUALITY_GATE_POLICY_VERSION = "ranking_quality_gate_v5"
 SUPPORTED_QUALITY_GATE_POLICY_VERSIONS = frozenset(
     {
         QUALITY_GATE_POLICY_V1,
         QUALITY_GATE_POLICY_V2,
         QUALITY_GATE_POLICY_V3,
+        QUALITY_GATE_POLICY_V4,
         QUALITY_GATE_POLICY_VERSION,
     }
 )
 # Policies that carry Phase C promotion evidence (prerequisites, ONNX parity,
 # RRF fusion policy).
 PHASE_C_QUALITY_GATE_POLICY_VERSIONS = frozenset(
-    {QUALITY_GATE_POLICY_V2, QUALITY_GATE_POLICY_V3, QUALITY_GATE_POLICY_VERSION}
+    {
+        QUALITY_GATE_POLICY_V2,
+        QUALITY_GATE_POLICY_V3,
+        QUALITY_GATE_POLICY_V4,
+        QUALITY_GATE_POLICY_VERSION,
+    }
 )
 EXPERIMENT_KINDS = frozenset({"features", "fusion", "calibration", "combined", "retrain"})
 # Pre-registered slices whose missing evidence or regression blocks the gate.
@@ -422,6 +433,7 @@ def evaluate_quality_gate(
     overall = {**overall, **bootstrap}
     slice_results: Dict[str, Mapping[str, object]] = {}
     insufficient_slices: list[str] = []
+    underpowered_slices: list[str] = []
     failed_slices: list[str] = []
     slices = list(_quality_slices(rows, config))
     # Bonferroni across the blocking slices that will be tested, so the
@@ -457,16 +469,26 @@ def evaluate_quality_gate(
         )
         metrics = {**metrics, **ci}
         failures = _metric_failures(metrics, config, slice_name=name)
+        underpowered = not failures and _ndcg_underpowered(
+            metrics, config, slice_name=name
+        )
+        if failures:
+            status = GateDecision.FAILED.value
+        elif underpowered:
+            status = GateDecision.INSUFFICIENT_EVIDENCE.value
+            failures = [f"slice_{name}_ndcg_underpowered"]
+        else:
+            status = GateDecision.PASSED.value
         slice_results[name] = {
-            "status": GateDecision.FAILED.value
-            if failures
-            else GateDecision.PASSED.value,
+            "status": status,
             "reasons": failures,
             "metrics": metrics,
             "blocking": blocking,
         }
-        if failures and blocking:
+        if blocking and status == GateDecision.FAILED.value:
             failed_slices.append(name)
+        elif blocking and underpowered:
+            underpowered_slices.append(name)
 
     if evidence_reasons or insufficient_slices:
         reasons = tuple(evidence_reasons) + tuple(
@@ -496,11 +518,29 @@ def evaluate_quality_gate(
                     failures.append(f"calibration_{head}_minimum_improvement")
                 if float(overall[f"{head}_brier_relative_regression"]) > 0.0:
                     failures.append(f"calibration_{head}_brier_regression")
-            if float(overall["ndcg_at_10_delta"]) < 0.0:
+            # Only a CI wholly below zero is a ranking regression; an
+            # equal-order calibration misses "point delta >= 0" half the time.
+            if float(overall["ndcg_at_10_delta_ci_upper"]) < 0.0:
                 failures.append("calibration_ndcg_regression")
         failures.extend(f"slice_{name}" for name in failed_slices)
-        reasons = tuple(failures)
-        decision = GateDecision.FAILED if failures else GateDecision.PASSED
+        underpowered = []
+        if _ndcg_underpowered(overall, config, slice_name=None):
+            underpowered.append("overall_ndcg_underpowered")
+            overall["ndcg_informative_impressions_required_estimate"] = (
+                _required_informative_impressions(overall, config)
+            )
+        underpowered.extend(
+            f"slice_{name}_ndcg_underpowered" for name in underpowered_slices
+        )
+        if failures:
+            reasons = tuple(failures)
+            decision = GateDecision.FAILED
+        elif underpowered:
+            reasons = tuple(underpowered)
+            decision = GateDecision.INSUFFICIENT_EVIDENCE
+        else:
+            reasons = ()
+            decision = GateDecision.PASSED
     return QualityGateResult(
         decision=decision,
         reasons=reasons,
@@ -796,7 +836,11 @@ def _cluster_bootstrap_ndcg(rows, champion, challenger, config, *, alpha: float 
         rows_by_user.setdefault(row.user_id, []).append(row)
     users = sorted(rows_by_user)
     if not users:
-        return {"ndcg_at_10_delta_ci_lower": 0.0, "ndcg_at_10_delta_ci_upper": 0.0}
+        return {
+            "ndcg_at_10_delta_ci_lower": 0.0,
+            "ndcg_at_10_delta_ci_upper": 0.0,
+            "ndcg_at_10_delta_ci_half_width": 0.0,
+        }
     generator = np.random.default_rng(config.random_seed)
     deltas = []
     for _ in range(max(1, int(config.bootstrap_samples))):
@@ -815,10 +859,37 @@ def _cluster_bootstrap_ndcg(rows, champion, challenger, config, *, alpha: float 
         deltas.append(
             _mean_ndcg(sampled_rows, challenger) - _mean_ndcg(sampled_rows, champion)
         )
+    lower = float(np.quantile(deltas, alpha / 2.0))
+    upper = float(np.quantile(deltas, 1.0 - alpha / 2.0))
     return {
-        "ndcg_at_10_delta_ci_lower": float(np.quantile(deltas, alpha / 2.0)),
-        "ndcg_at_10_delta_ci_upper": float(np.quantile(deltas, 1.0 - alpha / 2.0)),
+        "ndcg_at_10_delta_ci_lower": lower,
+        "ndcg_at_10_delta_ci_upper": upper,
+        "ndcg_at_10_delta_ci_half_width": (upper - lower) / 2.0,
     }
+
+
+def _ndcg_underpowered(metrics, config, *, slice_name: str | None) -> bool:
+    """The CI straddles the non-inferiority margin: the holdout cannot decide."""
+    margin = config.slice_ndcg_ci_lower if slice_name else config.overall_ndcg_ci_lower
+    return (
+        float(metrics["ndcg_at_10_delta_ci_lower"])
+        < margin
+        <= float(metrics["ndcg_at_10_delta_ci_upper"])
+    )
+
+
+def _required_informative_impressions(metrics, config) -> int | None:
+    """Rough holdout size at which the observed delta would clear the margin.
+
+    The CI half-width shrinks with 1/sqrt(n), so n_required = n * (h / gap)^2
+    where gap is the distance from the point delta to the margin.
+    """
+    gap = float(metrics["ndcg_at_10_delta"]) - config.overall_ndcg_ci_lower
+    half_width = float(metrics.get("ndcg_at_10_delta_ci_half_width") or 0.0)
+    informative = int(metrics.get("ndcg_informative_impressions") or 0)
+    if gap <= 0.0 or half_width <= 0.0 or informative <= 0:
+        return None
+    return int(math.ceil(informative * (half_width / gap) ** 2))
 
 
 def _metric_failures(metrics, config, *, slice_name: str | None) -> list[str]:
@@ -833,10 +904,15 @@ def _metric_failures(metrics, config, *, slice_name: str | None) -> list[str]:
         else config.probability_error_max_relative_regression
     )
     failures = []
-    if float(metrics["ndcg_at_10_delta"]) < ndcg_min:
+    # A non-positive minimum delta is a non-inferiority requirement, which the
+    # CI test below already covers; only a positive (superiority) minimum is
+    # checked on the point estimate.
+    if ndcg_min > 0.0 and float(metrics["ndcg_at_10_delta"]) < ndcg_min:
         failures.append(f"{prefix}_ndcg_point_delta")
-    if float(metrics["ndcg_at_10_delta_ci_lower"]) < ci_min:
-        failures.append(f"{prefix}_ndcg_ci_lower")
+    # Only a CI wholly below the margin is a regression; a CI straddling it is
+    # reported as underpowered by _ndcg_underpowered.
+    if float(metrics["ndcg_at_10_delta_ci_upper"]) < ci_min:
+        failures.append(f"{prefix}_ndcg_regression")
     for name in ("ctr_pr_auc_delta", "ctcvr_pr_auc_delta"):
         if float(metrics[name]) < -config.pr_auc_max_absolute_regression:
             failures.append(f"{prefix}_{name}")

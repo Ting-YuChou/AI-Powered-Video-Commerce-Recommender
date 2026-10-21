@@ -46,6 +46,42 @@
   - `SECURITY_OIDC_ISSUER=https://issuer.example.com/`
   - `SECURITY_OIDC_AUDIENCE=video-commerce-api`
   - `SECURITY_OIDC_JWKS_URL=https://issuer.example.com/.well-known/jwks.json`
+  - Production rejects bearer auth without issuer, audience and a JWKS URL,
+    and rejects `SECURITY_JWT_SHARED_SECRET`.
+- Bearer tokens must carry `exp`. JWKS lookups run off the event loop
+  (`SECURITY_JWKS_TIMEOUT_SECONDS`, default 2), and unknown `kid`s force at most
+  one JWKS refresh per `SECURITY_JWKS_MIN_REFRESH_INTERVAL_SECONDS` (30).
+- Bearer identity scope (server side only; API-key callers are treated as a
+  trusted backend and keep sending `user_id`):
+  - Recommendation, interaction and upload requests must use the token's own
+    user: `user_id` must equal the `SECURITY_OIDC_USER_ID_CLAIM` claim
+    (default `sub`), otherwise `403 USER_MISMATCH`. An upload without
+    `user_id` is attributed to the subject.
+  - `GET /api/content/{id}/status` returns 404 for another user's content.
+  - `GET /api/analytics` requires `SECURITY_ADMIN_SCOPE`
+    (default `video-commerce:admin`) in the token's `scope`/`scp`.
+- Public IDs are validated: `user_id` allows only `A-Z a-z 0-9 . _ @ -` (no
+  `:` or glob characters, since it is embedded in Redis key patterns), and
+  product/content IDs additionally allow `: / +`. `context` objects are limited
+  to 8KB serialized, 64 keys and 3 levels of nesting.
+
+## Rate Limits And Request Size
+- The gateway buckets requests by bearer subject, then API key, then client
+  IP. `X-Forwarded-For` is used only when the direct peer is in
+  `API_TRUSTED_PROXY_CIDRS` (Caddy), taking the right-most untrusted address.
+- Rate limiting fails open: a Redis call slower than `API_RATE_LIMIT_TIMEOUT_MS`
+  (50) or failing is allowed, counted in
+  `video_commerce_rate_limiter_errors_total{reason}`, and Redis is skipped for
+  one second.
+- Failed authentication is limited per client IP
+  (`API_UNAUTHENTICATED_RATE_LIMIT_REQUESTS` per minute, then
+  `429 AUTH_RATE_LIMITED`).
+- Bodies are checked from `Content-Length` before parsing: uploads may be
+  `DATA_MAX_FILE_SIZE` plus 1MiB and must send `Content-Length` (411
+  otherwise); other requests are limited to `API_MAX_REQUEST_SIZE` (1MiB).
+  Caddy enforces `EDGE_MAX_UPLOAD_BODY` (501MiB) and `EDGE_MAX_JSON_BODY`
+  (1MiB) for chunked bodies. In Helm, the `tmp`, `uploads` and
+  `objectStorage` scratch volumes have a 10Gi `sizeLimit`.
 
 ## Secret Files
 - Any environment variable can be sourced from `*_FILE`.

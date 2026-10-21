@@ -10,8 +10,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+_RANKING_DOWN = os.environ.get("INTEGRATION_EXPECT_RANKING_DOWN") == "1"
+
+
 def _base_url() -> str:
     return os.environ.get("INTEGRATION_BASE_URL", "http://localhost:8000").rstrip("/")
+
+
+def _edge_url() -> str | None:
+    value = os.environ.get("EDGE_BASE_URL")
+    return value.rstrip("/") if value else None
 
 
 def _headers() -> dict:
@@ -32,10 +40,34 @@ def test_gateway_livez():
 def test_gateway_readyz():
     response = httpx.get(f"{_base_url()}/readyz", timeout=10.0, trust_env=False)
 
+    # Readiness covers only the gateway's own state, so it stays 200 while a
+    # shared downstream is degraded or down.
     assert response.status_code == 200
-    assert response.json()["status"] == "ready"
+    assert response.json()["status"] in {"ready", "degraded"}
 
 
+def test_gateway_full_readiness_reports_downstreams():
+    response = httpx.get(
+        f"{_base_url()}/readyz/full", headers=_headers(), timeout=20.0, trust_env=False
+    )
+
+    checks = response.json()["checks"]
+    assert {"recommendation_service", "ranking_service", "kafka"} <= set(checks)
+    if _RANKING_DOWN:
+        assert checks["ranking_service"]["status"] != "healthy"
+
+
+@pytest.mark.skipif(not os.environ.get("EDGE_BASE_URL"), reason="requires EDGE_BASE_URL")
+def test_edge_serves_spa_and_its_own_health():
+    health = httpx.get(f"{_edge_url()}/caddy-healthz", timeout=10.0, trust_env=False)
+    index = httpx.get(f"{_edge_url()}/", timeout=10.0, trust_env=False)
+
+    assert health.status_code == 200
+    assert index.status_code == 200
+    assert "<html" in index.text.lower()
+
+
+@pytest.mark.skipif(_RANKING_DOWN, reason="ranking coordinator is stopped")
 def test_recommendations_round_trip():
     response = httpx.post(
         f"{_base_url()}/api/recommendations",

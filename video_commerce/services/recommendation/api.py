@@ -69,7 +69,7 @@ from video_commerce.common.service_common import (
     component_health,
     configure_service_logging,
     create_service_app,
-    require_internal_service_auth,
+    internal_service_auth_response,
     RoundRobinAsyncClientPool,
 )
 from video_commerce.ml.slate_diversity import select_mmr_recommendations
@@ -235,7 +235,9 @@ def _close_awaitable(awaitable) -> None:
 
 @app.middleware("http")
 async def internal_auth(request: Request, call_next):
-    require_internal_service_auth(request, app.state.runtime)
+    denied = internal_service_auth_response(request, app.state.runtime)
+    if denied is not None:
+        return denied
     return await call_next(request)
 
 
