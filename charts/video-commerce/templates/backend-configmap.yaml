@@ -117,6 +117,16 @@ data:
   DATABASE_ENABLE: {{ .Values.external.database.enable | quote }}
   DATABASE_POOL_SIZE: {{ .Values.external.database.poolSize | quote }}
   DATABASE_MAX_OVERFLOW: {{ .Values.external.database.maxOverflow | quote }}
+  DATABASE_POOL_TIMEOUT_SECONDS: {{ .Values.external.database.poolTimeoutSeconds | quote }}
+  DATABASE_POOL_RECYCLE_SECONDS: {{ .Values.external.database.poolRecycleSeconds | quote }}
+  DATABASE_CONNECT_TIMEOUT_SECONDS: {{ .Values.external.database.connectTimeoutSeconds | quote }}
+  DATABASE_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS: {{ .Values.external.database.idleInTransactionSessionTimeoutMs | quote }}
+  DATABASE_HOT_PATH_STATEMENT_TIMEOUT_MS: {{ .Values.external.database.hotPathStatementTimeoutMs | quote }}
+  DATABASE_SCHEMA_LOCK_TIMEOUT_MS: {{ .Values.external.database.schemaLockTimeoutMs | quote }}
+  {{- $statementCacheSize := .Values.external.database.statementCacheSize }}
+  {{- if and (not (kindIs "invalid" $statementCacheSize)) (ne (toString $statementCacheSize) "") }}
+  DATABASE_STATEMENT_CACHE_SIZE: {{ $statementCacheSize | toString | quote }}
+  {{- end }}
   DATABASE_ANALYTICS_SUMMARY_CACHE_TTL_SECONDS: {{ .Values.external.database.analyticsSummaryCacheTtlSeconds | quote }}
   DATABASE_TRAINING_SEQUENCE_LOOKBACK_DAYS: {{ .Values.external.database.trainingSequenceLookbackDays | quote }}
   DATABASE_LTR_IMPRESSION_LOOKBACK_DAYS: {{ .Values.external.database.ltrImpressionLookbackDays | quote }}
@@ -190,6 +200,7 @@ data:
   OBJECT_STORAGE_DOWNLOAD_DIR: {{ .Values.appConfig.objectStorageDownloadDir | quote }}
   RANKING_BATCH_MAX_REQUESTS: {{ .Values.appConfig.ranking.batchMaxRequests | quote }}
   RANKING_ALLOW_UNTRAINED_FALLBACK: {{ .Values.appConfig.ranking.allowUntrainedFallback | quote }}
+  RANKING_RUNTIME_AUTH_MODE: {{ .Values.appConfig.ranking.runtimeAuthMode | default "permissive" | quote }}
   RANKING_REQUIRE_VERIFIED_ARTIFACT: {{ .Values.appConfig.ranking.requireVerifiedArtifact | quote }}
   RANKING_TRIMODAL_ENABLED: {{ .Values.appConfig.ranking.trimodalEnabled | quote }}
   RANKING_TRIMODAL_SHADOW: {{ .Values.appConfig.ranking.trimodalShadow | quote }}

@@ -521,6 +521,12 @@ class ObservabilityManager:
             ["endpoint", "event"],
             registry=self.registry,
         )
+        self.ranking_runtime_auth_total = Counter(
+            "video_commerce_ranking_runtime_auth_total",
+            "Ranking TCP protocol connection auth outcomes by server role",
+            ["role", "result"],
+            registry=self.registry,
+        )
         self.ranking_runner_endpoint_state = Gauge(
             "video_commerce_ranking_runner_endpoint_state",
             "Coordinator runner endpoint state as a one-hot gauge",
@@ -725,6 +731,12 @@ class ObservabilityManager:
             "Age of the oldest unpublished served-impression outbox row",
             registry=self.registry,
         )
+        self.recommendation_outbox_terminal_total = Counter(
+            "video_commerce_recommendation_outbox_terminal_total",
+            "Served-impression outbox rows retired without publishing, by reason",
+            ["reason"],
+            registry=self.registry,
+        )
         self.content_uploads_total = Counter(
             "video_commerce_content_uploads_total",
             "Content upload enqueue outcomes by priority and status",
@@ -757,6 +769,12 @@ class ObservabilityManager:
         self.catalog_outbox_oldest_age_seconds = Gauge(
             "catalog_outbox_oldest_age_seconds",
             "Age of the oldest unpublished catalog outbox row",
+            registry=self.registry,
+        )
+        self.catalog_outbox_terminal_total = Counter(
+            "catalog_outbox_terminal_total",
+            "Catalog outbox rows retired without publishing, by reason",
+            ["reason"],
             registry=self.registry,
         )
         self.content_task_outbox_pending = Gauge(
@@ -1249,6 +1267,9 @@ class ObservabilityManager:
                 max(0, int(count))
             )
 
+    def record_catalog_outbox_terminal(self, reason: str) -> None:
+        self.catalog_outbox_terminal_total.labels(reason=reason).inc()
+
     def update_catalog_outbox(self, *, pending: int, oldest_age_seconds: float) -> None:
         self.catalog_outbox_pending.set(max(0, int(pending)))
         self.catalog_outbox_oldest_age_seconds.set(max(0.0, float(oldest_age_seconds)))
@@ -1549,6 +1570,9 @@ class ObservabilityManager:
             endpoint=endpoint
         ).set(max(0, int(available_connections)))
 
+    def record_ranking_runtime_auth(self, role: str, result: str) -> None:
+        self.ranking_runtime_auth_total.labels(role=role, result=result).inc()
+
     def record_ranking_runner_endpoint_event(self, endpoint: str, event: str) -> None:
         self.ranking_runner_endpoint_events_total.labels(
             endpoint=endpoint, event=event
@@ -1666,6 +1690,9 @@ class ObservabilityManager:
         self.recommendation_impression_events_total.labels(
             stage=stage, status=status
         ).inc()
+
+    def record_recommendation_outbox_terminal(self, reason: str) -> None:
+        self.recommendation_outbox_terminal_total.labels(reason=reason).inc()
 
     def update_recommendation_outbox(
         self, *, pending: int, oldest_age_seconds: float

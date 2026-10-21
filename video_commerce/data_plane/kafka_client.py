@@ -23,7 +23,12 @@ import time
 import uuid
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
-from aiokafka.errors import KafkaConnectionError, KafkaError
+from aiokafka.errors import (
+    KafkaConnectionError,
+    KafkaError,
+    KafkaTimeoutError,
+    MessageSizeTooLargeError,
+)
 
 try:
     from aiokafka import TopicPartition
@@ -42,6 +47,30 @@ from video_commerce.common.telemetry import inject_trace_headers, kafka_consumer
 logger = logging.getLogger(__name__)
 
 EVENT_SCHEMA_VERSION = 1
+
+
+class KafkaPublishError(RuntimeError):
+    """A publish that did not reach the broker, classified for outbox retry."""
+
+    reason = "publish_failed"
+    retryable = True
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        # Broker unreachable / timed out: an outage, not a property of the
+        # record, so it must not use up the outbox attempt cap.
+        self.transient = transient
+
+
+class KafkaMessageTooLargeError(KafkaPublishError):
+    """The serialized record exceeds max_request_size or the broker limit.
+
+    Retrying the same payload can never succeed, so outbox dispatchers mark the
+    row terminal instead of backing off forever.
+    """
+
+    reason = "message_too_large"
+    retryable = False
 
 
 def _build_event_payload(
@@ -165,6 +194,7 @@ class KafkaProducerClient:
                     compression_type=self.config.producer_compression_type,
                     request_timeout_ms=self.config.request_timeout_ms,
                     retry_backoff_ms=self.config.retry_backoff_ms,
+                    max_request_size=self.config.producer_max_request_size,
                     key_serializer=lambda k: k.encode("utf-8") if k else None,
                     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
                 )
@@ -261,6 +291,53 @@ class KafkaProducerClient:
             logger.error(f"Unexpected error sending message: {e}")
             self._record_produce(topic, "error")
             return False
+
+    async def send_or_raise(
+        self,
+        topic: str,
+        value: Dict[str, Any],
+        key: Optional[str] = None,
+        headers: Optional[List[tuple]] = None,
+    ) -> None:
+        """Send and wait for the broker ack, raising a classified error.
+
+        Unlike ``send`` this never returns False: callers that own a durable
+        outbox need to tell an oversized record (never retryable) apart from a
+        transient broker failure. It never (re)starts the producer inline: a
+        disconnected producer fails fast as transient, so an outage costs one
+        cheap error per row instead of a reconnect per row; reconnecting is the
+        owner's (supervisor's) job.
+        """
+        if not self.config.enable:
+            self._record_produce(topic, "disabled")
+            return
+
+        if not self.is_connected or not self.producer:
+            self._record_produce(topic, "error")
+            raise KafkaPublishError("Kafka producer not connected", transient=True)
+
+        value["_kafka_timestamp"] = datetime.utcnow().isoformat()
+        value["_kafka_topic"] = topic
+        try:
+            await self.producer.send_and_wait(
+                topic=topic, value=value, key=key, headers=headers
+            )
+        except MessageSizeTooLargeError as exc:
+            self._record_produce(topic, "message_too_large")
+            raise KafkaMessageTooLargeError(
+                f"record for topic '{topic}' exceeds the producer or broker "
+                f"size limit: {exc}"
+            ) from exc
+        except Exception as exc:
+            self._record_produce(topic, "error")
+            transient = isinstance(
+                exc, (KafkaConnectionError, KafkaTimeoutError, asyncio.TimeoutError)
+            ) or bool(getattr(exc, "retriable", False))
+            raise KafkaPublishError(
+                f"Failed to send message to topic '{topic}': {exc}",
+                transient=transient,
+            ) from exc
+        self._record_produce(topic, "success")
 
     async def send_nowait(
         self,
@@ -1030,6 +1107,19 @@ class KafkaManager:
             headers=_build_headers(event.get("request_id"), event["event_id"]),
         )
 
+    async def publish_recommendation_outbox_event(self, event: Dict[str, Any]) -> None:
+        """Publish a staged outbox event, raising a classified ``KafkaPublishError``.
+
+        ``KafkaMessageTooLargeError`` tells the dispatcher the row can never be
+        delivered and must go terminal instead of retrying.
+        """
+        await self.producer.send_or_raise(
+            topic=self.config.recommendation_events_topic,
+            value=event,
+            key=str(event.get("user_id") or ""),
+            headers=_build_headers(event.get("request_id"), event["event_id"]),
+        )
+
     async def send_recommendation_view(
         self,
         *,
@@ -1139,12 +1229,13 @@ class KafkaManager:
         if not event_id or not entity_id:
             raise ValueError("catalog feature event requires event_id and entity_id")
         request_id = event.get("request_id")
-        return await self.producer.send(
+        await self.producer.send_or_raise(
             topic=self.config.catalog_feature_events_topic,
             value=dict(event),
             key=entity_id,
             headers=_build_headers(request_id, event_id),
         )
+        return True
 
     async def send_feature_history_backfill_event(
         self,
