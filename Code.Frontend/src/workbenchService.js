@@ -1,4 +1,4 @@
-import { systemApi, videoApi } from './api';
+import { DEFAULT_UPLOAD_LIMITS, systemApi, videoApi } from './api';
 import {
   createMockInteractionResponse,
   createMockRecommendationResponse,
@@ -22,6 +22,7 @@ const createMockService = () => ({
     await delay(80);
     return createMockUploadResponse(file);
   },
+  getUploadLimits: async () => DEFAULT_UPLOAD_LIMITS,
   getContentStatus: async (contentId) => {
     await delay(80);
     return createMockStatusResponse(contentId);
@@ -50,6 +51,7 @@ const createMockService = () => ({
 
 const liveService = {
   uploadVideo: videoApi.uploadVideo,
+  getUploadLimits: videoApi.getUploadLimits,
   getContentStatus: videoApi.getContentStatus,
   getRecommendations: videoApi.getRecommendations,
   logInteraction: videoApi.logInteraction,

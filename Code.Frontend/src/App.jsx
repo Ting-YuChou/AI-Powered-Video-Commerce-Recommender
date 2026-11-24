@@ -22,7 +22,15 @@ import {
   WifiOff,
   X,
 } from 'lucide-react';
-import { interactionActions, utils } from './api';
+import {
+  DEFAULT_UPLOAD_LIMITS,
+  createUploadIdempotencyKey,
+  interactionActions,
+  isStaleIdempotencyKeyError,
+  isTerminalFailedStatus,
+  randomUuid,
+  utils,
+} from './api';
 import { clearUploadHistory, readUploadHistory, upsertUploadHistoryEntry } from './uploadHistory';
 import { WORKBENCH_MODES, createWorkbenchService } from './workbenchService';
 
@@ -176,7 +184,7 @@ const getStatusStyles = (status) => {
     return 'border-emerald-200 bg-emerald-50 text-emerald-700';
   }
 
-  if (['queued', 'processing', 'pending', 'uploading', 'recommending'].includes(normalized)) {
+  if (['queued', 'processing', 'pending', 'pending_publish', 'uploading', 'recommending'].includes(normalized)) {
     return 'border-sky-200 bg-sky-50 text-sky-700';
   }
 
@@ -184,7 +192,7 @@ const getStatusStyles = (status) => {
     return 'border-amber-200 bg-amber-50 text-amber-700';
   }
 
-  if (['failed', 'offline', 'unhealthy', 'error'].includes(normalized)) {
+  if (isTerminalFailedStatus(normalized) || ['offline', 'unhealthy', 'error'].includes(normalized)) {
     return 'border-red-200 bg-red-50 text-red-700';
   }
 
@@ -459,6 +467,7 @@ function UploadAnalysisPanel({
   uploadHistory,
   onRestoreHistory,
   onClearHistory,
+  uploadLimits = DEFAULT_UPLOAD_LIMITS,
 }) {
   const canUseMockSample = mode === WORKBENCH_MODES.MOCK;
 
@@ -575,7 +584,9 @@ function UploadAnalysisPanel({
               <UploadCloud className="h-10 w-10 text-slate-500" aria-hidden="true" />
               <div>
                 <p className="font-semibold text-slate-900">Drop a video or choose a file</p>
-                <p className="text-sm text-slate-500">MP4, MOV, AVI, MKV, or WEBM up to 100MB.</p>
+                <p className="text-sm text-slate-500" data-testid="upload-limits">
+                  {utils.describeUploadLimits(uploadLimits)}
+                </p>
               </div>
               <label className="inline-flex cursor-pointer items-center gap-2 rounded-md bg-slate-950 px-4 py-2 text-sm font-semibold text-white">
                 Choose video
@@ -1292,6 +1303,15 @@ function VideoCommerceApp() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedVideo, setSelectedVideo] = useState('');
   const selectedVideoRef = useRef('');
+  // { key, priority } for live uploads of the selected file: created on the
+  // first attempt and reused by retries, so the gateway replays the same job.
+  const uploadKeyRef = useRef(null);
+  // loaded=false until the gateway answered; the size check waits for it.
+  const [uploadLimitsState, setUploadLimitsState] = useState({
+    limits: DEFAULT_UPLOAD_LIMITS,
+    loaded: false,
+  });
+  const uploadLimits = uploadLimitsState.limits;
   const dashboardRequestRef = useRef(0);
   const [dragActive, setDragActive] = useState(false);
   const [phase, setPhase] = useState('idle');
@@ -1398,13 +1418,53 @@ function VideoCommerceApp() {
     loadDashboardData();
   }, [loadDashboardData]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setUploadLimitsState({ limits: DEFAULT_UPLOAD_LIMITS, loaded: false });
+    if (typeof service.getUploadLimits !== 'function') {
+      return undefined;
+    }
+    service.getUploadLimits()
+      .then((limits) => {
+        if (!cancelled && limits) {
+          setUploadLimitsState({ limits, loaded: true });
+        }
+      })
+      .catch(() => {
+        // Keep the defaults; the gateway still enforces its own limits.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [service]);
+
+  // Retries the limits call once more at upload time if it failed earlier.
+  const ensureUploadLimits = useCallback(async () => {
+    if (uploadLimitsState.loaded || typeof service.getUploadLimits !== 'function') {
+      return uploadLimitsState;
+    }
+    try {
+      const limits = await service.getUploadLimits();
+      if (limits) {
+        const nextState = { limits, loaded: true };
+        setUploadLimitsState(nextState);
+        return nextState;
+      }
+    } catch {
+      // Unknown limits: skip the size check and let the gateway enforce it.
+    }
+    return uploadLimitsState;
+  }, [service, uploadLimitsState]);
+
   const handleFileSelect = useCallback((fileList) => {
     const [file] = Array.from(fileList || []);
     if (!file) {
       return;
     }
 
-    const validation = utils.validateVideoFile(file);
+    const validation = utils.validateVideoFile(file, uploadLimitsState.limits, {
+      checkSize: uploadLimitsState.loaded,
+    });
     if (!validation.valid) {
       setError({ type: 'upload_failed', message: validation.error });
       return;
@@ -1419,10 +1479,11 @@ function VideoCommerceApp() {
     selectedVideoRef.current = objectUrl;
     setSelectedVideo(objectUrl);
     setSelectedFile(file);
+    uploadKeyRef.current = null;
     setError(null);
     setPhase('idle');
     setContentStatus({ status: 'ready', message: 'File selected and validated.' });
-  }, []);
+  }, [uploadLimitsState]);
 
   const pollContentStatus = useCallback(async (contentId, activeService) => {
     const maxAttempts = mode === WORKBENCH_MODES.MOCK ? 1 : 40;
@@ -1436,7 +1497,7 @@ function VideoCommerceApp() {
         return { success: true, status };
       }
 
-      if (status.status === 'failed') {
+      if (isTerminalFailedStatus(status.status)) {
         return { success: false, status };
       }
 
@@ -1504,11 +1565,39 @@ function VideoCommerceApp() {
       return;
     }
 
-    const validation = utils.validateVideoFile(activeFile);
+    const limitsState = await ensureUploadLimits();
+    const validation = utils.validateVideoFile(activeFile, limitsState.limits, {
+      checkSize: limitsState.loaded,
+    });
     if (!validation.valid) {
       setError({ type: 'upload_failed', message: validation.error });
       return;
     }
+
+    const reusesSelectedFileKey = mode === WORKBENCH_MODES.LIVE && activeFile === selectedFile;
+    // The gateway fingerprint includes priority, so a key is reused only for
+    // the priority it was created with. Mock uploads send no key.
+    const uploadKey = () => {
+      if (mode !== WORKBENCH_MODES.LIVE) {
+        return undefined;
+      }
+      const current = uploadKeyRef.current;
+      if (reusesSelectedFileKey && current && current.priority === priority) {
+        return current.key;
+      }
+      const key = createUploadIdempotencyKey();
+      if (reusesSelectedFileKey) {
+        uploadKeyRef.current = { key, priority };
+      }
+      return key;
+    };
+    // After a failed job (or a key rejected with 409) the next attempt for
+    // this file must be a new upload with a new key.
+    const forgetUploadKey = () => {
+      if (reusesSelectedFileKey) {
+        uploadKeyRef.current = null;
+      }
+    };
 
     setBusy(true);
     setError(null);
@@ -1516,7 +1605,24 @@ function VideoCommerceApp() {
     setContentStatus({ status: 'uploading', message: 'Uploading video through the active service.' });
 
     try {
-      const uploadResponse = await service.uploadVideo(activeFile, userId.trim() || 'demo_user', priority);
+      const upload = () => service.uploadVideo(
+        activeFile,
+        userId.trim() || 'demo_user',
+        priority,
+        { idempotencyKey: uploadKey() }
+      );
+      let uploadResponse;
+      try {
+        uploadResponse = await upload();
+      } catch (firstUploadError) {
+        if (!isStaleIdempotencyKeyError(firstUploadError)) {
+          throw firstUploadError;
+        }
+        // The key's job failed, or the key was used for a different request:
+        // upload again as a new job.
+        forgetUploadKey();
+        uploadResponse = await upload();
+      }
       const contentId = uploadResponse.content_id || uploadResponse.contentId;
       if (!contentId) {
         throw new Error('Upload response did not include content_id.');
@@ -1551,6 +1657,9 @@ function VideoCommerceApp() {
 
       if (!pollResult.success) {
         const status = pollResult.status?.status || 'failed';
+        if (isTerminalFailedStatus(status)) {
+          forgetUploadKey();
+        }
         setPhase(status === 'timeout' ? 'timeout' : 'failed');
         setError({
           type: status === 'timeout' ? 'processing_timeout' : 'upload_failed',
@@ -1561,16 +1670,31 @@ function VideoCommerceApp() {
 
       await fetchRecommendations({ contentId, activeService: service, modeOverride: mode });
     } catch (uploadError) {
+      const httpStatus = uploadError?.response?.status;
+      if (httpStatus === 409) {
+        forgetUploadKey();
+      }
+      const isRequestRejected = Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus < 500;
       setPhase('failed');
       setContentStatus({ status: 'failed', message: getErrorMessage(uploadError, 'Upload failed.') });
       setError({
-        type: mode === WORKBENCH_MODES.LIVE ? 'gateway_offline' : 'upload_failed',
+        type: mode === WORKBENCH_MODES.LIVE && !isRequestRejected ? 'gateway_offline' : 'upload_failed',
         message: getErrorMessage(uploadError, 'Upload failed.'),
       });
     } finally {
       setBusy(false);
     }
-  }, [fetchRecommendations, mode, persistHistoryEntry, pollContentStatus, priority, selectedFile, service, userId]);
+  }, [
+    fetchRecommendations,
+    mode,
+    persistHistoryEntry,
+    pollContentStatus,
+    priority,
+    selectedFile,
+    ensureUploadLimits,
+    service,
+    userId,
+  ]);
 
   const restoreHistoryEntry = useCallback(async (entry) => {
     const entryMode = entry.mode === WORKBENCH_MODES.MOCK ? WORKBENCH_MODES.MOCK : WORKBENCH_MODES.LIVE;
@@ -1582,7 +1706,7 @@ function VideoCommerceApp() {
       status: entry.status,
       message: `Restored ${entry.filename} from local upload history.`,
     });
-    setPhase(entry.status === 'completed' ? 'ready' : entry.status === 'failed' ? 'failed' : 'processing');
+    setPhase(entry.status === 'completed' ? 'ready' : isTerminalFailedStatus(entry.status) ? 'failed' : 'processing');
     setError(null);
 
     if (entry.status === 'completed' || entryMode === WORKBENCH_MODES.MOCK) {
@@ -1689,7 +1813,7 @@ function VideoCommerceApp() {
     const key = `${impressionId}:${product.product_id}`;
     if (viewedProductKeysRef.current.has(key)) return;
     viewedProductKeysRef.current.add(key);
-    const eventId = viewEventIdsRef.current.get(key) || crypto.randomUUID();
+    const eventId = viewEventIdsRef.current.get(key) || randomUuid();
     viewEventIdsRef.current.set(key, eventId);
     try {
       await service.logViewedImpression(
@@ -1796,6 +1920,7 @@ function VideoCommerceApp() {
             uploadHistory={uploadHistory}
             onRestoreHistory={restoreHistoryEntry}
             onClearHistory={clearHistory}
+            uploadLimits={uploadLimits}
           />
         )}
 

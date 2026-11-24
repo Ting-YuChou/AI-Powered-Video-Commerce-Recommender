@@ -406,6 +406,18 @@ class ComponentHealth(BaseModel):
     )
 
 
+class UploadLimitsResponse(BaseModel):
+    """Upload constraints the gateway enforces for POST /api/content/upload."""
+
+    max_file_size: int = Field(..., gt=0, description="Maximum upload size in bytes")
+    allowed_extensions: List[str] = Field(
+        ..., description="Lowercase file extensions, including the leading dot"
+    )
+    allowed_mime_types: List[str] = Field(
+        ..., description="Lowercase MIME types accepted for the uploaded file part"
+    )
+
+
 class HealthResponse(BaseModel):
     """Complete system health check response."""
 
