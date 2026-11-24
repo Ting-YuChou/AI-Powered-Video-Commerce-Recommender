@@ -418,6 +418,61 @@ async def test_analytics_requires_admin_scope_for_bearer_callers(monkeypatch):
     assert await gateway_api.analytics(request) == {"ok": True}
 
 
+class _StubBearerValidator:
+    """Maps ``Bearer <name>`` to fixed claims; no header means no bearer auth."""
+
+    TOKENS = {
+        "user": {"sub": "u1", "scope": "openid profile"},
+        "admin": {"sub": "u2", "scope": f"openid {Config().security_config.admin_scope}"},
+    }
+
+    async def authenticate_async(self, header):
+        if not header:
+            return None
+        return dict(self.TOKENS[header.split(" ", 1)[1]])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "auth_mode, headers, expected",
+    [
+        ("api_key_or_bearer", {"authorization": "Bearer user"}, "normal"),
+        ("api_key_or_bearer", {"authorization": "Bearer admin"}, "high"),
+        ("api_key_or_bearer", {"x-api-key": "secret"}, "high"),
+        # A valid bearer token wins over an API key sent alongside it.
+        (
+            "api_key_or_bearer",
+            {"authorization": "Bearer user", "x-api-key": "secret"},
+            "normal",
+        ),
+        ("bearer", {"authorization": "Bearer user"}, "normal"),
+        ("bearer", {"authorization": "Bearer admin"}, "high"),
+        # api_key mode never validates bearer tokens, so the API key decides.
+        ("api_key", {"authorization": "Bearer user", "x-api-key": "secret"}, "high"),
+        ("disabled", {"authorization": "Bearer user"}, "high"),
+    ],
+)
+async def test_high_upload_priority_follows_authenticated_principal(
+    monkeypatch, auth_mode, headers, expected
+):
+    _install_gateway(
+        monkeypatch, _gateway_config(auth_mode=auth_mode, api_key="secret")
+    )
+    monkeypatch.setattr(gateway_api, "bearer_token_validator", _StubBearerValidator())
+    seen = {}
+
+    async def call_next(request):
+        seen["priority"] = gateway_api._effective_upload_priority(request, "high")
+        return JSONResponse({"ok": True})
+
+    response = await gateway_api.auth_and_rate_limit(
+        _request(path="/api/content/upload", headers=headers), call_next
+    )
+
+    assert response.status_code == 200
+    assert seen["priority"] == expected
+
+
 def test_internal_service_auth_returns_401_instead_of_raising():
     runtime = ServiceRuntime("ranking-service")
     runtime.config = SimpleNamespace(

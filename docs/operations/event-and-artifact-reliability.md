@@ -19,8 +19,8 @@ the object and then atomically create the authoritative `content_jobs` row and
 pipeline version, so every inline or background publish attempt uses the same
 Kafka identity. The gateway returns `queued` only after Kafka acknowledges the
 event. If publication is still pending, it returns HTTP 503 with
-`CONTENT_ENQUEUE_PENDING`, `content_id`, `status=pending_publish`, and
-`Retry-After`; the durable object and outbox row remain available for retry.
+`CONTENT_ENQUEUE_PENDING`, `content_id`, `status=pending_publish`,
+`effective_priority`, and `Retry-After`; the durable object and outbox row remain available for retry.
 
 Run `content-task-publisher` in every environment that accepts uploads. Multiple
 replicas safely claim rows with `FOR UPDATE SKIP LOCKED` and owner-token leases.
@@ -68,7 +68,10 @@ unique index on `(COALESCE(user_id, ''), idempotency_key)`, an index on
 - **Upload retries.** Clients may send `Idempotency-Key` (1-128 characters of
   `A-Z a-z 0-9 _ . : ~ -`) on `POST /api/content/upload`; a key requires a
   `user_id`. The gateway hashes the body while streaming it and stores a `v1:`
-  fingerprint over the body SHA-256, size, filename, and priority.
+  fingerprint over the body SHA-256, size, filename, and effective priority
+  (bearer callers without the admin scope have `high` lowered to `normal`; a
+  replay also accepts the requested priority's fingerprint, see
+  `object-storage-and-auth.md`).
   - Same key and same request: the original `content_id` and current status
     with `idempotent_replay: true` (a `pending_publish` job is re-published
     inline).
