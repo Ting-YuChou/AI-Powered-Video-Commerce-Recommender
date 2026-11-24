@@ -2387,7 +2387,10 @@ class SecurityConfig(BaseSettings):
     )
     admin_scope: str = Field(
         "video-commerce:admin",
-        description="Bearer scope required for global endpoints such as /api/analytics",
+        description=(
+            "Bearer scope required for /api/analytics and for priority=high "
+            "content uploads (lowered to normal without it)"
+        ),
     )
     jwks_timeout_seconds: float = Field(
         2.0,

@@ -14,7 +14,7 @@ import re
 import tempfile
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import httpx
 from fastapi import Body, File, HTTPException, Query, Request, UploadFile
@@ -668,12 +668,46 @@ def _enforce_bearer_user(request: Request, user_id: Optional[str]) -> None:
         )
 
 
+def _token_scopes(claims: Dict[str, Any]) -> FrozenSet[str]:
+    """Scopes from both ``scope`` and ``scp``, as a space-separated string or a
+    list of strings. Any other shape (number, bool, object) grants nothing."""
+    scopes = set()
+    for claim in ("scope", "scp"):
+        value = claims.get(claim)
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, (list, tuple)):
+            items = value
+        else:
+            continue
+        for item in items:
+            if isinstance(item, str):
+                scopes.update(item.split())
+    return frozenset(scopes)
+
+
 def _has_admin_scope(claims: Dict[str, Any]) -> bool:
     required = app.state.runtime.config.security_config.admin_scope
-    scopes = claims.get("scope") or claims.get("scp") or []
-    if isinstance(scopes, str):
-        scopes = scopes.split()
-    return required in {str(scope) for scope in scopes}
+    return required in _token_scopes(claims)
+
+
+UPLOAD_PRIORITIES = frozenset({"low", "normal", "high"})
+
+
+def _effective_upload_priority(request: Request, requested: str) -> str:
+    """Bearer callers need the admin scope to upload at ``high`` priority.
+
+    Without it, ``high`` is lowered to ``normal`` instead of rejected, so
+    existing clients keep working. API-key callers are trusted backends, and
+    ``SECURITY_AUTH_MODE=disabled`` is local-only (production rejects it), so
+    both keep the requested priority.
+    """
+    if requested != "high":
+        return requested
+    claims = getattr(request.state, "auth_claims", None)
+    if claims is None or _has_admin_scope(claims):
+        return requested
+    return "normal"
 
 
 @app.post("/api/recommendations")
@@ -727,8 +761,12 @@ async def upload_content(
     if subject is not None:
         user_id = user_id or subject
         _enforce_bearer_user(request, user_id)
-    if priority not in {"low", "normal", "high"}:
+    if priority not in UPLOAD_PRIORITIES:
         raise HTTPException(status_code=400, detail="Invalid priority")
+    # From here on ``priority`` is the effective value: it is what gets stored,
+    # published, fingerprinted and counted.
+    requested_priority = priority
+    priority = _effective_upload_priority(request, requested_priority)
     # Keys are scoped to the (already bearer-bound) user_id. Without a user an
     # anonymous key namespace would be shared across callers, so require one.
     idempotency_key = parse_idempotency_key(
@@ -762,16 +800,26 @@ async def upload_content(
         chunk_size=runtime.config.data_config.upload_chunk_size_bytes,
         hasher=hasher,
     )
-    request_fingerprint = (
-        upload_request_fingerprint(
-            body_sha256=hasher.hexdigest(),
-            size_bytes=size_bytes,
-            filename=file.filename,
-            priority=priority,
-        )
-        if hasher is not None
-        else None
-    )
+    request_fingerprint = None
+    replay_fingerprints: FrozenSet[str] = frozenset()
+    if hasher is not None:
+        body_sha256 = hasher.hexdigest()
+        # New jobs store the effective-priority fingerprint. A replay also
+        # accepts the requested-priority one, so a key first used by the
+        # pre-gating gateway, an old pod mid-rollout, or a caller whose scope
+        # has since changed still replays. A replay only returns the existing
+        # job, so this grants nothing.
+        fingerprints = {
+            p: upload_request_fingerprint(
+                body_sha256=body_sha256,
+                size_bytes=size_bytes,
+                filename=file.filename,
+                priority=p,
+            )
+            for p in {priority, requested_priority}
+        }
+        request_fingerprint = fingerprints[priority]
+        replay_fingerprints = frozenset(fingerprints.values())
     lease_seconds = runtime.config.service_topology_config.content_outbox_lease_seconds
     if idempotency_key:
         try:
@@ -785,7 +833,7 @@ async def upload_content(
             _remove_staged_file(file_path)
             return await _idempotent_upload_response(
                 existing,
-                request_fingerprint=request_fingerprint,
+                replay_fingerprints=replay_fingerprints,
                 request=request,
                 priority=priority,
                 size_bytes=size_bytes,
@@ -838,7 +886,7 @@ async def upload_content(
             )
         return await _idempotent_upload_response(
             existing,
-            request_fingerprint=request_fingerprint,
+            replay_fingerprints=replay_fingerprints,
             request=request,
             priority=priority,
             size_bytes=size_bytes,
@@ -851,9 +899,21 @@ async def upload_content(
         # The staging COMMIT succeeded even though the call raised: the job and
         # its outbox row are durable and the publisher will enqueue them.
         success = False
+    if priority != requested_priority:
+        # Logged once per new job, not for rejected requests or replays.
+        logger.info(
+            "content_upload_priority_lowered: content_id=%s request_id=%s "
+            "requested=%s effective=%s",
+            content_id,
+            request.state.request_id,
+            requested_priority,
+            priority,
+        )
     if not success:
         runtime.observability.record_content_upload(priority, "enqueue_failed")
-        return _content_enqueue_pending_response(request, content_id)
+        return _content_enqueue_pending_response(
+            request, content_id, effective_priority=priority
+        )
     await feature_store.update_content_status(content_id, "queued")
     runtime.observability.record_content_upload(priority, "queued")
 
@@ -862,6 +922,7 @@ async def upload_content(
         "filename": file.filename,
         "size_bytes": size_bytes,
         "status": "queued",
+        "effective_priority": priority,
         "message": f"Content uploaded and queued for processing (priority: {priority}).",
     }
 
@@ -948,7 +1009,9 @@ async def _resolve_unknown_stage_outcome(
     return job
 
 
-def _content_enqueue_pending_response(request: Request, content_id: str) -> Response:
+def _content_enqueue_pending_response(
+    request: Request, content_id: str, *, effective_priority: Optional[str]
+) -> Response:
     return JSONResponse(
         status_code=503,
         content={
@@ -960,6 +1023,7 @@ def _content_enqueue_pending_response(request: Request, content_id: str) -> Resp
             },
             "content_id": content_id,
             "status": "pending_publish",
+            "effective_priority": effective_priority,
         },
         headers={"Retry-After": "1"},
     )
@@ -968,7 +1032,7 @@ def _content_enqueue_pending_response(request: Request, content_id: str) -> Resp
 async def _idempotent_upload_response(
     existing: Dict[str, Any],
     *,
-    request_fingerprint: Optional[str],
+    replay_fingerprints: FrozenSet[str],
     request: Request,
     priority: str,
     size_bytes: int,
@@ -977,7 +1041,7 @@ async def _idempotent_upload_response(
     """Replay the original upload result, or reject a reused key with new bytes."""
     runtime = app.state.runtime
     content_id = str(existing["content_id"])
-    if existing.get("request_fingerprint") != request_fingerprint:
+    if existing.get("request_fingerprint") not in replay_fingerprints:
         runtime.observability.record_content_upload(priority, "idempotency_conflict")
         return JSONResponse(
             status_code=409,
@@ -994,10 +1058,14 @@ async def _idempotent_upload_response(
             },
         )
     status = str(existing.get("status") or "")
+    # Report and count the job's stored priority: it is what the job was queued
+    # with, and differs from this request's when the requested-priority
+    # fingerprint matched (see upload_content).
+    effective_priority = existing.get("priority") or priority
     if status in TERMINAL_FAILED_CONTENT_STATUSES:
         # Replaying a terminal failure as 200 would hide it forever; the client
         # must re-upload under a new key.
-        runtime.observability.record_content_upload(priority, "idempotency_failed")
+        runtime.observability.record_content_upload(effective_priority, "idempotency_failed")
         return JSONResponse(
             status_code=409,
             content={
@@ -1022,16 +1090,19 @@ async def _idempotent_upload_response(
             lease_seconds=lease_seconds,
         )
         if not published:
-            runtime.observability.record_content_upload(priority, "enqueue_failed")
-            return _content_enqueue_pending_response(request, content_id)
+            runtime.observability.record_content_upload(effective_priority, "enqueue_failed")
+            return _content_enqueue_pending_response(
+                request, content_id, effective_priority=effective_priority
+            )
         await feature_store.update_content_status(content_id, "queued")
         status = "queued"
-    runtime.observability.record_content_upload(priority, "idempotent_replay")
+    runtime.observability.record_content_upload(effective_priority, "idempotent_replay")
     return {
         "content_id": content_id,
         "filename": existing.get("filename"),
         "size_bytes": size_bytes,
         "status": status,
+        "effective_priority": effective_priority,
         "idempotent_replay": True,
         "message": "Upload already accepted for this Idempotency-Key.",
     }
