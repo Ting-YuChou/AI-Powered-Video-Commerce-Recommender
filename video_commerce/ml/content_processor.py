@@ -11,9 +11,11 @@ import cv2
 import numpy as np
 import torch
 import asyncio
+import contextvars
 import json
 import logging
 import re
+import sys
 from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image, ImageEnhance
 import io
@@ -32,6 +34,8 @@ from pytesseract import Output
 # Local imports
 from video_commerce.common.models import AudioFeatures, ContentFeatures
 from video_commerce.common.config import ModelConfig
+from video_commerce.ml import opencv_keyframes
+from video_commerce.ml.opencv_keyframes import InvalidVideoError  # noqa: F401 (re-export)
 from video_commerce.ml.text_embeddings import MultilingualTextEmbedder
 from video_commerce.ml.visual_retrieval import load_visual_retrieval_checkpoint
 
@@ -40,6 +44,28 @@ logger = logging.getLogger(__name__)
 
 ZERO_NORM_EPSILON = 1e-6
 
+# Monotonic deadline for the keyframe extraction in progress (None outside it).
+# Every media command's timeout is capped by what remains, so scene detection,
+# frame extraction and fallbacks share one budget.
+_keyframe_extraction_deadline: contextvars.ContextVar[Optional[float]] = (
+    contextvars.ContextVar("keyframe_extraction_deadline", default=None)
+)
+
+
+class KeyframeExtractionDeadlineExceeded(TimeoutError):
+    """Keyframe extraction used up MODEL_KEYFRAME_EXTRACTION_DEADLINE_SECONDS."""
+
+
+_SHOWINFO_FRAME_LINE = re.compile(
+    r"(?:^|\r)\[Parsed_showinfo_\d+ @ [^\]]*\]\s+n:\s*\d+\s+pts:\s*-?\d+\s+"
+    r"pts_time:(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)",
+    re.MULTILINE,
+)
+
+# Share of the extraction deadline the scene pass leaves for the uniform
+# fallback, so a scene pass that runs out of time still leaves room for seeks.
+UNIFORM_FALLBACK_DEADLINE_SHARE = 0.2
+
 
 class ContentModalityError(RuntimeError):
     """A required modality failed; the task is retryable (never silently zeroed)."""
@@ -47,10 +73,6 @@ class ContentModalityError(RuntimeError):
     def __init__(self, modality: str, message: str):
         super().__init__(f"{modality} extraction failed: {message}")
         self.modality = modality
-
-
-class InvalidVideoError(ValueError):
-    """The source media cannot be decoded into frames; retrying will not help."""
 
 
 def embedding_has_signal(embedding: Any) -> bool:
@@ -466,32 +488,67 @@ class ContentProcessor:
     async def _extract_keyframes(
         self, video_path: str
     ) -> Tuple[List[np.ndarray], Dict]:
-        """Extract keyframes from video file."""
-        if self.config.ffmpeg_frame_extraction_enabled:
+        """Extract keyframes within MODEL_KEYFRAME_EXTRACTION_DEADLINE_SECONDS.
+
+        FFmpeg (scene pass, then uniform seeks) runs first. OpenCV, in a child
+        process bounded by the same deadline, runs when FFmpeg extraction is
+        disabled, ffprobe cannot read the file, or FFmpeg produced no frames.
+        The opencv-python wheel bundles its own FFmpeg build, so it sometimes
+        decodes what the system FFmpeg cannot. When it also fails it reports
+        ``InvalidVideoError`` (not retryable), so a corrupt upload is
+        dead-lettered at once instead of using the whole retry budget.
+        Running out of time raises ``KeyframeExtractionDeadlineExceeded``.
+        """
+        deadline = time.monotonic() + float(
+            self.config.keyframe_extraction_deadline_seconds
+        )
+        token = _keyframe_extraction_deadline.set(deadline)
+        try:
+            if not self.config.ffmpeg_frame_extraction_enabled:
+                return await self._extract_keyframes_opencv(video_path)
             try:
-                keyframes, video_info = await self._extract_keyframes_ffmpeg(video_path)
-                if keyframes:
-                    logger.info(
-                        "Extracted %s keyframes from video using FFmpeg",
-                        len(keyframes),
-                    )
-                    return keyframes, video_info
-                logger.warning(
-                    "FFmpeg keyframe extraction returned no frames; falling back to OpenCV"
-                )
+                video_info = await self._probe_video_metadata(video_path)
+            except KeyframeExtractionDeadlineExceeded:
+                raise
             except Exception as exc:
                 logger.warning(
-                    "FFmpeg keyframe extraction failed; falling back to OpenCV: %s",
+                    "ffprobe could not read the video; falling back to OpenCV: %s",
                     exc,
                 )
-
-        return await self._extract_keyframes_opencv(video_path)
+                return await self._extract_keyframes_opencv(video_path)
+            try:
+                keyframes, video_info = await self._extract_keyframes_ffmpeg(
+                    video_path, video_info
+                )
+            except KeyframeExtractionDeadlineExceeded:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "FFmpeg keyframe extraction failed; trying OpenCV: %s", exc
+                )
+                keyframes = []
+            if keyframes:
+                logger.info(
+                    "Extracted %s keyframes from video using FFmpeg", len(keyframes)
+                )
+                return keyframes, video_info
+            logger.warning("FFmpeg extracted no keyframes; trying OpenCV")
+            keyframes, opencv_info = await self._extract_keyframes_opencv(video_path)
+            # Keep ffprobe's metadata (duration, audio); OpenCV supplies frames.
+            video_info.pop("sampled_frame_indices", None)
+            video_info["frame_timestamps_seconds"] = opencv_info.get(
+                "frame_timestamps_seconds", []
+            )
+            return keyframes, video_info
+        finally:
+            _keyframe_extraction_deadline.reset(token)
 
     async def _extract_keyframes_ffmpeg(
-        self, video_path: str
+        self, video_path: str, video_info: Optional[Dict[str, Any]] = None
     ) -> Tuple[List[np.ndarray], Dict]:
         """Extract RGB keyframes using ffprobe and FFmpeg."""
-        video_info = await self._probe_video_metadata(video_path)
+        if video_info is None:
+            video_info = await self._probe_video_metadata(video_path)
         frame_count = int(video_info.get("frame_count") or 0)
         fps = float(video_info.get("fps") or 0)
         duration = float(video_info.get("duration") or 0)
@@ -532,6 +589,8 @@ class ContentProcessor:
                 "Scene-adaptive FFmpeg extraction returned no usable frames; "
                 "falling back to uniform FFmpeg extraction"
             )
+        except KeyframeExtractionDeadlineExceeded:
+            raise
         except Exception as exc:
             logger.warning(
                 "Scene-adaptive FFmpeg extraction failed; "
@@ -551,35 +610,88 @@ class ContentProcessor:
         video_info: Dict[str, Any],
         frame_count: int,
     ) -> Tuple[List[np.ndarray], Dict[str, Any]]:
-        """Extract uniformly sampled RGB keyframes using FFmpeg."""
-        frame_indices = self._keyframe_indices(frame_count)
-        if not frame_indices:
-            return [], video_info
-        keyframes = await self._extract_ffmpeg_frames_by_index(
-            video_path, frame_indices
-        )
-        fps = float(video_info.get("fps") or 0.0)
-        video_info["frame_timestamps_seconds"] = [
-            float(index) / fps if fps > 0 else 0.0 for index in frame_indices
-        ]
-        video_info["sampled_frame_indices"] = list(frame_indices)
-        return keyframes, video_info
+        """Uniformly sampled RGB keyframes, one input seek per sample.
 
-    async def _extract_scene_adaptive_keyframes_ffmpeg(
+        Seeking decodes only from the nearest keyframe, so this stays cheap
+        when the scene pass failed because a full decode was too slow.
+        """
+        frame_indices = self._keyframe_indices(frame_count)
+        fps = float(video_info.get("fps") or 0.0)
+        duration = float(video_info.get("duration") or 0.0)
+        if fps > 0:
+            timestamps = [float(index) / fps for index in frame_indices]
+        elif duration > 0 and frame_count > 0:
+            timestamps = [float(index) * duration / frame_count for index in frame_indices]
+        else:
+            timestamps = []
+        if not timestamps:
+            return [], video_info
+        sampled = await self._extract_ffmpeg_frames_at_times(video_path, timestamps)
+        video_info["frame_timestamps_seconds"] = [ts for ts, _ in sampled]
+        video_info.pop("sampled_frame_indices", None)
+        return [frame for _, frame in sampled], video_info
+
+    async def _extract_ffmpeg_frames_at_times(
         self,
         video_path: str,
-        frame_count: int,
-        fps: float,
-        duration: float,
-    ) -> List[np.ndarray]:
-        """Extract bounded scene-aware keyframes and filter low-value frames."""
-        frames, _ = await self._extract_scene_adaptive_keyframes_with_timestamps_ffmpeg(
-            video_path,
-            frame_count,
-            fps,
-            duration,
-        )
-        return frames
+        timestamps: List[float],
+    ) -> List[Tuple[float, np.ndarray]]:
+        """Decode one frame at (or just after) each timestamp.
+
+        Returns ``(timestamp, frame)`` for the samples that decoded. A seek at
+        the very end of a stream can legitimately return no frame, and one bad
+        seek should not discard the rest, so failures drop that sample. If
+        every seek fails, the last error is raised. At the extraction deadline
+        the samples decoded so far are returned (raising only if there are
+        none), so a slow file degrades to fewer frames instead of failing the
+        same way on every retry.
+        """
+        target_width = max(1, int(self.config.ffmpeg_target_width))
+        sampled: List[Tuple[float, np.ndarray]] = []
+        last_error: Optional[Exception] = None
+        for timestamp in timestamps:
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-ss",
+                f"{max(0.0, timestamp):.3f}",
+                *self._ffmpeg_input(video_path),
+                "-frames:v",
+                "1",
+                "-an",
+                "-sn",
+                "-dn",
+                "-vf",
+                f"scale=min({target_width}\\,iw):-2,format=rgb24",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "ppm",
+                "pipe:1",
+            ]
+            try:
+                frames = self._parse_ppm_frames(await self._run_media_command(command))
+            except KeyframeExtractionDeadlineExceeded:
+                if not sampled:
+                    raise
+                logger.warning(
+                    "Keyframe extraction deadline reached after %s of %s seeks",
+                    len(sampled),
+                    len(timestamps),
+                )
+                return sampled
+            except Exception as exc:
+                last_error = exc
+                logger.warning("FFmpeg seek to %.3fs failed: %s", timestamp, exc)
+                continue
+            if frames:
+                sampled.append((float(timestamp), frames[0]))
+        if not sampled and last_error is not None:
+            raise last_error
+        return sampled
 
     async def _extract_scene_adaptive_keyframes_with_timestamps_ffmpeg(
         self,
@@ -588,8 +700,15 @@ class ContentProcessor:
         fps: float,
         duration: float,
     ) -> Tuple[List[np.ndarray], List[float]]:
-        """Extract scene-aware frames together with source timestamps."""
-        if frame_count <= 0 or fps <= 0 or self.max_keyframes <= 0:
+        """Scene-aware keyframes from one decode, with source timestamps.
+
+        One FFmpeg pass selects scene-change and floor candidates, then the
+        quality filter drops dark, blurry and duplicate frames and the rest are
+        thinned to ``num_keyframes``. (This replaced a scene-detection pass
+        followed by a second decode up to the last candidate.)
+        """
+        # Only the duration matters here; fps and frame_count may be unknown.
+        if self.max_keyframes <= 0:
             return [], []
 
         effective_duration = self._effective_keyframe_duration(
@@ -597,112 +716,130 @@ class ContentProcessor:
             fps=fps,
             duration=duration,
         )
-        scene_times = await self._detect_scene_change_times_ffmpeg(
-            video_path,
-            effective_duration,
+        candidates, timestamps = await self._extract_scene_candidates_ffmpeg(
+            video_path, effective_duration
         )
-        candidate_limit = max(self.max_keyframes, self.max_keyframes * 3)
-        frame_indices = self._scene_adaptive_keyframe_indices(
-            frame_count=frame_count,
-            fps=fps,
-            duration=effective_duration,
-            scene_times=scene_times,
-            max_indices=candidate_limit,
-        )
-        if not frame_indices:
-            return [], []
-
-        keyframes = await self._extract_ffmpeg_frames_by_index(
-            video_path, frame_indices
-        )
-        retained_positions = self._quality_keyframe_positions(keyframes)
+        retained_positions = self._quality_keyframe_positions(candidates)
         sampled = [
-            (keyframes[position], frame_indices[position])
+            (candidates[position], timestamps[position])
             for position in retained_positions
         ]
         sampled = self._thin_ordered_items(sampled, self.max_keyframes)
+        return [frame for frame, _ in sampled], [ts for _, ts in sampled]
+
+    def _scene_candidate_select_expression(self, effective_duration: float) -> str:
+        """FFmpeg ``select`` expression for scene-change and floor candidates.
+
+        Selects the first frame; any frame ``floor`` seconds after the previous
+        selection; scene changes at least ``min_gap`` after it; and one frame in
+        the last ``min_gap`` (at least 1 s) of the processed span, so the end of
+        the video is covered as the first frame is. Raising ``min_gap`` to
+        ``duration / candidate_limit`` bounds the output to about
+        ``candidate_limit`` frames however often the scene changes, which bounds
+        the memory the decoded candidates take.
+        """
+        candidate_limit = max(1, self.max_keyframes * 3)
+        min_gap = max(
+            float(self.config.keyframe_min_scene_gap_seconds),
+            float(effective_duration) / candidate_limit,
+        )
+        floor = max(float(self.config.keyframe_floor_seconds), min_gap)
+        threshold = float(self.config.keyframe_scene_threshold)
+        tail_start = max(0.0, float(effective_duration) - max(min_gap, 1.0))
+        since = "t-prev_selected_t"
+        spaced = f"gte({since}\\,{min_gap:.6f})"
         return (
-            [frame for frame, _ in sampled],
-            [float(index) / fps for _, index in sampled],
+            "gt(isnan(prev_selected_t)"
+            f"+gte({since}\\,{floor:.6f})"
+            f"+gt(scene\\,{threshold:.6f})*{spaced}"
+            f"+gte(t\\,{tail_start:.6f})*{spaced}"
+            "\\,0)"
         )
 
-    async def _detect_scene_change_times_ffmpeg(
-        self,
-        video_path: str,
-        effective_duration: float,
-    ) -> List[float]:
-        """Run FFmpeg scene detection and return selected frame timestamps."""
-        threshold = float(self.config.keyframe_scene_threshold)
-        filter_graph = f"select=gt(scene\\,{threshold:.6f}),showinfo"
-        command = [
+    def _scene_candidates_command(
+        self, video_path: str, effective_duration: float
+    ) -> List[str]:
+        """The scene-pass FFmpeg command (also run by the benchmark script).
+
+        ``-t`` is an input option: as an output option FFmpeg trims after
+        ``select,showinfo``, so ``showinfo`` would log a frame the trim drops.
+        """
+        target_width = max(1, int(self.config.ffmpeg_target_width))
+        filter_graph = (
+            f"select={self._scene_candidate_select_expression(effective_duration)},"
+            "showinfo,"
+            f"scale=min({target_width}\\,iw):-2,"
+            "format=rgb24"
+        )
+        return [
             "ffmpeg",
             "-hide_banner",
+            "-nostats",
             "-loglevel",
             "info",
             "-nostdin",
-            "-i",
-            video_path,
-            "-t",
-            f"{effective_duration:.1f}",
+            *self._ffmpeg_input(video_path, duration=effective_duration),
+            "-an",
+            "-sn",
+            "-dn",
             "-vf",
             filter_graph,
-            "-an",
+            "-vsync",
+            "vfr",
             "-f",
-            "null",
-            "-",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "pipe:1",
         ]
-        _, stderr = await self._run_media_command_with_stderr(command)
-        return self._parse_scene_change_times(stderr)
 
-    def _parse_scene_change_times(self, payload: bytes) -> List[float]:
-        """Parse FFmpeg showinfo `pts_time` entries from stderr."""
-        text = payload.decode("utf-8", errors="replace")
-        times: List[float] = []
-        for match in re.finditer(r"pts_time:([0-9]+(?:\.[0-9]+)?)", text):
-            times.append(float(match.group(1)))
-        return times
-
-    def _scene_adaptive_keyframe_indices(
+    async def _extract_scene_candidates_ffmpeg(
         self,
-        *,
-        frame_count: int,
-        fps: float,
-        duration: float,
-        scene_times: List[float],
-        max_indices: Optional[int] = None,
-    ) -> List[int]:
-        if frame_count <= 0 or fps <= 0 or self.max_keyframes <= 0:
-            return []
+        video_path: str,
+        effective_duration: float,
+    ) -> Tuple[List[np.ndarray], List[float]]:
+        """Decode once and return candidate frames with their timestamps.
 
-        effective_duration = self._effective_keyframe_duration(
-            frame_count=frame_count,
-            fps=fps,
-            duration=duration,
+        Timestamps come from ``showinfo`` (the frames' own presentation times,
+        so variable-frame-rate video is placed correctly) relative to the first
+        frame, which is always selected.
+        """
+        command = self._scene_candidates_command(video_path, effective_duration)
+        stdout, stderr = await self._run_media_command_with_stderr(
+            command, timeout=self._scene_pass_timeout(effective_duration)
         )
+        frames = self._parse_ppm_frames(stdout)
+        presentation_times = self._parse_showinfo_times(stderr)
+        if len(presentation_times) != len(frames):
+            raise ValueError(
+                f"FFmpeg returned {len(frames)} candidate frames but "
+                f"{len(presentation_times)} timestamps"
+            )
+        if not frames:
+            return [], []
+        origin = presentation_times[0]
+        timestamps: List[float] = []
+        for value in presentation_times:
+            # Monotonic and non-negative, as the OCR tracker and pooler expect.
+            timestamp = max(0.0, value - origin)
+            if timestamps and timestamp < timestamps[-1]:
+                timestamp = timestamps[-1]
+            timestamps.append(timestamp)
+        return frames, timestamps
 
-        candidates = {0}
-        floor_seconds = float(self.config.keyframe_floor_seconds)
-        floor_time = 0.0
-        while floor_time <= effective_duration + 1e-6:
-            candidates.add(self._timestamp_to_frame_index(floor_time, fps, frame_count))
-            floor_time += floor_seconds
-        candidates.add(
-            self._timestamp_to_frame_index(effective_duration, fps, frame_count)
-        )
+    @staticmethod
+    def _parse_showinfo_times(payload: bytes) -> List[float]:
+        """``pts_time`` of each frame ``showinfo`` logged to stderr.
 
-        min_gap = float(self.config.keyframe_min_scene_gap_seconds)
-        last_scene_time: Optional[float] = None
-        for scene_time in sorted(scene_times):
-            if scene_time < 0 or scene_time > effective_duration:
-                continue
-            if last_scene_time is not None and scene_time - last_scene_time < min_gap:
-                continue
-            candidates.add(self._timestamp_to_frame_index(scene_time, fps, frame_count))
-            last_scene_time = scene_time
-
-        ordered_candidates = sorted(candidates)
-        limit = self.max_keyframes if max_indices is None else max_indices
-        return self._thin_ordered_items(ordered_candidates, limit)
+        Anchored to showinfo's per-frame line (``[Parsed_showinfo_N @ 0x..] n:
+        pts: pts_time:``) so container metadata that happens to contain
+        ``pts_time:`` is not counted. ``NOPTS`` frames are not matched.
+        """
+        text = payload.decode("utf-8", errors="replace")
+        return [
+            float(match.group(1))
+            for match in _SHOWINFO_FRAME_LINE.finditer(text)
+        ]
 
     def _effective_keyframe_duration(
         self,
@@ -711,16 +848,18 @@ class ContentProcessor:
         fps: float,
         duration: float,
     ) -> float:
-        if fps <= 0:
-            return 0.0
-        effective_duration = duration if duration > 0 else frame_count / fps
-        effective_duration = max(
-            0.0,
-            min(effective_duration, float(self.max_video_length)),
-        )
-        if effective_duration <= 0:
-            effective_duration = frame_count / fps
-        return effective_duration
+        """Seconds of video to sample, capped at ``max_video_length``.
+
+        Uses the probed duration, else ``frame_count / fps``. When neither is
+        known (a WebM/MKV written to a pipe reports no duration), the whole
+        allowed length is decoded; FFmpeg stops at the end of the file anyway.
+        """
+        limit = float(self.max_video_length)
+        if duration > 0:
+            return min(float(duration), limit)
+        if fps > 0 and frame_count > 0:
+            return min(float(frame_count) / float(fps), limit)
+        return limit
 
     def _thin_ordered_items(self, items: List[Any], limit: int) -> List[Any]:
         if limit <= 0:
@@ -735,55 +874,6 @@ class ContentProcessor:
             dtype=int,
         )
         return [items[int(position)] for position in positions]
-
-    def _timestamp_to_frame_index(
-        self,
-        timestamp: float,
-        fps: float,
-        frame_count: int,
-    ) -> int:
-        frame_index = int(round(max(0.0, timestamp) * fps))
-        return max(0, min(frame_index, frame_count - 1))
-
-    async def _extract_ffmpeg_frames_by_index(
-        self,
-        video_path: str,
-        frame_indices: List[int],
-    ) -> List[np.ndarray]:
-        select_filter = "+".join(f"eq(n\\,{idx})" for idx in frame_indices)
-        target_width = max(1, int(self.config.ffmpeg_target_width))
-        filter_graph = (
-            f"select={select_filter},"
-            f"scale=min({target_width}\\,iw):-2,"
-            "format=rgb24"
-        )
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-            video_path,
-            "-vf",
-            filter_graph,
-            "-vsync",
-            "vfr",
-            "-frames:v",
-            str(len(frame_indices)),
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "ppm",
-            "pipe:1",
-        ]
-        output = await self._run_media_command(command)
-        keyframes = self._parse_ppm_frames(output)
-        if len(keyframes) != len(frame_indices):
-            raise ValueError(
-                f"FFmpeg extracted {len(keyframes)} of {len(frame_indices)} requested frames"
-            )
-        return keyframes
 
     def _filter_keyframes_for_quality(
         self,
@@ -859,9 +949,10 @@ class ContentProcessor:
             raise ValueError("ffprobe did not report a video stream")
 
         format_info = payload.get("format") or {}
-        fps = self._parse_frame_rate(
-            video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate")
-        )
+        # avg_frame_rate is "0/0" (truthy, parses to 0) for some streams.
+        fps = self._parse_frame_rate(video_stream.get("avg_frame_rate"))
+        if fps <= 0:
+            fps = self._parse_frame_rate(video_stream.get("r_frame_rate"))
         duration = self._parse_float(
             video_stream.get("duration"),
             default=self._parse_float(format_info.get("duration"), default=0.0),
@@ -879,35 +970,108 @@ class ContentProcessor:
             "height": self._parse_int(video_stream.get("height"), default=0),
         }
 
-    async def _run_media_command(self, command: List[str]) -> bytes:
+    def _ffmpeg_input(
+        self, video_path: str, *, duration: Optional[float] = None
+    ) -> List[str]:
+        """Input options (decoder threads, read duration) and the input."""
+        threads = int(self.config.ffmpeg_decode_threads)
+        args = ["-threads", str(threads)] if threads > 0 else []
+        if duration is not None:
+            args += ["-t", f"{float(duration):.3f}"]
+        return [*args, "-i", video_path]
+
+    def _full_decode_timeout(self, effective_duration: float) -> float:
+        """Timeout for a command that decodes the whole (length-capped) video."""
+        return float(self.config.ffmpeg_timeout_seconds) + max(
+            0.0, float(effective_duration)
+        ) * float(self.config.ffmpeg_timeout_per_media_second)
+
+    def _scene_pass_timeout(self, effective_duration: float) -> float:
+        """Full-decode timeout, leaving the uniform fallback its share."""
+        timeout = self._full_decode_timeout(effective_duration)
+        deadline = _keyframe_extraction_deadline.get()
+        if deadline is None:
+            return timeout
+        reserve = UNIFORM_FALLBACK_DEADLINE_SHARE * float(
+            self.config.keyframe_extraction_deadline_seconds
+        )
+        available = deadline - time.monotonic() - reserve
+        if available <= 0:
+            raise TimeoutError("no time left for the scene pass before the fallback")
+        return min(timeout, available)
+
+    def _media_command_limit(self, timeout: Optional[float]) -> Tuple[float, bool]:
+        """``(limit, deadline_bound)``: the effective timeout, and whether the
+        extraction deadline (rather than the command's own timeout) set it."""
+        requested = float(
+            self.config.ffmpeg_timeout_seconds if timeout is None else timeout
+        )
+        deadline = _keyframe_extraction_deadline.get()
+        if deadline is None:
+            return requested, False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise KeyframeExtractionDeadlineExceeded(
+                "keyframe extraction deadline of "
+                f"{self.config.keyframe_extraction_deadline_seconds:g}s exceeded"
+            )
+        return min(requested, remaining), remaining < requested
+
+    async def _run_media_command(
+        self, command: List[str], *, timeout: Optional[float] = None
+    ) -> bytes:
         """Run an FFmpeg/ffprobe command and return stdout."""
-        stdout, _ = await self._run_media_command_with_stderr(command)
+        stdout, _ = await self._run_media_command_with_stderr(command, timeout=timeout)
         return stdout
 
     async def _run_media_command_with_stderr(
         self,
         command: List[str],
+        *,
+        timeout: Optional[float] = None,
     ) -> Tuple[bytes, bytes]:
-        """Run an FFmpeg/ffprobe command and return stdout and stderr."""
+        """Run an FFmpeg/ffprobe command and return stdout and stderr.
+
+        ``timeout`` defaults to ``ffmpeg_timeout_seconds`` and is capped by the
+        keyframe extraction deadline. The process is killed on timeout and on
+        cancellation, so an abandoned command never keeps decoding.
+        """
+        limit, deadline_bound = self._media_command_limit(timeout)
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=self.config.ffmpeg_timeout_seconds,
-            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=limit)
         except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.communicate()
-            raise TimeoutError(f"{command[0]} timed out") from exc
+            await self._kill_media_process(process)
+            if deadline_bound:
+                raise KeyframeExtractionDeadlineExceeded(
+                    f"{command[0]} stopped at the keyframe extraction deadline"
+                ) from exc
+            raise TimeoutError(f"{command[0]} timed out after {limit:.1f}s") from exc
+        except BaseException:
+            await self._kill_media_process(process)
+            raise
 
         if process.returncode != 0:
-            message = stderr.decode("utf-8", errors="replace").strip()
+            # The tail holds the error; info-level logs can be many KB.
+            message = stderr.decode("utf-8", errors="replace").strip()[-2000:]
             raise RuntimeError(f"{command[0]} failed: {message}")
         return stdout, stderr
+
+    @staticmethod
+    async def _kill_media_process(process) -> None:
+        if process.returncode is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        # Drain and close the pipes while reaping. If this is itself
+        # cancelled, the kill was already sent.
+        await process.communicate()
 
     async def _extract_audio_features(
         self, video_path: str, video_info: Dict[str, Any]
@@ -1195,69 +1359,50 @@ class ContentProcessor:
     async def _extract_keyframes_opencv(
         self, video_path: str
     ) -> Tuple[List[np.ndarray], Dict]:
-        """Extract keyframes with OpenCV off the event loop."""
-        return await asyncio.to_thread(self._extract_keyframes_opencv_sync, video_path)
+        """Extract uniform keyframes with OpenCV in a child process.
 
-    def _extract_keyframes_opencv_sync(
-        self, video_path: str
-    ) -> Tuple[List[np.ndarray], Dict]:
-        """Extract keyframes from video file using OpenCV."""
-        keyframes = []
-        video_info = {}
-
-        if not os.path.exists(video_path):
-            # Not a decode problem: let the caller retry or classify it.
-            raise FileNotFoundError(f"Video file does not exist: {video_path}")
-        cap = cv2.VideoCapture(video_path)
-        try:
-            if not cap.isOpened():
-                raise InvalidVideoError(f"Could not open video file: {video_path}")
-
-            # Get video properties
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            duration = frame_count / fps if fps > 0 else 0
-
-            # Limit video length
-            if duration > self.max_video_length:
-                logger.warning(
-                    f"Video duration {duration}s exceeds limit {self.max_video_length}s"
+        A child process (unlike a thread) can be killed at the extraction
+        deadline and does not hold an executor thread CLIP/OCR need.
+        """
+        with tempfile.TemporaryDirectory(prefix="opencv-keyframes-") as directory:
+            frames_path = os.path.join(directory, "frames.npz")
+            result_path = os.path.join(directory, "result.json")
+            command = [
+                sys.executable,
+                "-I",
+                opencv_keyframes.__file__,
+                video_path,
+                frames_path,
+                result_path,
+                str(self.max_keyframes),
+                str(self.max_video_length),
+            ]
+            await self._run_media_command(
+                command,
+                timeout=self._full_decode_timeout(float(self.max_video_length)),
+            )
+            try:
+                with open(result_path, encoding="utf-8") as handle:
+                    result = json.load(handle)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"OpenCV keyframe extraction wrote no result: {exc}"
+                ) from exc
+            error = result.get("error")
+            if error == "missing":
+                raise FileNotFoundError(result.get("message"))
+            if error == "invalid_video":
+                raise InvalidVideoError(result.get("message"))
+            if error:
+                raise RuntimeError(
+                    f"OpenCV keyframe extraction failed: {result.get('message')}"
                 )
-                frame_count = int(self.max_video_length * fps)
-
-            video_info = {
-                "duration": duration,
-                "fps": fps,
-                "frame_count": frame_count,
-                "has_audio": True,  # Assume audio exists (basic check)
-                "frame_timestamps_seconds": [],
-            }
-
-            # Calculate frame indices for uniform sampling
-            frame_indices = self._keyframe_indices(frame_count)
-
-            # Extract keyframes
-            for frame_idx in frame_indices:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-
-                if ret:
-                    # Convert BGR to RGB
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    keyframes.append(frame_rgb)
-                    video_info["frame_timestamps_seconds"].append(
-                        float(frame_idx) / fps if fps > 0 else 0.0
-                    )
-                else:
-                    logger.warning(f"Could not read frame {frame_idx}")
-
-            logger.info(f"Extracted {len(keyframes)} keyframes from video")
-            return keyframes, video_info
-        except cv2.error as exc:
-            # OpenCV decode/convert failures mean the media is unusable.
-            raise InvalidVideoError(f"OpenCV could not decode video: {exc}") from exc
-        finally:
-            cap.release()
+            with np.load(frames_path, allow_pickle=False) as archive:
+                keyframes = [
+                    archive[f"frame_{index}"] for index in range(int(result["frames"]))
+                ]
+        logger.info("Extracted %s keyframes from video using OpenCV", len(keyframes))
+        return keyframes, result["info"]
 
     async def _extract_visual_features(
         self, keyframes: List[np.ndarray]

@@ -192,7 +192,32 @@ class ModelConfig(BaseSettings):
         description="Use FFmpeg/ffprobe for video metadata and keyframe extraction",
     )
     ffmpeg_timeout_seconds: float = Field(
-        30.0, description="Timeout for each FFmpeg/ffprobe command"
+        30.0,
+        description=(
+            "Timeout for each FFmpeg/ffprobe command; commands that decode the "
+            "whole video also get ffmpeg_timeout_per_media_second"
+        ),
+    )
+    ffmpeg_timeout_per_media_second: float = Field(
+        0.5,
+        description=(
+            "Extra timeout per second of video for commands that decode the "
+            "whole (length-capped) video, such as scene detection"
+        ),
+    )
+    ffmpeg_decode_threads: int = Field(
+        1,
+        description=(
+            "FFmpeg decoder threads per command (0: one per visible core, which "
+            "ignores container CPU quotas)"
+        ),
+    )
+    keyframe_extraction_deadline_seconds: float = Field(
+        150.0,
+        description=(
+            "Wall-clock budget for keyframe extraction including fallbacks; "
+            "every FFmpeg command's timeout is capped by what remains"
+        ),
     )
     ffmpeg_target_width: int = Field(
         640, description="Maximum frame width produced by FFmpeg extraction"
@@ -2983,6 +3008,47 @@ class ModelReleaseConfig(BaseSettings):
         env_prefix = "MODEL_RELEASE_"
 
 
+# Time a content-processing attempt spends outside keyframe extraction and ASR:
+# object download, CLIP/OCR/detection inference and artifact persistence.
+CONTENT_HANDLER_OTHER_STAGES_SECONDS = 60.0
+
+
+def content_handler_budget_errors(config: "Config") -> List[str]:
+    """One content-processing attempt must fit inside the Kafka retry budget.
+
+    The consumer stops retrying a message once another attempt would run past
+    90% of max.poll.interval (``KafkaConsumerClient._process_message_with_retries``).
+    If a single worst-case attempt does not fit, the partition is rebalanced
+    away mid-processing instead of the message being retried or dead-lettered.
+
+    Only the content worker checks this at startup (``validate_content_worker_config``),
+    so a content-only setting cannot stop other services. The 60 s for the
+    other stages is an allowance, not an enforced timeout (OCR has none).
+    """
+    model = config.model_config
+    worst_case = (
+        float(model.keyframe_extraction_deadline_seconds)
+        # Audio extraction decodes audio only (~1 s for 300 s of AAC), so it
+        # keeps the base timeout rather than the per-media-second scaling.
+        + float(model.ffmpeg_timeout_seconds)
+        + CONTENT_HANDLER_OTHER_STAGES_SECONDS
+    )
+    if model.speech_to_text_enabled:
+        worst_case += float(model.speech_to_text_timeout_seconds) * max(
+            1, int(model.speech_to_text_max_attempts)
+        )
+    budget = 0.9 * float(config.kafka_config.consumer_max_poll_interval_ms) / 1000.0
+    if budget > 0 and worst_case > budget:
+        return [
+            "Content processing worst case "
+            f"({worst_case:.0f}s = MODEL_KEYFRAME_EXTRACTION_DEADLINE_SECONDS "
+            "+ MODEL_FFMPEG_TIMEOUT_SECONDS + speech-to-text timeout x attempts "
+            f"+ {CONTENT_HANDLER_OTHER_STAGES_SECONDS:.0f}s) exceeds 90% of "
+            f"KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS ({budget:.0f}s)"
+        ]
+    return []
+
+
 class Config:
     """Main configuration class that combines all configuration sections."""
 
@@ -3160,6 +3226,14 @@ class Config:
             errors.append(
                 "Model keyframe minimum blur Laplacian variance must be non-negative"
             )
+        if self.model_config.ffmpeg_timeout_seconds <= 0:
+            errors.append("Model FFmpeg timeout must be positive")
+        if self.model_config.ffmpeg_timeout_per_media_second < 0:
+            errors.append("Model FFmpeg timeout per media second must be non-negative")
+        if self.model_config.ffmpeg_decode_threads < 0:
+            errors.append("Model FFmpeg decode threads must be non-negative")
+        if self.model_config.keyframe_extraction_deadline_seconds <= 0:
+            errors.append("Model keyframe extraction deadline must be positive")
         if self.model_config.speech_to_text_timeout_seconds <= 0:
             errors.append("Speech-to-text timeout must be positive")
         if self.model_config.speech_to_text_max_attempts <= 0:

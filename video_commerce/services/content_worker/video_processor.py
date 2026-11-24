@@ -29,7 +29,11 @@ from video_commerce.data_plane.kafka_client import (
     NonRetryableProcessingError,
     get_kafka_manager,
 )
-from video_commerce.common.config import Config, KafkaConfig
+from video_commerce.common.config import (
+    Config,
+    KafkaConfig,
+    content_handler_budget_errors,
+)
 from video_commerce.ml.content_processor import (
     ContentModalityError,
     ContentProcessor,
@@ -674,12 +678,22 @@ class VideoProcessorWorker:
         logger.info("Video processor worker shutdown complete")
 
 
+def validate_content_worker_config(config: Config) -> None:
+    """Refuse to start if one processing attempt cannot fit the retry budget."""
+    errors = content_handler_budget_errors(config)
+    if errors:
+        for error in errors:
+            logger.error(error)
+        raise ValueError("Invalid content worker configuration: " + "; ".join(errors))
+
+
 async def main():
     """Main entry point for the video processor worker."""
     logger.info("Starting Video Processor Worker")
 
     # Load configuration
     config = Config()
+    validate_content_worker_config(config)
 
     # Create and initialize worker
     worker = VideoProcessorWorker(config)
