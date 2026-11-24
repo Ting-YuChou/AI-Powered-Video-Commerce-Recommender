@@ -8,6 +8,64 @@
 - S3 clients use bounded connect/read timeouts and standard retries. Set `OBJECT_STORAGE_CHECKSUM_ALGORITHM` and `OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION` for checksum/SSE enforcement when the backend supports them.
 - Bucket creation is intentionally conservative: startup may create the bucket only for a missing-bucket response, while auth, region, and permission errors fail startup instead of being swallowed.
 
+## Key Layout
+In S3 mode, keys under `OBJECT_STORAGE_PREFIX` (default `uploads`) are:
+- `<prefix>/raw/<content_id><suffix>`: uploaded videos.
+- `<prefix>/artifacts/...`: model artifacts.
+- `<prefix>/content-features/...`: content feature artifacts.
+
+Uploads written before the `raw/` layout stay at `<prefix>/<content_id><suffix>`
+and are not moved. `content_jobs.storage_path` holds the full URI, so workers
+read both the same way. Local mode is unchanged: uploads stay flat in
+`DATA_UPLOAD_DIR`.
+
+All keys stay under `<prefix>/`. Object permissions on `<prefix>/*` cover
+`raw/`. Listing is different: the orphan reconciler lists both `<prefix>/raw/`
+and `<prefix>/`, so an `s3:ListBucket` condition on `s3:prefix` must allow
+both. `StringLike` `<prefix>/*` does; `StringEquals` `<prefix>/` does not.
+
+## Lifecycle
+`deploy/object-storage/lifecycle.json` holds the bucket lifecycle rules, in the
+S3 API format, for AWS S3. Whoever manages the bucket applies it; the services
+never change bucket configuration.
+- **Raw uploads** (`uploads/raw/`): move to `STANDARD_IA` after 30 days and are
+  kept forever.
+  - Do not add an expiration rule. A queued job whose object is gone fails as
+    `failed_missing_object`, and reprocessing
+    (`scripts/backfill_temporal_multimodal.py`) reads the raw video again.
+  - `STANDARD_IA` charges per GB retrieved and bills at least 30 days.
+    Reprocessing old uploads pays that retrieval charge.
+  - `STANDARD_IA` is an AWS storage class. Most S3-compatible stores (MinIO,
+    Ceph RGW) do not have it unless an operator defines it, so they reject or
+    ignore this rule. On those, keep only the multipart rule.
+- **Incomplete multipart uploads** (whole bucket): aborted after 7 days. The
+  gateway uploads large files in parts. boto3 aborts the upload when it fails,
+  but a gateway killed mid-upload (eviction, OOM) leaves its parts behind,
+  billed but invisible in listings.
+- **Applying it:**
+  1. Read the current rules. `put-bucket-lifecycle-configuration` replaces the
+     bucket's whole lifecycle configuration, so anything not in the file you
+     put is deleted. The read fails with `NoSuchLifecycleConfiguration` when
+     the bucket has no rules yet.
+
+     ```bash
+     aws s3api get-bucket-lifecycle-configuration --bucket <bucket> > current-lifecycle.json
+     ```
+  2. Write `merged-lifecycle.json`: the current rules plus the two rules from
+     the repo file, with `uploads/` replaced by your `OBJECT_STORAGE_PREFIX`.
+  3. Put the merged file:
+
+     ```bash
+     aws s3api put-bucket-lifecycle-configuration --bucket <bucket> --lifecycle-configuration file://merged-lifecycle.json
+     ```
+
+  Add `--endpoint-url` for a non-AWS endpoint.
+- **Legacy uploads** do not match the `raw/` rule and stay in `STANDARD`. A
+  lifecycle filter cannot select only the direct children of a prefix.
+- **MinIO (Compose)** gets no rules. Community MinIO has no `STANDARD_IA`
+  class (transitions need a remote tier), and it removes stale multipart
+  uploads itself.
+
 ## MinIO Bring-Up
 - Start the profile with `docker compose --profile object-storage up -d minio minio-init`.
 - Set:

@@ -4014,9 +4014,18 @@ class SystemStore:
     async def filter_referenced_storage_paths(
         self, storage_paths: Iterable[str]
     ) -> Set[str]:
-        """Return the subset of storage paths still referenced by a content job."""
+        """Return the subset of storage paths still referenced by a content job.
+
+        Raises when the store is disabled: an empty answer would mark every
+        upload as an orphan and the reconciler would delete it.
+        """
+        if not self.enabled:
+            raise RuntimeError(
+                "cannot check upload references: the system store is disabled "
+                "(DATABASE_ENABLE=false)"
+            )
         candidates = sorted({str(path) for path in storage_paths if path})
-        if not self.enabled or not candidates:
+        if not candidates:
             return set()
         async with self.session_factory() as session:
             rows = (

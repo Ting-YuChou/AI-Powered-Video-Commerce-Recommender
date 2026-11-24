@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import hashlib
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +16,13 @@ from typing import AsyncIterator, Optional, Tuple
 from urllib.parse import urlparse
 
 from video_commerce.common.config import ObjectStorageConfig
+
+logger = logging.getLogger(__name__)
+
+# S3 uploads are written to ``<prefix>/raw/`` so a bucket lifecycle rule can
+# target raw videos without touching ``artifacts/`` or ``content-features/``
+# under the same prefix. deploy/object-storage/lifecycle.json depends on it.
+RAW_UPLOAD_SUBPREFIX = "raw"
 
 
 @dataclass(frozen=True)
@@ -326,10 +334,11 @@ class ObjectStorage:
     ) -> AsyncIterator[list[StoredObject]]:
         """Yield pages of upload objects stored directly under ``prefix_uri``.
 
-        Uploads are flat (``<prefix>/<content_id><suffix>``); nested keys such as
-        ``<prefix>/artifacts/`` and ``<prefix>/content-features/`` hold model and
-        feature artifacts that are not referenced by ``content_jobs`` and must
-        never be treated as orphan uploads. Only one page is held in memory.
+        Uploads are flat within their prefix (``<prefix>/raw/<content_id><suffix>``,
+        or ``<prefix>/<content_id><suffix>`` for older uploads); nested keys such
+        as ``<prefix>/artifacts/`` and ``<prefix>/content-features/`` hold model
+        and feature artifacts that are not referenced by ``content_jobs`` and
+        must never be treated as orphan uploads. Only one page is held in memory.
         """
         page_size = max(1, int(page_size))
         if self.is_remote and self.is_remote_uri(prefix_uri):
@@ -438,9 +447,37 @@ class ObjectStorage:
         return storage_path.startswith("s3://")
 
     def build_object_name(self, *, content_id: str, suffix: str) -> str:
+        """S3 key for a new upload: ``<prefix>/raw/<content_id><suffix>``."""
+        return f"{self._raw_upload_key_prefix()}/{content_id}{suffix}"
+
+    def upload_reconcile_prefixes(self, *, local_upload_dir: str) -> list[str]:
+        """Prefixes whose direct children are upload objects, for orphan cleanup.
+
+        S3: ``<prefix>/raw`` and, for uploads written before that layout,
+        ``<prefix>`` itself. With an empty prefix both would be shared with
+        anything else in the bucket (the root, and a root-level ``raw/``), so
+        nothing is listed, as before the ``raw/`` layout. Local storage keeps
+        the flat upload directory.
+        """
+        if not self.is_remote:
+            return [local_upload_dir] if local_upload_dir else []
         prefix = self.config.prefix.strip("/")
-        filename = f"{content_id}{suffix}"
-        return f"{prefix}/{filename}" if prefix else filename
+        if not prefix:
+            logger.warning(
+                "object_storage_orphan_reconcile_disabled: OBJECT_STORAGE_PREFIX "
+                "is empty, so upload objects share the bucket root with other "
+                "objects; set a prefix to enable orphan cleanup"
+            )
+            return []
+        bucket = self.config.bucket
+        return [
+            f"s3://{bucket}/{prefix}/{RAW_UPLOAD_SUBPREFIX}",
+            f"s3://{bucket}/{prefix}",
+        ]
+
+    def _raw_upload_key_prefix(self) -> str:
+        prefix = self.config.prefix.strip("/")
+        return f"{prefix}/{RAW_UPLOAD_SUBPREFIX}" if prefix else RAW_UPLOAD_SUBPREFIX
 
     def build_artifact_object_name(
         self,

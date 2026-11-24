@@ -8,7 +8,7 @@ import os
 import signal
 import socket
 import time
-from typing import Any
+from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ class ContentTaskPublisher:
         config: Any,
         worker_id: str,
         object_storage: Any = None,
-        upload_prefix: str = "",
+        upload_prefixes: Sequence[str] = (),
         observability: Any = None,
     ) -> None:
         self.system_store = system_store
@@ -30,7 +30,10 @@ class ContentTaskPublisher:
         self.config = config
         self.worker_id = worker_id
         self.object_storage = object_storage
-        self.upload_prefix = upload_prefix
+        if isinstance(upload_prefixes, str):
+            # A str is a Sequence[str]: "/data" would become "/", "d", "a", ...
+            raise TypeError("upload_prefixes must be a sequence of prefixes, not a str")
+        self.upload_prefixes = tuple(prefix for prefix in upload_prefixes if prefix)
         self.observability = observability
 
     async def publish_once(self) -> int:
@@ -96,27 +99,47 @@ class ContentTaskPublisher:
         return counts
 
     async def reconcile_objects(self, *, now: float | None = None) -> dict[str, int]:
-        """Delete old upload objects no content job references, one page at a time."""
-        if self.object_storage is None or not self.upload_prefix:
+        """Delete old upload objects no content job references, one page at a time.
+
+        Every prefix is scanned even if an earlier one fails (for example a
+        listing the bucket policy denies); the first failure is raised at the
+        end so the stage still counts it.
+        """
+        if self.object_storage is None or not self.upload_prefixes:
             return {"orphan_objects": 0, "deleted_objects": 0}
         current_time = time.time() if now is None else float(now)
         grace = int(self.config.content_orphan_grace_seconds)
         page_size = int(getattr(self.config, "content_reconcile_page_size", 1000))
         orphan_objects = 0
         deleted_objects = 0
-        async for page in self.object_storage.iter_upload_object_pages(
-            self.upload_prefix, page_size=page_size
-        ):
-            referenced = await self.system_store.filter_referenced_storage_paths(
-                [item.uri for item in page]
-            )
-            for item in page:
-                if item.uri in referenced:
-                    continue
-                orphan_objects += 1
-                if current_time - float(item.last_modified) >= grace:
-                    await self.object_storage.delete_uploaded_object(item.uri)
-                    deleted_objects += 1
+        first_error: Exception | None = None
+        for prefix in self.upload_prefixes:
+            try:
+                async for page in self.object_storage.iter_upload_object_pages(
+                    prefix, page_size=page_size
+                ):
+                    referenced = (
+                        await self.system_store.filter_referenced_storage_paths(
+                            [item.uri for item in page]
+                        )
+                    )
+                    for item in page:
+                        if item.uri in referenced:
+                            continue
+                        orphan_objects += 1
+                        if current_time - float(item.last_modified) >= grace:
+                            await self.object_storage.delete_uploaded_object(item.uri)
+                            deleted_objects += 1
+            except Exception as exc:
+                logger.warning(
+                    "content_orphan_reconcile_prefix_failed: prefix=%s error=%s",
+                    prefix,
+                    exc,
+                )
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
         return {
             "orphan_objects": orphan_objects,
             "deleted_objects": deleted_objects,
@@ -322,16 +345,13 @@ async def main() -> None:
     await storage.initialize()
     kafka = await init_kafka(config.kafka_config, observability=observability)
     worker_id = f"content-publisher-{socket.gethostname()}-{os.getpid()}"
-    upload_prefix = (
-        f"s3://{config.object_storage_config.bucket}/{config.object_storage_config.prefix}"
-        if storage.is_remote
-        else config.data_config.upload_dir
-    )
     publisher = ContentTaskPublisher(
         system_store=store,
         kafka_manager=kafka,
         object_storage=storage,
-        upload_prefix=upload_prefix,
+        upload_prefixes=storage.upload_reconcile_prefixes(
+            local_upload_dir=config.data_config.upload_dir
+        ),
         config=config.service_topology_config,
         worker_id=worker_id,
         observability=observability,

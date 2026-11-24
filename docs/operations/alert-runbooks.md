@@ -515,8 +515,12 @@ docker compose exec alertmanager amtool silence add alertname=<AlertName> \
 - **Symptom:** a durable content job referenced a missing object and was
   terminalized as `failed_missing_object`.
 - **Impact:** that upload will not be processed.
-- **First checks:** object storage bucket, prefix and lifecycle rules; the
-  orphan reconciliation grace period.
+- **First checks:**
+  - The object storage bucket and prefix.
+  - Lifecycle rules: nothing may expire objects under `<prefix>/raw/` or, for
+    older uploads, directly under `<prefix>/`
+    ([Lifecycle](object-storage-and-auth.md#lifecycle)).
+  - The orphan reconciliation grace period.
 - **Remediation:** fix storage retention; ask the user to re-upload.
 
 ## ContentProcessingLeaseLost
