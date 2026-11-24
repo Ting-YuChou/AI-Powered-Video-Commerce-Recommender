@@ -3892,11 +3892,15 @@ class SystemStore:
         self._update_pool_metrics()
 
     async def get_content_feature_artifact(
-        self, content_id: str
+        self, content_id: str, *, hot_path: bool = False
     ) -> Optional[Dict[str, Any]]:
+        """Durable content features; ``hot_path`` bounds the statement time."""
         if not self.enabled:
             return None
-        async with self.session_factory() as session:
+        session_scope = (
+            self._hot_path_session() if hot_path else self.session_factory()
+        )
+        async with session_scope as session:
             row = await session.get(ContentFeatureArtifact, content_id)
         self._update_pool_metrics()
         return dict(row.features) if row is not None else None

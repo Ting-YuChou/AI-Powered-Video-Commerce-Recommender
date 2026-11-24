@@ -41,6 +41,21 @@ artifact without recomputing the model. Keep
 explicit mismatched event is failed for investigation. Legacy events without a
 version map to the configured worker version during migration.
 
+The Redis `cf:` projection expires after `CACHE_CONTENT_FEATURES_TTL` (24 h by
+default) and the worker never rewrites it, so the recommendation service
+rehydrates it: on a Redis or snapshot miss for a request's `content_id` it reads
+`content_feature_artifacts` by primary key (hot-path statement timeout) and
+re-projects the row into Redis. Concurrent misses share one read, at most
+`RECOMMENDATION_CONTENT_FEATURES_REHYDRATE_MAX_CONCURRENCY` (4) reads run per
+process, and IDs without an artifact are remembered for
+`RECOMMENDATION_CONTENT_FEATURES_REHYDRATE_NEGATIVE_TTL_SECONDS` (60). The read
+runs under `CACHE_HOT_PATH_READ_TIMEOUT_MS`; a slower read still finishes in the
+background, so only that one request is served without content features. Set
+`RECOMMENDATION_CONTENT_FEATURES_REHYDRATE_ENABLED=false` to go back to
+Redis-only reads. Watch
+`video_commerce_content_feature_rehydrations_total{outcome}` (`rehydrated`,
+`not_found`, `negative_cached`, `invalid`, `error`, `shed`).
+
 ### Content pipeline failure handling (migration 013)
 
 Apply `migrations/postgres/013_content_upload_idempotency.sql` before deploying

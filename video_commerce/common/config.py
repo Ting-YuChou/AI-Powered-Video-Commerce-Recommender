@@ -602,6 +602,26 @@ class RecommendationConfig(BaseSettings):
         100000,
         description="Maximum content feature entries to keep in the per-process snapshot",
     )
+    content_features_rehydrate_enabled: bool = Field(
+        True,
+        description=(
+            "On a Redis content-feature miss, load the durable Postgres artifact "
+            "and re-project it into Redis (needs DATABASE_ENABLE)"
+        ),
+    )
+    content_features_rehydrate_max_concurrency: int = Field(
+        4,
+        ge=1,
+        description="Concurrent Postgres reads per process for content-feature rehydration",
+    )
+    content_features_rehydrate_negative_ttl_seconds: float = Field(
+        60.0,
+        ge=0.0,
+        description=(
+            "How long a content ID without a durable artifact is remembered "
+            "before Postgres is asked again"
+        ),
+    )
     preload_product_metadata_on_startup: bool = Field(
         False,
         description="Preload product metadata into Redis during recommendation service startup",
