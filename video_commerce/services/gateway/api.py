@@ -29,6 +29,7 @@ from video_commerce.data_plane.kafka_client import KafkaProducerSupervisor
 from video_commerce.common.models import (
     USER_ID_PATTERN,
     RecommendationRequest,
+    UploadLimitsResponse,
     UserInteractionRequest,
     ViewedImpressionRequest,
 )
@@ -1137,6 +1138,21 @@ async def _publish_staged_content_task(
                 bookkeeping_error,
             )
         return False
+
+
+@app.get("/api/content/upload-limits", response_model=UploadLimitsResponse)
+async def content_upload_limits() -> UploadLimitsResponse:
+    """Upload constraints the gateway enforces, so clients validate the same way."""
+    data_config = app.state.runtime.config.data_config
+    return UploadLimitsResponse(
+        max_file_size=int(data_config.max_file_size),
+        allowed_extensions=sorted(
+            {extension.lower() for extension in data_config.allowed_extensions}
+        ),
+        allowed_mime_types=sorted(
+            {mime.lower() for mime in data_config.allowed_mime_types}
+        ),
+    )
 
 
 @app.get("/api/content/{content_id}/status")

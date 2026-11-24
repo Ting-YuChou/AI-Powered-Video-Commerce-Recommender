@@ -6,7 +6,8 @@ import pytest
 from fastapi import HTTPException, UploadFile
 from starlette.datastructures import Headers
 
-from video_commerce.common.config import Config
+from video_commerce.common.config import Config, DataConfig
+from video_commerce.common.models import UploadLimitsResponse
 from video_commerce.services.gateway import api as gateway_api
 from video_commerce.services.gateway.api import (
     _content_upload_dependency_error,
@@ -621,3 +622,75 @@ async def test_upload_replay_of_failed_job_is_not_reported_as_success(
     assert body["error"]["code"] == "IDEMPOTENCY_KEY_JOB_FAILED"
     assert body["status"] == terminal
     assert body["content_id"] == first["content_id"]
+
+
+@pytest.mark.asyncio
+async def test_upload_limits_report_the_enforced_gateway_limits(upload_env):
+    data_config = upload_env.runtime.config.data_config
+    data_config.max_file_size = 12345
+    data_config.allowed_extensions = [".MP4", ".webm", ".mp4"]
+    data_config.allowed_mime_types = ["video/webm", "VIDEO/MP4"]
+
+    limits = await gateway_api.content_upload_limits()
+
+    assert limits.dict() == {
+        "max_file_size": 12345,
+        "allowed_extensions": [".mp4", ".webm"],
+        "allowed_mime_types": ["video/mp4", "video/webm"],
+    }
+
+
+def test_upload_limits_route_declares_its_response_model():
+    route = next(
+        route
+        for route in gateway_api.app.routes
+        if getattr(route, "path", None) == "/api/content/upload-limits"
+    )
+
+    assert route.response_model is UploadLimitsResponse
+
+
+def test_default_upload_limit_matches_compose_helm_and_env_example():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    # The field default, not Config(): a developer .env may set DATA_MAX_FILE_SIZE.
+    limit = DataConfig.__fields__["max_file_size"].default
+
+    assert limit == 100 * 1024 * 1024
+    compose = (root / "docker-compose.yml").read_text()
+    assert f"DATA_MAX_FILE_SIZE: ${{DATA_MAX_FILE_SIZE:-{limit}}}" in compose
+    values = (root / "charts/video-commerce/values.yaml").read_text()
+    assert f'dataMaxFileSize: "{limit}"' in values
+    env_example = (root / ".env.example").read_text()
+    assert f"\nDATA_MAX_FILE_SIZE={limit}\n" in env_example
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [".mp4,.avi, .mov,.mkv,.webm", '[".mp4",".avi",".mov",".mkv",".webm"]'],
+)
+def test_data_config_reads_comma_separated_or_json_extension_lists(monkeypatch, raw):
+    monkeypatch.setenv("DATA_ALLOWED_EXTENSIONS", raw)
+    monkeypatch.setenv("DATA_ALLOWED_MIME_TYPES", "video/mp4, video/webm")
+
+    data_config = DataConfig()
+
+    assert data_config.allowed_extensions == [".mp4", ".avi", ".mov", ".mkv", ".webm"]
+    assert data_config.allowed_mime_types == ["video/mp4", "video/webm"]
+
+
+def test_env_example_extension_list_parses():
+    from pathlib import Path
+
+    env_example = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
+    line = next(
+        line for line in env_example.splitlines()
+        if line.startswith("DATA_ALLOWED_EXTENSIONS=")
+    )
+
+    parsed = DataConfig.Config.parse_env_var(
+        "allowed_extensions", line.split("=", 1)[1]
+    )
+
+    assert ".webm" in parsed and all(item.startswith(".") for item in parsed)

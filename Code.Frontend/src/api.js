@@ -48,6 +48,112 @@ export const buildUploadParams = (userId = 'demo_user', priority = 'normal') => 
   priority,
 });
 
+// crypto.randomUUID exists only in secure contexts (HTTPS or localhost); plain
+// HTTP hosts such as an ingress without TLS fall back to getRandomValues.
+export const randomUuid = () => {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === 'function') {
+    return cryptoApi.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  if (typeof cryptoApi?.getRandomValues === 'function') {
+    cryptoApi.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
+
+// Used until GET /api/content/upload-limits answers (or when it is unavailable).
+// Keep in sync with the gateway's DataConfig defaults.
+export const DEFAULT_UPLOAD_LIMITS = Object.freeze({
+  max_file_size: 100 * 1024 * 1024,
+  allowed_extensions: Object.freeze(['.avi', '.mkv', '.mov', '.mp4', '.webm']),
+  allowed_mime_types: Object.freeze([
+    'video/mp4',
+    'video/quicktime',
+    'video/webm',
+    'video/x-matroska',
+    'video/x-msvideo',
+  ]),
+});
+
+// Browsers leave File.type empty for some containers; the gateway rejects an
+// empty (application/octet-stream) part, so uploads declare the type implied
+// by the extension instead.
+const MIME_TYPE_BY_EXTENSION = Object.freeze({
+  '.avi': 'video/x-msvideo',
+  '.mkv': 'video/x-matroska',
+  '.mov': 'video/quicktime',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+});
+
+const fileExtension = (fileName) => {
+  const match = /\.[^./\\]+$/.exec(String(fileName || '').toLowerCase());
+  return match ? match[0] : '';
+};
+
+export const uploadMimeType = (file) => file?.type || MIME_TYPE_BY_EXTENSION[fileExtension(file?.name)] || '';
+
+export const normalizeUploadLimits = (limits) => {
+  const maxFileSize = Number(limits?.max_file_size);
+  const extensions = Array.isArray(limits?.allowed_extensions)
+    ? limits.allowed_extensions.map((value) => String(value).toLowerCase())
+    : [];
+  const mimeTypes = Array.isArray(limits?.allowed_mime_types)
+    ? limits.allowed_mime_types.map((value) => String(value).toLowerCase())
+    : [];
+  return {
+    max_file_size: Number.isFinite(maxFileSize) && maxFileSize > 0
+      ? maxFileSize
+      : DEFAULT_UPLOAD_LIMITS.max_file_size,
+    allowed_extensions: extensions.length ? extensions : [...DEFAULT_UPLOAD_LIMITS.allowed_extensions],
+    allowed_mime_types: mimeTypes.length ? mimeTypes : [...DEFAULT_UPLOAD_LIMITS.allowed_mime_types],
+  };
+};
+
+// Statuses after which a content job will never complete; polling stops on
+// these. Matches the gateway's TERMINAL_FAILED_CONTENT_STATUSES.
+const TERMINAL_FAILED_CONTENT_STATUSES = new Set(['failed', 'failed_missing_object']);
+
+export const isTerminalFailedStatus = (status) => TERMINAL_FAILED_CONTENT_STATUSES.has(
+  String(status || '').toLowerCase()
+);
+
+// Reusing one key for retries of the same upload lets the gateway replay the
+// original content job instead of creating a duplicate.
+export const createUploadIdempotencyKey = () => randomUuid();
+
+// 409 codes after which the key can never succeed for this request: the job
+// behind it failed, or the key was used for a different request.
+const STALE_IDEMPOTENCY_KEY_CODES = new Set(['IDEMPOTENCY_KEY_REUSED', 'IDEMPOTENCY_KEY_JOB_FAILED']);
+
+export const isStaleIdempotencyKeyError = (error) => (
+  error?.response?.status === 409
+  && STALE_IDEMPOTENCY_KEY_CODES.has(error?.response?.data?.error?.code)
+);
+
+// The gateway answers 503 CONTENT_ENQUEUE_PENDING when the upload is durable
+// but Kafka has not acknowledged it yet. The job will still be processed.
+export const pendingUploadFromError = (error) => {
+  const response = error?.response;
+  const data = response?.data;
+  if (response?.status !== 503 || data?.error?.code !== 'CONTENT_ENQUEUE_PENDING' || !data?.content_id) {
+    return null;
+  }
+  return {
+    content_id: data.content_id,
+    status: data.status || 'pending_publish',
+    message: 'Upload stored; waiting for the processing queue to accept it.',
+  };
+};
+
 export const buildRecommendationPayload = (
   userId,
   contentId = null,
@@ -76,7 +182,7 @@ export const buildInteractionPayload = (
   productId,
   action,
   context = {},
-  eventId = crypto.randomUUID()
+  eventId = randomUuid()
 ) => ({
   event_id: eventId,
   user_id: userId,
@@ -92,18 +198,36 @@ export const buildInteractionPayload = (
 // API Functions
 export const videoApi = {
   // Upload and process video
-  uploadVideo: async (file, userId = 'demo_user', priority = 'normal') => {
+  uploadVideo: async (file, userId = 'demo_user', priority = 'normal', { idempotencyKey } = {}) => {
     const formData = new FormData();
-    formData.append('file', file);
-    
-    const response = await api.post('/api/content/upload', formData, {
-      params: buildUploadParams(userId, priority),
-      timeout: 60000, // 60 seconds for video upload
-    });
-    
-    return response.data;
+    const mimeType = uploadMimeType(file);
+    formData.append(
+      'file',
+      mimeType && mimeType !== file.type ? new File([file], file.name, { type: mimeType }) : file
+    );
+
+    try {
+      const response = await api.post('/api/content/upload', formData, {
+        params: buildUploadParams(userId, priority),
+        headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+        timeout: 60000, // 60 seconds for video upload
+      });
+      return response.data;
+    } catch (error) {
+      const pending = pendingUploadFromError(error);
+      if (pending) {
+        return pending;
+      }
+      throw error;
+    }
   },
-  
+
+  // Limits the gateway enforces for uploads
+  getUploadLimits: async () => {
+    const response = await api.get('/api/content/upload-limits');
+    return normalizeUploadLimits(response.data);
+  },
+
   // Get content processing status
   getContentStatus: async (contentId) => {
     const response = await api.get(`/api/content/${contentId}/status`);
@@ -182,7 +306,7 @@ export const utils = {
         
         if (status.status === 'completed') {
           return { success: true, status };
-        } else if (status.status === 'failed') {
+        } else if (isTerminalFailedStatus(status.status)) {
           return { success: false, status };
         }
         
@@ -214,28 +338,46 @@ export const utils = {
   },
   
   // Validate video file
-  validateVideoFile: (file) => {
-    const maxSize = 100 * 1024 * 1024; // 100MB
-    const allowedTypes = new Set([
-      'video/mp4',
-      'video/quicktime',
-      'video/x-msvideo',
-      'video/x-matroska',
-      'video/webm',
-    ]);
-    const allowedExtensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm'];
+  // Mirrors the gateway checks: size, extension, and declared MIME type.
+  // checkSize=false skips the size check while the gateway limits are unknown.
+  validateVideoFile: (file, limits = DEFAULT_UPLOAD_LIMITS, { checkSize = true } = {}) => {
+    const { max_file_size: maxSize, allowed_extensions: extensions, allowed_mime_types: mimeTypes } = (
+      normalizeUploadLimits(limits)
+    );
     const fileName = file.name?.toLowerCase() ?? '';
-    const hasAllowedExtension = allowedExtensions.some((extension) => fileName.endsWith(extension));
-    
-    if (file.size > maxSize) {
-      return { valid: false, error: 'File size exceeds 100MB limit' };
+    const extensionList = extensions
+      .map((extension) => extension.replace(/^\./, '').toUpperCase())
+      .join(', ');
+
+    if (checkSize && file.size > maxSize) {
+      return {
+        valid: false,
+        error: `File size exceeds the ${utils.formatFileSize(maxSize)} upload limit`,
+      };
     }
-    
-    if (file.type && !allowedTypes.has(file.type) && !hasAllowedExtension) {
-      return { valid: false, error: 'File type not supported. Please use MP4, MOV, AVI, MKV, or WEBM.' };
+
+    if (!extensions.some((extension) => fileName.endsWith(extension))) {
+      return { valid: false, error: `File type not supported. Please use ${extensionList}.` };
     }
-    
+
+    // An empty type is sent as the type implied by the extension (uploadMimeType).
+    const mimeType = uploadMimeType(file).toLowerCase();
+    if (!mimeTypes.includes(mimeType)) {
+      return {
+        valid: false,
+        error: `This browser reports the file as "${file.type || 'unknown type'}", which the upload service does not accept.`,
+      };
+    }
+
     return { valid: true };
+  },
+
+  describeUploadLimits: (limits = DEFAULT_UPLOAD_LIMITS) => {
+    const normalized = normalizeUploadLimits(limits);
+    const extensions = normalized.allowed_extensions
+      .map((extension) => extension.replace(/^\./, '').toUpperCase())
+      .join(', ');
+    return `${extensions} up to ${utils.formatFileSize(normalized.max_file_size)}.`;
   },
 
   formatDuration: (seconds) => {

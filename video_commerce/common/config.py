@@ -2686,7 +2686,11 @@ class DataConfig(BaseSettings):
     # Data storage
     upload_dir: str = Field("/tmp/uploads", description="File upload directory")
     max_file_size: int = Field(
-        500 * 1024 * 1024, description="Max upload file size (500MB)"
+        100 * 1024 * 1024,
+        description=(
+            "Max upload file size in bytes (100MiB, same as Compose and Helm). "
+            "Clients read it from GET /api/content/upload-limits."
+        ),
     )
     allowed_extensions: List[str] = Field(
         [".mp4", ".avi", ".mov", ".mkv", ".webm"],
@@ -2713,6 +2717,20 @@ class DataConfig(BaseSettings):
 
     class Config:
         env_prefix = "DATA_"
+
+        @classmethod
+        def parse_env_var(cls, field_name: str, raw_val: Any):
+            # .env.example writes these comma-separated; JSON lists also work.
+            if field_name in {"allowed_extensions", "allowed_mime_types"} and isinstance(
+                raw_val, str
+            ):
+                value = raw_val.strip()
+                if not value:
+                    return []
+                if value.startswith("["):
+                    return json.loads(value)
+                return [item.strip() for item in value.split(",") if item.strip()]
+            return super().parse_env_var(field_name, raw_val)
 
 
 class ObjectStorageConfig(BaseSettings):

@@ -82,6 +82,21 @@
   Caddy enforces `EDGE_MAX_UPLOAD_BODY` (501MiB) and `EDGE_MAX_JSON_BODY`
   (1MiB) for chunked bodies. In Helm, the `tmp`, `uploads` and
   `objectStorage` scratch volumes have a 10Gi `sizeLimit`.
+- `DATA_MAX_FILE_SIZE` is 100MiB in the code default, `.env.example`, Compose
+  and Helm (a test keeps them equal). `EDGE_MAX_UPLOAD_BODY` is only the outer
+  ceiling; raise both together if larger uploads are needed.
+- `GET /api/content/upload-limits` returns `max_file_size`,
+  `allowed_extensions` and `allowed_mime_types`. The frontend validates files
+  against it. Until the call succeeds it checks types against built-in
+  defaults and skips the size check (the gateway still enforces it), and it
+  retries the call when an upload starts. Files the browser reports with an
+  empty type are sent with the MIME type implied by their extension.
+- The frontend sends one `Idempotency-Key` per selected file and reuses it on
+  retries. It treats `503 CONTENT_ENQUEUE_PENDING` as accepted (the upload is
+  durable) and keeps polling the returned `content_id`; `failed` and
+  `failed_missing_object` end polling. Running the same file at a different
+  priority uses a new key (the fingerprint includes priority), and a `409`
+  for a failed job or a reused key is retried once with a new key.
 
 ## Secret Files
 - Any environment variable can be sourced from `*_FILE`.

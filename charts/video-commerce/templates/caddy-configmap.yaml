@@ -15,8 +15,9 @@ data:
             # SPA) while the gateway or its dependencies are degraded.
             respond /caddy-healthz 200
 
-            # Bound request bodies before they reach the gateway. Uploads allow
-            # DATA_MAX_FILE_SIZE (500MiB) plus multipart overhead.
+            # Bound request bodies before they reach the gateway. The gateway caps
+            # uploads at DATA_MAX_FILE_SIZE (100MiB by default); 501MiB is only the
+            # edge ceiling, room for DATA_MAX_FILE_SIZE up to 500MiB plus multipart.
             @upload path /api/content/upload
             request_body @upload {
                 max_size {$EDGE_MAX_UPLOAD_BODY:501MiB}

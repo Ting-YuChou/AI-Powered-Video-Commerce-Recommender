@@ -562,7 +562,8 @@ backend:
   terminationGracePeriodSeconds: 60
   # Bound scratch volumes so a burst of large uploads (FastAPI spools each
   # multipart body to /tmp before the handler runs) evicts one pod instead of
-  # filling the node. Uploads are capped at 500MiB each by the gateway and Caddy.
+  # filling the node. The gateway caps each upload at appConfig.dataMaxFileSize
+  # (100MiB); Caddy's 501MiB EDGE_MAX_UPLOAD_BODY is only the outer ceiling.
   emptyDirs:
     models: {}
     uploads:
