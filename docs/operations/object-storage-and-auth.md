@@ -60,6 +60,23 @@
   - `GET /api/content/{id}/status` returns 404 for another user's content.
   - `GET /api/analytics` requires `SECURITY_ADMIN_SCOPE`
     (default `video-commerce:admin`) in the token's `scope`/`scp`.
+  - Uploads at `priority=high` also need `SECURITY_ADMIN_SCOPE`. Without it
+    the gateway lowers `high` to `normal` (no error) and logs
+    `content_upload_priority_lowered` once per new job. API-key callers and
+    `SECURITY_AUTH_MODE=disabled` keep the requested priority. When a request
+    carries both a valid bearer token and an API key, the bearer token decides.
+  - Scopes are read from both `scope` and `scp`, each a space-separated string
+    or a list of strings. Other claim shapes grant no scope.
+  - `200` upload responses (new or replayed) and `503 CONTENT_ENQUEUE_PENDING`
+    return `effective_priority`; `409` responses do not. A replay reports the
+    priority the job was stored with.
+  - The stored job, the Kafka task, the `Idempotency-Key` fingerprint and
+    `video_commerce_content_uploads_total` use the effective priority, so
+    retrying a lowered upload with the same key replays it whether the retry
+    asks for `high` or `normal`. A replay also matches the fingerprint of the
+    requested priority, so keys first used before this rule existed, on an old
+    gateway pod during a rollout, or by a caller whose scope has since changed
+    still replay instead of returning `409`.
 - Public IDs are validated: `user_id` allows only `A-Z a-z 0-9 . _ @ -` (no
   `:` or glob characters, since it is embedded in Redis key patterns), and
   product/content IDs additionally allow `: / +`. `context` objects are limited

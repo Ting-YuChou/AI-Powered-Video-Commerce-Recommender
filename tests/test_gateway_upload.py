@@ -1,4 +1,5 @@
 import io
+import logging
 from types import SimpleNamespace
 
 import httpx
@@ -348,6 +349,7 @@ class UploadStore:
             "filename": job["filename"],
             "storage_path": job["storage_path"],
             "user_id": job["user_id"],
+            "priority": job["priority"],
             "status": "pending_publish",
             "task_event_id": task.event_id,
             "idempotency_key": job.get("idempotency_key"),
@@ -418,12 +420,19 @@ def upload_env(monkeypatch, tmp_path):
 
 
 async def _upload(
-    body, *, key=None, user_id="user-1", filename="clip.mp4", priority="normal"
+    body,
+    *,
+    key=None,
+    user_id="user-1",
+    filename="clip.mp4",
+    priority="normal",
+    claims=None,
 ):
     headers = {gateway_api.IDEMPOTENCY_KEY_HEADER: key} if key is not None else {}
-    request = SimpleNamespace(
-        headers=headers, state=SimpleNamespace(request_id="request-1")
-    )
+    state = SimpleNamespace(request_id="request-1")
+    if claims is not None:
+        state.auth_claims = claims
+    request = SimpleNamespace(headers=headers, state=state)
     file = UploadFile(
         file=io.BytesIO(body),
         filename=filename,
@@ -694,3 +703,216 @@ def test_env_example_extension_list_parses():
     )
 
     assert ".webm" in parsed and all(item.startswith(".") for item in parsed)
+
+
+ADMIN_SCOPE = Config().security_config.admin_scope
+
+
+@pytest.mark.parametrize(
+    "claims, requested, expected",
+    [
+        (None, "high", "high"),  # API key, or SECURITY_AUTH_MODE=disabled
+        ({"sub": "user-1"}, "high", "normal"),
+        ({"sub": "user-1", "scope": "openid profile"}, "high", "normal"),
+        ({"sub": "user-1", "scope": f"openid {ADMIN_SCOPE}"}, "high", "high"),
+        ({"sub": "user-1", "scp": [ADMIN_SCOPE]}, "high", "high"),
+        ({"sub": "user-1", "scp": ADMIN_SCOPE}, "high", "high"),
+        # A non-admin ``scope`` must not hide an admin ``scp``.
+        ({"sub": "user-1", "scope": "openid", "scp": [ADMIN_SCOPE]}, "high", "high"),
+        ({"sub": "user-1", "scope": [f"openid {ADMIN_SCOPE}"]}, "high", "high"),
+        # Other shapes grant nothing, and never raise.
+        ({"sub": "user-1", "scope": {ADMIN_SCOPE: True}}, "high", "normal"),
+        ({"sub": "user-1", "scope": 5}, "high", "normal"),
+        ({"sub": "user-1", "scope": True}, "high", "normal"),
+        ({"sub": "user-1", "scope": [5, None]}, "high", "normal"),
+        ({"sub": "user-1", "scope": None}, "high", "normal"),
+        ({"sub": "user-1"}, "normal", "normal"),
+        ({"sub": "user-1"}, "low", "low"),
+    ],
+)
+def test_effective_upload_priority(monkeypatch, claims, requested, expected):
+    monkeypatch.setattr(
+        gateway_api.app.state,
+        "runtime",
+        SimpleNamespace(config=Config()),
+        raising=False,
+    )
+    state = SimpleNamespace(request_id="request-1")
+    if claims is not None:
+        state.auth_claims = claims
+    request = SimpleNamespace(state=state)
+
+    assert gateway_api._effective_upload_priority(request, requested) == expected
+
+
+@pytest.mark.asyncio
+async def test_bearer_upload_without_admin_scope_is_queued_at_normal(upload_env):
+    response = await _upload(
+        b"video-bytes", key="retry-1", priority="high", claims={"sub": "user-1"}
+    )
+
+    assert response["status"] == "queued"
+    assert response["effective_priority"] == "normal"
+    assert "priority: normal" in response["message"]
+    task, job = upload_env.store.staged[0]
+    assert job["priority"] == "normal"
+    assert task.payload["priority"] == "normal"
+    import hashlib
+
+    assert job["request_fingerprint"] == gateway_api.upload_request_fingerprint(
+        body_sha256=hashlib.sha256(b"video-bytes").hexdigest(),
+        size_bytes=11,
+        filename="clip.mp4",
+        priority="normal",
+    )
+    assert upload_env.runtime.observability.uploads == [("normal", "queued")]
+
+
+@pytest.mark.asyncio
+async def test_admin_bearer_and_api_key_uploads_keep_high_priority(upload_env):
+    admin = await _upload(
+        b"video-bytes",
+        priority="high",
+        claims={"sub": "user-1", "scope": ADMIN_SCOPE},
+    )
+    api_key = await _upload(b"video-bytes", priority="high")
+
+    assert admin["effective_priority"] == "high"
+    assert api_key["effective_priority"] == "high"
+    assert [job["priority"] for _task, job in upload_env.store.staged] == [
+        "high",
+        "high",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_priority", ["high", "normal"])
+async def test_lowered_upload_retry_replays_under_the_same_key(
+    upload_env, retry_priority
+):
+    """The fingerprint uses the effective priority, so both retries match."""
+    claims = {"sub": "user-1"}
+    first = await _upload(b"video-bytes", key="retry-1", priority="high", claims=claims)
+    replay = await _upload(
+        b"video-bytes", key="retry-1", priority=retry_priority, claims=claims
+    )
+
+    assert replay["content_id"] == first["content_id"]
+    assert replay["idempotent_replay"] is True
+    assert replay["effective_priority"] == "normal"
+    assert len(upload_env.store.staged) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_upload_reports_effective_priority(upload_env):
+    gateway_api.kafka_manager.acknowledged = False
+    claims = {"sub": "user-1"}
+
+    first = await _upload(b"video-bytes", key="retry-1", priority="high", claims=claims)
+    replay = await _upload(
+        b"video-bytes", key="retry-1", priority="high", claims=claims
+    )
+
+    for response in (first, replay):
+        assert response.status_code == 503
+        body = _json(response)
+        assert body["error"]["code"] == "CONTENT_ENQUEUE_PENDING"
+        assert body["effective_priority"] == "normal"
+
+
+def _seed_pre_gating_job(store, *, priority="high", key="old-key"):
+    """A job the gateway wrote before priority gating, fingerprinted at ``high``."""
+    import hashlib
+
+    store.jobs["content-old"] = {
+        "content_id": "content-old",
+        "filename": "clip.mp4",
+        "storage_path": "s3://bucket/uploads/content-old.mp4",
+        "user_id": "user-1",
+        "priority": priority,
+        "status": "queued",
+        "task_event_id": "event-old",
+        "idempotency_key": key,
+        "request_fingerprint": gateway_api.upload_request_fingerprint(
+            body_sha256=hashlib.sha256(b"video-bytes").hexdigest(),
+            size_bytes=11,
+            filename="clip.mp4",
+            priority=priority,
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_lowered_retry_replays_a_job_written_before_gating(upload_env):
+    _seed_pre_gating_job(upload_env.store)
+
+    replay = await _upload(
+        b"video-bytes", key="old-key", priority="high", claims={"sub": "user-1"}
+    )
+
+    assert replay["content_id"] == "content-old"
+    assert replay["idempotent_replay"] is True
+    # The job's stored priority is reported and counted, not this request's.
+    assert replay["effective_priority"] == "high"
+    assert upload_env.runtime.observability.uploads == [("high", "idempotent_replay")]
+    assert upload_env.store.staged == []
+
+
+@pytest.mark.asyncio
+async def test_different_priority_than_a_pre_gating_job_is_still_409(upload_env):
+    _seed_pre_gating_job(upload_env.store)
+
+    conflict = await _upload(
+        b"video-bytes", key="old-key", priority="normal", claims={"sub": "user-1"}
+    )
+
+    assert conflict.status_code == 409
+    assert _json(conflict)["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+
+
+@pytest.mark.asyncio
+async def test_retry_after_losing_admin_scope_replays_the_high_job(upload_env):
+    first = await _upload(
+        b"video-bytes",
+        key="retry-1",
+        priority="high",
+        claims={"sub": "user-1", "scope": ADMIN_SCOPE},
+    )
+    replay = await _upload(
+        b"video-bytes", key="retry-1", priority="high", claims={"sub": "user-1"}
+    )
+
+    assert replay["content_id"] == first["content_id"]
+    assert replay["effective_priority"] == "high"
+    assert len(upload_env.store.staged) == 1
+
+
+@pytest.mark.asyncio
+async def test_priority_lowering_is_logged_once_per_new_job(upload_env, caplog):
+    claims = {"sub": "user-1"}
+    logger_name = gateway_api.logger.name
+
+    def lowered_logs():
+        return [
+            record
+            for record in caplog.records
+            if record.name == logger_name
+            and "content_upload_priority_lowered" in record.getMessage()
+        ]
+
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        # Rejected after the priority is resolved but before staging.
+        with pytest.raises(HTTPException):
+            await _upload(
+                b"video-bytes", key="bad key", priority="high", claims=claims
+            )
+        assert lowered_logs() == []
+
+        first = await _upload(
+            b"video-bytes", key="retry-1", priority="high", claims=claims
+        )
+        await _upload(b"video-bytes", key="retry-1", priority="high", claims=claims)
+
+    records = lowered_logs()
+    assert len(records) == 1
+    assert first["content_id"] in records[0].getMessage()
