@@ -27,6 +27,9 @@ from video_commerce.common.feature_history_contracts import (
     RANKING_LTR_FEATURE_DEFINITION_VERSION,
     payload_sha256,
 )
+from video_commerce.data_plane.content_feature_rehydrator import (
+    ContentFeatureRehydrator,
+)
 from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.kafka_client import (
     KafkaProducerSupervisor,
@@ -111,6 +114,7 @@ system_store: Optional[SystemStore] = None
 serving_artifact_sync_task: Optional[asyncio.Task] = None
 known_user_snapshot_refresh_task: Optional[asyncio.Task] = None
 content_feature_snapshot_refresh_task: Optional[asyncio.Task] = None
+content_feature_rehydrator: Optional[ContentFeatureRehydrator] = None
 object_storage: Optional[ObjectStorage] = None
 artifact_manager: Optional[ModelArtifactManager] = None
 best_effort_task_queue = None
@@ -1232,7 +1236,7 @@ async def startup_event():
     global feature_store, vector_search, recommendation_engine, ranking_model, ranking_batcher, ranking_client_pool, ranking_coordinator_client_pool, kafka_manager
     global system_store
     global serving_artifact_sync_task, known_user_snapshot_refresh_task
-    global content_feature_snapshot_refresh_task
+    global content_feature_snapshot_refresh_task, content_feature_rehydrator
     global object_storage, artifact_manager
     global best_effort_task_queue, recommendation_outbox_task
     global _serving_version_context_cache, _serving_version_context_paths
@@ -1334,6 +1338,19 @@ async def startup_event():
         )
         await system_store.initialize()
         await _warm_impression_outbox_pool(runtime)
+        recommendation_config = runtime.config.recommendation_config
+        if recommendation_config.content_features_rehydrate_enabled:
+            content_feature_rehydrator = ContentFeatureRehydrator(
+                feature_store=feature_store,
+                system_store=system_store,
+                max_concurrency=(
+                    recommendation_config.content_features_rehydrate_max_concurrency
+                ),
+                negative_ttl_seconds=(
+                    recommendation_config.content_features_rehydrate_negative_ttl_seconds
+                ),
+                observability=runtime.observability,
+            )
 
     if (
         os.getenv("ENVIRONMENT", "").lower() == "production"
@@ -1542,6 +1559,7 @@ def _on_kafka_connected(manager) -> None:
 @app.on_event("shutdown")
 async def shutdown_event():
     global serving_artifact_sync_task, known_user_snapshot_refresh_task
+    global content_feature_snapshot_refresh_task, content_feature_rehydrator
     global best_effort_task_queue, ranking_coordinator_client_pool
     global recommendation_outbox_task, kafka_supervisor, kafka_manager
     global _late_impression_retirer
@@ -1583,6 +1601,9 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
         content_feature_snapshot_refresh_task = None
+    if content_feature_rehydrator:
+        await content_feature_rehydrator.close()
+        content_feature_rehydrator = None
     if best_effort_task_queue:
         await best_effort_task_queue.close()
         best_effort_task_queue = None
@@ -1808,7 +1829,7 @@ async def get_recommendations(
                     _bounded_hot_path_read(
                         runtime,
                         "content_features",
-                        feature_store.get_content_features(payload.content_id),
+                        _read_content_features(payload.content_id),
                         None,
                     )
                 ),
@@ -3214,6 +3235,18 @@ async def _bounded_hot_path_read(runtime, operation_name: str, awaitable, fallba
     except Exception as exc:
         logger.warning("%s_hot_path_read_failed: %s", operation_name, exc)
         return fallback
+
+
+async def _read_content_features(content_id: str) -> Optional[ContentFeatures]:
+    """Redis projection first; on a miss, the durable artifact via the rehydrator.
+
+    Run under ``_bounded_hot_path_read``: when its timeout cancels this read, the
+    shielded rehydration keeps running and repairs Redis for the next request.
+    """
+    features = await feature_store.get_content_features(content_id)
+    if features is not None or content_feature_rehydrator is None:
+        return features
+    return await content_feature_rehydrator.load(content_id)
 
 
 async def _read_din_sequences_strict(runtime, user_id: str, as_of_ts: float):

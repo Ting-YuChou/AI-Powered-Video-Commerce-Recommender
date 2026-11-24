@@ -930,6 +930,13 @@ class ObservabilityManager:
             "Content visual embeddings with (near) zero L2 norm",
             registry=self.registry,
         )
+        self.content_feature_rehydrations_total = Counter(
+            "video_commerce_content_feature_rehydrations_total",
+            "Serving-path Redis content-feature misses resolved from Postgres "
+            "(rehydrated, not_found, negative_cached, invalid, error, shed)",
+            ["outcome"],
+            registry=self.registry,
+        )
         self.content_task_publisher_errors_total = Counter(
             "video_commerce_content_task_publisher_errors_total",
             "Content task publisher loop iterations that raised, by stage",
@@ -1510,6 +1517,9 @@ class ObservabilityManager:
 
     def record_content_processing(self, outcome: str) -> None:
         self.content_processing_events_total.labels(outcome=str(outcome)).inc()
+
+    def record_content_feature_rehydration(self, outcome: str) -> None:
+        self.content_feature_rehydrations_total.labels(outcome=str(outcome)).inc()
 
     def record_content_processing_redrives(self, outcome: str, count: int = 1) -> None:
         if int(count) > 0:
