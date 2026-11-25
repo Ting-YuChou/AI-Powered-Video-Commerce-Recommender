@@ -111,13 +111,34 @@ never change bucket configuration.
   Add `--endpoint-url` for a non-AWS endpoint.
 - **Legacy uploads** do not match the `raw/` rule and stay in `STANDARD`. A
   lifecycle filter cannot select only the direct children of a prefix.
-- **MinIO (Compose)** gets only the `incoming/` rule, which `minio-init`
+- **Compose (Silo)** gets only the `incoming/` rule, which `minio-init`
   imports on every start (the import replaces the bucket's rules, so it stays
-  idempotent). Community MinIO has no `STANDARD_IA` class (transitions need a
-  remote tier), and it removes stale multipart uploads itself.
+  idempotent). MinIO and its forks have no `STANDARD_IA` class (transitions
+  need a remote tier), and they remove stale multipart uploads themselves.
 
 ## MinIO Bring-Up
 - Start the profile with `docker compose --profile object-storage up -d minio minio-init`.
+- The `minio` and `minio-init` services run Silo (`pgsty/silo` and
+  `pgsty/mc`), a MinIO fork maintained by Pigsty under AGPL-3.0
+  ([pgsty/silo](https://github.com/pgsty/silo)). MinIO stopped publishing
+  community images: `minio/minio` and `minio/mc` are gone from Docker Hub,
+  `quay.io/minio` refuses anonymous pulls, and the upstream repository is
+  archived. Silo keeps the S3 API, the `MINIO_*` variables, the `server`
+  command and the `mc` commands, so service names, the `minio_data` volume
+  and `minio-init` are unchanged.
+  - The server image has no `minio` binary. It ships the client as `mcli`
+    with an `mc` symlink, which the healthcheck uses.
+  - Silo reads data that `minio/minio:RELEASE.2024-06-29T01-20-47Z` wrote,
+    so an existing `minio_data` volume does not need to be recreated.
+  - Silo adds a per-bucket CORS API (`put-bucket-cors`). A bucket rule
+    replaces `MINIO_API_CORS_ALLOW_ORIGIN` for that bucket; without one the
+    server-wide setting applies.
+  - Both images are pinned by tag and digest. To upgrade, read the
+    [release notes](https://github.com/pgsty/silo/releases), get the new
+    digests with `docker buildx imagetools inspect pgsty/silo:<tag>` (and
+    `pgsty/mc:<tag>`), update both `image:` lines, and re-check a presigned
+    POST, a CORS preflight, `copy_upload_object` with a stale ETag (must raise
+    `UploadObjectChanged`) and the `minio-init` lifecycle import.
 - Set:
   - `OBJECT_STORAGE_BACKEND=s3`
   - `OBJECT_STORAGE_ENDPOINT_URL=http://minio:9000`
@@ -128,10 +149,10 @@ never change bucket configuration.
   - `OBJECT_STORAGE_READ_TIMEOUT_SECONDS=60`
   - `OBJECT_STORAGE_MAX_ATTEMPTS=3`
   - `OBJECT_STORAGE_CHECKSUM_ALGORITHM=SHA256`
-- Leave `OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION` empty for Compose MinIO.
-  MinIO refuses SSE-S3 (`AES256`) without a KMS, and Compose configures none,
-  so every upload, multipart or direct, would fail. Set it where the store
-  encrypts, such as AWS S3.
+- Leave `OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION` empty for the Compose
+  server. MinIO refuses SSE-S3 (`AES256`) without a KMS, and Compose
+  configures none for its MinIO fork, so every upload, multipart or direct,
+  would fail. Set it where the store encrypts, such as AWS S3.
 - For direct uploads also set `DATA_DIRECT_UPLOAD_ENABLED=true` and apply
   migration 014. Compose defaults `OBJECT_STORAGE_PUBLIC_ENDPOINT_URL`
   to `http://127.0.0.1:9000` (MinIO's published port; set it to an empty
