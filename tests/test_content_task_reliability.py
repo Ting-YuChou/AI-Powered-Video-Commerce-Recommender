@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import uuid
 
+import pytest
 from sqlalchemy import inspect
 
 from video_commerce.common.config import DatabaseConfig
@@ -400,7 +401,7 @@ def test_content_reconciler_deletes_only_old_unreferenced_objects():
         system_store=store,
         kafka_manager=FakeKafka(),
         object_storage=storage,
-        upload_prefix="/uploads",
+        upload_prefixes=["/uploads"],
         config=SimpleNamespace(
             content_outbox_batch_size=10,
             content_outbox_lease_seconds=60,
@@ -420,6 +421,129 @@ def test_content_reconciler_deletes_only_old_unreferenced_objects():
         ["/uploads/referenced.mp4", "/uploads/orphan.mp4"],
         ["/uploads/young.mp4"],
     ]
+
+
+def test_content_reconciler_scans_every_upload_prefix():
+    class ReconcileStore:
+        async def filter_referenced_storage_paths(self, paths):
+            return {path for path in paths if path.endswith("referenced.mp4")}
+
+    class ReconcileStorage:
+        def __init__(self):
+            self.listed = []
+            self.deleted = []
+
+        async def iter_upload_object_pages(self, prefix, *, page_size):
+            self.listed.append(prefix)
+            yield [
+                SimpleNamespace(
+                    uri=f"{prefix}/referenced.mp4", size=1, last_modified=1.0
+                ),
+                SimpleNamespace(uri=f"{prefix}/orphan.mp4", size=1, last_modified=1.0),
+            ]
+
+        async def delete_uploaded_object(self, uri):
+            self.deleted.append(uri)
+
+    storage = ReconcileStorage()
+    publisher = ContentTaskPublisher(
+        system_store=ReconcileStore(),
+        kafka_manager=FakeKafka(),
+        object_storage=storage,
+        upload_prefixes=["s3://bucket/uploads/raw", "", "s3://bucket/uploads"],
+        config=SimpleNamespace(
+            content_outbox_batch_size=10,
+            content_outbox_lease_seconds=60,
+            content_orphan_grace_seconds=10,
+            content_reconcile_page_size=100,
+        ),
+        worker_id="publisher-1",
+    )
+
+    stats = asyncio.run(publisher.reconcile_objects(now=100.0))
+
+    assert storage.listed == ["s3://bucket/uploads/raw", "s3://bucket/uploads"]
+    assert storage.deleted == [
+        "s3://bucket/uploads/raw/orphan.mp4",
+        "s3://bucket/uploads/orphan.mp4",
+    ]
+    assert stats == {"orphan_objects": 2, "deleted_objects": 2}
+
+
+def test_content_reconciler_scans_remaining_prefixes_after_a_failure():
+    class ReconcileStore:
+        async def filter_referenced_storage_paths(self, paths):
+            return set()
+
+    class ReconcileStorage:
+        def __init__(self):
+            self.deleted = []
+
+        async def iter_upload_object_pages(self, prefix, *, page_size):
+            if prefix.endswith("/raw"):
+                raise PermissionError("AccessDenied: ListObjectsV2 raw/")
+            yield [SimpleNamespace(uri=f"{prefix}/old.mp4", size=1, last_modified=1.0)]
+
+        async def delete_uploaded_object(self, uri):
+            self.deleted.append(uri)
+
+    storage = ReconcileStorage()
+    publisher = ContentTaskPublisher(
+        system_store=ReconcileStore(),
+        kafka_manager=FakeKafka(),
+        object_storage=storage,
+        upload_prefixes=["s3://bucket/uploads/raw", "s3://bucket/uploads"],
+        config=SimpleNamespace(
+            content_orphan_grace_seconds=10, content_reconcile_page_size=100
+        ),
+        worker_id="publisher-1",
+    )
+
+    with pytest.raises(PermissionError):
+        asyncio.run(publisher.reconcile_objects(now=100.0))
+
+    # The legacy prefix was still cleaned; the raw/ failure is still raised.
+    assert storage.deleted == ["s3://bucket/uploads/old.mp4"]
+
+
+def test_content_reconciler_rejects_a_single_string_prefix():
+    with pytest.raises(TypeError):
+        ContentTaskPublisher(
+            system_store=object(),
+            kafka_manager=FakeKafka(),
+            object_storage=object(),
+            upload_prefixes="/data/uploads",
+            config=SimpleNamespace(),
+            worker_id="publisher-1",
+        )
+
+
+def test_reference_check_refuses_to_answer_without_a_database():
+    store = SystemStore(DatabaseConfig(enable=False))
+
+    # An empty answer would make every upload an orphan to be deleted.
+    with pytest.raises(RuntimeError, match="system store is disabled"):
+        asyncio.run(store.filter_referenced_storage_paths(["s3://bucket/a.mp4"]))
+
+
+def test_content_reconciler_without_prefixes_lists_nothing():
+    class Storage:
+        async def iter_upload_object_pages(self, prefix, *, page_size):
+            raise AssertionError("must not list")
+            yield []
+
+    publisher = ContentTaskPublisher(
+        system_store=object(),
+        kafka_manager=FakeKafka(),
+        object_storage=Storage(),
+        config=SimpleNamespace(content_orphan_grace_seconds=10),
+        worker_id="publisher-1",
+    )
+
+    assert asyncio.run(publisher.reconcile_objects(now=100.0)) == {
+        "orphan_objects": 0,
+        "deleted_objects": 0,
+    }
 
 
 def test_local_upload_pages_skip_nested_artifacts_and_respect_page_size(tmp_path):
@@ -649,7 +773,7 @@ def test_failing_or_slow_maintenance_never_delays_publishing():
             system_store=store,
             kafka_manager=FakeKafka(),
             object_storage=SlowStorage(),
-            upload_prefix="s3://bucket/uploads",
+            upload_prefixes=["s3://bucket/uploads"],
             config=_reaper_config(content_processing_reaper_interval_seconds=0.01),
             worker_id="publisher-1",
             observability=observability,

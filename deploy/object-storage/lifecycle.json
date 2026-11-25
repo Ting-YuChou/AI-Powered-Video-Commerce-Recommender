@@ -1,0 +1,27 @@
+{
+  "Rules": [
+    {
+      "ID": "raw-uploads-standard-ia-after-30-days",
+      "Filter": {
+        "Prefix": "uploads/raw/"
+      },
+      "Status": "Enabled",
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "STANDARD_IA"
+        }
+      ]
+    },
+    {
+      "ID": "abort-incomplete-multipart-uploads-after-7-days",
+      "Filter": {
+        "Prefix": ""
+      },
+      "Status": "Enabled",
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
+    }
+  ]
+}

@@ -96,8 +96,19 @@ unique index on `(COALESCE(user_id, ''), idempotency_key)`, an index on
 - **Orphan reconciliation.** The publisher lists upload objects one page at a
   time (`SERVICE_CONTENT_RECONCILE_PAGE_SIZE`, default 1000) and checks each page
   against `content_jobs.storage_path` with one batched `IN` query. Only objects
-  directly under the upload prefix are considered; `artifacts/` and
+  directly under an upload prefix are considered; `artifacts/` and
   `content-features/` under the same S3 prefix are never treated as orphans.
+  - In S3 mode it lists `<prefix>/raw/` and, for uploads written before that
+    layout, `<prefix>/` ([Key Layout](object-storage-and-auth.md#key-layout)).
+    A failure on one prefix does not stop the other; the stage still reports
+    the failure.
+  - With an empty `OBJECT_STORAGE_PREFIX` it lists nothing and logs
+    `object_storage_orphan_reconcile_disabled` at startup. The bucket root and
+    a root-level `raw/` may hold other systems' objects, so set a prefix to
+    get orphan cleanup.
+  - In local mode it lists `DATA_UPLOAD_DIR`.
+  - The reference check needs Postgres. With `DATABASE_ENABLE=false` it raises
+    instead of reporting every object as unreferenced, so nothing is deleted.
 - **Dead workers.** A delivery that finds a live competing lease (`lease_held`)
   commits its offset. The publisher's reaper (every
   `SERVICE_CONTENT_PROCESSING_REAPER_INTERVAL_SECONDS`, default 15) finds
