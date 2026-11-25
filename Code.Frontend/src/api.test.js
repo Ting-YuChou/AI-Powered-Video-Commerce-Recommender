@@ -254,10 +254,10 @@ describe('upload helpers', () => {
   });
 
   it('knows every terminal failed status', () => {
-    for (const status of ['failed', 'failed_missing_object', 'FAILED']) {
+    for (const status of ['failed', 'failed_missing_object', 'upload_expired', 'FAILED']) {
       expect(isTerminalFailedStatus(status)).toBe(true);
     }
-    for (const status of ['queued', 'pending_publish', 'processing', 'completed', 'upload_expired', undefined]) {
+    for (const status of ['queued', 'pending_publish', 'processing', 'completed', 'awaiting_upload', undefined]) {
       expect(isTerminalFailedStatus(status)).toBe(false);
     }
   });

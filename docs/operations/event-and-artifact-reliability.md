@@ -142,6 +142,87 @@ unique index on `(COALESCE(user_id, ''), idempotency_key)`, an index on
   the durable source and the worker never deletes it; only temporary files
   materialized from S3 are removed.
 
+### Direct uploads (migration 014)
+
+With `DATA_DIRECT_UPLOAD_ENABLED=true` (S3 only, off by default) the client
+uploads the video straight to object storage instead of through the gateway.
+`POST /api/content/upload` keeps working either way.
+
+Apply `migrations/postgres/014_content_direct_upload.sql` before deploying the
+gateway, content-task publisher, or content workers, whether or not the flag is
+on: the `content_jobs` model maps the new columns, so any service that loads a
+content job fails until they exist. It is additive:
+`content_jobs.declared_size_bytes`, `declared_content_type`,
+`upload_expires_at`, and a partial index on `upload_expires_at` for
+`status = 'awaiting_upload'`. `auto_create_schema` applies the same statements
+at startup.
+
+1. **Reserve.** `POST /api/content/uploads` with JSON
+   `{filename, content_type, size_bytes, priority, user_id}`. It needs a user:
+   the bearer subject, or `user_id` from an API-key caller. The gateway applies
+   the multipart endpoint's rules (extension, MIME type,
+   `DATA_MAX_FILE_SIZE`, priority lowering) and inserts an `awaiting_upload`
+   job with no `storage_path` and no outbox row. The response has
+   `content_id`, `upload.url` and `upload.fields` (a presigned POST),
+   `expires_at`, and `complete_path`.
+   - The POST policy allows only `<prefix>/incoming/<content_id><suffix>`,
+     exactly `size_bytes` bytes, the declared `Content-Type`, and the
+     configured SSE. It expires after `DATA_DIRECT_UPLOAD_URL_TTL_SECONDS`
+     (900, at least 300). The gateway signs it before inserting the job, so a
+     signing failure leaves no reservation behind.
+   - A user may hold `DATA_DIRECT_UPLOAD_MAX_PENDING_PER_USER` (5)
+     reservations that can still be completed (until `expires_at` plus the
+     grace period below); the next one gets `429 TOO_MANY_PENDING_UPLOADS`.
+   - With the flag off it answers `404 DIRECT_UPLOAD_DISABLED`;
+     `GET /api/content/upload-limits` reports `direct_upload_enabled`.
+2. **Upload.** The client sends `upload.fields` and then the file as
+   `multipart/form-data` to `upload.url`.
+3. **Complete.** `POST /api/content/uploads/{content_id}/complete` (API-key
+   callers add `?user_id=`). Only the owner can complete; anyone else gets
+   404. The gateway:
+   1. HEADs the incoming object and checks its size and `Content-Type`
+      against the reservation: `422 DIRECT_UPLOAD_MISMATCH` if they differ,
+      `409 DIRECT_UPLOAD_OBJECT_MISSING` (retryable) before the file arrives.
+   2. Copies it server-side to `<prefix>/raw/<content_id>-<random><suffix>`
+      with `CopySourceIfMatch` on the checked ETag. If the object changed in
+      between: `409 DIRECT_UPLOAD_CHANGED` (retryable), unless a concurrent
+      complete already staged the job, in which case it answers with the
+      job's status.
+   3. Moves the job to `pending_publish`, writes `storage_path`, and inserts
+      the outbox row in one transaction, then publishes inline and answers
+      like the multipart endpoint (`queued`, or `503 CONTENT_ENQUEUE_PENDING`).
+   4. Deletes the incoming object (best effort).
+   The presigned POST stays usable until it expires, but it can only replace
+   the incoming object, never the `raw/` copy a job points at; a fresh raw key
+   per attempt means concurrent completes cannot overwrite each other either.
+   A complete that loses the race deletes its own copy and answers with the
+   job's current status, as does any repeated complete (`already_completed:
+   true`; a `pending_publish` job is re-published inline). A job whose
+   processing failed answers `409 CONTENT_JOB_FAILED`; start a new upload.
+4. **Expiry.** /complete is accepted until `expires_at` plus
+   `DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS` (3600), for uploads that started
+   before the URL expired; after that it answers `410 DIRECT_UPLOAD_EXPIRED`.
+   The content-task-publisher's `upload_expiry` stage (every minute, database
+   clock) marks those jobs `upload_expired`, a terminal status like `failed`.
+   Their incoming objects are left to the `incoming/` lifecycle rule
+   ([Lifecycle](object-storage-and-auth.md#lifecycle)); URL TTL plus grace must
+   stay under that rule's one day.
+
+`Idempotency-Key` works on the reserve call: a retry with the same request
+gets the same `content_id` and a newly signed POST for the time the
+reservation has left (`409 DIRECT_UPLOAD_URL_EXPIRED` once less than a minute
+is left), or the job's status once it was completed. Its fingerprint is `v2:`
+over filename, content type, size, and priority, so a key used for a
+multipart upload cannot be reused for a direct upload or the other way round
+(`409 IDEMPOTENCY_KEY_REUSED`).
+
+Between the copy and the commit the `raw/` object is unreferenced, like a
+multipart upload between its S3 write and staging; the orphan reconciler keeps
+it for `SERVICE_CONTENT_ORPHAN_GRACE_SECONDS`. If staging raises, the gateway
+checks whether it committed before deleting the copy, as for multipart uploads.
+Turning the flag off stops new reservations only: /complete stays available
+so reservations already handed out can finish.
+
 `video-processing-tasks` defaults to 12 partitions in Compose and Helm so up to
 12 content workers can consume in parallel. The Compose `kafka-init` service and
 the Helm topic init job (`alterPartitions: true`) also run `kafka-topics --alter`

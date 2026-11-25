@@ -4,8 +4,14 @@ import os
 
 import pytest
 
-from video_commerce.common.config import ObjectStorageConfig
-from video_commerce.data_plane.object_storage import ObjectStorage
+from video_commerce.common.config import (
+    DIRECT_UPLOAD_INCOMING_EXPIRY_SECONDS,
+    ObjectStorageConfig,
+)
+from video_commerce.data_plane.object_storage import (
+    ObjectStorage,
+    UploadObjectChanged,
+)
 
 
 async def _persist_and_materialize(storage: ObjectStorage, path: str):
@@ -378,15 +384,29 @@ def test_lifecycle_rules_match_upload_layout_and_s3_schema(tmp_path):
     raw_key_prefix = storage.build_object_name(content_id="c1", suffix=".mp4")[
         : -len("c1.mp4")
     ]
+    incoming_key_prefix = storage.build_incoming_object_name(
+        content_id="c1", suffix=".mp4"
+    )[: -len("c1.mp4")]
     rules = {rule["ID"]: rule for rule in lifecycle["Rules"]}
 
     raw_rule = rules["raw-uploads-standard-ia-after-30-days"]
     assert raw_rule["Filter"] == {"Prefix": raw_key_prefix}
     assert raw_rule["Transitions"] == [{"Days": 30, "StorageClass": "STANDARD_IA"}]
-    # Raw videos are kept forever: no rule may expire anything.
+    # Raw videos are kept forever: only incoming/ may expire, and its prefix
+    # does not cover raw/.
+    incoming_rule = rules["incoming-direct-uploads-expire-after-1-day"]
+    assert incoming_rule["Filter"] == {"Prefix": incoming_key_prefix}
+    assert incoming_rule["Expiration"] == {"Days": 1}
+    assert incoming_key_prefix.startswith(f"{default_prefix}/")
+    assert not raw_key_prefix.startswith(incoming_key_prefix)
     assert all(
         "Expiration" not in rule and "NoncurrentVersionExpiration" not in rule
         for rule in lifecycle["Rules"]
+        if rule is not incoming_rule
+    )
+    # DATA_DIRECT_UPLOAD_* validation keeps URL TTL + grace under this expiry.
+    assert incoming_rule["Expiration"]["Days"] * 86400 == (
+        DIRECT_UPLOAD_INCOMING_EXPIRY_SECONDS
     )
     multipart_rule = rules["abort-incomplete-multipart-uploads-after-7-days"]
     assert multipart_rule["Filter"] == {"Prefix": ""}
@@ -406,3 +426,253 @@ def test_empty_s3_prefix_disables_orphan_cleanup_with_warning(tmp_path, caplog):
         assert storage.upload_reconcile_prefixes(local_upload_dir="/data") == []
 
     assert "object_storage_orphan_reconcile_disabled" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "prefix,expected",
+    [
+        ("uploads", "uploads/incoming/content-1.mp4"),
+        ("/team/uploads/", "team/uploads/incoming/content-1.mp4"),
+        ("", "incoming/content-1.mp4"),
+    ],
+)
+def test_incoming_object_names_use_incoming_subprefix(tmp_path, prefix, expected):
+    storage = ObjectStorage(
+        ObjectStorageConfig(
+            backend="s3", bucket="bucket", prefix=prefix, download_dir=str(tmp_path)
+        )
+    )
+
+    assert (
+        storage.build_incoming_object_name(content_id="content-1", suffix=".mp4")
+        == expected
+    )
+
+
+def _decode_policy(fields):
+    import base64
+    import json
+
+    return json.loads(base64.b64decode(fields["policy"]))
+
+
+def test_presigned_direct_upload_pins_key_size_type_and_sse(tmp_path):
+    storage = ObjectStorage(
+        ObjectStorageConfig(
+            backend="s3",
+            bucket="bucket",
+            endpoint_url="http://minio:9000",
+            public_endpoint_url="http://127.0.0.1:9000",
+            access_key_id="test-access-key",
+            secret_access_key="test-secret-key",
+            server_side_encryption="AES256",
+            download_dir=str(tmp_path),
+        )
+    )
+    # initialize() builds both clients without any network call.
+    asyncio.run(storage.initialize())
+
+    post = storage.presign_direct_upload(
+        "s3://bucket/uploads/incoming/content-1.mp4",
+        content_type="video/mp4",
+        size_bytes=1234,
+        expires_in=900,
+    )
+
+    # Signed for the browser-reachable endpoint, not the in-cluster one.
+    assert post["url"] == "http://127.0.0.1:9000/bucket"
+    fields = post["fields"]
+    assert fields["key"] == "uploads/incoming/content-1.mp4"
+    assert fields["Content-Type"] == "video/mp4"
+    assert fields["x-amz-server-side-encryption"] == "AES256"
+    assert fields["x-amz-algorithm"] == "AWS4-HMAC-SHA256"
+    conditions = _decode_policy(fields)["conditions"]
+    assert {"bucket": "bucket"} in conditions
+    assert {"key": "uploads/incoming/content-1.mp4"} in conditions
+    assert ["content-length-range", 1234, 1234] in conditions
+    assert {"Content-Type": "video/mp4"} in conditions
+    assert {"x-amz-server-side-encryption": "AES256"} in conditions
+    # The in-cluster client keeps the internal endpoint.
+    assert storage._client.meta.endpoint_url == "http://minio:9000"
+
+
+def test_presigned_direct_upload_defaults_to_internal_endpoint(tmp_path):
+    storage = ObjectStorage(
+        ObjectStorageConfig(
+            backend="s3",
+            bucket="bucket",
+            endpoint_url="http://minio:9000",
+            access_key_id="test-access-key",
+            secret_access_key="test-secret-key",
+            download_dir=str(tmp_path),
+        )
+    )
+    asyncio.run(storage.initialize())
+
+    post = storage.presign_direct_upload(
+        "s3://bucket/uploads/incoming/content-1.mp4",
+        content_type="video/mp4",
+        size_bytes=10,
+        expires_in=60,
+    )
+
+    assert post["url"] == "http://minio:9000/bucket"
+    assert "x-amz-server-side-encryption" not in post["fields"]
+
+
+def test_bad_public_endpoint_only_fails_when_presigning(tmp_path):
+    storage = ObjectStorage(
+        ObjectStorageConfig(
+            backend="s3",
+            bucket="bucket",
+            endpoint_url="http://minio:9000",
+            public_endpoint_url="127.0.0.1:9000",
+            access_key_id="test-access-key",
+            secret_access_key="test-secret-key",
+            download_dir=str(tmp_path),
+        )
+    )
+
+    # Services that never presign start normally.
+    asyncio.run(storage.initialize())
+
+    with pytest.raises(ValueError):
+        storage.presign_direct_upload(
+            "s3://bucket/uploads/incoming/c.mp4",
+            content_type="video/mp4",
+            size_bytes=1,
+            expires_in=60,
+        )
+
+
+def test_presigned_direct_upload_requires_s3(tmp_path):
+    storage = ObjectStorage(
+        ObjectStorageConfig(backend="local", download_dir=str(tmp_path))
+    )
+
+    with pytest.raises(RuntimeError):
+        storage.presign_direct_upload(
+            "s3://bucket/uploads/incoming/c.mp4",
+            content_type="video/mp4",
+            size_bytes=1,
+            expires_in=60,
+        )
+
+
+def _client_error(status, code):
+    from botocore.exceptions import ClientError
+
+    return ClientError(
+        {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}},
+        "Operation",
+    )
+
+
+def test_head_upload_object_reports_size_etag_and_type_or_none(tmp_path):
+    class Client:
+        def head_object(self, *, Bucket, Key):
+            assert Bucket == "bucket"
+            if Key == "uploads/incoming/missing.mp4":
+                raise _client_error(404, "404")
+            assert Key == "uploads/incoming/c.mp4"
+            return {"ContentLength": 42, "ETag": '"abc"', "ContentType": "video/mp4"}
+
+    storage = ObjectStorage(ObjectStorageConfig(backend="s3", bucket="bucket"))
+    storage._client = Client()
+
+    head = asyncio.run(storage.head_upload_object("s3://bucket/uploads/incoming/c.mp4"))
+    assert (head.size, head.etag, head.content_type) == (42, '"abc"', "video/mp4")
+    assert (
+        asyncio.run(
+            storage.head_upload_object("s3://bucket/uploads/incoming/missing.mp4")
+        )
+        is None
+    )
+
+
+def test_head_upload_object_raises_other_errors(tmp_path):
+    class Client:
+        def head_object(self, **_kwargs):
+            raise _client_error(403, "AccessDenied")
+
+    storage = ObjectStorage(ObjectStorageConfig(backend="s3", bucket="bucket"))
+    storage._client = Client()
+
+    with pytest.raises(Exception, match="AccessDenied"):
+        asyncio.run(storage.head_upload_object("s3://bucket/uploads/incoming/c.mp4"))
+
+
+def test_copy_upload_object_is_conditional_on_the_checked_etag(tmp_path):
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def copy_object(self, **kwargs):
+            self.calls.append(kwargs)
+
+    storage = ObjectStorage(
+        ObjectStorageConfig(
+            backend="s3",
+            bucket="bucket",
+            server_side_encryption="AES256",
+            checksum_algorithm="SHA256",
+        )
+    )
+    client = Client()
+    storage._client = client
+
+    uri = asyncio.run(
+        storage.copy_upload_object(
+            "s3://bucket/uploads/incoming/c.mp4",
+            object_name="uploads/raw/c-1.mp4",
+            if_match='"abc"',
+        )
+    )
+
+    assert uri == "s3://bucket/uploads/raw/c-1.mp4"
+    assert client.calls == [
+        {
+            "Bucket": "bucket",
+            "Key": "uploads/raw/c-1.mp4",
+            "CopySource": {"Bucket": "bucket", "Key": "uploads/incoming/c.mp4"},
+            "CopySourceIfMatch": '"abc"',
+            "MetadataDirective": "COPY",
+            "ServerSideEncryption": "AES256",
+            "ChecksumAlgorithm": "SHA256",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_client_error(412, "PreconditionFailed"), _client_error(404, "NoSuchKey")],
+)
+def test_copy_upload_object_reports_a_changed_or_removed_source(tmp_path, error):
+    class Client:
+        def copy_object(self, **_kwargs):
+            raise error
+
+    storage = ObjectStorage(ObjectStorageConfig(backend="s3", bucket="bucket"))
+    storage._client = Client()
+
+    with pytest.raises(UploadObjectChanged):
+        asyncio.run(
+            storage.copy_upload_object(
+                "s3://bucket/uploads/incoming/c.mp4",
+                object_name="uploads/raw/c-1.mp4",
+                if_match='"abc"',
+            )
+        )
+
+
+def test_copy_upload_object_requires_an_etag(tmp_path):
+    storage = ObjectStorage(ObjectStorageConfig(backend="s3", bucket="bucket"))
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            storage.copy_upload_object(
+                "s3://bucket/uploads/incoming/c.mp4",
+                object_name="uploads/raw/c-1.mp4",
+                if_match="",
+            )
+        )

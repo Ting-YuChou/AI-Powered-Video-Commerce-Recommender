@@ -558,3 +558,83 @@ def test_required_ranking_runtime_auth_needs_internal_key(monkeypatch):
     with pytest.raises(ValueError):
         Config()
     reset_config()
+
+
+def _direct_upload_env(monkeypatch, **values):
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("DATA_DIRECT_UPLOAD_ENABLED", "true")
+    monkeypatch.setenv("OBJECT_STORAGE_BACKEND", "s3")
+    monkeypatch.setenv("OBJECT_STORAGE_BUCKET", "bucket")
+    for name, value in values.items():
+        monkeypatch.setenv(name, str(value))
+
+
+def test_direct_uploads_accept_the_defaults_on_s3(monkeypatch):
+    _direct_upload_env(monkeypatch)
+
+    reset_config()
+    config = Config()
+
+    assert config.data_config.direct_upload_enabled is True
+    assert config.data_config.direct_upload_url_ttl_seconds == 900
+    reset_config()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"OBJECT_STORAGE_BACKEND": "local"},
+        {"DATA_MAX_FILE_SIZE": 5 * 1024**3 + 1},
+        {"DATA_DIRECT_UPLOAD_URL_TTL_SECONDS": 299},
+        {"OBJECT_STORAGE_PUBLIC_ENDPOINT_URL": "127.0.0.1:9000"},
+        {"OBJECT_STORAGE_PUBLIC_ENDPOINT_URL": "ftp://storage.example"},
+        {"DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS": -1},
+        # The incoming/ lifecycle rule deletes uploads after a day.
+        {
+            "DATA_DIRECT_UPLOAD_URL_TTL_SECONDS": 43200,
+            "DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS": 43200,
+        },
+        {"DATA_DIRECT_UPLOAD_MAX_PENDING_PER_USER": 0},
+    ],
+)
+def test_direct_upload_config_is_validated(monkeypatch, values):
+    _direct_upload_env(monkeypatch, **values)
+
+    reset_config()
+    with pytest.raises(ValueError):
+        Config()
+    reset_config()
+
+
+def test_direct_upload_accepts_the_shortest_ttl_and_a_public_endpoint(monkeypatch):
+    from video_commerce.common.config import DIRECT_UPLOAD_MIN_URL_TTL_SECONDS
+    from video_commerce.services.gateway import api as gateway_api
+
+    _direct_upload_env(
+        monkeypatch,
+        DATA_DIRECT_UPLOAD_URL_TTL_SECONDS=DIRECT_UPLOAD_MIN_URL_TTL_SECONDS,
+        OBJECT_STORAGE_PUBLIC_ENDPOINT_URL="http://127.0.0.1:9000",
+    )
+
+    reset_config()
+    assert Config().data_config.direct_upload_url_ttl_seconds == 300
+    reset_config()
+    # A replay is re-signed only while this much is left, so even the shortest
+    # TTL leaves room to retry.
+    assert (
+        gateway_api._DIRECT_UPLOAD_MIN_RESIGN_SECONDS
+        < DIRECT_UPLOAD_MIN_URL_TTL_SECONDS
+    )
+
+
+def test_direct_upload_limits_are_not_checked_while_disabled(monkeypatch):
+    _direct_upload_env(
+        monkeypatch,
+        OBJECT_STORAGE_BACKEND="local",
+        OBJECT_STORAGE_PUBLIC_ENDPOINT_URL="127.0.0.1:9000",
+    )
+    monkeypatch.setenv("DATA_DIRECT_UPLOAD_ENABLED", "false")
+
+    reset_config()
+    assert Config().data_config.direct_upload_enabled is False
+    reset_config()
