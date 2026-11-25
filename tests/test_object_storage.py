@@ -502,6 +502,9 @@ def test_presigned_direct_upload_defaults_to_internal_endpoint(tmp_path):
             backend="s3",
             bucket="bucket",
             endpoint_url="http://minio:9000",
+            # Explicit, so OBJECT_STORAGE_PUBLIC_ENDPOINT_URL from the Compose
+            # test environment does not leak into this settings object.
+            public_endpoint_url=None,
             access_key_id="test-access-key",
             secret_access_key="test-secret-key",
             download_dir=str(tmp_path),
