@@ -73,6 +73,7 @@ export const randomUuid = () => {
 // Keep in sync with the gateway's DataConfig defaults.
 export const DEFAULT_UPLOAD_LIMITS = Object.freeze({
   max_file_size: 100 * 1024 * 1024,
+  direct_upload_enabled: false,
   allowed_extensions: Object.freeze(['.avi', '.mkv', '.mov', '.mp4', '.webm']),
   allowed_mime_types: Object.freeze([
     'video/mp4',
@@ -115,6 +116,7 @@ export const normalizeUploadLimits = (limits) => {
       : DEFAULT_UPLOAD_LIMITS.max_file_size,
     allowed_extensions: extensions.length ? extensions : [...DEFAULT_UPLOAD_LIMITS.allowed_extensions],
     allowed_mime_types: mimeTypes.length ? mimeTypes : [...DEFAULT_UPLOAD_LIMITS.allowed_mime_types],
+    direct_upload_enabled: limits?.direct_upload_enabled === true,
   };
 };
 
@@ -134,14 +136,115 @@ export const isTerminalFailedStatus = (status) => TERMINAL_FAILED_CONTENT_STATUS
 // original content job instead of creating a duplicate.
 export const createUploadIdempotencyKey = () => randomUuid();
 
-// 409 codes after which the key can never succeed for this request: the job
-// behind it failed, or the key was used for a different request.
-const STALE_IDEMPOTENCY_KEY_CODES = new Set(['IDEMPOTENCY_KEY_REUSED', 'IDEMPOTENCY_KEY_JOB_FAILED']);
+// Codes after which the key can never succeed for this request: the job
+// behind it failed or expired, its direct-upload URL expired, or the key was
+// used for a different request.
+const STALE_IDEMPOTENCY_KEY_CODES = new Set([
+  'IDEMPOTENCY_KEY_REUSED',
+  'IDEMPOTENCY_KEY_JOB_FAILED',
+  'DIRECT_UPLOAD_URL_EXPIRED',
+  'CONTENT_JOB_FAILED',
+]);
 
-export const isStaleIdempotencyKeyError = (error) => (
-  error?.response?.status === 409
-  && STALE_IDEMPOTENCY_KEY_CODES.has(error?.response?.data?.error?.code)
+export const isStaleIdempotencyKeyError = (error) => {
+  const status = error?.response?.status;
+  const code = error?.response?.data?.error?.code;
+  return (status === 409 && STALE_IDEMPOTENCY_KEY_CODES.has(code))
+    || (status === 410 && code === 'DIRECT_UPLOAD_EXPIRED');
+};
+
+// POST /api/content/uploads answers 404 when the gateway does not offer direct
+// uploads (DIRECT_UPLOAD_DISABLED, or a gateway without the route); the
+// caller then uses POST /api/content/upload with a new Idempotency-Key, since
+// the gateway fingerprints the two kinds of upload differently. Only the
+// reservation sets this: a 404 from /complete is not a reason to fall back.
+export const isDirectUploadUnavailableError = (error) => error?.directUploadUnavailable === true;
+
+// /complete codes worth retrying: the object is not visible yet, or it
+// changed while the gateway checked it. The reservation stays usable, so its
+// Idempotency-Key must be kept.
+const RETRYABLE_COMPLETE_CODES = new Set(['DIRECT_UPLOAD_OBJECT_MISSING', 'DIRECT_UPLOAD_CHANGED']);
+const COMPLETE_ATTEMPTS = 3;
+const COMPLETE_RETRY_DELAY_MS = 1000;
+// /complete HEADs and copies the whole object server-side before answering.
+const COMPLETE_TIMEOUT_MS = 120000;
+// A stalled storage upload fails after this long plus one millisecond per
+// STORAGE_MIN_BYTES_PER_MS bytes (about 128 KB/s).
+const STORAGE_UPLOAD_BASE_TIMEOUT_MS = 60000;
+const STORAGE_MIN_BYTES_PER_MS = 128;
+
+const errorCode = (error) => error?.response?.data?.error?.code;
+
+export const isRetryableCompleteError = (error) => RETRYABLE_COMPLETE_CODES.has(errorCode(error));
+
+export const storageUploadTimeoutMs = (sizeBytes) => (
+  STORAGE_UPLOAD_BASE_TIMEOUT_MS + Math.ceil((Number(sizeBytes) || 0) / STORAGE_MIN_BYTES_PER_MS)
 );
+
+// S3 and MinIO answer a rejected POST with <Error><Code>..</Code><Message>..
+// </Message></Error>; surface them instead of only the HTTP status.
+const parseStorageError = (body) => {
+  const text = String(body || '');
+  const field = (name) => {
+    const match = new RegExp(`<${name}>([^<]*)</${name}>`).exec(text);
+    return match ? match[1].trim() : '';
+  };
+  return { code: field('Code'), message: field('Message') };
+};
+
+const progressFraction = (event) => {
+  if (event?.total) {
+    return Math.min(1, event.loaded / event.total);
+  }
+  return Number.isFinite(event?.progress) ? Math.min(1, event.progress) : null;
+};
+
+// Sends the file to a presigned POST: every policy field, then the file last,
+// as S3 requires. XMLHttpRequest instead of the axios instance: the instance
+// adds a _t query parameter, and XHR reports upload progress.
+export const uploadToStorage = (
+  upload,
+  file,
+  { onProgress, timeoutMs = storageUploadTimeoutMs(file?.size) } = {}
+) => new Promise((resolve, reject) => {
+  const form = new FormData();
+  Object.entries(upload?.fields || {}).forEach(([name, value]) => form.append(name, value));
+  form.append('file', file);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', upload.url);
+  xhr.timeout = timeoutMs;
+  if (onProgress) {
+    xhr.upload.onprogress = (event) => {
+      const fraction = progressFraction(event);
+      if (fraction !== null) {
+        onProgress(fraction);
+      }
+    };
+  }
+  xhr.onload = () => {
+    if (xhr.status >= 200 && xhr.status < 300) {
+      resolve();
+      return;
+    }
+    const storageError = parseStorageError(xhr.responseText);
+    const detail = [storageError.code, storageError.message].filter(Boolean).join(': ');
+    const message = `Storage rejected the upload (HTTP ${xhr.status}${detail ? `, ${detail}` : ''})`;
+    reject(Object.assign(new Error(message), {
+      response: {
+        status: xhr.status,
+        data: { error: { code: storageError.code || 'STORAGE_REJECTED', message } },
+      },
+    }));
+  };
+  xhr.onerror = () => reject(new Error('Upload to storage failed: network error or blocked by CORS'));
+  xhr.ontimeout = () => reject(new Error('Upload to storage timed out; check the connection and retry'));
+  xhr.onabort = () => reject(new Error('Upload to storage was aborted'));
+  xhr.send(form);
+});
+
+const wait = (ms) => new Promise((resolve) => {
+  setTimeout(resolve, ms);
+});
 
 // The gateway answers 503 CONTENT_ENQUEUE_PENDING when the upload is durable
 // but Kafka has not acknowledged it yet. The job will still be processed.
@@ -202,7 +305,12 @@ export const buildInteractionPayload = (
 // API Functions
 export const videoApi = {
   // Upload and process video
-  uploadVideo: async (file, userId = 'demo_user', priority = 'normal', { idempotencyKey } = {}) => {
+  uploadVideo: async (
+    file,
+    userId = 'demo_user',
+    priority = 'normal',
+    { idempotencyKey, onProgress } = {}
+  ) => {
     const formData = new FormData();
     const mimeType = uploadMimeType(file);
     formData.append(
@@ -215,6 +323,14 @@ export const videoApi = {
         params: buildUploadParams(userId, priority),
         headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
         timeout: 60000, // 60 seconds for video upload
+        onUploadProgress: onProgress
+          ? (event) => {
+            const fraction = progressFraction(event);
+            if (fraction !== null) {
+              onProgress(fraction);
+            }
+          }
+          : undefined,
       });
       return response.data;
     } catch (error) {
@@ -224,6 +340,82 @@ export const videoApi = {
       }
       throw error;
     }
+  },
+
+  // Direct upload: reserve, send the file straight to object storage, then
+  // complete. Throws an error matching isDirectUploadUnavailableError when the
+  // gateway does not offer it.
+  uploadVideoDirect: async (
+    file,
+    userId = 'demo_user',
+    priority = 'normal',
+    { idempotencyKey, onProgress, completeRetryDelayMs = COMPLETE_RETRY_DELAY_MS } = {}
+  ) => {
+    let reservation;
+    try {
+      reservation = await api.post('/api/content/uploads', {
+        filename: file.name,
+        content_type: uploadMimeType(file),
+        size_bytes: file.size,
+        priority,
+        user_id: userId,
+      }, {
+        headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+      });
+    } catch (error) {
+      if (error?.response?.status === 404) {
+        error.directUploadUnavailable = true;
+      }
+      throw error;
+    }
+    const ticket = reservation.data;
+    if (!ticket?.upload) {
+      // A retried reservation whose upload was already completed.
+      return {
+        content_id: ticket?.content_id,
+        status: ticket?.status,
+        message: ticket?.message,
+      };
+    }
+    const completePath = ticket.complete_path || `/api/content/uploads/${ticket.content_id}/complete`;
+    // Retries the retryable answers and network errors (/complete is
+    // idempotent). retryMissing=false gives up at once on OBJECT_MISSING.
+    const complete = async ({ retryMissing }) => {
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          const response = await api.post(completePath, null, {
+            params: { user_id: userId },
+            timeout: COMPLETE_TIMEOUT_MS,
+          });
+          return response.data;
+        } catch (error) {
+          const pending = pendingUploadFromError(error);
+          if (pending) {
+            return pending;
+          }
+          const missing = errorCode(error) === 'DIRECT_UPLOAD_OBJECT_MISSING';
+          const retryable = (isRetryableCompleteError(error) && (retryMissing || !missing))
+            || !error?.response;
+          if (attempt >= COMPLETE_ATTEMPTS || !retryable) {
+            throw error;
+          }
+          await wait(completeRetryDelayMs * attempt);
+        }
+      }
+    };
+    if (ticket.idempotent_replay) {
+      // A retry of a reservation: the file may already be in storage from the
+      // last attempt, so try to complete before sending it again.
+      try {
+        return await complete({ retryMissing: false });
+      } catch (error) {
+        if (errorCode(error) !== 'DIRECT_UPLOAD_OBJECT_MISSING') {
+          throw error;
+        }
+      }
+    }
+    await uploadToStorage(ticket.upload, file, { onProgress });
+    return complete({ retryMissing: true });
   },
 
   // Limits the gateway enforces for uploads

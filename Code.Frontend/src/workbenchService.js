@@ -51,6 +51,7 @@ const createMockService = () => ({
 
 const liveService = {
   uploadVideo: videoApi.uploadVideo,
+  uploadVideoDirect: videoApi.uploadVideoDirect,
   getUploadLimits: videoApi.getUploadLimits,
   getContentStatus: videoApi.getContentStatus,
   getRecommendations: videoApi.getRecommendations,

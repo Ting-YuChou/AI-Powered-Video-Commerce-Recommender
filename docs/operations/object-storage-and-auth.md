@@ -39,9 +39,32 @@ Set `OBJECT_STORAGE_PUBLIC_ENDPOINT_URL` when browsers reach storage at a
 different address than the gateway does, for example `http://127.0.0.1:9000`
 for Compose MinIO while the gateway uses `http://minio:9000`. Presigned POSTs
 are signed for that endpoint. It is read only when the gateway signs a direct
-upload, and validated only while `DATA_DIRECT_UPLOAD_ENABLED=true`. The bucket also needs a CORS rule that allows
-`POST` from the frontend origin and exposes `ETag`; the frontend change that
-uses direct uploads ships it.
+upload, and validated only while `DATA_DIRECT_UPLOAD_ENABLED=true`.
+
+## CORS
+The frontend sends direct uploads from the browser to the bucket, a different
+origin, so the bucket must allow it. The frontend reports upload progress,
+which makes the browser send a preflight `OPTIONS` first; without a matching
+rule the upload fails as a network error and the frontend shows "blocked by
+CORS".
+- `deploy/object-storage/cors.json` (S3 API format) allows `POST` with any
+  request header from one origin. Replace `https://app.example.com` with the
+  frontend's origin (scheme, host and port, no path), one entry per origin.
+- `put-bucket-cors` replaces the bucket's whole CORS configuration, so merge
+  as for lifecycle rules: read the current rules (`NoSuchCORSConfiguration`
+  when there are none), add this one, put the result.
+
+  ```bash
+  aws s3api get-bucket-cors --bucket <bucket> > current-cors.json
+  aws s3api put-bucket-cors --bucket <bucket> --cors-configuration file://merged-cors.json
+  ```
+- Compose sets the server-wide `MINIO_API_CORS_ALLOW_ORIGIN`
+  (comma-separated) to the Caddy and Vite origins on localhost. Community
+  MinIO only has this server-wide setting; servers with a bucket CORS API
+  (AWS, and MinIO forks such as Silo) also accept `cors.json`, and a bucket
+  rule replaces the server-wide origins for that bucket.
+- The frontend does not read any response header from storage, so no
+  `ExposeHeaders` are needed.
 
 ## Lifecycle
 `deploy/object-storage/lifecycle.json` holds the bucket lifecycle rules, in the
@@ -88,10 +111,10 @@ never change bucket configuration.
   Add `--endpoint-url` for a non-AWS endpoint.
 - **Legacy uploads** do not match the `raw/` rule and stay in `STANDARD`. A
   lifecycle filter cannot select only the direct children of a prefix.
-- **MinIO (Compose)** gets no rules yet. Community MinIO has no `STANDARD_IA`
-  class (transitions need a remote tier), and it removes stale multipart
-  uploads itself. Compose does not enable direct uploads; the change that
-  wires them into Compose also adds the `incoming/` expiry to `minio-init`.
+- **Compose (Silo)** gets only the `incoming/` rule, which `minio-init`
+  imports on every start (the import replaces the bucket's rules, so it stays
+  idempotent). MinIO and its forks have no `STANDARD_IA` class (transitions
+  need a remote tier), and they remove stale multipart uploads themselves.
 
 ## MinIO Bring-Up
 - Start the profile with `docker compose --profile object-storage up -d minio minio-init`.
@@ -126,7 +149,19 @@ never change bucket configuration.
   - `OBJECT_STORAGE_READ_TIMEOUT_SECONDS=60`
   - `OBJECT_STORAGE_MAX_ATTEMPTS=3`
   - `OBJECT_STORAGE_CHECKSUM_ALGORITHM=SHA256`
-  - `OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION=AES256`
+- Leave `OBJECT_STORAGE_SERVER_SIDE_ENCRYPTION` empty for the Compose
+  server. MinIO refuses SSE-S3 (`AES256`) without a KMS, and Compose
+  configures none for its MinIO fork, so every upload, multipart or direct,
+  would fail. Set it where the store encrypts, such as AWS S3.
+- For direct uploads also set `DATA_DIRECT_UPLOAD_ENABLED=true` and apply
+  migration 014. Compose defaults `OBJECT_STORAGE_PUBLIC_ENDPOINT_URL`
+  to `http://127.0.0.1:9000` (MinIO's published port; set it to an empty
+  value to presign for `OBJECT_STORAGE_ENDPOINT_URL` instead) and
+  `MINIO_API_CORS_ALLOW_ORIGIN` to `http://localhost`, `http://127.0.0.1` and
+  their `:3000` (Vite) variants. Open the frontend at one of those origins.
+  The frontend reads `direct_upload_enabled` from
+  `GET /api/content/upload-limits` and falls back to
+  `POST /api/content/upload` when the gateway answers 404.
 
 ## Client Auth
 - `SECURITY_AUTH_MODE=api_key` keeps the current `X-API-Key` flow.

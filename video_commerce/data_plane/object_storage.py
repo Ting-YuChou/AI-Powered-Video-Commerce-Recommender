@@ -88,7 +88,9 @@ class ObjectStorage:
 
         return boto3.client(
             "s3",
-            endpoint_url=endpoint_url,
+            # Helm and .env send unset endpoints as "", which boto3 rejects;
+            # None selects the AWS endpoint for the region.
+            endpoint_url=(endpoint_url or "").strip() or None,
             region_name=self.config.region,
             aws_access_key_id=self.config.access_key_id,
             aws_secret_access_key=self.config.secret_access_key,

@@ -223,6 +223,22 @@ checks whether it committed before deleting the copy, as for multipart uploads.
 Turning the flag off stops new reservations only: /complete stays available
 so reservations already handed out can finish.
 
+The workbench frontend uses this flow when `GET /api/content/upload-limits`
+reports `direct_upload_enabled`:
+- It shows upload progress, and fails a storage upload that stalls (60 s plus
+  about 1 s per 128 KB).
+- It retries /complete on `DIRECT_UPLOAD_OBJECT_MISSING`,
+  `DIRECT_UPLOAD_CHANGED` and network errors, and keeps the key afterwards,
+  so the next attempt replays the same reservation. A replayed reservation
+  tries /complete before sending the file again.
+- It starts over with a new key on `DIRECT_UPLOAD_URL_EXPIRED`,
+  `DIRECT_UPLOAD_EXPIRED` and `CONTENT_JOB_FAILED`.
+- When the reservation answers 404 it uses `POST /api/content/upload`, with
+  its own key, and skips direct uploads until the limits are loaded again.
+  Each method keeps its own key per file, so retries replay the same job.
+- The bucket needs a CORS rule for the frontend's origin
+  ([CORS](object-storage-and-auth.md#cors)).
+
 `video-processing-tasks` defaults to 12 partitions in Compose and Helm so up to
 12 content workers can consume in parallel. The Compose `kafka-init` service and
 the Helm topic init job (`alterPartitions: true`) also run `kafka-topics --alter`

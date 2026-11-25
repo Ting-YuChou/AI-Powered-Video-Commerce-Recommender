@@ -680,6 +680,47 @@ def test_default_upload_limit_matches_compose_helm_and_env_example():
 
 
 @pytest.mark.parametrize(
+    "env_name,field,helm_key",
+    [
+        ("DATA_DIRECT_UPLOAD_ENABLED", "direct_upload_enabled", "enabled"),
+        ("DATA_DIRECT_UPLOAD_URL_TTL_SECONDS", "direct_upload_url_ttl_seconds", "urlTtlSeconds"),
+        (
+            "DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS",
+            "direct_upload_complete_grace_seconds",
+            "completeGraceSeconds",
+        ),
+        (
+            "DATA_DIRECT_UPLOAD_MAX_PENDING_PER_USER",
+            "direct_upload_max_pending_per_user",
+            "maxPendingPerUser",
+        ),
+    ],
+)
+def test_direct_upload_defaults_match_compose_helm_and_env_example(
+    env_name, field, helm_key
+):
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    default = DataConfig.__fields__[field].default
+    rendered = str(default).lower() if isinstance(default, bool) else str(default)
+
+    compose = (root / "docker-compose.yml").read_text()
+    assert f"{env_name}: ${{{env_name}:-{rendered}}}" in compose
+    values = yaml.safe_load((root / "charts/video-commerce/values.yaml").read_text())
+    assert values["appConfig"]["directUpload"][helm_key] == default
+    configmap = (root / "charts/video-commerce/templates/backend-configmap.yaml").read_text()
+    assert (
+        f"{env_name}: {{{{ .Values.appConfig.directUpload.{helm_key} | quote }}}}"
+        in configmap
+    )
+    env_example = (root / ".env.example").read_text()
+    assert f"\n{env_name}={rendered}\n" in env_example
+
+
+@pytest.mark.parametrize(
     "raw",
     [".mp4,.avi, .mov,.mkv,.webm", '[".mp4",".avi",".mov",".mkv",".webm"]'],
 )

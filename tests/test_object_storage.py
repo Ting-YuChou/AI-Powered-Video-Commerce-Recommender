@@ -502,6 +502,9 @@ def test_presigned_direct_upload_defaults_to_internal_endpoint(tmp_path):
             backend="s3",
             bucket="bucket",
             endpoint_url="http://minio:9000",
+            # Explicit, so OBJECT_STORAGE_PUBLIC_ENDPOINT_URL from the Compose
+            # test environment does not leak into this settings object.
+            public_endpoint_url=None,
             access_key_id="test-access-key",
             secret_access_key="test-secret-key",
             download_dir=str(tmp_path),
@@ -676,3 +679,78 @@ def test_copy_upload_object_requires_an_etag(tmp_path):
                 if_match="",
             )
         )
+
+
+def test_cors_rule_allows_presigned_posts_and_matches_the_s3_schema():
+    import json
+    from pathlib import Path
+
+    import botocore.session
+    from botocore.validate import ParamValidator
+
+    cors = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "object-storage"
+            / "cors.json"
+        ).read_text()
+    )
+    operation = (
+        botocore.session.get_session()
+        .get_service_model("s3")
+        .operation_model("PutBucketCors")
+    )
+    report = ParamValidator().validate(
+        {"Bucket": "bucket", "CORSConfiguration": cors},
+        operation.input_shape,
+    )
+    assert not report.has_errors(), report.generate_report()
+
+    [rule] = cors["CORSRules"]
+    # Presigned POSTs only; the upload-progress listener forces a preflight,
+    # which must accept the browser's request headers.
+    assert rule["AllowedMethods"] == ["POST"]
+    assert rule["AllowedHeaders"] == ["*"]
+    assert "*" not in rule["AllowedOrigins"]
+
+
+def test_empty_endpoints_use_the_aws_endpoint(tmp_path):
+    # Helm and .env send unset endpoints as "", which boto3 would reject.
+    storage = ObjectStorage(
+        ObjectStorageConfig(
+            backend="s3",
+            bucket="bucket",
+            region="eu-west-1",
+            endpoint_url="",
+            public_endpoint_url="",
+            access_key_id="test-access-key",
+            secret_access_key="test-secret-key",
+            force_path_style=False,
+            download_dir=str(tmp_path),
+        )
+    )
+    asyncio.run(storage.initialize())
+
+    assert storage._client.meta.endpoint_url == "https://s3.eu-west-1.amazonaws.com"
+    post = storage.presign_direct_upload(
+        "s3://bucket/uploads/incoming/c.mp4",
+        content_type="video/mp4",
+        size_bytes=1,
+        expires_in=60,
+    )
+    assert post["url"] == "https://bucket.s3.eu-west-1.amazonaws.com/"
+
+
+def test_compose_public_endpoint_keeps_an_explicit_empty_value():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "docker-compose.yml").read_text()
+    # "-", not ":-": an empty value means "presign for the endpoint URL".
+    assert (
+        "OBJECT_STORAGE_PUBLIC_ENDPOINT_URL: "
+        "${OBJECT_STORAGE_PUBLIC_ENDPOINT_URL-http://127.0.0.1:9000}"
+    ) in compose
+    env_example = (root / ".env.example").read_text()
+    assert "\nOBJECT_STORAGE_PUBLIC_ENDPOINT_URL=http://127.0.0.1:9000\n" in env_example

@@ -26,6 +26,8 @@ import {
   DEFAULT_UPLOAD_LIMITS,
   createUploadIdempotencyKey,
   interactionActions,
+  isDirectUploadUnavailableError,
+  isRetryableCompleteError,
   isStaleIdempotencyKeyError,
   isTerminalFailedStatus,
   randomUuid,
@@ -339,7 +341,29 @@ function Field({ label, children }) {
   );
 }
 
-function ProcessingTimeline({ phase, contentStatus }) {
+function UploadProgressBar({ progress }) {
+  const percent = Math.round(Math.max(0, Math.min(1, progress)) * 100);
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between text-xs text-slate-500">
+        <span>Uploading video</span>
+        <span>{percent}%</span>
+      </div>
+      <div
+        role="progressbar"
+        aria-label="Upload progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+        className="h-2 overflow-hidden rounded-full bg-slate-100"
+      >
+        <div className="h-full rounded-full bg-sky-500 transition-all" style={{ width: `${percent}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function ProcessingTimeline({ phase, contentStatus, uploadProgress = null }) {
   const status = contentStatus?.status || 'idle';
   const steps = [
     {
@@ -384,6 +408,7 @@ function ProcessingTimeline({ phase, contentStatus }) {
           </div>
         ))}
       </div>
+      {phase === 'uploading' && uploadProgress !== null && <UploadProgressBar progress={uploadProgress} />}
       {contentStatus?.message && <p className="text-sm text-slate-600">{contentStatus.message}</p>}
     </div>
   );
@@ -468,6 +493,7 @@ function UploadAnalysisPanel({
   onRestoreHistory,
   onClearHistory,
   uploadLimits = DEFAULT_UPLOAD_LIMITS,
+  uploadProgress = null,
 }) {
   const canUseMockSample = mode === WORKBENCH_MODES.MOCK;
 
@@ -650,7 +676,7 @@ function UploadAnalysisPanel({
             </div>
           )}
 
-          <ProcessingTimeline phase={phase} contentStatus={contentStatus} />
+          <ProcessingTimeline phase={phase} contentStatus={contentStatus} uploadProgress={uploadProgress} />
         </div>
 
         <UploadHistoryList
@@ -1303,9 +1329,17 @@ function VideoCommerceApp() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedVideo, setSelectedVideo] = useState('');
   const selectedVideoRef = useRef('');
-  // { key, priority } for live uploads of the selected file: created on the
-  // first attempt and reused by retries, so the gateway replays the same job.
+  // { direct, multipart }, each { key, priority }, for live uploads of the
+  // selected file: created on the first attempt with that method and reused by
+  // retries, so the gateway replays the same job. Direct and multipart uploads
+  // are fingerprinted differently, so each method keeps its own key.
   const uploadKeyRef = useRef(null);
+  // Set when the gateway answered a direct-upload reservation with 404 although
+  // the limits offered it; later runs go straight to the multipart upload
+  // until the limits are loaded again.
+  const directUploadUnavailableRef = useRef(false);
+  // Fraction of the file sent (0-1) while uploading, or null when unknown.
+  const [uploadProgress, setUploadProgress] = useState(null);
   // loaded=false until the gateway answered; the size check waits for it.
   const [uploadLimitsState, setUploadLimitsState] = useState({
     limits: DEFAULT_UPLOAD_LIMITS,
@@ -1427,6 +1461,7 @@ function VideoCommerceApp() {
     service.getUploadLimits()
       .then((limits) => {
         if (!cancelled && limits) {
+          directUploadUnavailableRef.current = false;
           setUploadLimitsState({ limits, loaded: true });
         }
       })
@@ -1446,6 +1481,7 @@ function VideoCommerceApp() {
     try {
       const limits = await service.getUploadLimits();
       if (limits) {
+        directUploadUnavailableRef.current = false;
         const nextState = { limits, loaded: true };
         setUploadLimitsState(nextState);
         return nextState;
@@ -1575,26 +1611,34 @@ function VideoCommerceApp() {
     }
 
     const reusesSelectedFileKey = mode === WORKBENCH_MODES.LIVE && activeFile === selectedFile;
-    // The gateway fingerprint includes priority, so a key is reused only for
-    // the priority it was created with. Mock uploads send no key.
-    const uploadKey = () => {
+    // The gateway fingerprint includes priority and the upload method, so a
+    // key is reused only for the ones it was created with. Mock uploads send
+    // no key.
+    const uploadKey = (method) => {
       if (mode !== WORKBENCH_MODES.LIVE) {
         return undefined;
       }
-      const current = uploadKeyRef.current;
+      const current = uploadKeyRef.current?.[method];
       if (reusesSelectedFileKey && current && current.priority === priority) {
         return current.key;
       }
       const key = createUploadIdempotencyKey();
       if (reusesSelectedFileKey) {
-        uploadKeyRef.current = { key, priority };
+        uploadKeyRef.current = { ...uploadKeyRef.current, [method]: { key, priority } };
       }
       return key;
     };
     // After a failed job (or a key rejected with 409) the next attempt for
-    // this file must be a new upload with a new key.
-    const forgetUploadKey = () => {
-      if (reusesSelectedFileKey) {
+    // this file must be a new upload with a new key: for one method, or for
+    // both when the job itself failed.
+    const forgetUploadKey = (method) => {
+      if (!reusesSelectedFileKey || !uploadKeyRef.current) {
+        return;
+      }
+      if (method) {
+        const { [method]: _forgotten, ...remaining } = uploadKeyRef.current;
+        uploadKeyRef.current = remaining;
+      } else {
         uploadKeyRef.current = null;
       }
     };
@@ -1602,32 +1646,61 @@ function VideoCommerceApp() {
     setBusy(true);
     setError(null);
     setPhase('uploading');
+    setUploadProgress(null);
     setContentStatus({ status: 'uploading', message: 'Uploading video through the active service.' });
 
+    // The method of the attempt in flight, so a failure forgets only its key.
+    let attemptMethod = 'multipart';
     try {
-      const upload = () => service.uploadVideo(
-        activeFile,
-        userId.trim() || 'demo_user',
-        priority,
-        { idempotencyKey: uploadKey() }
-      );
-      let uploadResponse;
-      try {
-        uploadResponse = await upload();
-      } catch (firstUploadError) {
-        if (!isStaleIdempotencyKeyError(firstUploadError)) {
-          throw firstUploadError;
+      const send = (method) => {
+        attemptMethod = method;
+        const options = {
+          idempotencyKey: uploadKey(method),
+          onProgress: (fraction) => setUploadProgress(fraction),
+        };
+        const uploadFn = method === 'direct' ? service.uploadVideoDirect : service.uploadVideo;
+        return uploadFn(activeFile, userId.trim() || 'demo_user', priority, options);
+      };
+      const upload = async (method) => {
+        try {
+          return await send(method);
+        } catch (firstUploadError) {
+          if (!isStaleIdempotencyKeyError(firstUploadError)) {
+            throw firstUploadError;
+          }
+          // The key's job failed or expired, or the key was used for a
+          // different request: upload again as a new job.
+          forgetUploadKey(method);
+          setUploadProgress(null);
+          return send(method);
         }
-        // The key's job failed, or the key was used for a different request:
-        // upload again as a new job.
-        forgetUploadKey();
-        uploadResponse = await upload();
+      };
+      // Direct uploads go straight to object storage when the gateway offers
+      // them; a gateway that answers 404 gets the multipart upload instead.
+      const prefersDirect = limitsState.limits.direct_upload_enabled === true
+        && typeof service.uploadVideoDirect === 'function'
+        && !directUploadUnavailableRef.current;
+      let uploadResponse;
+      if (prefersDirect) {
+        try {
+          uploadResponse = await upload('direct');
+        } catch (directError) {
+          if (!isDirectUploadUnavailableError(directError)) {
+            throw directError;
+          }
+          directUploadUnavailableRef.current = true;
+          setUploadProgress(null);
+          uploadResponse = await upload('multipart');
+        }
+      } else {
+        uploadResponse = await upload('multipart');
       }
       const contentId = uploadResponse.content_id || uploadResponse.contentId;
       if (!contentId) {
         throw new Error('Upload response did not include content_id.');
       }
 
+      setUploadProgress(null);
       setCurrentContentId(contentId);
       const queuedStatus = {
         content_id: contentId,
@@ -1671,10 +1744,13 @@ function VideoCommerceApp() {
       await fetchRecommendations({ contentId, activeService: service, modeOverride: mode });
     } catch (uploadError) {
       const httpStatus = uploadError?.response?.status;
-      if (httpStatus === 409) {
-        forgetUploadKey();
+      // A retryable /complete answer leaves the reservation usable: keep its
+      // key so the next attempt replays it instead of reserving again.
+      if (httpStatus === 409 && !isRetryableCompleteError(uploadError)) {
+        forgetUploadKey(attemptMethod);
       }
       const isRequestRejected = Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus < 500;
+      setUploadProgress(null);
       setPhase('failed');
       setContentStatus({ status: 'failed', message: getErrorMessage(uploadError, 'Upload failed.') });
       setError({
@@ -1912,6 +1988,7 @@ function VideoCommerceApp() {
             isBusy={busy}
             phase={phase}
             contentStatus={contentStatus}
+            uploadProgress={uploadProgress}
             currentContentId={currentContentId}
             error={error}
             onRetry={() => runAnalysis(false)}

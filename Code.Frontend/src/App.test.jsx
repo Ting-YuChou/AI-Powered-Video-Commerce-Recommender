@@ -19,12 +19,15 @@ vi.mock('./api', async () => {
   return {
     DEFAULT_UPLOAD_LIMITS: actual.DEFAULT_UPLOAD_LIMITS,
     createUploadIdempotencyKey: vi.fn(),
+    isDirectUploadUnavailableError: actual.isDirectUploadUnavailableError,
+    isRetryableCompleteError: actual.isRetryableCompleteError,
     isStaleIdempotencyKeyError: actual.isStaleIdempotencyKeyError,
     isTerminalFailedStatus: actual.isTerminalFailedStatus,
     randomUuid: actual.randomUuid,
     interactionActions,
     videoApi: {
       uploadVideo: vi.fn(),
+      uploadVideoDirect: vi.fn(),
       getUploadLimits: vi.fn(),
       getContentStatus: vi.fn(),
       getRecommendations: vi.fn().mockRejectedValue(new Error('live recommendations unavailable')),
@@ -56,6 +59,8 @@ beforeEach(() => {
   });
   videoApi.uploadVideo.mockReset();
   videoApi.uploadVideo.mockRejectedValue(new Error('live upload unavailable'));
+  videoApi.uploadVideoDirect.mockReset();
+  videoApi.uploadVideoDirect.mockRejectedValue(new Error('live direct upload unavailable'));
   videoApi.getUploadLimits.mockReset();
   videoApi.getUploadLimits.mockRejectedValue(new Error('live limits unavailable'));
   videoApi.getContentStatus.mockReset();
@@ -70,6 +75,14 @@ const selectLiveFile = async (user, file = new File(['video-bytes'], 'clip.mp4',
 const runAnalysisButton = () => screen.getByRole('button', { name: /Run analysis/i });
 
 const uploadKeys = () => videoApi.uploadVideo.mock.calls.map((call) => call[3]?.idempotencyKey);
+const directUploadKeys = () => videoApi.uploadVideoDirect.mock.calls.map((call) => call[3]?.idempotencyKey);
+
+const directUploadLimits = {
+  max_file_size: 1000,
+  allowed_extensions: ['.mp4'],
+  allowed_mime_types: ['video/mp4'],
+  direct_upload_enabled: true,
+};
 
 const renderWorkbench = async () => {
   const user = userEvent.setup();
@@ -201,7 +214,7 @@ describe('VideoCommerce workbench', () => {
       expect.objectContaining({ name: 'clip.mp4' }),
       'user-test',
       'normal',
-      { idempotencyKey: 'upload-key-1' }
+      expect.objectContaining({ idempotencyKey: 'upload-key-1' })
     );
     expect(videoApi.getContentStatus).toHaveBeenCalledTimes(1);
 
@@ -260,5 +273,166 @@ describe('VideoCommerce workbench', () => {
 
     expect(await screen.findByText('Upload failed')).toBeInTheDocument();
     expect(screen.queryByText('Gateway offline')).not.toBeInTheDocument();
+  });
+
+  it('uploads directly to storage when the gateway offers it and shows progress', async () => {
+    videoApi.getUploadLimits.mockResolvedValue(directUploadLimits);
+    let finishUpload;
+    videoApi.uploadVideoDirect.mockImplementationOnce((_file, _userId, _priority, options) => {
+      options.onProgress(0.42);
+      return new Promise((resolve) => {
+        finishUpload = () => resolve({ content_id: 'content-d1', status: 'queued' });
+      });
+    });
+    videoApi.getContentStatus.mockResolvedValueOnce({
+      content_id: 'content-d1',
+      status: 'failed',
+      message: 'Processing failed',
+    });
+    const user = await renderWorkbench();
+    await waitFor(() => expect(videoApi.getUploadLimits).toHaveBeenCalled());
+
+    await selectLiveFile(user);
+    await user.click(runAnalysisButton());
+
+    const progress = await screen.findByRole('progressbar', { name: 'Upload progress' });
+    expect(progress).toHaveAttribute('aria-valuenow', '42');
+    expect(videoApi.uploadVideoDirect).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'clip.mp4' }),
+      'user-test',
+      'normal',
+      expect.objectContaining({ idempotencyKey: 'upload-key-1' })
+    );
+    expect(videoApi.uploadVideo).not.toHaveBeenCalled();
+
+    finishUpload();
+    expect(await screen.findAllByText('Processing failed')).not.toHaveLength(0);
+    expect(screen.queryByRole('progressbar', { name: 'Upload progress' })).not.toBeInTheDocument();
+    expect(videoApi.getContentStatus).toHaveBeenCalledWith('content-d1');
+  });
+
+  it('falls back to the multipart upload with a new key when direct uploads are unavailable', async () => {
+    videoApi.getUploadLimits.mockResolvedValue(directUploadLimits);
+    videoApi.uploadVideoDirect.mockRejectedValue(Object.assign(new Error('Request failed with status code 404'), {
+      response: { status: 404, data: { error: { code: 'DIRECT_UPLOAD_DISABLED' } } },
+      directUploadUnavailable: true,
+    }));
+    const user = await renderWorkbench();
+    await waitFor(() => expect(videoApi.getUploadLimits).toHaveBeenCalled());
+
+    await selectLiveFile(user);
+    await user.click(runAnalysisButton());
+    await waitFor(() => expect(videoApi.uploadVideo).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(runAnalysisButton()).toBeEnabled());
+
+    // Direct and multipart uploads are fingerprinted differently, so the
+    // multipart upload never reuses the direct key.
+    expect(directUploadKeys()).toEqual(['upload-key-1']);
+    expect(uploadKeys()).toEqual(['upload-key-2']);
+
+    // The retry skips the unavailable direct upload and replays the multipart
+    // job with its own key.
+    await user.click(runAnalysisButton());
+    await waitFor(() => expect(videoApi.uploadVideo).toHaveBeenCalledTimes(2));
+    expect(directUploadKeys()).toEqual(['upload-key-1']);
+    expect(uploadKeys()).toEqual(['upload-key-2', 'upload-key-2']);
+  });
+
+  it('tries direct uploads again after the limits are reloaded', async () => {
+    videoApi.getUploadLimits.mockResolvedValue(directUploadLimits);
+    videoApi.uploadVideoDirect
+      .mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 404'), {
+        response: { status: 404, data: { detail: 'Not Found' } },
+        directUploadUnavailable: true,
+      }))
+      .mockRejectedValueOnce(new Error('network down'));
+    const user = await renderWorkbench();
+    await waitFor(() => expect(videoApi.getUploadLimits).toHaveBeenCalled());
+    await selectLiveFile(user);
+
+    await user.click(runAnalysisButton());
+    await waitFor(() => expect(videoApi.uploadVideo).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(runAnalysisButton()).toBeEnabled());
+    // Reloading the limits (here: a new service after a mode switch) clears
+    // the remembered 404, so the next upload tries the direct path again; the
+    // newly selected file gets new keys.
+    await user.click(screen.getByRole('button', { name: /^Mock$/i }));
+    await user.click(screen.getByRole('button', { name: /^Live$/i }));
+    await waitFor(() => expect(videoApi.getUploadLimits).toHaveBeenCalledTimes(2));
+    await selectLiveFile(user);
+    await user.click(runAnalysisButton());
+    await waitFor(() => expect(videoApi.uploadVideoDirect).toHaveBeenCalledTimes(2));
+
+    expect(uploadKeys()).toEqual(['upload-key-2']);
+    expect(directUploadKeys()).toEqual(['upload-key-1', 'upload-key-3']);
+  });
+
+  it('keeps the direct key after a retryable complete answer', async () => {
+    videoApi.getUploadLimits.mockResolvedValue(directUploadLimits);
+    videoApi.uploadVideoDirect.mockRejectedValue(Object.assign(new Error('Request failed with status code 409'), {
+      response: { status: 409, data: { error: { code: 'DIRECT_UPLOAD_OBJECT_MISSING', retryable: true } } },
+    }));
+    const user = await renderWorkbench();
+    await waitFor(() => expect(videoApi.getUploadLimits).toHaveBeenCalled());
+    await selectLiveFile(user);
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      await user.click(runAnalysisButton());
+      await waitFor(() => expect(videoApi.uploadVideoDirect).toHaveBeenCalledTimes(attempt));
+      await waitFor(() => expect(runAnalysisButton()).toBeEnabled());
+    }
+
+    // The retry replays the same reservation instead of reserving again.
+    expect(directUploadKeys()).toEqual(['upload-key-1', 'upload-key-1']);
+  });
+
+  it('clears the progress bar before a stale-key retry starts over', async () => {
+    videoApi.getUploadLimits.mockResolvedValue(directUploadLimits);
+    videoApi.uploadVideoDirect
+      .mockImplementationOnce((_file, _userId, _priority, options) => {
+        options.onProgress(1);
+        return Promise.reject(Object.assign(new Error('Request failed with status code 410'), {
+          response: { status: 410, data: { error: { code: 'DIRECT_UPLOAD_EXPIRED' } } },
+        }));
+      })
+      .mockImplementationOnce(() => new Promise(() => {}));
+    const user = await renderWorkbench();
+    await waitFor(() => expect(videoApi.getUploadLimits).toHaveBeenCalled());
+    await selectLiveFile(user);
+
+    await user.click(runAnalysisButton());
+    await waitFor(() => expect(videoApi.uploadVideoDirect).toHaveBeenCalledTimes(2));
+
+    expect(directUploadKeys()).toEqual(['upload-key-1', 'upload-key-2']);
+    await waitFor(() => {
+      expect(screen.queryByRole('progressbar', { name: 'Upload progress' })).not.toBeInTheDocument();
+    });
+  });
+
+  it('retries a direct upload with the same key, and with a new one once it expired', async () => {
+    videoApi.getUploadLimits.mockResolvedValue(directUploadLimits);
+    const expired = Object.assign(new Error('Request failed with status code 410'), {
+      response: { status: 410, data: { error: { code: 'DIRECT_UPLOAD_EXPIRED' } } },
+    });
+    videoApi.uploadVideoDirect
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockRejectedValueOnce(expired)
+      .mockResolvedValueOnce({ content_id: 'content-d2', status: 'queued' });
+    videoApi.getContentStatus.mockResolvedValueOnce({
+      content_id: 'content-d2',
+      status: 'failed',
+      message: 'Processing failed',
+    });
+    const user = await renderWorkbench();
+    await waitFor(() => expect(videoApi.getUploadLimits).toHaveBeenCalled());
+
+    await selectLiveFile(user);
+    await user.click(runAnalysisButton());
+    await waitFor(() => expect(runAnalysisButton()).toBeEnabled());
+    await user.click(runAnalysisButton());
+
+    expect(await screen.findAllByText('Processing failed')).not.toHaveLength(0);
+    expect(directUploadKeys()).toEqual(['upload-key-1', 'upload-key-1', 'upload-key-2']);
+    expect(videoApi.uploadVideo).not.toHaveBeenCalled();
   });
 });
