@@ -18,6 +18,7 @@ from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import httpx
 from fastapi import Body, File, HTTPException, Query, Request, UploadFile
+from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse, Response
 from starlette.middleware import Middleware
 
@@ -28,12 +29,17 @@ from video_commerce.data_plane.feature_store import FeatureStore
 from video_commerce.data_plane.kafka_client import KafkaProducerSupervisor
 from video_commerce.common.models import (
     USER_ID_PATTERN,
+    DirectUploadRequest,
     RecommendationRequest,
     UploadLimitsResponse,
     UserInteractionRequest,
     ViewedImpressionRequest,
 )
-from video_commerce.data_plane.object_storage import ObjectStorage
+from video_commerce.data_plane.object_storage import (
+    ObjectHead,
+    ObjectStorage,
+    UploadObjectChanged,
+)
 from video_commerce.common.service_common import (
     RedisRateLimiter,
     add_inner_http_middleware,
@@ -51,7 +57,10 @@ from video_commerce.common.service_common import (
     RoundRobinAsyncClientPool,
 )
 from video_commerce.data_plane.system_store import (
+    CONTENT_AWAITING_UPLOAD_STATUS,
+    CONTENT_UPLOAD_EXPIRED_STATUS,
     ContentIdempotencyKeyInUse,
+    ContentUploadReservationLimit,
     PreparedContentTask,
     SystemStore,
     prepare_content_task,
@@ -944,7 +953,9 @@ def upload_request_fingerprint(
     return "v1:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-TERMINAL_FAILED_CONTENT_STATUSES = frozenset({"failed", "failed_missing_object"})
+TERMINAL_FAILED_CONTENT_STATUSES = frozenset(
+    {"failed", "failed_missing_object", CONTENT_UPLOAD_EXPIRED_STATUS}
+)
 
 
 def parse_idempotency_key(value: Optional[str]) -> Optional[str]:
@@ -1211,6 +1222,576 @@ async def _publish_staged_content_task(
         return False
 
 
+# --- Direct uploads -----------------------------------------------------------
+#
+# POST /api/content/uploads reserves an ``awaiting_upload`` job and returns a
+# presigned POST for <prefix>/incoming/<content_id><suffix>. The client uploads
+# the file straight to object storage, then calls
+# POST /api/content/uploads/{content_id}/complete, which checks the object
+# against the declared size and type, copies it to raw/ (only if its ETag is
+# still the checked one), and stages the job and its outbox row like
+# POST /api/content/upload. The copy makes the processed object immutable:
+# the presigned POST stays usable until it expires, but it can only overwrite
+# incoming/, never the raw/ object a job points at.
+
+# A replayed reservation is re-signed only if this much of its TTL is left.
+# Must stay below config.DIRECT_UPLOAD_MIN_URL_TTL_SECONDS.
+_DIRECT_UPLOAD_MIN_RESIGN_SECONDS = 60
+_DIRECT_UPLOAD_PATH = "/api/content/uploads"
+
+
+@app.post(_DIRECT_UPLOAD_PATH)
+async def initiate_direct_upload(
+    request: Request, payload: DirectUploadRequest = Body(...)
+):
+    runtime = app.state.runtime
+    data_config = runtime.config.data_config
+    if not data_config.direct_upload_enabled:
+        return _upload_error_response(
+            request,
+            status_code=404,
+            code="DIRECT_UPLOAD_DISABLED",
+            message="Direct uploads are disabled; use POST /api/content/upload",
+        )
+    user_id = _direct_upload_owner(request, payload.user_id)
+    if payload.priority not in UPLOAD_PRIORITIES:
+        raise HTTPException(status_code=400, detail="Invalid priority")
+    requested_priority = payload.priority
+    priority = _effective_upload_priority(request, requested_priority)
+    idempotency_key = parse_idempotency_key(
+        request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    )
+    content_type = payload.content_type.strip().lower()
+    suffix = validate_upload_metadata(payload.filename, content_type, runtime.config)
+    if payload.size_bytes > int(data_config.max_file_size):
+        raise HTTPException(status_code=413, detail="Uploaded file exceeds size limit")
+    await _require_direct_upload_dependencies(runtime, check_health=True)
+
+    # Same requested/effective priority rule as upload_content: a replay also
+    # matches the requested-priority fingerprint.
+    fingerprints = {
+        p: direct_upload_request_fingerprint(
+            filename=payload.filename,
+            content_type=content_type,
+            size_bytes=payload.size_bytes,
+            priority=p,
+        )
+        for p in {priority, requested_priority}
+    }
+    replay_fingerprints = frozenset(fingerprints.values())
+    if idempotency_key:
+        existing = await system_store.get_content_job_by_idempotency_key(
+            user_id=user_id, idempotency_key=idempotency_key
+        )
+        if existing is not None:
+            return await _replay_direct_upload(
+                existing,
+                replay_fingerprints=replay_fingerprints,
+                request=request,
+                priority=priority,
+            )
+
+    content_id = str(uuid.uuid4())
+    incoming_uri = object_storage.object_uri(
+        object_storage.build_incoming_object_name(content_id=content_id, suffix=suffix)
+    )
+    ttl = int(data_config.direct_upload_url_ttl_seconds)
+    upload_expires_at = time.time() + ttl
+    # Sign before reserving: a signing failure then leaves no reservation
+    # behind to count against the user's cap.
+    upload = await _sign_direct_upload(
+        incoming_uri,
+        content_type=content_type,
+        size_bytes=payload.size_bytes,
+        expires_in=ttl,
+    )
+    try:
+        job = await system_store.reserve_direct_upload(
+            content_id=content_id,
+            filename=payload.filename,
+            user_id=user_id,
+            priority=priority,
+            request_id=request.state.request_id,
+            incoming_uri=incoming_uri,
+            declared_size_bytes=payload.size_bytes,
+            declared_content_type=content_type,
+            upload_expires_at=upload_expires_at,
+            max_pending_per_user=int(data_config.direct_upload_max_pending_per_user),
+            complete_grace_seconds=int(
+                data_config.direct_upload_complete_grace_seconds
+            ),
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprints[priority] if idempotency_key else None,
+        )
+    except ContentIdempotencyKeyInUse:
+        # A concurrent request with the same key reserved first.
+        existing = await system_store.get_content_job_by_idempotency_key(
+            user_id=user_id, idempotency_key=idempotency_key
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=409, detail="Idempotency-Key is already in use"
+            )
+        return await _replay_direct_upload(
+            existing,
+            replay_fingerprints=replay_fingerprints,
+            request=request,
+            priority=priority,
+        )
+    except ContentUploadReservationLimit:
+        runtime.observability.record_content_upload(priority, "direct_limited")
+        return _upload_error_response(
+            request,
+            status_code=429,
+            code="TOO_MANY_PENDING_UPLOADS",
+            message=(
+                "Too many unfinished direct uploads; complete one or wait for "
+                "it to expire"
+            ),
+            retryable=True,
+        )
+    if priority != requested_priority:
+        logger.info(
+            "content_upload_priority_lowered: content_id=%s request_id=%s "
+            "requested=%s effective=%s",
+            content_id,
+            request.state.request_id,
+            requested_priority,
+            priority,
+        )
+    runtime.observability.record_content_upload(priority, "direct_reserved")
+    return _direct_upload_ticket(job, upload=upload)
+
+
+@app.post(_DIRECT_UPLOAD_PATH + "/{content_id}/complete")
+async def complete_direct_upload(
+    request: Request,
+    content_id: str = PathParam(..., min_length=1, max_length=64),
+    user_id: Optional[str] = Query(
+        None, min_length=1, max_length=255, regex=USER_ID_PATTERN
+    ),
+):
+    """Stage a direct upload once its object is in storage.
+
+    Still accepted while DATA_DIRECT_UPLOAD_ENABLED is off, so uploads that
+    were reserved before the flag was turned off can finish.
+    """
+    runtime = app.state.runtime
+    owner = _direct_upload_owner(request, user_id)
+    await _require_direct_upload_dependencies(runtime, check_health=False)
+    job = await system_store.get_content_job(content_id)
+    # 404, not 403, so content IDs of other users cannot be probed.
+    if job is None or job.get("user_id") != owner or not _is_direct_upload(job):
+        raise HTTPException(status_code=404, detail="Direct upload not found")
+    if job["status"] != CONTENT_AWAITING_UPLOAD_STATUS:
+        return await _direct_upload_state_response(job, request)
+    if _direct_upload_complete_deadline_passed(job, runtime.config):
+        return _direct_upload_expired_response(request, content_id)
+    dependency_error = await _content_upload_dependency_error(runtime)
+    if dependency_error:
+        raise HTTPException(status_code=503, detail=dependency_error)
+
+    incoming_uri = str(job["payload"]["incoming_uri"])
+    head = await object_storage.head_upload_object(incoming_uri)
+    if head is None:
+        # A concurrent /complete may have staged the job and removed the object.
+        current = await system_store.get_content_job(content_id)
+        if current is not None and current["status"] != CONTENT_AWAITING_UPLOAD_STATUS:
+            return await _direct_upload_state_response(current, request)
+        return _upload_error_response(
+            request,
+            status_code=409,
+            code="DIRECT_UPLOAD_OBJECT_MISSING",
+            message="Upload the file to the presigned URL before completing",
+            retryable=True,
+            content_id=content_id,
+        )
+    mismatch = _direct_upload_mismatch(
+        job, head, max_size=int(runtime.config.data_config.max_file_size)
+    )
+    if mismatch:
+        return _upload_error_response(
+            request,
+            status_code=422,
+            code="DIRECT_UPLOAD_MISMATCH",
+            message=mismatch,
+            content_id=content_id,
+        )
+
+    # A fresh raw key per attempt: a concurrent /complete can never overwrite
+    # the object the staged job points at.
+    raw_object = object_storage.build_object_name(
+        content_id=f"{content_id}-{uuid.uuid4().hex[:12]}",
+        suffix=Path(incoming_uri).suffix,
+    )
+    try:
+        raw_uri = await object_storage.copy_upload_object(
+            incoming_uri, object_name=raw_object, if_match=head.etag
+        )
+    except UploadObjectChanged:
+        # A concurrent /complete may have staged the job and removed the
+        # incoming object between our HEAD and the copy.
+        current = await system_store.get_content_job(content_id)
+        if current is not None and current["status"] != CONTENT_AWAITING_UPLOAD_STATUS:
+            return await _direct_upload_state_response(current, request)
+        return _upload_error_response(
+            request,
+            status_code=409,
+            code="DIRECT_UPLOAD_CHANGED",
+            message="The uploaded object changed while it was checked; complete again",
+            retryable=True,
+            content_id=content_id,
+        )
+
+    priority = str(job.get("priority") or "normal")
+    task = prepare_content_task(
+        content_id=content_id,
+        pipeline_version=runtime.config.model_config.content_pipeline_version,
+        storage_path=raw_uri,
+        filename=job.get("filename"),
+        user_id=job.get("user_id"),
+        priority=priority,
+        request_id=request.state.request_id,
+        timestamp=time.time(),
+    )
+    published = False
+    try:
+        finalized, current = await system_store.finalize_direct_upload(
+            task, storage_path=raw_uri
+        )
+    except Exception:
+        if not await _finalize_committed_despite_error(content_id, raw_uri):
+            raise
+        # Staged even though the call raised; the publisher enqueues it.
+    else:
+        if not finalized:
+            # Another /complete staged it first, or it expired: this copy is
+            # referenced by nothing.
+            await _delete_uploaded_object_quietly(raw_uri)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Direct upload not found")
+            return await _direct_upload_state_response(current, request)
+        published = await _publish_staged_content_task(
+            system_store=system_store,
+            kafka_manager=kafka_manager,
+            event_id=task.event_id,
+            lease_seconds=runtime.config.service_topology_config.content_outbox_lease_seconds,
+        )
+    # Best effort: the incoming/ lifecycle rule removes it otherwise.
+    await _delete_uploaded_object_quietly(incoming_uri)
+    if not published:
+        runtime.observability.record_content_upload(priority, "enqueue_failed")
+        return _content_enqueue_pending_response(
+            request, content_id, effective_priority=priority
+        )
+    await feature_store.update_content_status(content_id, "queued")
+    runtime.observability.record_content_upload(priority, "queued")
+    return {
+        "content_id": content_id,
+        "filename": job.get("filename"),
+        "size_bytes": head.size,
+        "status": "queued",
+        "effective_priority": priority,
+        "message": f"Content uploaded and queued for processing (priority: {priority}).",
+    }
+
+
+def direct_upload_request_fingerprint(
+    *, filename: str, content_type: str, size_bytes: int, priority: str
+) -> str:
+    """Identity of a direct-upload reservation for Idempotency-Key replay.
+
+    The ``v2:`` prefix keeps it distinct from multipart upload fingerprints, so
+    a key used for one kind of upload is rejected (409) for the other.
+    """
+    canonical = json.dumps(
+        {
+            "content_type": content_type,
+            "filename": filename,
+            "priority": priority,
+            "size_bytes": int(size_bytes),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "v2:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _upload_error_response(
+    request: Request,
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    retryable: bool = False,
+    **extra: Any,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "request_id": request.state.request_id,
+                "retryable": retryable,
+            },
+            **extra,
+        },
+    )
+
+
+def _direct_upload_owner(request: Request, user_id: Optional[str]) -> str:
+    """The user a direct upload belongs to: the bearer subject or ``user_id``."""
+    subject = _bearer_subject(request)
+    if subject is not None:
+        user_id = user_id or subject
+        _enforce_bearer_user(request, user_id)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Direct uploads require a user_id")
+    return user_id
+
+
+async def _require_direct_upload_dependencies(runtime, *, check_health: bool) -> None:
+    if (
+        not kafka_manager
+        or not runtime.config.kafka_config.enable
+        or system_store is None
+        or object_storage is None
+        or not object_storage.is_remote
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Direct uploads require Postgres, S3 object storage, and Kafka",
+        )
+    if check_health:
+        dependency_error = await _content_upload_dependency_error(runtime)
+        if dependency_error:
+            raise HTTPException(status_code=503, detail=dependency_error)
+
+
+def _is_direct_upload(job: Dict[str, Any]) -> bool:
+    return job.get("declared_size_bytes") is not None and bool(
+        (job.get("payload") or {}).get("incoming_uri")
+    )
+
+
+def _direct_upload_complete_deadline_passed(job: Dict[str, Any], config) -> bool:
+    expires_at = job.get("upload_expires_at")
+    if expires_at is None:
+        return False
+    grace = int(config.data_config.direct_upload_complete_grace_seconds)
+    return time.time() > float(expires_at) + grace
+
+
+def _direct_upload_mismatch(
+    job: Dict[str, Any], head: ObjectHead, *, max_size: int
+) -> Optional[str]:
+    declared_size = int(job["declared_size_bytes"])
+    if head.size != declared_size:
+        return (
+            f"Uploaded object is {head.size} bytes but {declared_size} were declared"
+        )
+    if head.size > max_size:
+        return "Uploaded file exceeds size limit"
+    content_type = head.content_type.split(";", 1)[0].strip().lower()
+    declared_type = str(job.get("declared_content_type") or "")
+    if content_type != declared_type:
+        return (
+            f"Uploaded object has Content-Type {content_type!r} but "
+            f"{declared_type!r} was declared"
+        )
+    return None
+
+
+async def _sign_direct_upload(
+    incoming_uri: str, *, content_type: str, size_bytes: int, expires_in: int
+) -> Dict[str, Any]:
+    # Off the event loop: signing may fetch or refresh role credentials.
+    return await asyncio.to_thread(
+        object_storage.presign_direct_upload,
+        incoming_uri,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        expires_in=expires_in,
+    )
+
+
+def _direct_upload_ticket(
+    job: Dict[str, Any], *, upload: Dict[str, Any], replay: bool = False
+) -> Dict[str, Any]:
+    content_id = str(job["content_id"])
+    response = {
+        "content_id": content_id,
+        "status": CONTENT_AWAITING_UPLOAD_STATUS,
+        "upload": upload,
+        "expires_at": job.get("upload_expires_at"),
+        "size_bytes": int(job["declared_size_bytes"]),
+        "max_file_size": int(app.state.runtime.config.data_config.max_file_size),
+        "effective_priority": job.get("priority"),
+        "complete_path": f"{_DIRECT_UPLOAD_PATH}/{content_id}/complete",
+    }
+    if replay:
+        response["idempotent_replay"] = True
+    return response
+
+
+async def _replay_direct_upload(
+    existing: Dict[str, Any],
+    *,
+    replay_fingerprints: FrozenSet[str],
+    request: Request,
+    priority: str,
+):
+    """Answer a reservation retried with the same Idempotency-Key."""
+    runtime = app.state.runtime
+    content_id = str(existing["content_id"])
+    if existing.get("request_fingerprint") not in replay_fingerprints:
+        runtime.observability.record_content_upload(priority, "idempotency_conflict")
+        return _upload_error_response(
+            request,
+            status_code=409,
+            code="IDEMPOTENCY_KEY_REUSED",
+            message="Idempotency-Key was already used for a different upload",
+            content_id=content_id,
+        )
+    status = str(existing.get("status") or "")
+    effective_priority = existing.get("priority") or priority
+    if status in TERMINAL_FAILED_CONTENT_STATUSES:
+        runtime.observability.record_content_upload(
+            effective_priority, "idempotency_failed"
+        )
+        return _upload_error_response(
+            request,
+            status_code=409,
+            code="IDEMPOTENCY_KEY_JOB_FAILED",
+            message=(
+                "The upload for this Idempotency-Key failed; retry with a new "
+                "Idempotency-Key"
+            ),
+            content_id=content_id,
+            status=status,
+        )
+    if status == CONTENT_AWAITING_UPLOAD_STATUS:
+        remaining = float(existing.get("upload_expires_at") or 0.0) - time.time()
+        if remaining < _DIRECT_UPLOAD_MIN_RESIGN_SECONDS:
+            runtime.observability.record_content_upload(
+                effective_priority, "idempotency_failed"
+            )
+            return _upload_error_response(
+                request,
+                status_code=409,
+                code="DIRECT_UPLOAD_URL_EXPIRED",
+                message=(
+                    "The upload URL for this Idempotency-Key has expired; complete "
+                    "the upload if the file was sent, otherwise retry with a new "
+                    "Idempotency-Key"
+                ),
+                content_id=content_id,
+                status=status,
+            )
+        runtime.observability.record_content_upload(
+            effective_priority, "idempotent_replay"
+        )
+        # Re-sign for the time the reservation has left, so the new policy
+        # does not outlive it.
+        upload = await _sign_direct_upload(
+            str(existing["payload"]["incoming_uri"]),
+            content_type=str(existing["declared_content_type"]),
+            size_bytes=int(existing["declared_size_bytes"]),
+            expires_in=int(remaining),
+        )
+        return _direct_upload_ticket(existing, upload=upload, replay=True)
+    runtime.observability.record_content_upload(effective_priority, "idempotent_replay")
+    return {
+        "content_id": content_id,
+        "status": status,
+        "upload": None,
+        "effective_priority": effective_priority,
+        "idempotent_replay": True,
+        "message": "This upload was already completed.",
+    }
+
+
+def _direct_upload_expired_response(request: Request, content_id: str) -> Response:
+    return _upload_error_response(
+        request,
+        status_code=410,
+        code="DIRECT_UPLOAD_EXPIRED",
+        message="The direct upload expired before it was completed; start a new one",
+        content_id=content_id,
+        status=CONTENT_UPLOAD_EXPIRED_STATUS,
+    )
+
+
+async def _direct_upload_state_response(job: Dict[str, Any], request: Request):
+    """Answer /complete for a job that is no longer awaiting its upload."""
+    runtime = app.state.runtime
+    content_id = str(job["content_id"])
+    status = str(job.get("status") or "")
+    priority = str(job.get("priority") or "normal")
+    if status == CONTENT_UPLOAD_EXPIRED_STATUS:
+        return _direct_upload_expired_response(request, content_id)
+    if status in TERMINAL_FAILED_CONTENT_STATUSES:
+        return _upload_error_response(
+            request,
+            status_code=409,
+            code="CONTENT_JOB_FAILED",
+            message="Processing of this upload failed; start a new upload",
+            content_id=content_id,
+            status=status,
+        )
+    if status == "pending_publish" and job.get("task_event_id"):
+        published = await _publish_staged_content_task(
+            system_store=system_store,
+            kafka_manager=kafka_manager,
+            event_id=str(job["task_event_id"]),
+            lease_seconds=runtime.config.service_topology_config.content_outbox_lease_seconds,
+        )
+        if not published:
+            runtime.observability.record_content_upload(priority, "enqueue_failed")
+            return _content_enqueue_pending_response(
+                request, content_id, effective_priority=priority
+            )
+        await feature_store.update_content_status(content_id, "queued")
+        status = "queued"
+    runtime.observability.record_content_upload(priority, "idempotent_replay")
+    return {
+        "content_id": content_id,
+        "filename": job.get("filename"),
+        "size_bytes": job.get("declared_size_bytes"),
+        "status": status,
+        "effective_priority": priority,
+        "already_completed": True,
+        "message": "This upload was already completed.",
+    }
+
+
+async def _finalize_committed_despite_error(content_id: str, raw_uri: str) -> bool:
+    """After finalize raised, decide whether it committed, like
+    ``_resolve_unknown_stage_outcome``. Deletes the raw copy only when the job
+    definitely does not point at it; if the lookup fails too, the orphan
+    reconciler deletes it after the grace period."""
+    try:
+        job = await system_store.get_content_job(content_id)
+    except Exception as lookup_error:
+        logger.warning(
+            "content_direct_upload_finalize_outcome_unknown: content_id=%s "
+            "keeping object for reconciliation: %s",
+            content_id,
+            lookup_error,
+        )
+        return False
+    if job is not None and job.get("storage_path") == raw_uri:
+        logger.warning(
+            "content_direct_upload_finalized_despite_error: content_id=%s status=%s",
+            content_id,
+            job.get("status"),
+        )
+        return True
+    await _delete_uploaded_object_quietly(raw_uri)
+    return False
+
+
 @app.get("/api/content/upload-limits", response_model=UploadLimitsResponse)
 async def content_upload_limits() -> UploadLimitsResponse:
     """Upload constraints the gateway enforces, so clients validate the same way."""
@@ -1223,6 +1804,7 @@ async def content_upload_limits() -> UploadLimitsResponse:
         allowed_mime_types=sorted(
             {mime.lower() for mime in data_config.allowed_mime_types}
         ),
+        direct_upload_enabled=bool(data_config.direct_upload_enabled),
     )
 
 
@@ -1333,9 +1915,16 @@ async def metrics():
 
 def validate_upload_file(file: UploadFile, config: Config) -> str:
     """Validate upload file metadata before streaming it to disk."""
-    filename = file.filename or ""
+    return validate_upload_metadata(file.filename, file.content_type, config)
+
+
+def validate_upload_metadata(
+    filename: Optional[str], content_type: Optional[str], config: Config
+) -> str:
+    """Return the lowercase suffix of an allowed filename and MIME type, or 400."""
+    filename = filename or ""
     suffix = Path(filename).suffix.lower()
-    content_type = (file.content_type or "").lower()
+    content_type = (content_type or "").lower()
 
     if not filename:
         raise HTTPException(status_code=400, detail="Filename is required")

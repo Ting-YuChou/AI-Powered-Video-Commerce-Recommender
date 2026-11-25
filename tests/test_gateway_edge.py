@@ -341,6 +341,35 @@ def test_body_limit_rejects_oversized_json_and_unsized_uploads(monkeypatch):
     assert unsized.status_code == 411
 
 
+def test_direct_upload_routes_require_auth_and_bound_json_bodies(monkeypatch):
+    config = _gateway_config(auth_mode="api_key", api_key="secret")
+    config.api_config.max_request_size = 1024
+    _install_gateway(monkeypatch, config)
+    client = TestClient(gateway_api.app)
+
+    for path in ("/api/content/uploads", "/api/content/uploads/c1/complete"):
+        assert client.post(path, json={}).status_code == 401
+    # Reservations are small JSON bodies, held to API_MAX_REQUEST_SIZE.
+    too_big = client.post(
+        "/api/content/uploads",
+        content=b"{" + b" " * 2048 + b"}",
+        headers={"Content-Type": "application/json", "x-api-key": "secret"},
+    )
+    assert too_big.status_code == 413
+    disabled = client.post(
+        "/api/content/uploads",
+        json={
+            "filename": "clip.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 10,
+            "user_id": "u1",
+        },
+        headers={"x-api-key": "secret"},
+    )
+    assert disabled.status_code == 404
+    assert disabled.json()["error"]["code"] == "DIRECT_UPLOAD_DISABLED"
+
+
 # --- identity ----------------------------------------------------------------
 
 

@@ -120,7 +120,11 @@ export const normalizeUploadLimits = (limits) => {
 
 // Statuses after which a content job will never complete; polling stops on
 // these. Matches the gateway's TERMINAL_FAILED_CONTENT_STATUSES.
-const TERMINAL_FAILED_CONTENT_STATUSES = new Set(['failed', 'failed_missing_object']);
+const TERMINAL_FAILED_CONTENT_STATUSES = new Set([
+  'failed',
+  'failed_missing_object',
+  'upload_expired',
+]);
 
 export const isTerminalFailedStatus = (status) => TERMINAL_FAILED_CONTENT_STATUSES.has(
   String(status || '').toLowerCase()

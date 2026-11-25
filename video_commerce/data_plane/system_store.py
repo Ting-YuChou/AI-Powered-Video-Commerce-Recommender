@@ -101,6 +101,17 @@ class ContentIdempotencyKeyInUse(Exception):
     """Another content job already owns this (user_id, Idempotency-Key) pair."""
 
 
+# Direct uploads (migration 014): a reserved job waits in AWAITING_UPLOAD until
+# /complete stages it, or the publisher marks it UPLOAD_EXPIRED.
+CONTENT_AWAITING_UPLOAD_STATUS = "awaiting_upload"
+CONTENT_UPLOAD_EXPIRED_STATUS = "upload_expired"
+CONTENT_AWAITING_UPLOAD_INDEX = "ix_content_jobs_awaiting_upload"
+
+
+class ContentUploadReservationLimit(Exception):
+    """The user already has the maximum number of open direct-upload reservations."""
+
+
 @dataclass(frozen=True)
 class PreparedContentTask:
     event_id: str
@@ -129,6 +140,11 @@ def _content_job_dict(row: "ContentJob") -> Dict[str, Any]:
         "task_event_id": row.task_event_id,
         "idempotency_key": row.idempotency_key,
         "request_fingerprint": row.request_fingerprint,
+        "declared_size_bytes": row.declared_size_bytes,
+        "declared_content_type": row.declared_content_type,
+        "upload_expires_at": (
+            row.upload_expires_at.timestamp() if row.upload_expires_at else None
+        ),
         "created_at": row.created_at.timestamp() if row.created_at else None,
         "updated_at": row.updated_at.timestamp() if row.updated_at else None,
     }
@@ -848,6 +864,16 @@ class ContentJob(Base):
     )
     request_fingerprint: Mapped[Optional[str]] = mapped_column(
         String(128), nullable=True
+    )
+    # Direct uploads only (migration 014).
+    declared_size_bytes: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    declared_content_type: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    upload_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1724,7 +1750,7 @@ class SystemStore:
         )
 
     async def _ensure_content_reliability_schema(self, conn) -> None:
-        """Apply migration 013 additively for existing content tables."""
+        """Apply migrations 013 and 014 additively for existing content tables."""
         await self._add_missing_columns(
             conn,
             "content_jobs",
@@ -1750,6 +1776,23 @@ class SystemStore:
             conn,
             "content_processing_runs",
             {"redrive_count": "INTEGER NOT NULL DEFAULT 0"},
+        )
+        # migrations/postgres/014_content_direct_upload.sql
+        await self._add_missing_columns(
+            conn,
+            "content_jobs",
+            {
+                "declared_size_bytes": "BIGINT",
+                "declared_content_type": "VARCHAR(255)",
+                "upload_expires_at": "TIMESTAMPTZ",
+            },
+        )
+        await self._create_index_if_missing(
+            conn,
+            CONTENT_AWAITING_UPLOAD_INDEX,
+            f"CREATE INDEX IF NOT EXISTS {CONTENT_AWAITING_UPLOAD_INDEX} "
+            "ON content_jobs (upload_expires_at) "
+            f"WHERE status = '{CONTENT_AWAITING_UPLOAD_STATUS}'",
         )
 
     async def _ensure_partitioned_interaction_events(self, conn) -> None:
@@ -3425,6 +3468,186 @@ class SystemStore:
             raise
         self._update_pool_metrics()
         return "duplicate" if existing is not None else "inserted"
+
+    async def reserve_direct_upload(
+        self,
+        *,
+        content_id: str,
+        filename: str,
+        user_id: str,
+        priority: str,
+        request_id: Optional[str],
+        incoming_uri: str,
+        declared_size_bytes: int,
+        declared_content_type: str,
+        upload_expires_at: float,
+        max_pending_per_user: int,
+        complete_grace_seconds: int,
+        idempotency_key: Optional[str] = None,
+        request_fingerprint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Insert an ``awaiting_upload`` job for a direct upload.
+
+        The job has no storage_path and no outbox row until
+        ``finalize_direct_upload``. Raises ``ContentUploadReservationLimit`` when
+        the user already has ``max_pending_per_user`` reservations that can
+        still be completed (URL expiry plus ``complete_grace_seconds`` not yet
+        passed), and ``ContentIdempotencyKeyInUse`` when another job owns the key.
+        """
+        if not self.enabled:
+            raise RuntimeError("direct uploads require Postgres")
+        if not user_id:
+            raise ValueError("direct uploads require a user_id")
+        now = _utc_now()
+        row = ContentJob(
+            content_id=content_id,
+            filename=filename,
+            storage_path=None,
+            user_id=user_id,
+            priority=priority,
+            status=CONTENT_AWAITING_UPLOAD_STATUS,
+            error_message=None,
+            payload={"request_id": request_id, "incoming_uri": incoming_uri},
+            pipeline_version=None,
+            task_event_id=None,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint if idempotency_key else None,
+            declared_size_bytes=int(declared_size_bytes),
+            declared_content_type=declared_content_type,
+            upload_expires_at=datetime.fromtimestamp(
+                float(upload_expires_at), tz=timezone.utc
+            ),
+            created_at=now,
+            updated_at=now,
+        )
+        try:
+            async with self.session_factory.begin() as session:
+                # One reservation at a time per user, so concurrent requests
+                # cannot both pass the cap. Released at commit.
+                await session.execute(
+                    select(
+                        func.pg_advisory_xact_lock(
+                            func.hashtextextended(
+                                f"content-direct-upload:{user_id}", 0
+                            )
+                        )
+                    )
+                )
+                pending = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(ContentJob)
+                        .where(
+                            ContentJob.user_id == user_id,
+                            ContentJob.status == CONTENT_AWAITING_UPLOAD_STATUS,
+                            # /complete accepts a reservation until its URL
+                            # expiry plus the grace period, so count it until then.
+                            ContentJob.upload_expires_at
+                            > func.now()
+                            - timedelta(seconds=max(0, int(complete_grace_seconds))),
+                        )
+                    )
+                ).scalar_one()
+                if int(pending) >= int(max_pending_per_user):
+                    raise ContentUploadReservationLimit(user_id)
+                session.add(row)
+                await session.flush()
+        except IntegrityError as exc:
+            if CONTENT_UPLOAD_IDEMPOTENCY_INDEX in str(exc.orig or exc):
+                raise ContentIdempotencyKeyInUse(str(idempotency_key)) from exc
+            raise
+        self._update_pool_metrics()
+        return _content_job_dict(row)
+
+    async def finalize_direct_upload(
+        self,
+        task: PreparedContentTask,
+        *,
+        storage_path: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Stage a reserved direct upload: ``awaiting_upload`` -> ``pending_publish``.
+
+        Writes storage_path and the outbox row in one transaction, like
+        ``stage_content_task``. Returns ``(True, job)`` when this call staged
+        it, ``(False, job)`` with the current job when it was no longer
+        awaiting upload (another /complete won, or it expired), and
+        ``(False, None)`` when the job does not exist.
+        """
+        if not self.enabled:
+            raise RuntimeError("content task outbox requires Postgres")
+        now = _utc_now()
+        outbox_stmt = (
+            pg_insert(ContentTaskOutbox)
+            .values(
+                event_id=task.event_id,
+                content_id=task.content_id,
+                pipeline_version=task.pipeline_version,
+                payload_hash=task.payload_hash,
+                event_payload=task.payload,
+                next_attempt_at=now,
+            )
+            .on_conflict_do_nothing(index_elements=[ContentTaskOutbox.event_id])
+        )
+        async with self.session_factory.begin() as session:
+            row = await session.get(ContentJob, task.content_id, with_for_update=True)
+            if row is None:
+                return False, None
+            if row.status != CONTENT_AWAITING_UPLOAD_STATUS:
+                return False, _content_job_dict(row)
+            existing = await session.get(ContentTaskOutbox, task.event_id)
+            if existing is not None and existing.payload_hash != task.payload_hash:
+                raise ValueError("content task outbox event_id payload collision")
+            row.status = "pending_publish"
+            row.storage_path = storage_path
+            row.pipeline_version = task.pipeline_version
+            row.task_event_id = task.event_id
+            row.error_message = None
+            row.updated_at = now
+            await session.flush()
+            await session.execute(outbox_stmt)
+            job = _content_job_dict(row)
+        self._update_pool_metrics()
+        return True, job
+
+    async def expire_direct_uploads(
+        self, *, grace_seconds: int, batch_size: int = 100
+    ) -> int:
+        """Mark reservations not completed within their URL TTL plus grace as expired.
+
+        Uses the database clock and SKIP LOCKED, so it never waits on a
+        concurrent /complete; that row is retried on the next pass.
+        """
+        if not self.enabled:
+            return 0
+        cutoff = func.now() - timedelta(seconds=max(0, int(grace_seconds)))
+        candidates = (
+            select(ContentJob.content_id)
+            .where(
+                ContentJob.status == CONTENT_AWAITING_UPLOAD_STATUS,
+                ContentJob.upload_expires_at < cutoff,
+            )
+            .order_by(ContentJob.upload_expires_at)
+            .limit(max(1, int(batch_size)))
+            .with_for_update(skip_locked=True)
+        )
+        async with self.session_factory.begin() as session:
+            content_ids = (await session.execute(candidates)).scalars().all()
+            if not content_ids:
+                return 0
+            result = await session.execute(
+                update(ContentJob)
+                .where(
+                    ContentJob.content_id.in_(content_ids),
+                    ContentJob.status == CONTENT_AWAITING_UPLOAD_STATUS,
+                )
+                .values(
+                    status=CONTENT_UPLOAD_EXPIRED_STATUS,
+                    error_message="Direct upload was not completed before it expired",
+                    updated_at=_utc_now(),
+                )
+            )
+        self._update_pool_metrics()
+        return int(result.rowcount or 0)
 
     async def claim_content_task_outbox(
         self, *, worker_id: str, batch_size: int, lease_seconds: int

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 from typing import AsyncIterator, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -23,6 +24,9 @@ logger = logging.getLogger(__name__)
 # target raw videos without touching ``artifacts/`` or ``content-features/``
 # under the same prefix. deploy/object-storage/lifecycle.json depends on it.
 RAW_UPLOAD_SUBPREFIX = "raw"
+# Direct uploads are POSTed by the client to ``<prefix>/incoming/`` and copied
+# to ``raw/`` on /complete. A lifecycle rule expires ``incoming/`` after a day.
+INCOMING_UPLOAD_SUBPREFIX = "incoming"
 
 
 @dataclass(frozen=True)
@@ -32,12 +36,25 @@ class StoredObject:
     last_modified: float
 
 
+@dataclass(frozen=True)
+class ObjectHead:
+    size: int
+    etag: str
+    content_type: str
+
+
+class UploadObjectChanged(Exception):
+    """The copy source changed or was removed after it was checked."""
+
+
 class ObjectStorage:
     """Persist uploads either locally or to a remote S3-compatible bucket."""
 
     def __init__(self, config: ObjectStorageConfig):
         self.config = config
         self._client = None
+        self._presign_client = None
+        self._presign_client_lock = threading.Lock()
 
     @property
     def is_remote(self) -> bool:
@@ -46,12 +63,32 @@ class ObjectStorage:
     async def initialize(self) -> None:
         if not self.is_remote:
             return
+        self._client = self._build_client(self.config.endpoint_url)
+        if self.config.create_bucket_on_startup:
+            await asyncio.to_thread(self._ensure_bucket_exists)
+
+    def _get_presign_client(self):
+        """Client that signs presigned POSTs for the browser-facing endpoint.
+
+        Built on first use, so services that never presign (and the gateway
+        while direct uploads are off) do not depend on
+        OBJECT_STORAGE_PUBLIC_ENDPOINT_URL being valid.
+        """
+        with self._presign_client_lock:
+            if self._presign_client is None:
+                self._presign_client = self._build_client(
+                    self.config.public_endpoint_url or self.config.endpoint_url,
+                    signature_version="s3v4",
+                )
+            return self._presign_client
+
+    def _build_client(self, endpoint_url: Optional[str], **config_kwargs):
         import boto3
         from botocore.client import Config as BotoConfig
 
-        self._client = boto3.client(
+        return boto3.client(
             "s3",
-            endpoint_url=self.config.endpoint_url,
+            endpoint_url=endpoint_url,
             region_name=self.config.region,
             aws_access_key_id=self.config.access_key_id,
             aws_secret_access_key=self.config.secret_access_key,
@@ -64,10 +101,9 @@ class ObjectStorage:
                 connect_timeout=self.config.connect_timeout_seconds,
                 read_timeout=self.config.read_timeout_seconds,
                 retries={"max_attempts": self.config.max_attempts, "mode": "standard"},
+                **config_kwargs,
             ),
         )
-        if self.config.create_bucket_on_startup:
-            await asyncio.to_thread(self._ensure_bucket_exists)
 
     async def health_check(self, *, local_path: Optional[str] = None) -> dict:
         """Verify the storage operations required by uploads and reconciliation."""
@@ -278,15 +314,98 @@ class ObjectStorage:
                 )
                 return True
             except Exception as exc:
-                response = getattr(exc, "response", {}) or {}
-                status = (response.get("ResponseMetadata", {}) or {}).get(
-                    "HTTPStatusCode"
-                )
-                code = str((response.get("Error", {}) or {}).get("Code") or "")
-                if status == 404 or code in {"404", "NoSuchKey", "NotFound"}:
+                if self._is_not_found(exc):
                     return False
                 raise
         return bool(storage_path and os.path.exists(storage_path))
+
+    def object_uri(self, object_name: str) -> str:
+        return f"s3://{self.config.bucket}/{object_name}"
+
+    def presign_direct_upload(
+        self,
+        storage_uri: str,
+        *,
+        content_type: str,
+        size_bytes: int,
+        expires_in: int,
+    ) -> dict:
+        """Presigned POST that writes exactly one file of this size and type.
+
+        Returns ``{"url": ..., "fields": {...}}``; the client sends every field
+        followed by the file as ``multipart/form-data``. The policy pins the
+        key, the Content-Type, the exact length and SSE, so the client cannot
+        write anywhere else or send a different size. Blocking: signing may
+        fetch or refresh credentials, so call it from a worker thread.
+        """
+        if not self.is_remote:
+            raise RuntimeError("direct uploads require S3 object storage")
+        bucket, object_name = self._parse_s3_uri(storage_uri)
+        fields = {"Content-Type": content_type}
+        conditions: list = [
+            ["content-length-range", int(size_bytes), int(size_bytes)],
+            {"Content-Type": content_type},
+        ]
+        if self.config.server_side_encryption:
+            fields["x-amz-server-side-encryption"] = self.config.server_side_encryption
+            conditions.append(
+                {"x-amz-server-side-encryption": self.config.server_side_encryption}
+            )
+        post = self._get_presign_client().generate_presigned_post(
+            Bucket=bucket,
+            Key=object_name,
+            Fields=fields,
+            Conditions=conditions,
+            ExpiresIn=int(expires_in),
+        )
+        return {"url": post["url"], "fields": dict(post["fields"])}
+
+    async def head_upload_object(self, storage_uri: str) -> Optional[ObjectHead]:
+        """Size, ETag and Content-Type of an S3 object, or None when it is missing."""
+        bucket, key = self._parse_s3_uri(storage_uri)
+        try:
+            response = await asyncio.to_thread(
+                self._client.head_object, Bucket=bucket, Key=key
+            )
+        except Exception as exc:
+            if self._is_not_found(exc):
+                return None
+            raise
+        return ObjectHead(
+            size=int(response.get("ContentLength") or 0),
+            etag=str(response.get("ETag") or ""),
+            content_type=str(response.get("ContentType") or ""),
+        )
+
+    async def copy_upload_object(
+        self, source_uri: str, *, object_name: str, if_match: str
+    ) -> str:
+        """Server-side copy of ``source_uri`` to ``object_name`` in the bucket.
+
+        Copies only while the source still has ETag ``if_match``; raises
+        ``UploadObjectChanged`` if it was replaced or removed since then.
+        """
+        if not if_match:
+            raise ValueError("if_match must be the ETag of the checked source")
+        source_bucket, source_key = self._parse_s3_uri(source_uri)
+        kwargs = {
+            "Bucket": self.config.bucket,
+            "Key": object_name,
+            "CopySource": {"Bucket": source_bucket, "Key": source_key},
+            "CopySourceIfMatch": if_match,
+            "MetadataDirective": "COPY",
+        }
+        if self.config.server_side_encryption:
+            kwargs["ServerSideEncryption"] = self.config.server_side_encryption
+        if self.config.checksum_algorithm:
+            kwargs["ChecksumAlgorithm"] = self.config.checksum_algorithm
+        try:
+            await asyncio.to_thread(self._client.copy_object, **kwargs)
+        except Exception as exc:
+            if self._is_not_found(exc) or self._is_precondition_failed(exc):
+                raise UploadObjectChanged(source_uri) from exc
+            raise
+        return self.object_uri(object_name)
 
     async def list_storage_objects(self, prefix_uri: str) -> list[StoredObject]:
         if self.is_remote and self.is_remote_uri(prefix_uri):
@@ -475,9 +594,16 @@ class ObjectStorage:
             f"s3://{bucket}/{prefix}",
         ]
 
+    def build_incoming_object_name(self, *, content_id: str, suffix: str) -> str:
+        """S3 key a direct upload is POSTed to: ``<prefix>/incoming/<content_id><suffix>``."""
+        return f"{self._upload_key_prefix(INCOMING_UPLOAD_SUBPREFIX)}/{content_id}{suffix}"
+
     def _raw_upload_key_prefix(self) -> str:
+        return self._upload_key_prefix(RAW_UPLOAD_SUBPREFIX)
+
+    def _upload_key_prefix(self, subprefix: str) -> str:
         prefix = self.config.prefix.strip("/")
-        return f"{prefix}/{RAW_UPLOAD_SUBPREFIX}" if prefix else RAW_UPLOAD_SUBPREFIX
+        return f"{prefix}/{subprefix}" if prefix else subprefix
 
     def build_artifact_object_name(
         self,
@@ -624,6 +750,28 @@ class ObjectStorage:
         response = getattr(exc, "response", {}) or {}
         error = response.get("Error", {}) if isinstance(response, dict) else {}
         return str(error.get("Code", ""))
+
+    @staticmethod
+    def _get_s3_status(exc: Exception) -> Optional[int]:
+        response = getattr(exc, "response", {}) or {}
+        if not isinstance(response, dict):
+            return None
+        return (response.get("ResponseMetadata", {}) or {}).get("HTTPStatusCode")
+
+    @classmethod
+    def _is_not_found(cls, exc: Exception) -> bool:
+        return cls._get_s3_status(exc) == 404 or cls._get_s3_error_code(exc) in {
+            "404",
+            "NoSuchKey",
+            "NotFound",
+        }
+
+    @classmethod
+    def _is_precondition_failed(cls, exc: Exception) -> bool:
+        return cls._get_s3_status(exc) == 412 or cls._get_s3_error_code(exc) in {
+            "412",
+            "PreconditionFailed",
+        }
 
     @staticmethod
     def _parse_s3_uri(storage_path: str) -> Tuple[str, str]:

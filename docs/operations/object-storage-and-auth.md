@@ -10,7 +10,11 @@
 
 ## Key Layout
 In S3 mode, keys under `OBJECT_STORAGE_PREFIX` (default `uploads`) are:
-- `<prefix>/raw/<content_id><suffix>`: uploaded videos.
+- `<prefix>/raw/<content_id><suffix>`: uploaded videos. Direct uploads add a
+  random part: `<prefix>/raw/<content_id>-<random><suffix>`.
+- `<prefix>/incoming/<content_id><suffix>`: direct uploads before /complete
+  copies them to `raw/` (see
+  [Direct uploads](event-and-artifact-reliability.md#direct-uploads-migration-014)).
 - `<prefix>/artifacts/...`: model artifacts.
 - `<prefix>/content-features/...`: content feature artifacts.
 
@@ -20,9 +24,24 @@ read both the same way. Local mode is unchanged: uploads stay flat in
 `DATA_UPLOAD_DIR`.
 
 All keys stay under `<prefix>/`. Object permissions on `<prefix>/*` cover
-`raw/`. Listing is different: the orphan reconciler lists both `<prefix>/raw/`
+`raw/` and `incoming/`. Listing is different: the orphan reconciler lists both `<prefix>/raw/`
 and `<prefix>/`, so an `s3:ListBucket` condition on `s3:prefix` must allow
 both. `StringLike` `<prefix>/*` does; `StringEquals` `<prefix>/` does not.
+
+Direct uploads need these on the gateway's credentials, because a presigned
+POST acts with the permissions of whoever signed it:
+- `s3:PutObject` on `<prefix>/incoming/*` (the browser's POST) and on
+  `<prefix>/raw/*` (the copy).
+- `s3:GetObject` on `<prefix>/incoming/*` (the HEAD and the copy source).
+- `s3:DeleteObject` on `<prefix>/incoming/*` and `<prefix>/raw/*` (cleanup).
+
+Set `OBJECT_STORAGE_PUBLIC_ENDPOINT_URL` when browsers reach storage at a
+different address than the gateway does, for example `http://127.0.0.1:9000`
+for Compose MinIO while the gateway uses `http://minio:9000`. Presigned POSTs
+are signed for that endpoint. It is read only when the gateway signs a direct
+upload, and validated only while `DATA_DIRECT_UPLOAD_ENABLED=true`. The bucket also needs a CORS rule that allows
+`POST` from the frontend origin and exposes `ETag`; the frontend change that
+uses direct uploads ships it.
 
 ## Lifecycle
 `deploy/object-storage/lifecycle.json` holds the bucket lifecycle rules, in the
@@ -37,7 +56,14 @@ never change bucket configuration.
     Reprocessing old uploads pays that retrieval charge.
   - `STANDARD_IA` is an AWS storage class. Most S3-compatible stores (MinIO,
     Ceph RGW) do not have it unless an operator defines it, so they reject or
-    ignore this rule. On those, keep only the multipart rule.
+    ignore this rule. On those, keep the `incoming/` and multipart rules.
+- **Direct uploads before /complete** (`uploads/incoming/`): deleted after 1
+  day. /complete copies the file to `raw/` and deletes the incoming object, so
+  this only removes uploads that were never completed, or whose delete failed.
+  `DATA_DIRECT_UPLOAD_URL_TTL_SECONDS` plus
+  `DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS` must stay under a day so the
+  rule never removes an upload that can still be completed; config validation
+  enforces it.
 - **Incomplete multipart uploads** (whole bucket): aborted after 7 days. The
   gateway uploads large files in parts. boto3 aborts the upload when it fails,
   but a gateway killed mid-upload (eviction, OOM) leaves its parts behind,
@@ -51,7 +77,7 @@ never change bucket configuration.
      ```bash
      aws s3api get-bucket-lifecycle-configuration --bucket <bucket> > current-lifecycle.json
      ```
-  2. Write `merged-lifecycle.json`: the current rules plus the two rules from
+  2. Write `merged-lifecycle.json`: the current rules plus the three rules from
      the repo file, with `uploads/` replaced by your `OBJECT_STORAGE_PREFIX`.
   3. Put the merged file:
 
@@ -62,9 +88,10 @@ never change bucket configuration.
   Add `--endpoint-url` for a non-AWS endpoint.
 - **Legacy uploads** do not match the `raw/` rule and stay in `STANDARD`. A
   lifecycle filter cannot select only the direct children of a prefix.
-- **MinIO (Compose)** gets no rules. Community MinIO has no `STANDARD_IA`
+- **MinIO (Compose)** gets no rules yet. Community MinIO has no `STANDARD_IA`
   class (transitions need a remote tier), and it removes stale multipart
-  uploads itself.
+  uploads itself. Compose does not enable direct uploads; the change that
+  wires them into Compose also adds the `incoming/` expiry to `minio-init`.
 
 ## MinIO Bring-Up
 - Start the profile with `docker compose --profile object-storage up -d minio minio-init`.

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 from types import SimpleNamespace
+import time
 import uuid
 
 import pytest
@@ -684,6 +685,43 @@ def test_reaper_passes_policy_to_store_and_counts_outcomes():
     assert observability.redrives == [("redriven", 2), ("exhausted", 1)]
 
 
+def test_upload_expiry_stage_expires_in_batches_with_the_grace_period():
+    class ExpiryStore:
+        def __init__(self, results):
+            self.results = list(results)
+            self.calls = []
+
+        async def expire_direct_uploads(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.results.pop(0)
+
+    store = ExpiryStore([10, 10, 3])
+    publisher = ContentTaskPublisher(
+        system_store=store,
+        kafka_manager=FakeKafka(),
+        config=_reaper_config(),
+        worker_id="publisher-1",
+        direct_upload_grace_seconds=120,
+    )
+
+    assert asyncio.run(publisher.expire_direct_uploads()) == 23
+    assert store.calls == [{"grace_seconds": 120, "batch_size": 10}] * 3
+    assert ("upload_expiry", 60.0, publisher.expire_direct_uploads) in (
+        publisher.maintenance_stages()
+    )
+
+    # A full batch every time stops after a bounded number of batches.
+    from video_commerce.services.content_task_publisher.main import (
+        UPLOAD_EXPIRY_MAX_BATCHES,
+    )
+
+    busy = ExpiryStore([10] * (UPLOAD_EXPIRY_MAX_BATCHES + 1))
+    publisher.system_store = busy
+    assert asyncio.run(publisher.expire_direct_uploads()) == (
+        10 * UPLOAD_EXPIRY_MAX_BATCHES
+    )
+
+
 def test_publisher_loop_survives_failing_publishes_with_backoff(monkeypatch):
     from video_commerce.services.content_task_publisher import main as publisher_main
 
@@ -825,6 +863,20 @@ def test_upload_idempotency_migration_is_additive():
     assert "ADD COLUMN IF NOT EXISTS redrive_count INTEGER NOT NULL DEFAULT 0" in (
         migration
     )
+    assert "DROP " not in migration.upper()
+
+
+def test_direct_upload_migration_is_additive():
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "migrations/postgres/014_content_direct_upload.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "ADD COLUMN IF NOT EXISTS declared_size_bytes BIGINT" in migration
+    assert "ADD COLUMN IF NOT EXISTS declared_content_type VARCHAR(255)" in migration
+    assert "ADD COLUMN IF NOT EXISTS upload_expires_at TIMESTAMPTZ" in migration
+    assert "CREATE INDEX IF NOT EXISTS ix_content_jobs_awaiting_upload" in migration
+    assert "WHERE status = 'awaiting_upload'" in migration
     assert "DROP " not in migration.upper()
 
 
@@ -1135,6 +1187,131 @@ def test_reaper_ignores_renewing_run_and_uses_database_clock(monkeypatch):
             )
         finally:
             await _cleanup_content(store, [content_id])
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_direct_upload_reserve_finalize_and_expire_in_postgres():
+    from sqlalchemy import text
+
+    from video_commerce.data_plane.system_store import (
+        ContentIdempotencyKeyInUse,
+        ContentUploadReservationLimit,
+    )
+
+    store = _postgres_store()
+    user_id = f"direct-{uuid.uuid4().hex}"
+    ids = [f"content-direct-{uuid.uuid4().hex}" for _ in range(5)]
+
+    async def reserve(content_id, *, key=None, max_pending=2):
+        return await store.reserve_direct_upload(
+            content_id=content_id,
+            filename="clip.mp4",
+            user_id=user_id,
+            priority="normal",
+            request_id="request-1",
+            incoming_uri=f"s3://bucket/uploads/incoming/{content_id}.mp4",
+            declared_size_bytes=100,
+            declared_content_type="video/mp4",
+            upload_expires_at=time.time() + 900,
+            max_pending_per_user=max_pending,
+            complete_grace_seconds=3600,
+            idempotency_key=key,
+            request_fingerprint="v2:abc" if key else None,
+        )
+
+    def task_for(content_id):
+        return prepare_content_task(
+            content_id=content_id,
+            pipeline_version="pipeline-v1",
+            storage_path=f"s3://bucket/uploads/raw/{content_id}-1.mp4",
+            filename="clip.mp4",
+            user_id=user_id,
+            priority="normal",
+            request_id="request-2",
+            timestamp=100.0,
+        )
+
+    async def exercise() -> None:
+        await store.initialize()
+        try:
+            job = await reserve(ids[0], key="k1")
+            assert job["status"] == "awaiting_upload"
+            assert job["storage_path"] is None
+            assert job["task_event_id"] is None
+            assert job["declared_size_bytes"] == 100
+            assert job["declared_content_type"] == "video/mp4"
+            assert job["payload"]["incoming_uri"].endswith(f"{ids[0]}.mp4")
+            assert abs(job["upload_expires_at"] - (time.time() + 900)) < 60
+            stored = await store.get_content_job(ids[0])
+            assert stored["upload_expires_at"] == pytest.approx(
+                job["upload_expires_at"]
+            )
+            assert stored["request_fingerprint"] == "v2:abc"
+
+            # The cap counts reservations until URL expiry plus grace (3600 s).
+            await reserve(ids[1])
+            with pytest.raises(ContentUploadReservationLimit):
+                await reserve(ids[2])
+            assert await store.get_content_job(ids[2]) is None
+
+            async def expire_url(content_id, interval):
+                async with store.session_factory.begin() as session:
+                    await session.execute(
+                        text(
+                            "UPDATE content_jobs SET upload_expires_at = "
+                            f"now() - interval '{interval}' WHERE content_id = :id"
+                        ),
+                        {"id": content_id},
+                    )
+
+            await expire_url(ids[1], "30 minutes")
+            with pytest.raises(ContentUploadReservationLimit):
+                await reserve(ids[2])
+            await expire_url(ids[1], "2 hours")
+            await reserve(ids[2])
+            with pytest.raises(ContentIdempotencyKeyInUse):
+                await reserve(ids[3], key="k1", max_pending=10)
+
+            # Finalize stages the job and its outbox row once.
+            task = task_for(ids[0])
+            finalized, staged = await store.finalize_direct_upload(
+                task, storage_path=task.payload["file_path"]
+            )
+            assert finalized is True
+            assert staged["status"] == "pending_publish"
+            assert staged["storage_path"] == task.payload["file_path"]
+            assert staged["task_event_id"] == task.event_id
+            claimed = await store.claim_content_task_outbox_event(
+                task.event_id, worker_id="publisher-1", lease_seconds=60
+            )
+            assert claimed["file_path"] == task.payload["file_path"]
+            assert await store.filter_referenced_storage_paths(
+                [task.payload["file_path"]]
+            ) == {task.payload["file_path"]}
+            again, current = await store.finalize_direct_upload(
+                task_for(ids[0]), storage_path="s3://bucket/uploads/raw/other.mp4"
+            )
+            assert again is False
+            assert current["storage_path"] == task.payload["file_path"]
+            assert await store.finalize_direct_upload(
+                task_for(ids[4]), storage_path="s3://bucket/uploads/raw/x.mp4"
+            ) == (False, None)
+
+            # Expiry uses URL expiry plus grace, on the database clock.
+            assert await store.expire_direct_uploads(grace_seconds=3600) >= 1
+            assert (await store.get_content_job(ids[1]))["status"] == "upload_expired"
+            assert (await store.get_content_job(ids[2]))["status"] == "awaiting_upload"
+            assert (await store.get_content_job(ids[0]))["status"] == "pending_publish"
+            late, expired = await store.finalize_direct_upload(
+                task_for(ids[1]), storage_path="s3://bucket/uploads/raw/late.mp4"
+            )
+            assert late is False
+            assert expired["status"] == "upload_expired"
+            assert expired["storage_path"] is None
+        finally:
+            await _cleanup_content(store, ids)
             await store.close()
 
     asyncio.run(exercise())

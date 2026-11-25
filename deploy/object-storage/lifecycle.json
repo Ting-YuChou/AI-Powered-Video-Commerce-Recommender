@@ -14,6 +14,16 @@
       ]
     },
     {
+      "ID": "incoming-direct-uploads-expire-after-1-day",
+      "Filter": {
+        "Prefix": "uploads/incoming/"
+      },
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      }
+    },
+    {
       "ID": "abort-incomplete-multipart-uploads-after-7-days",
       "Filter": {
         "Prefix": ""

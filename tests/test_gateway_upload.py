@@ -646,7 +646,11 @@ async def test_upload_limits_report_the_enforced_gateway_limits(upload_env):
         "max_file_size": 12345,
         "allowed_extensions": [".mp4", ".webm"],
         "allowed_mime_types": ["video/mp4", "video/webm"],
+        "direct_upload_enabled": False,
     }
+
+    data_config.direct_upload_enabled = True
+    assert (await gateway_api.content_upload_limits()).direct_upload_enabled is True
 
 
 def test_upload_limits_route_declares_its_response_model():

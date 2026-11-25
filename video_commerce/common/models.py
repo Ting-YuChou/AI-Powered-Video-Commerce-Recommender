@@ -416,6 +416,26 @@ class UploadLimitsResponse(BaseModel):
     allowed_mime_types: List[str] = Field(
         ..., description="Lowercase MIME types accepted for the uploaded file part"
     )
+    direct_upload_enabled: bool = Field(
+        False,
+        description="Whether POST /api/content/uploads (direct upload) is offered",
+    )
+
+
+class DirectUploadRequest(BaseModel):
+    """Body of POST /api/content/uploads: reserve a direct upload to storage."""
+
+    filename: str = Field(..., min_length=1, max_length=1024)
+    content_type: str = Field(..., min_length=1, max_length=255)
+    size_bytes: int = Field(..., gt=0, description="Exact size of the file in bytes")
+    priority: str = Field("normal", description="low, normal, or high")
+    user_id: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=255,
+        regex=USER_ID_PATTERN,
+        description="Owner of the upload; defaults to the bearer token subject",
+    )
 
 
 class HealthResponse(BaseModel):

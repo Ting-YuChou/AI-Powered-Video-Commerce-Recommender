@@ -24,6 +24,7 @@ class ContentTaskPublisher:
         object_storage: Any = None,
         upload_prefixes: Sequence[str] = (),
         observability: Any = None,
+        direct_upload_grace_seconds: int = 3600,
     ) -> None:
         self.system_store = system_store
         self.kafka_manager = kafka_manager
@@ -35,6 +36,7 @@ class ContentTaskPublisher:
             raise TypeError("upload_prefixes must be a sequence of prefixes, not a str")
         self.upload_prefixes = tuple(prefix for prefix in upload_prefixes if prefix)
         self.observability = observability
+        self.direct_upload_grace_seconds = int(direct_upload_grace_seconds)
 
     async def publish_once(self) -> int:
         rows = await self.system_store.claim_content_task_outbox(
@@ -161,6 +163,25 @@ class ContentTaskPublisher:
             retention_days=self.config.content_outbox_retention_days
         )
 
+    async def expire_direct_uploads(self) -> int:
+        """Mark direct-upload reservations that were never completed as expired.
+
+        Their objects under ``incoming/`` are left to the bucket lifecycle rule.
+        """
+        batch_size = int(self.config.content_outbox_batch_size)
+        expired = 0
+        for _ in range(UPLOAD_EXPIRY_MAX_BATCHES):
+            count = await self.system_store.expire_direct_uploads(
+                grace_seconds=self.direct_upload_grace_seconds,
+                batch_size=batch_size,
+            )
+            expired += count
+            if count < batch_size:
+                break
+        if expired:
+            logger.info("content_direct_uploads_expired: count=%s", expired)
+        return expired
+
     def maintenance_stages(self) -> list[tuple[str, float, Any]]:
         """(stage, interval_seconds, action) run independently of publishing."""
         return [
@@ -172,12 +193,19 @@ class ContentTaskPublisher:
             ),
             ("reconcile", RECONCILE_INTERVAL_SECONDS, self.reconcile_and_record),
             ("prune", PRUNE_INTERVAL_SECONDS, self.prune_outbox),
+            (
+                "upload_expiry",
+                UPLOAD_EXPIRY_INTERVAL_SECONDS,
+                self.expire_direct_uploads,
+            ),
         ]
 
 
 OUTBOX_STATS_INTERVAL_SECONDS = 5.0
 RECONCILE_INTERVAL_SECONDS = 300.0
 PRUNE_INTERVAL_SECONDS = 3600.0
+UPLOAD_EXPIRY_INTERVAL_SECONDS = 60.0
+UPLOAD_EXPIRY_MAX_BATCHES = 10
 
 
 def failure_backoff_seconds(
@@ -355,6 +383,9 @@ async def main() -> None:
         config=config.service_topology_config,
         worker_id=worker_id,
         observability=observability,
+        direct_upload_grace_seconds=(
+            config.data_config.direct_upload_complete_grace_seconds
+        ),
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

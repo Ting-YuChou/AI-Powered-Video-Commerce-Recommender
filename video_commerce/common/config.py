@@ -17,8 +17,17 @@ except ImportError:
     from pydantic import BaseSettings, Field, root_validator, validator
 from pathlib import Path
 import logging
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# Largest object a single S3 CopyObject call can copy.
+S3_MAX_COPY_OBJECT_BYTES = 5 * 1024**3
+# deploy/object-storage/lifecycle.json expires <prefix>/incoming/ after 1 day.
+DIRECT_UPLOAD_INCOMING_EXPIRY_SECONDS = 86400
+# Shortest presigned-POST TTL. The gateway re-signs a replayed reservation only
+# while a minute of it is left, so the TTL must leave room for retries.
+DIRECT_UPLOAD_MIN_URL_TTL_SECONDS = 300
 
 
 def _load_secret_file_env() -> None:
@@ -2738,6 +2747,31 @@ class DataConfig(BaseSettings):
         1024 * 1024,
         description="Chunk size for streaming uploads to disk",
     )
+    # Direct uploads: the client POSTs the file straight to object storage with
+    # a presigned POST, then calls /complete. Requires OBJECT_STORAGE_BACKEND=s3.
+    direct_upload_enabled: bool = Field(
+        False,
+        description=(
+            "Offer POST /api/content/uploads (presigned direct upload to S3). "
+            "Requires OBJECT_STORAGE_BACKEND=s3."
+        ),
+    )
+    direct_upload_url_ttl_seconds: int = Field(
+        900,
+        description="How long a presigned direct-upload POST stays valid",
+    )
+    direct_upload_complete_grace_seconds: int = Field(
+        3600,
+        description=(
+            "How long after the presigned POST expires /complete is still "
+            "accepted, for uploads that started before it expired. After that "
+            "the content-task-publisher marks the job upload_expired."
+        ),
+    )
+    direct_upload_max_pending_per_user: int = Field(
+        5,
+        description="Unfinished direct-upload reservations allowed per user",
+    )
 
     # Data processing
     cleanup_temp_files: bool = Field(True, description="Cleanup temporary files")
@@ -2771,6 +2805,13 @@ class ObjectStorageConfig(BaseSettings):
     endpoint_url: Optional[str] = Field(
         None,
         description="S3-compatible endpoint URL such as http://minio:9000",
+    )
+    public_endpoint_url: Optional[str] = Field(
+        None,
+        description=(
+            "Browser-reachable endpoint for presigned direct uploads, such as "
+            "http://127.0.0.1:9000 for Compose MinIO. Defaults to endpoint_url."
+        ),
     )
     region: str = Field("us-east-1", description="Object storage region")
     bucket: Optional[str] = Field(
@@ -3335,6 +3376,8 @@ class Config:
                     errors.append(
                         "Default MinIO secret key is not allowed in production"
                     )
+        if self.data_config.direct_upload_enabled:
+            errors.extend(self._direct_upload_errors())
         if self.security_config.auth_mode not in {
             "disabled",
             "api_key",
@@ -3470,6 +3513,51 @@ class Config:
             for error in errors:
                 logger.error(f"  - {error}")
             raise ValueError("Invalid configuration")
+
+    def _direct_upload_errors(self) -> List[str]:
+        data = self.data_config
+        errors = []
+        if self.object_storage_config.backend != "s3":
+            errors.append(
+                "DATA_DIRECT_UPLOAD_ENABLED=true requires OBJECT_STORAGE_BACKEND=s3"
+            )
+        if data.max_file_size > S3_MAX_COPY_OBJECT_BYTES:
+            errors.append(
+                "DATA_DIRECT_UPLOAD_ENABLED=true requires DATA_MAX_FILE_SIZE <= 5 GiB: "
+                "/complete copies the object with a single S3 CopyObject"
+            )
+        if (
+            not DIRECT_UPLOAD_MIN_URL_TTL_SECONDS
+            <= data.direct_upload_url_ttl_seconds
+            <= 43200
+        ):
+            errors.append(
+                "DATA_DIRECT_UPLOAD_URL_TTL_SECONDS must be between "
+                f"{DIRECT_UPLOAD_MIN_URL_TTL_SECONDS} and 43200"
+            )
+        if data.direct_upload_complete_grace_seconds < 0:
+            errors.append("DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS must be >= 0")
+        if (
+            data.direct_upload_url_ttl_seconds
+            + data.direct_upload_complete_grace_seconds
+            >= DIRECT_UPLOAD_INCOMING_EXPIRY_SECONDS
+        ):
+            errors.append(
+                "DATA_DIRECT_UPLOAD_URL_TTL_SECONDS + "
+                "DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS must be under one day: "
+                "the incoming/ lifecycle rule deletes uploads after a day"
+            )
+        if data.direct_upload_max_pending_per_user < 1:
+            errors.append("DATA_DIRECT_UPLOAD_MAX_PENDING_PER_USER must be >= 1")
+        public_endpoint = self.object_storage_config.public_endpoint_url
+        if public_endpoint:
+            parsed = urlparse(public_endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                errors.append(
+                    "OBJECT_STORAGE_PUBLIC_ENDPOINT_URL must be an http(s) URL, "
+                    "for example http://127.0.0.1:9000"
+                )
+        return errors
 
     def get_redis_url(self) -> str:
         """Get Redis connection URL."""
