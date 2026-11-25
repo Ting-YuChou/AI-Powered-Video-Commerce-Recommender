@@ -1541,7 +1541,10 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:RELEASE.2024-06-29T01-20-47Z
+    # Silo, a maintained MinIO fork; MinIO no longer publishes images. It keeps
+    # the MINIO_* variables and the `server` command, and the image ships `mc`
+    # for the healthcheck. See docs/operations/object-storage-and-auth.md.
+    image: pgsty/silo:RELEASE.2026-11-12T00-00-00Z@sha256:c20d112390b9a9ce8c11b8af95ad35bcaa62f4759663c09c936cd8d2b511f329
     profiles: ["object-storage", "feature-lake", "feature-lake-pit"]
     command: server /data --console-address ":9001"
     environment:
@@ -1566,7 +1569,8 @@ services:
     restart: unless-stopped
 
   minio-init:
-    image: minio/mc:RELEASE.2025-04-03T17-07-56Z
+    # The Silo fork of the MinIO client; same commands as `mc`.
+    image: pgsty/mc:RELEASE.2026-11-12T00-00-00Z@sha256:b532278b7a3747dbab6fe45eebb40a653efa704e6758e24e9d9ec54fc96c1800
     profiles: ["object-storage", "feature-lake", "feature-lake-pit"]
     depends_on:
       minio:

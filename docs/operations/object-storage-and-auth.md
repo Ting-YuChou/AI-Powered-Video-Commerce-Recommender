@@ -95,6 +95,27 @@ never change bucket configuration.
 
 ## MinIO Bring-Up
 - Start the profile with `docker compose --profile object-storage up -d minio minio-init`.
+- The `minio` and `minio-init` services run Silo (`pgsty/silo` and
+  `pgsty/mc`), a MinIO fork maintained by Pigsty under AGPL-3.0
+  ([pgsty/silo](https://github.com/pgsty/silo)). MinIO stopped publishing
+  community images: `minio/minio` and `minio/mc` are gone from Docker Hub,
+  `quay.io/minio` refuses anonymous pulls, and the upstream repository is
+  archived. Silo keeps the S3 API, the `MINIO_*` variables, the `server`
+  command and the `mc` commands, so service names, the `minio_data` volume
+  and `minio-init` are unchanged.
+  - The server image has no `minio` binary. It ships the client as `mcli`
+    with an `mc` symlink, which the healthcheck uses.
+  - Silo reads data that `minio/minio:RELEASE.2024-06-29T01-20-47Z` wrote,
+    so an existing `minio_data` volume does not need to be recreated.
+  - Silo adds a per-bucket CORS API (`put-bucket-cors`). A bucket rule
+    replaces `MINIO_API_CORS_ALLOW_ORIGIN` for that bucket; without one the
+    server-wide setting applies.
+  - Both images are pinned by tag and digest. To upgrade, read the
+    [release notes](https://github.com/pgsty/silo/releases), get the new
+    digests with `docker buildx imagetools inspect pgsty/silo:<tag>` (and
+    `pgsty/mc:<tag>`), update both `image:` lines, and re-check a presigned
+    POST, a CORS preflight, `copy_upload_object` with a stale ETag (must raise
+    `UploadObjectChanged`) and the `minio-init` lifecycle import.
 - Set:
   - `OBJECT_STORAGE_BACKEND=s3`
   - `OBJECT_STORAGE_ENDPOINT_URL=http://minio:9000`
