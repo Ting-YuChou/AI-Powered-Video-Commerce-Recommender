@@ -133,6 +133,12 @@ x-common-service: &common-service
     DATA_UPLOAD_DIR: /app/uploads
     DATA_LOAD_SAMPLE_DATA: "false"
     DATA_MAX_FILE_SIZE: ${DATA_MAX_FILE_SIZE:-104857600}
+    # Direct uploads need OBJECT_STORAGE_BACKEND=s3 and the object-storage
+    # profile; see docs/operations/object-storage-and-auth.md#minio-bring-up.
+    DATA_DIRECT_UPLOAD_ENABLED: ${DATA_DIRECT_UPLOAD_ENABLED:-false}
+    DATA_DIRECT_UPLOAD_URL_TTL_SECONDS: ${DATA_DIRECT_UPLOAD_URL_TTL_SECONDS:-900}
+    DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS: ${DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS:-3600}
+    DATA_DIRECT_UPLOAD_MAX_PENDING_PER_USER: ${DATA_DIRECT_UPLOAD_MAX_PENDING_PER_USER:-5}
     MODEL_LAZY_LOAD: "true"
     MODEL_TORCH_NUM_THREADS: ${MODEL_TORCH_NUM_THREADS:-1}
     MODEL_TORCH_NUM_INTEROP_THREADS: ${MODEL_TORCH_NUM_INTEROP_THREADS:-1}
@@ -301,6 +307,11 @@ x-common-service: &common-service
     SECURITY_JWT_ALGORITHMS: ${SECURITY_JWT_ALGORITHMS:-RS256}
     OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-local}
     OBJECT_STORAGE_ENDPOINT_URL: ${OBJECT_STORAGE_ENDPOINT_URL:-http://minio:9000}
+    # Where the browser reaches MinIO (its published port), for presigned
+    # direct uploads; the services use the in-network endpoint above. Set it
+    # to an empty value to presign for OBJECT_STORAGE_ENDPOINT_URL instead
+    # (for example real S3), so "-" here, not ":-".
+    OBJECT_STORAGE_PUBLIC_ENDPOINT_URL: ${OBJECT_STORAGE_PUBLIC_ENDPOINT_URL-http://127.0.0.1:9000}
     OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
     OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-video-commerce-assets}
     OBJECT_STORAGE_ACCESS_KEY_ID: ${OBJECT_STORAGE_ACCESS_KEY_ID:-}
@@ -1547,6 +1558,9 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # Server-wide CORS origins, so the frontend (Caddy on :80, Vite on :3000)
+      # can POST direct uploads.
+      MINIO_API_CORS_ALLOW_ORIGIN: ${MINIO_API_CORS_ALLOW_ORIGIN:-http://localhost,http://127.0.0.1,http://localhost:3000,http://127.0.0.1:3000}
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
@@ -1578,6 +1592,11 @@ services:
         mc alias set local http://minio:9000 "${MINIO_ROOT_USER:-minioadmin}" "${MINIO_ROOT_PASSWORD:-minioadmin}"
         mc mb --ignore-existing "local/${OBJECT_STORAGE_BUCKET:-video-commerce-assets}"
         mc mb --ignore-existing "local/video-commerce-features"
+        # Expire direct uploads that were never completed (see
+        # deploy/object-storage/lifecycle.json). Import replaces the bucket's
+        # rules, so re-running this is idempotent.
+        echo '{"Rules":[{"ID":"incoming-direct-uploads-expire-after-1-day","Status":"Enabled","Filter":{"Prefix":"${OBJECT_STORAGE_PREFIX:-uploads}/incoming/"},"Expiration":{"Days":1}}]}' \
+          | mc ilm import "local/${OBJECT_STORAGE_BUCKET:-video-commerce-assets}"
     networks:
       - video-commerce-network
     restart: "no"

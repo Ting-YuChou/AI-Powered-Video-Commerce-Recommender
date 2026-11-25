@@ -156,6 +156,10 @@ data:
   DATA_UPLOAD_DIR: {{ .Values.appConfig.dataUploadDir | quote }}
   DATA_LOAD_SAMPLE_DATA: "false"
   DATA_MAX_FILE_SIZE: {{ .Values.appConfig.dataMaxFileSize | quote }}
+  DATA_DIRECT_UPLOAD_ENABLED: {{ .Values.appConfig.directUpload.enabled | quote }}
+  DATA_DIRECT_UPLOAD_URL_TTL_SECONDS: {{ .Values.appConfig.directUpload.urlTtlSeconds | quote }}
+  DATA_DIRECT_UPLOAD_COMPLETE_GRACE_SECONDS: {{ .Values.appConfig.directUpload.completeGraceSeconds | quote }}
+  DATA_DIRECT_UPLOAD_MAX_PENDING_PER_USER: {{ .Values.appConfig.directUpload.maxPendingPerUser | quote }}
   MODEL_LAZY_LOAD: {{ .Values.appConfig.modelLazyLoad | quote }}
   MODEL_TORCH_NUM_THREADS: {{ .Values.appConfig.modelTorchNumThreads | quote }}
   MODEL_TORCH_NUM_INTEROP_THREADS: {{ .Values.appConfig.modelTorchNumInteropThreads | quote }}
@@ -187,6 +191,7 @@ data:
   RETRIEVAL_VISUAL_TRAINING_VALIDATION_FRACTION: {{ .Values.appConfig.visualRetrieval.trainingValidationFraction | quote }}
   OBJECT_STORAGE_BACKEND: {{ .Values.external.objectStorage.backend | quote }}
   OBJECT_STORAGE_ENDPOINT_URL: {{ .Values.external.objectStorage.endpointUrl | quote }}
+  OBJECT_STORAGE_PUBLIC_ENDPOINT_URL: {{ .Values.external.objectStorage.publicEndpointUrl | quote }}
   OBJECT_STORAGE_REGION: {{ .Values.external.objectStorage.region | quote }}
   OBJECT_STORAGE_BUCKET: {{ .Values.external.objectStorage.bucket | quote }}
   OBJECT_STORAGE_PREFIX: {{ .Values.external.objectStorage.prefix | quote }}

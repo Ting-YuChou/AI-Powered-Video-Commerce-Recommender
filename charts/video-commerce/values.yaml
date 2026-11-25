@@ -166,6 +166,9 @@ external:
     region: us-east-1
     bucket: ""
     prefix: uploads
+    # Browser-reachable endpoint for presigned direct uploads; empty uses
+    # endpointUrl (or the AWS default endpoint).
+    publicEndpointUrl: ""
     forcePathStyle: true
     createBucketOnStartup: false
     connectTimeoutSeconds: 5
@@ -323,6 +326,15 @@ appConfig:
   dataUploadDir: /app/uploads
   objectStorageDownloadDir: /tmp/object-storage
   dataMaxFileSize: "104857600"
+  # Direct uploads (POST /api/content/uploads): browsers upload straight to
+  # object storage. Needs migration 014, the bucket CORS rule in
+  # deploy/object-storage/cors.json, and external.objectStorage.publicEndpointUrl
+  # when browsers reach storage at a different address than the pods do.
+  directUpload:
+    enabled: false
+    urlTtlSeconds: 900
+    completeGraceSeconds: 3600
+    maxPendingPerUser: 5
   modelLazyLoad: "true"
   modelTorchNumThreads: 1
   modelTorchNumInteropThreads: 1
